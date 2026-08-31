@@ -1,0 +1,83 @@
+.playground {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  font-family: system-ui, sans-serif;
+}
+
+header {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.subtitle {
+  color: #888;
+  font-size: 0.85rem;
+}
+
+main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.editor-pane,
+.console-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 0.75rem;
+}
+
+.editor-pane {
+  border-right: 1px solid #333;
+}
+
+textarea {
+  flex: 1;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.9rem;
+  resize: none;
+  padding: 0.5rem;
+}
+
+.editor-pane button {
+  margin-top: 0.5rem;
+  padding: 0.5rem 1rem;
+  align-self: flex-start;
+  cursor: pointer;
+}
+
+.editor-pane button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.console-pane h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  color: #888;
+  margin: 0 0 0.5rem 0;
+}
+
+.console-pane pre {
+  flex: 1;
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+.console-error {
+  color: #e5534b;
+}
