@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+target/
+
+# Generated wasm-bindgen output (regenerate with `npm run build:wasm`)
+packages/lua-runtime/pkg/
+
+# App build output
+dist/
+
+# Editor / OS
+.DS_Store
+*.log
