@@ -27,7 +27,26 @@ and [risks.md](./risks.md#decision-log) for what that changed.
 
 ## Status
 
-Pre-implementation. No code has been written yet. `risks.md` §1 (piccolo's
-debug-introspection surface) should be spiked before committing to Phase 3
-of the roadmap — it's the one architectural assumption in this doc set that
-hasn't been proven against real code.
+MVP-1 slice implemented: Phases 0-2 of the roadmap (conformance harness,
+piccolo-backed Lua runtime compiled to WASM, playground UI) are built and
+verified end-to-end, including in a real browser. Phases 3-8 (the debugger)
+are explicitly deferred — `risks.md` §1 is resolved and concluded that
+piccolo's public API has no frame/locals introspection surface, so a
+debugger needs a piccolo fork (or upstream contribution) before that work
+can start; see `risks.md` §1 and `roadmap.md` for the consequences.
+
+What exists:
+
+- `crates/lua-vm` — the piccolo-backed runtime (`run`/`run_named`), with a
+  sandboxed `print` and small host-added stdlib extensions
+  (`table.insert`/`concat`/`sort`, `xpcall`) that piccolo itself doesn't
+  ship. Unit-tested and conformance-tested.
+- `conformance/fixtures` — a 10-fixture corpus diffed against real Lua
+  5.5.1 output; see [conformance.md](./conformance.md)'s known-deviations
+  ledger for what piccolo actually diverges on (confirmed by source
+  inspection, not guesswork): no arithmetic/comparison metamethods, no
+  string pattern matching, no string metatable.
+- `packages/lua-runtime` — the `wasm-bindgen`-generated npm package wrapping
+  `crates/lua-vm`.
+- `apps/web` — a Vite/React playground UI that runs the VM in a Web Worker,
+  per architecture.md's worker-isolation requirement.

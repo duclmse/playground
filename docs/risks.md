@@ -15,43 +15,58 @@ roughly by how much they'd cost to discover late.
   semantic conformance more broadly (mitigated by
   [conformance.md](./conformance.md), a new dedicated doc).
 
-## 1. piccolo debug-introspection surface (the central risk)
+## 1. piccolo debug-introspection surface (the central risk) — RESOLVED: fork required
 
-The entire debugger (Phases 3–8) depends on getting per-`step()`
-introspection out of piccolo's fuel-driven executor: current source line,
-call-stack frames, named locals, and upvalues.
+Spiked directly against piccolo 0.3.3 source
+(`~/.cargo/registry/.../piccolo-0.3.3/src/thread/{executor,thread}.rs`,
+`src/closure.rs`). Verdict: **piccolo's public API does not expose enough
+introspection to build the debugger without forking it.** This was the
+central unknown; it's no longer unknown, and it's the reason this MVP slice
+implements Phases 0–2 (real runtime + playground UI) and defers Phases 3–8
+(the debugger) rather than attempting them on unmodified piccolo.
 
-**What's known:**
+**What's confirmed:**
 
-- piccolo's execution model (an `Executor` stepped via something like
-  `step(&mut ctx, &mut fuel)`, backed by `gc-arena` for
-  interruption-safe GC) is *exactly* the right shape for pause/resume — no
-  Atomics/threads/blocking needed, since "pause" is just "the host stops
-  calling `step()`." This is a genuine, structural improvement over the
-  Wasmoon design.
-- What's **not** established: whether piccolo's public API exposes enough
-  of the executor's internal frame/call-stack/local-variable state for our
-  instrumentation layer to build `DebugEvent`s (line/call/return) and
-  `StackFrame`/`Scope` data from it (see
-  [debug-protocol.md](./debug-protocol.md#debug-events)). piccolo is built
-  for embedding Lua-like scripting in Rust applications (e.g. game
-  engines) — introspection for an external debugger UI is not its stated
-  design goal the way `lua_sethook`/`lua_getlocal`/`lua_getinfo` are
-  official Lua's.
+- The fuel-stepped model itself is real and exactly as documented:
+  `Executor::step(self, ctx: Context<'gc>, fuel: &mut Fuel) -> bool`, driven
+  in a loop by `Lua::finish()`. `Fuel::interrupt()` lets a host force early
+  return. This part of the architecture is sound.
+- `Closure::load(ctx, name, source)` / `FunctionPrototype::compile(ctx,
+  source_name, source)` take an explicit chunk name, confirming risks.md §6
+  (source mapping) is fine — piccolo does have Lua's `@path`-style
+  chunk-naming equivalent, threaded through to `FunctionPrototype::chunk_name`
+  and (via `opcode_line_numbers: Box<[(usize, LineNumber)]>`) a real
+  pc→line table per prototype.
+- **But** `thread::thread::Frame` (the enum holding `bottom`/`base`/`pc`/
+  `stack_size` per Lua call frame), `ThreadState` (the `frames`/`stack`/
+  `open_upvalues` vectors), `LuaFrame`, and `LuaRegisters` are all
+  `pub(super)` — module-private to `piccolo::thread`. `Thread`'s only public
+  methods are `new`, `start`, `take_result`, `resume`, `resume_err`,
+  `mode`, `reset` — none expose the call stack, frame locals, or current pc.
+  `Executor` itself exposes no per-frame accessor at all.
+- The one public introspection hook that exists,
+  `Execution::upper_lua_frame()` (`chunk_name`/`current_function`/
+  `current_line` of the frame *above* the current callback), only fires
+  from inside a `Callback`/`Sequence` being run by the VM — it cannot be
+  polled by host code between `step()` calls, which is the shape the
+  debugger actually needs (pause after N instructions, then ask "what line,
+  what locals, what call stack").
 
-**Likely outcome:** some combination of (a) using whatever introspection
-piccolo already exposes publicly, (b) forking piccolo to add the missing
-hooks ourselves, or (c) upstreaming those hooks as a contribution. Any of
-these is workable, but the estimate for Phase 3 depends entirely on which
-one it turns out to be — that's the spike.
+**Consequence for the roadmap:** Phase 3 ("instrument piccolo's existing
+frame/step API") as originally scoped is not possible against piccolo
+0.3.3 unmodified — option (a) from the old "likely outcome" list is off the
+table. It's (b) fork piccolo to make `Frame`/`ThreadState` (or a purpose-built
+read-only view of them) `pub`, or (c) upstream that as a contribution and
+depend on a patched/forked crate in the meantime. Either way this is
+real, scoped Rust work against piccolo's internals, not a thin
+instrumentation wrapper — treat Phase 3's estimate accordingly, and don't
+start it without first deciding fork-and-vendor vs. upstream-and-wait.
 
-**Recommended action:** time-box a spike before Phase 3 proper: from a
-running `Executor`, after a single `step()` call, (1) determine the current
-source line, (2) enumerate the current frame's locals by name and value,
-(3) confirm nested `step()` calls can report a `CALL` boundary. If any of
-the three isn't reachable through piccolo's existing public API, scope
-whether it's a small fork/patch or a deeper change before committing to the
-rest of the roadmap's estimates.
+**What this MVP does instead:** ships Phases 0–2 (conformance harness, real
+piccolo-backed `execute()`, Monaco-less-for-now playground UI with
+Run/Console) against piccolo's public API as-is — none of that needs frame
+introspection. The debugger (Phases 3–8) stays explicitly blocked on the
+fork-vs-upstream decision above and is not part of this MVP slice.
 
 ## 2. SharedArrayBuffer / cross-origin-isolation requirement — RESOLVED (not applicable)
 
@@ -136,14 +151,27 @@ stating what happens by default before Phase 8 exists.
 
 ## 8. WASM load-time budget
 
-Not addressed in the original plan. The compiled VM adds to initial load
-time; recommend lazy-loading it (on first "Run" press, or idle-after-paint)
-rather than blocking the initial page render, and showing an explicit
-loading state in the UI rather than a frozen Run button. A Rust/wasm-bindgen
-build with `wasm-opt` tends to produce a smaller binary than an
-Emscripten-compiled C Lua + JS shim, but that's a reasonable expectation,
-not a measurement — profile the actual `crates/lua-vm` output early, since
-it sets the loading-UX bar.
+**MEASURED** (Phase 1-2 implementation, including the host stdlib
+extensions added during Phase 0 conformance work — `table.insert`/
+`concat`/`sort`, `xpcall`). `cargo build --release --target
+wasm32-unknown-unknown` on `crates/lua-vm` produces a 952.1 KB raw
+`.wasm`. After `wasm-bindgen --target web` + Vite's production build, the
+shipped asset is **696.71 KB (236.41 KB gzip)**. This is *without*
+`wasm-opt` — the Cargo.toml has no `wasm-opt`/`binaryen` post-processing
+step wired in yet, so there's real headroom left on the table; adding a
+`wasm-opt -O` pass (or `wasm-pack`'s built-in one) before shipping to real
+users is a cheap follow-up, not yet done.
+
+The original plan's recommendation still stands and is implemented in
+`apps/web`: the VM initializes inside a Web Worker
+(`src/lua-worker.ts`), off the UI thread, and the UI shows an explicit
+"loading" gate on the Run button rather than blocking initial page render —
+confirmed working via a real Playwright browser run.
+
+236.41 KB gzip is comparable to a mid-size JS framework bundle, not
+negligible, but well within budget for a playground tool where the user has
+explicitly navigated to "go write Lua." No further action needed for MVP-1;
+`wasm-opt` is the natural next lever if load time becomes a complaint.
 
 ## 9. Minor: citation accuracy in the original doc
 

@@ -36,14 +36,31 @@ just exist at launch.
 - Metatables/metamethods actually needed for the inspector and for typical
   user scripts: `__index`, `__newindex`, `__call`, `__tostring`, the
   arithmetic/comparison metamethods.
+  **Update (Phase 0 finding):** piccolo 0.3.3's VM does not implement the
+  arithmetic/comparison metamethods at all (confirmed by source inspection —
+  see the known-deviations ledger below); `__index`/`__newindex`/`__call`/
+  `__tostring` do work and are conformance-tested. Arithmetic/comparison
+  metamethod support is now tracked as VM-fork work, not a conformance gap
+  to close by testing harder.
 - Error handling: `error`, `pcall`, `xpcall`, error object types (string vs
   table errors).
+  **Update (Phase 0 finding):** `pcall`/`error`/`assert` ship with piccolo;
+  `xpcall` did not and has been added as a host-registered stdlib extension
+  (see the ledger). `error()`'s position-prefixing does not match real Lua
+  and is a documented, accepted deviation for this MVP.
 - Coroutines: `create`/`resume`/`yield`/`status`, since Phase 8's coroutine
   debugging design depends on this matching Lua's model.
 - A practical subset of the standard library: `string` (including pattern
   matching — this is a known area where non-reference implementations
   diverge), `table`, `math`, `os.time`/`os.clock` (the sandbox-safe subset,
   see [architecture.md](./architecture.md#sandbox)).
+  **Update (Phase 0 finding):** piccolo 0.3.3 ships no Lua pattern-matching
+  engine (`find`/`match`/`gmatch`/`gsub`) and no `string.format`, and no
+  string metatable (so `s:method()` colon-call syntax doesn't work on
+  strings) — all confirmed by source inspection, all documented in the
+  ledger, all deferred out of this MVP. `table.insert`/`concat`/`sort` were
+  missing from piccolo too, but were small enough to add as host stdlib
+  extensions rather than defer.
 
 **Out of scope / explicitly not chased for v1:**
 
@@ -103,7 +120,15 @@ for anything a user could plausibly hit, e.g.:
 
 | Feature | Status | Notes |
 |---|---|---|
-| *(populate once Phase 0 runs the corpus for the first time)* | | |
+| Arithmetic/comparison metamethods (`__add`, `__sub`, `__mul`, `__div`, `__mod`, `__pow`, `__eq`, `__lt`, `__le`, ...) | **Unsupported** | piccolo 0.3.3's VM binary-op opcodes (`crates/thread/vm.rs`) raise a `BinaryOperatorError` directly and never consult `meta_ops` for these operators — confirmed by reading `meta_ops.rs`, which only implements `index`/`new_index`/`call`/`tostring` dispatch, nothing arithmetic. Fixing this needs VM changes, not host code — tracked alongside the [risks.md §1](./risks.md#1-piccolo-debug-introspection-surface-the-central-risk) fork decision. `metatables.lua` only exercises `__index`/`__newindex`/`__call`/`__tostring`, which do work. |
+| `string` pattern matching (`find`, `match`, `gmatch`, `gsub`) and `string.format` | **Unsupported** | piccolo 0.3.3's `stdlib/string.rs` only implements `len`, `lower`, `reverse`, `sub`, `upper` — no pattern engine at all. Would require hand-writing a Lua pattern-matching engine; deferred out of this MVP, tracked as future host-stdlib work. `strings.lua` only exercises the supported subset. |
+| `s:method()` colon-call syntax on string values | **Unsupported** | piccolo has no string metatable/`__index` fallback for `Value::String` (`meta_ops::index` has no `Value::String` arm) — `("hello"):upper()` raises a type error. Use `string.upper("hello")` form instead. |
+| `table.insert` / `table.concat` / `table.sort` | **Supported (host extension)** | piccolo 0.3.3's `stdlib/table.rs` only ships `pack`/`unpack`. Added as host-registered callbacks in `crates/lua-vm/src/lib.rs` (`extend_table_library`), consistent with architecture.md's "host opts stdlib pieces in explicitly" design. `table.sort` with a custom comparator is not supported (would need a `Sequence`-driven callback into Lua for each comparison) and errors explicitly rather than silently ignoring the comparator. |
+| `xpcall` | **Supported (host extension)** | piccolo 0.3.3's `stdlib/base.rs` only ships `pcall`. Added as a host-registered global in `crates/lua-vm/src/lib.rs` (`install_xpcall`), mirroring piccolo's own `pcall` `Sequence` implementation. |
+| `error(msg)` position-prefixing (`"chunk:line: " .. msg`) | **Unsupported** | piccolo's `error` callback (`stdlib/base.rs`) passes the message value through unchanged; real Lua prepends the call-site position for string messages at the default level (1). No current-line introspection is available from a host callback without the frame/position API that [risks.md §1](./risks.md#1-piccolo-debug-introspection-surface-the-central-risk) found missing. `errors.lua`'s expected output reflects piccolo's actual (unprefixed) behavior. |
+| `type()` of a VM-internal runtime error (e.g. `1 + nil`) caught by `pcall`/`xpcall` | **Deviates: `"userdata"` not `"string"`** | Confirmed in piccolo's `error.rs`: `Error::Runtime(...)` (anything raised by the VM itself rather than a user `error()` call) converts to a Lua value as a `UserData` wrapping the Rust error (with a `__tostring` metamethod for display), never a plain string. Only errors explicitly raised via `error("...")` are real Lua strings. `errors.lua`'s expected output reflects this. |
+| Integral-float display (`2^10` → `"1024.0"` not `"1024"`) | **Fixed (host workaround)** | piccolo's own `Value::Display` (`value.rs`) does `write!(w, "{}", f)`, which drops the trailing `.0`; `meta_ops::tostring` bakes this in internally before a caller ever sees it (it eagerly stringifies non-string/non-metatable values). Worked around in `crates/lua-vm/src/lib.rs`'s `print` by special-casing `Value::Number` *before* calling `meta_ops::tostring` (numbers can never carry a metatable in piccolo, so this is safe) and formatting via a small `format_lua_number` helper. Only fixes numbers that flow through this project's `print`; any future host code calling piccolo's own `tostring`/`Display` directly on a float will still see the truncated form. |
+| `table`/`function`/`thread`/`userdata` raw `tostring` format | **Deviates: `<table 0x...>` not `table: 0x...`** | piccolo's `Value::display` (`value.rs`) uses `<table {:p}>` instead of Lua's `table: 0x...`. Not currently exercised by any fixture (nothing in the corpus prints a raw table/function without `__tostring`); noted here so it doesn't surprise a future fixture. |
 
 Rules for the ledger:
 
