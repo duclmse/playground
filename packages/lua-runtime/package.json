@@ -1,0 +1,10 @@
+{
+  "name": "@lua-playground/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "pkg/lua_vm.js",
+  "module": "pkg/lua_vm.js",
+  "types": "pkg/lua_vm.d.ts",
+  "files": ["pkg"]
+}
