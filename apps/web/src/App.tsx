@@ -1,6 +1,7 @@
 import Editor, {type OnMount} from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -156,11 +157,17 @@ function App() {
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
+    // If the mouse button is released outside the browser window (or the
+    // window loses focus mid-drag, e.g. alt-tab), no "mouseup" ever reaches
+    // `document` - without this, the drag listeners and the resize cursor
+    // would stay stuck on indefinitely.
+    window.addEventListener("blur", onUp);
     document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
   };
@@ -268,6 +275,15 @@ function App() {
     setStopEvent(null);
     breakpointIdsRef.current = {};
   };
+
+  // Stable identity, not `() => {}` inline in JSX: DebugPanel's main effect
+  // depends on this prop, so a fresh closure every App render (e.g. from
+  // dragging a resize handle or toggling a breakpoint while paused, both of
+  // which update unrelated App state) would spuriously re-run it - resetting
+  // the selected frame and wiping every watch's evaluated value without
+  // recomputing them (confirmed live: a watch showing `2` reverted to `…`
+  // and stuck there after a resize-handle drag).
+  const handleFrameSelected = useCallback(() => {}, []);
 
   /** Toggles a breakpoint from the gutter, keeping a live session in sync. */
   const toggleBreakpoint = async (file: string, line: number) => {
@@ -574,7 +590,7 @@ function App() {
               onStepInto={() => doDebugAction(s => s.stepInto())}
               onStepOut={() => doDebugAction(s => s.stepOut())}
               onStop={stopDebugging}
-              onFrameSelected={() => {}}
+              onFrameSelected={handleFrameSelected}
             />
           ) : analysis?.type === "profile" ? (
             <ProfilerPanel stats={analysis.stats} onClose={() => setAnalysis(null)} />

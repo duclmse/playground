@@ -12,14 +12,15 @@
 // and what's still unbuilt (profiler/timeline UI, a thread selector for
 // coroutines, pause()).
 
-import type {
-  BreakpointInfo,
-  DebugRequest,
-  EvalResultInfo,
-  StackFrameInfo,
-  ThreadInfo,
-  VariableInfo,
-  WorkerEvent,
+import {
+  allocateRequestId,
+  type BreakpointInfo,
+  type DebugRequest,
+  type EvalResultInfo,
+  type StackFrameInfo,
+  type ThreadInfo,
+  type VariableInfo,
+  type WorkerEvent,
 } from "./debug-protocol";
 
 export type { BreakpointInfo, StackFrameInfo, ThreadInfo, VariableInfo, EvalResultInfo };
@@ -58,7 +59,6 @@ export interface Scope {
  */
 export class DebugSession {
   private worker: Worker;
-  private nextId = 0;
   private pending = new Map<
     number,
     { resolve: (event: WorkerEvent) => void; reject: (err: Error) => void }
@@ -91,7 +91,7 @@ export class DebugSession {
   };
 
   private send<T extends WorkerEvent>(request: DebugRequestWithoutId): Promise<T> {
-    const id = this.nextId++;
+    const id = allocateRequestId();
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (e: WorkerEvent) => void, reject });
       this.worker.postMessage({ ...request, id } as DebugRequest);

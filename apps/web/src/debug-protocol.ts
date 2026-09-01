@@ -6,6 +6,23 @@
 // right pending Promise - `postMessage` itself has no request/response
 // correlation built in.
 
+/**
+ * One id sequence shared by every id-correlated caller of the single Lua
+ * worker (`DebugSession` in debug-session.ts, the one-shot profiler/timeline
+ * calls in analysis.ts). All of them listen for "message" on the *same*
+ * `Worker` object and filter by `id`, so two callers minting ids from their
+ * own counters (both naturally starting at 0) could otherwise collide and
+ * resolve each other's pending promise with the wrong response - confirmed
+ * live: firing a Profile request immediately followed by starting a debug
+ * session produced an uncaught `TypeError` and left the debugger UI
+ * permanently stuck. A single shared counter makes every id on the wire
+ * unique regardless of which caller sent it.
+ */
+let nextRequestId = 0;
+export function allocateRequestId(): number {
+  return nextRequestId++;
+}
+
 export type StackFrameInfo = {
   index: number;
   name: string;

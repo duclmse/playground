@@ -8,16 +8,14 @@
 // arrives - same id-correlation idea as `DebugSession.send`, just without
 // a whole class's worth of state for two one-shot calls.
 
-import type { FunctionStatsInfo, TimelineInfo, WorkerEvent } from "./debug-protocol";
-
-let nextId = 0;
+import { allocateRequestId, type FunctionStatsInfo, type TimelineInfo, type WorkerEvent } from "./debug-protocol";
 
 function sendOneShot<T extends WorkerEvent>(
   worker: Worker,
   request: object,
   isMatch: (event: WorkerEvent) => event is T,
 ): Promise<T> {
-  const id = nextId++;
+  const id = allocateRequestId();
   return new Promise<T>((resolve, reject) => {
     const handleMessage = (event: MessageEvent<WorkerEvent>) => {
       const message = event.data;
