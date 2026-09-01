@@ -1,7 +1,7 @@
 # Debug Protocol & Engine
 
 This is the internal contract between the UI and the debug engine. It's
-modeled on Debug Adapter Protocol (DAP) concepts — not implementing DAP
+modeled on Debug Adapter Protocol (DAP) concepts - not implementing DAP
 itself in v1, but shaped so that exposing a DAP server later (letting VS
 Code/Neovim attach to an in-browser session) is additive rather than a
 rewrite. See [architecture.md](./architecture.md) for where this sits in the
@@ -11,7 +11,7 @@ instrumented (or forked) to produce the events described below.
 
 ## DebugSession interface
 
-The UI never talks to the Lua runtime directly — only to this:
+The UI never talks to the Lua runtime directly - only to this:
 
 ```typescript
 interface DebugSession {
@@ -39,13 +39,13 @@ interface DebugSession {
 
 Call chain: `React → DebugSession → LuaDebugger → LuaRuntime → piccolo (WASM)`.
 Because everything routes through `DebugSession`, swapping the backend later
-(a different Lua engine, a remote Lua process) doesn't touch the UI — this
+(a different Lua engine, a remote Lua process) doesn't touch the UI - this
 interface is unchanged by the Wasmoon→piccolo pivot, which is the point of
 having it.
 
 ## State machine
 
-Debugger state is modeled explicitly, in one place — not scattered across
+Debugger state is modeled explicitly, in one place - not scattered across
 React components.
 
 ```mermaid
@@ -78,10 +78,10 @@ class DebugSessionManager {
 
 **Default behavior for uncaught errors** (not specified in the original
 plan): an uncaught Lua runtime error transitions `Running → Failed` and
-surfaces as a `stopped` event with `reason: "exception"` — the UI should
+surfaces as a `stopped` event with `reason: "exception"` - the UI should
 treat this like hitting a breakpoint (show the failing line, populate call
 stack/locals) rather than just dumping a stack trace to the console. Errors
-caught by `pcall`/`xpcall` inside user code do **not** trigger this — they
+caught by `pcall`/`xpcall` inside user code do **not** trigger this - they
 stay inside `Running`. Breaking on *caught* errors too ("exception
 breakpoints") is a Phase 8 feature, not v1 default behavior.
 
@@ -92,19 +92,19 @@ execution model is different and the events below have to be **produced by
 our own instrumentation**, not read off an existing hook API:
 
 - piccolo drives execution by repeatedly calling something like
-  `executor.step(&mut ctx, &mut fuel)` — each call performs a bounded unit
+  `executor.step(&mut ctx, &mut fuel)` - each call performs a bounded unit
   of work (an instruction, or a small batch) and returns control to the
   host.
 - The instrumentation layer (in `crates/lua-vm`, see
   [architecture.md](./architecture.md#project-structure)) wraps that loop
   and, after each `step()`, inspects whether a line boundary, a call, or a
   return just happened, and whether the fuel/instruction budget for this
-  turn is exhausted — then emits the corresponding event across the
+  turn is exhausted - then emits the corresponding event across the
   `wasm-bindgen` boundary.
 - This is the crux of [risks.md §1](./risks.md#1-piccolo-debug-introspection-surface-the-central-risk):
   piccolo needs to expose enough of its internal executor/frame state for
   this wrapper to determine "did the line change," "did we just enter a
-  Lua function," "did we just return," and "what are this frame's locals" —
+  Lua function," "did we just return," and "what are this frame's locals" -
   and it isn't guaranteed to expose all of that out of the box.
 
 The event shape the rest of the debugger consumes stays the same regardless
@@ -128,7 +128,7 @@ Why all four kinds, not just line:
 | RETURN | step out, call stack updates                              |
 | COUNT  | pause responsiveness, infinite-loop protection, profiling |
 
-The COUNT-equivalent here is naturally covered by the fuel budget itself —
+The COUNT-equivalent here is naturally covered by the fuel budget itself -
 "exceeded the per-turn fuel allowance" is the same signal that would
 otherwise come from a Lua instruction-count hook, so it doesn't need a
 separate mechanism.
@@ -148,14 +148,14 @@ interface Breakpoint {
 ```
 
 Sequencing: **set/remove/hit** basic line breakpoints first (Phase 4).
-**Conditional breakpoints, hit counts, logpoints** are Phase 8 — they reuse
+**Conditional breakpoints, hit counts, logpoints** are Phase 8 - they reuse
 the same `Breakpoint` shape (the fields already exist above) but need
 `condition`/`logMessage` evaluated against the paused frame before deciding
 whether to actually stop.
 
 ## Stepping algorithms
 
-These are the fiddly part — get the depth/line comparison wrong and step
+These are the fiddly part - get the depth/line comparison wrong and step
 operations silently do nothing or skip a frame. Each should have dedicated
 tests against fixture `.lua` files (see
 [risks.md §4](./risks.md#4-testing-strategy-for-stepping-logic)), and
@@ -163,7 +163,7 @@ against the [conformance.md](./conformance.md) fixture corpus once that
 exists, since stepping bugs and semantic bugs both surface as "wrong
 behavior on this test script."
 
-**Step Over** — resume execution until stack depth returns to ≤ the starting
+**Step Over** - resume execution until stack depth returns to ≤ the starting
 depth *and* the line has changed:
 
 ```typescript
@@ -176,11 +176,11 @@ interface StepOperation {
 }
 ```
 
-**Step Into** — capture the current frame, resume, and stop on the next
+**Step Into** - capture the current frame, resume, and stop on the next
 `CALL` event (entering the callee) rather than waiting for a line change at
 the same depth.
 
-**Step Out** — capture the current stack depth, resume, and stop once depth
+**Step Out** - capture the current stack depth, resume, and stop once depth
 drops below the captured value (i.e. the current function has returned).
 
 ## Call stack
@@ -199,7 +199,7 @@ interface StackFrame {
 ```
 
 Backed by the introspection layer described in
-[Debug events](#debug-events) above — piccolo's executor/frame stack, walked
+[Debug events](#debug-events) above - piccolo's executor/frame stack, walked
 by our instrumentation rather than `lua_getstack()`/`lua_getinfo()`.
 Rendering is unaffected:
 
@@ -212,7 +212,7 @@ Call Stack
 
 ## Value / inspector model
 
-Don't `JSON.stringify(luaValue)` — Lua values aren't JSON values (nil,
+Don't `JSON.stringify(luaValue)` - Lua values aren't JSON values (nil,
 boolean, number, string, table, function, thread, userdata; tables can be
 cyclic; distinct objects need distinct identity).
 
@@ -236,7 +236,7 @@ interface LuaValue {
 ```
 
 These values are marshaled across the `wasm-bindgen` boundary from piccolo's
-own Rust value representation — see
+own Rust value representation - see
 [architecture.md](./architecture.md#runtime-choice-rust--piccolo) for where
 that boundary sits.
 
@@ -248,7 +248,7 @@ local b = a
 ```
 
 `a` and `b` must serialize as the *same* referenced object (`#1`), not two
-separately-rendered empty tables — otherwise self-referential tables
+separately-rendered empty tables - otherwise self-referential tables
 (`t.self = t`) infinite-loop the serializer.
 
 ```typescript
@@ -278,7 +278,7 @@ interface LuaTableEntry {
 }
 ```
 
-Lazy-load entries — never enumerate a 100,000-entry table eagerly:
+Lazy-load entries - never enumerate a 100,000-entry table eagerly:
 
 ```typescript
 getVariables(reference, { start: 0, count: 100 });
@@ -296,7 +296,7 @@ getVariables(reference, { start: 0, count: 100 });
 
 Metatable support depth (which metamethods piccolo implements) is one of
 the items tracked in [conformance.md](./conformance.md)'s known-deviations
-ledger — don't assume full parity with official Lua's metamethod set
+ledger - don't assume full parity with official Lua's metamethod set
 without checking.
 
 ### Functions and upvalues
@@ -310,7 +310,7 @@ Parameters a, b
 ```
 
 Upvalue exposure depends on what the instrumentation layer can read from
-piccolo's closure representation — same lazy-expansion treatment as table
+piccolo's closure representation - same lazy-expansion treatment as table
 entries once available.
 
 ### Scopes / locals
@@ -326,18 +326,18 @@ interface Scope {
 ## Evaluation
 
 `evaluate(expression, frameId)` must run **in the selected stack frame's
-environment**, not global scope — otherwise a paused local like
+environment**, not global scope - otherwise a paused local like
 `local secret = 123` inside `foo()` wouldn't be visible to
 `evaluate("secret")` while stopped inside `foo`.
 
 Used by three surfaces, all going through the same `evaluate()`:
 
-- **Watch expressions** — re-evaluated on every stop:
+- **Watch expressions** - re-evaluated on every stop:
   ```text
   for watch in watches:
       evaluate(watch.expression)
   ```
-- **REPL** — two modes: a global REPL, and (when paused) a debug-frame REPL
+- **REPL** - two modes: a global REPL, and (when paused) a debug-frame REPL
   where `REPL context = current stack frame`.
 - **Hover evaluation** in the editor.
 
@@ -361,7 +361,7 @@ type WorkerEvent =
   | { type: "error"; message: string };
 ```
 
-Unchanged from the Wasmoon design, and unaffected by the runtime pivot —
+Unchanged from the Wasmoon design, and unaffected by the runtime pivot -
 this boundary was already engine-agnostic. What changed underneath is how
 `"pause"` is implemented worker-side: previously an `Atomics.notify` wakeup,
 now just "the driver loop stops calling `step()`."
@@ -369,7 +369,7 @@ now just "the driver loop stops calling `step()`."
 ## Instruction limits / infinite-loop protection
 
 The fuel budget passed to `executor.step()` is the direct analog of a Lua
-instruction-count hook — cap the total fuel spent per `launch()`/`continue()`
+instruction-count hook - cap the total fuel spent per `launch()`/`continue()`
 run:
 
 ```typescript
@@ -391,9 +391,9 @@ Lua VM
 ```
 
 `getThreads()` already exists in the v1 `DebugSession` interface for this
-reason — call stack queries take a `threadId` so the UI's thread selector
+reason - call stack queries take a `threadId` so the UI's thread selector
 just changes which stack is being viewed. Verify piccolo's own
-coroutine/thread model maps cleanly onto this before Phase 8 — it's on the
+coroutine/thread model maps cleanly onto this before Phase 8 - it's on the
 [conformance.md](./conformance.md) checklist.
 
 ## Advanced: profiler (Phase 8)
@@ -423,6 +423,6 @@ Not implemented in v1, but the API surface above is deliberately shaped
 after DAP's core requests (`initialize`, `launch`, `setBreakpoints`,
 `threads`, `stackTrace`, `scopes`, `variables`, `continue`, `next`,
 `stepIn`, `stepOut`, `evaluate`, `setVariable`, `pause`, `disconnect`) so
-that exposing an actual DAP server later — letting external editors attach
-to a session — is a translation layer on top of `DebugSession`, not a
+that exposing an actual DAP server later - letting external editors attach
+to a session - is a translation layer on top of `DebugSession`, not a
 redesign.

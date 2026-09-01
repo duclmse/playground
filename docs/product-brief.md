@@ -18,7 +18,7 @@ stdout."
 
 ## Goals (v1)
 
-- Lua semantics validated against a conformance suite, not assumed — the
+- Lua semantics validated against a conformance suite, not assumed - the
   runtime (Rust + piccolo, see [architecture.md](./architecture.md#runtime-choice-rust--piccolo))
   is a from-scratch implementation rather than the official reference, so
   "real Lua semantics" means "matches the corpus in
@@ -34,7 +34,7 @@ stdout."
 
 ## Non-goals (v1)
 
-Explicitly deferred — not because they're unimportant, but because pulling any
+Explicitly deferred - not because they're unimportant, but because pulling any
 of these into v1 changes the architecture materially and the core debugger needs
 to be proven first:
 
@@ -44,7 +44,7 @@ to be proven first:
 - Multi-user / collaborative editing, accounts, or any backend.
 - LuaJIT or Lua 5.5 support (the runtime is adapter-based so this is additive
   later, not a rewrite).
-- Coroutine debugging, profiling, memory inspection, execution timeline — these
+- Coroutine debugging, profiling, memory inspection, execution timeline - these
   are real features (see [roadmap.md](./roadmap.md) Phase 8) but they build on a
   stepping/inspection core that doesn't exist yet.
 - DAP server exposure (VS Code/Neovim attaching to the in-browser session). The
@@ -56,12 +56,12 @@ to be proven first:
 See [roadmap.md](./roadmap.md#mvp-1-capability-cut-line) for the exact
 10-capability list. Informally: a user can write multi-file Lua, set a
 breakpoint, hit it, step through code, inspect locals/globals including nested
-tables, and evaluate an expression in the paused frame — all without the tab
+tables, and evaluate an expression in the paused frame - all without the tab
 freezing on bad input.
 
 ## Constraints
 
-- Browser-only execution environment; no real filesystem — a virtual FS backs
+- Browser-only execution environment; no real filesystem - a virtual FS backs
   `require()`.
 - Lua execution happens in a Web Worker, never the UI thread (see
   [architecture.md](./architecture.md#web-worker-architecture)).

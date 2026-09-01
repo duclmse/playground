@@ -6,7 +6,7 @@ set -euo pipefail
 # Repo root, regardless of where a script is invoked from.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Must match the `wasm-bindgen = "=X.Y.Z"` pin in crates/lua-vm/Cargo.toml —
+# Must match the `wasm-bindgen = "=X.Y.Z"` pin in crates/lua-vm/Cargo.toml -
 # the wasm-bindgen CLI and the crate's wasm-bindgen dependency have to be
 # the exact same version or the generated JS glue fails at runtime.
 WASM_BINDGEN_VERSION="0.2.100"

@@ -8,7 +8,7 @@ import { loader } from "@monaco-editor/react";
 // Without an explicit `getWorker`, Monaco falls back to instantiating its
 // editorWorkerService worker from a `blob:` URL, whose relative ESM imports
 // then fail to resolve (`Invalid relative url or base scheme isn't
-// hierarchical` — a browser limitation, not a Monaco bug) — confirmed via a
+// hierarchical` - a browser limitation, not a Monaco bug) - confirmed via a
 // real Playwright run against both dev and production builds. Serving the
 // worker file from its real, non-blob URL avoids that entirely.
 self.MonacoEnvironment = {

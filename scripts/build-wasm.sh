@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds crates/lua-vm for wasm32 and regenerates the wasm-bindgen JS glue
-# into packages/lua-runtime/pkg — the npm package apps/web depends on.
+# into packages/lua-runtime/pkg - the npm package apps/web depends on.
 # Run this after any change to crates/lua-vm before `npm run dev`/`build`.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"

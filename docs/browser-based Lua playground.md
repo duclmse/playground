@@ -1,5 +1,5 @@
 Your goal is a **browser-based Lua playground written primarily in TypeScript**,
-with a real debugger and object inspector—not just a text editor + `eval()`—I
+with a real debugger and object inspector-not just a text editor + `eval()`-I
 would design it as a small IDE/runtime platform.
 
 The key architectural decision is:
@@ -10,8 +10,8 @@ The key architectural decision is:
 
 Wasmoon is a good starting point because it embeds the real Lua VM through
 WebAssembly and exposes TypeScript/JavaScript bindings. ([npm][1]) Lua itself
-exposes the primitives needed for debugging—hooks, stack inspection, locals,
-upvalues, etc.—through its debug API. ([Lua][2])
+exposes the primitives needed for debugging-hooks, stack inspection, locals,
+upvalues, etc.-through its debug API. ([Lua][2])
 
 ---
 
@@ -118,7 +118,7 @@ Lua Debugger
 
 There are three broad approaches.
 
-## Option A — Wasmoon
+## Option A - Wasmoon
 
 ```text
 TypeScript
@@ -146,7 +146,7 @@ Advantages:
 
 ---
 
-## Option B — Fengari
+## Option B - Fengari
 
 ```text
 TypeScript
@@ -170,7 +170,7 @@ approach versus Fengari, while Fengari has the smaller payload. ([GitHub][4])
 
 ---
 
-## Option C — Write your own Lua VM
+## Option C - Write your own Lua VM
 
 Don't do this initially.
 
@@ -1428,7 +1428,7 @@ I'd use a VS Code-style layout:
 
 I would implement this in **8 phases**.
 
-## Phase 1 — Lua runtime
+## Phase 1 - Lua runtime
 
 Goal:
 
@@ -1459,7 +1459,7 @@ await runtime.execute(`
 
 ---
 
-# Phase 2 — Playground
+# Phase 2 - Playground
 
 Implement:
 
@@ -1487,7 +1487,7 @@ At this point you have a usable Lua playground.
 
 ---
 
-# Phase 3 — Debug instrumentation
+# Phase 3 - Debug instrumentation
 
 Modify/integrate the Lua runtime so you can receive:
 
@@ -1525,7 +1525,7 @@ You can observe execution without yet implementing UI debugging.
 
 ---
 
-# Phase 4 — Breakpoints
+# Phase 4 - Breakpoints
 
 Implement:
 
@@ -1546,7 +1546,7 @@ yellow arrow → current line
 
 ---
 
-# Phase 5 — Call stack + stepping
+# Phase 5 - Call stack + stepping
 
 Implement:
 
@@ -1563,7 +1563,7 @@ This is the first point where you have a real debugger.
 
 ---
 
-# Phase 6 — Inspector
+# Phase 6 - Inspector
 
 Implement the value model:
 
@@ -1589,7 +1589,7 @@ lazy expansion
 
 ---
 
-# Phase 7 — Expression evaluation
+# Phase 7 - Expression evaluation
 
 Implement:
 
@@ -1605,7 +1605,7 @@ At this point the debugger becomes genuinely useful.
 
 ---
 
-# Phase 8 — Advanced debugger
+# Phase 8 - Advanced debugger
 
 Add:
 

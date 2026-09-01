@@ -1,7 +1,7 @@
 // Client-only virtual filesystem model backing multi-file projects and
 // `require()` (product-brief.md: "Browser-only execution environment; no
-// real filesystem — a virtual FS backs `require()`"). Persisted to
-// localStorage only — no backend, no shareable links (risks.md §4).
+// real filesystem - a virtual FS backs `require()`"). Persisted to
+// localStorage only - no backend, no shareable links (risks.md §4).
 
 export type Project = {
   files: Record<string, string>;
@@ -64,7 +64,7 @@ export function saveProject(project: Project) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
   } catch {
-    // localStorage unavailable (private mode, quota, etc.) — save is best
+    // localStorage unavailable (private mode, quota, etc.) - save is best
     // effort per risks.md §4's client-only persistence model; nothing else
     // in the app depends on it succeeding.
   }
