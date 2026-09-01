@@ -70,6 +70,12 @@ export function saveProject(project: Project) {
   }
 }
 
+/**
+ * A bare file name (`utils.lua`) or a `/`-separated path within an imported
+ * directory (`lib/utils.lua`) - the virtual FS is a flat string-keyed map
+ * (see `install_require` in lib.rs), so a path is just a key that happens to
+ * contain slashes; no directory entities actually exist.
+ */
 export function isValidFileName(name: string): boolean {
-  return /^[A-Za-z0-9_-]+\.lua$/.test(name);
+  return /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*\.lua$/.test(name);
 }

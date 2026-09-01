@@ -60,6 +60,8 @@ export type TimelineEventInfo = {
   source: string | null;
   line: number | null;
   local0: string | null;
+  /** Opcode steps since the previously recorded event (see `DebugEvent::duration`). */
+  duration: number;
 };
 
 export type TimelineInfo = {

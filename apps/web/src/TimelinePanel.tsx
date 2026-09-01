@@ -41,6 +41,9 @@ export function TimelinePanel({ events, truncated, onClose }: TimelinePanelProps
         <ol className="timeline-list">
           {rows.map(({ event, depth, index }) => (
             <li key={index} style={{ paddingLeft: `${depth * 1.1}rem` }}>
+              <span className="timeline-duration" title="Opcode steps since the previous event">
+                +{event.duration}
+              </span>
               <span className={`timeline-badge timeline-${event.eventType}`}>{event.eventType}</span>
               {event.source && (
                 <span className="timeline-location">

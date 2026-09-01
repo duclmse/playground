@@ -239,6 +239,7 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
           source: e.source ?? null,
           line: e.line ?? null,
           local0: e.local0 ?? null,
+          duration: e.duration,
         }));
         post({
           type: "timelineResult",

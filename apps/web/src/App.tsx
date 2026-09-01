@@ -1,6 +1,6 @@
 import Editor, { type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import "./monaco-setup";
 import type { WorkerEvent } from "./lua-worker";
 import type { FunctionStatsInfo, TimelineEventInfo } from "./debug-protocol";
@@ -68,6 +68,7 @@ function App() {
   const decorationsRef = useRef<string[]>([]);
   const activeFileRef = useRef(activeFile);
   activeFileRef.current = activeFile;
+  const dirInputRef = useRef<HTMLInputElement | null>(null);
 
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
   const isTerminated = stopEvent
@@ -328,19 +329,128 @@ function App() {
     setProject((p) => ({ ...p, entry: name }));
   };
 
+  const importDirectoryClick = () => dirInputRef.current?.click();
+
+  /**
+   * Imports every `.lua` file under a locally-picked directory into the
+   * (flat, string-keyed) virtual FS - see `isValidFileName`'s doc comment.
+   * The top-level folder name itself is dropped from each path so imported
+   * files land at the project root (`lib/utils.lua`, not
+   * `my-project/lib/utils.lua`); files whose path doesn't fit the
+   * `[A-Za-z0-9_-]` charset are skipped rather than silently mangled.
+   */
+  const handleImportDirChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    // `input.files` is live - snapshot it into a plain array *before*
+    // resetting `input.value` below (needed so re-importing the same
+    // directory later still fires a "change" event), since clearing
+    // `.value` also clears the underlying FileList out from under any
+    // reference still pointing at it.
+    const luaFiles = Array.from(input.files ?? []).filter((f) => f.name.endsWith(".lua"));
+    input.value = "";
+    const entries = await Promise.all(
+      luaFiles.map(async (f) => {
+        const relativePath = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+        const path = relativePath.split("/").slice(1).join("/") || f.name;
+        return [path, await f.text()] as const;
+      }),
+    );
+
+    if (entries.length === 0) {
+      window.alert("No .lua files found in that directory.");
+      return;
+    }
+
+    const valid = entries.filter(([path]) => isValidFileName(path));
+    const invalid = entries.filter(([path]) => !isValidFileName(path));
+    if (invalid.length > 0) {
+      window.alert(
+        `Skipped ${invalid.length} file(s) with unsupported names (letters, digits, _, - and / only):\n${invalid
+          .map(([p]) => p)
+          .join("\n")}`,
+      );
+    }
+    if (valid.length === 0) return;
+
+    setProject((p) => ({ ...p, files: { ...p.files, ...Object.fromEntries(valid) } }));
+    setActiveFile(valid[0][0]);
+  };
+
   return (
     <div className="playground">
       <header>
         <h1>Lua Playground</h1>
         <span className="subtitle">Rust + piccolo, compiled to WebAssembly</span>
+        <div className="header-actions">
+          <button
+            type="button"
+            className="run-button"
+            onClick={run}
+            disabled={status !== "ready" || !!debugSession}
+          >
+            {status === "ready" ? "▶" : "⏳"} {runButtonLabel(status)}
+          </button>
+          {!debugSession && (
+            <button
+              type="button"
+              className="debug-button"
+              onClick={startDebugging}
+              disabled={status !== "ready"}
+            >
+              🐞 Debug
+            </button>
+          )}
+          {!debugSession && (
+            <button
+              type="button"
+              className="analysis-button"
+              onClick={runProfileClick}
+              disabled={status !== "ready" || analysisBusy}
+              title="Phase 8: profile calls/instructions per function"
+            >
+              📊 Profile
+            </button>
+          )}
+          {!debugSession && (
+            <button
+              type="button"
+              className="analysis-button"
+              onClick={runTimelineClick}
+              disabled={status !== "ready" || analysisBusy}
+              title="Phase 8: record a capped execution timeline"
+            >
+              ⏱ Timeline
+            </button>
+          )}
+        </div>
       </header>
       <main>
         <aside className="file-tree">
           <div className="file-tree-header">
             <h2>Files</h2>
-            <button type="button" className="icon-button" onClick={addFile} title="New file">
-              +
-            </button>
+            <div className="file-tree-header-actions">
+              <button
+                type="button"
+                className="icon-button"
+                onClick={importDirectoryClick}
+                title="Import a directory of .lua files"
+              >
+                📁
+              </button>
+              <button type="button" className="icon-button" onClick={addFile} title="New file">
+                +
+              </button>
+            </div>
+            <input
+              ref={dirInputRef}
+              type="file"
+              className="visually-hidden"
+              multiple
+              // @ts-expect-error non-standard attributes (Chrome/Firefox/Edge); no directory picker without them
+              webkitdirectory=""
+              directory=""
+              onChange={handleImportDirChange}
+            />
           </div>
           <ul>
             {fileNames.map((name) => (
@@ -368,97 +478,68 @@ function App() {
             ))}
           </ul>
         </aside>
-        <section className="editor-pane">
-          <div className="editor-toolbar">
-            <span className="active-file-name">
-              {activeFile}
-              {activeFile === project.entry ? " (entry)" : ""}
-            </span>
-            <button type="button" className="icon-button" onClick={renameActiveFile} title="Rename file">
-              rename
-            </button>
-          </div>
-          <Editor
-            height="100%"
-            language="lua"
-            path={activeFile}
-            value={project.files[activeFile] ?? ""}
-            onChange={(value) => updateActiveFileContent(value ?? "")}
-            onMount={handleEditorMount}
-            options={{
-              minimap: { enabled: false },
-              fontSize: 14,
-              automaticLayout: true,
-              glyphMargin: true,
-              readOnly: !!debugSession,
-            }}
-          />
-          <div className="editor-actions">
-            <button type="button" onClick={run} disabled={status !== "ready" || !!debugSession}>
-              {runButtonLabel(status)}
-            </button>
-            {!debugSession && (
-              <button
-                type="button"
-                className="debug-button"
-                onClick={startDebugging}
-                disabled={status !== "ready"}
-              >
-                🐞 Debug
+        <div className="center-pane">
+          <section className="editor-pane">
+            <div className="editor-toolbar">
+              <span className="active-file-name">
+                {activeFile}
+                {activeFile === project.entry ? " (entry)" : ""}
+              </span>
+              <button type="button" className="icon-button" onClick={renameActiveFile} title="Rename file">
+                rename
               </button>
-            )}
-            {!debugSession && (
-              <button
-                type="button"
-                className="analysis-button"
-                onClick={runProfileClick}
-                disabled={status !== "ready" || analysisBusy}
-                title="Phase 8: profile calls/instructions per function"
-              >
-                📊 Profile
-              </button>
-            )}
-            {!debugSession && (
-              <button
-                type="button"
-                className="analysis-button"
-                onClick={runTimelineClick}
-                disabled={status !== "ready" || analysisBusy}
-                title="Phase 8: record a capped execution timeline"
-              >
-                ⏱ Timeline
-              </button>
-            )}
-          </div>
-        </section>
-        {debugSession && stopEvent ? (
-          <DebugPanel
-            session={debugSession}
-            stop={stopEvent}
-            isTerminated={isTerminated}
-            onContinue={() => doDebugAction((s) => s.continue())}
-            onStepOver={() => doDebugAction((s) => s.stepOver())}
-            onStepInto={() => doDebugAction((s) => s.stepInto())}
-            onStepOut={() => doDebugAction((s) => s.stepOut())}
-            onStop={stopDebugging}
-            onFrameSelected={() => {}}
-          />
-        ) : analysis?.type === "profile" ? (
-          <ProfilerPanel stats={analysis.stats} onClose={() => setAnalysis(null)} />
-        ) : analysis?.type === "timeline" ? (
-          <TimelinePanel
-            events={analysis.events}
-            truncated={analysis.truncated}
-            onClose={() => setAnalysis(null)}
-          />
-        ) : (
+            </div>
+            <Editor
+              height="100%"
+              language="lua"
+              theme="vs-dark"
+              path={activeFile}
+              value={project.files[activeFile] ?? ""}
+              onChange={(value) => updateActiveFileContent(value ?? "")}
+              onMount={handleEditorMount}
+              options={{
+                minimap: { enabled: false },
+                fontSize: 14,
+                automaticLayout: true,
+                glyphMargin: true,
+                readOnly: !!debugSession,
+              }}
+            />
+          </section>
           <section className="console-pane">
             <h2>Console</h2>
             <pre className={error ? "console-error" : "console-output"}>
               {error ?? (output || "(no output yet)")}
             </pre>
           </section>
-        )}
+        </div>
+        <aside className="side-panel">
+          {debugSession && stopEvent ? (
+            <DebugPanel
+              session={debugSession}
+              stop={stopEvent}
+              isTerminated={isTerminated}
+              onContinue={() => doDebugAction((s) => s.continue())}
+              onStepOver={() => doDebugAction((s) => s.stepOver())}
+              onStepInto={() => doDebugAction((s) => s.stepInto())}
+              onStepOut={() => doDebugAction((s) => s.stepOut())}
+              onStop={stopDebugging}
+              onFrameSelected={() => {}}
+            />
+          ) : analysis?.type === "profile" ? (
+            <ProfilerPanel stats={analysis.stats} onClose={() => setAnalysis(null)} />
+          ) : analysis?.type === "timeline" ? (
+            <TimelinePanel
+              events={analysis.events}
+              truncated={analysis.truncated}
+              onClose={() => setAnalysis(null)}
+            />
+          ) : (
+            <div className="side-panel-placeholder">
+              <p>Debug, Profile, or Timeline output shows up here.</p>
+            </div>
+          )}
+        </aside>
       </main>
     </div>
   );

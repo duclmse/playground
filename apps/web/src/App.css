@@ -9,8 +9,37 @@ header {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid #333;
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 0.75rem;
+}
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.header-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.header-actions button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.run-button {
+  background: #1f2f4a;
+  color: #8fc4ff;
+  border: 1px solid #2f5a9a;
 }
 
 header h1 {
@@ -43,6 +72,20 @@ main {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.file-tree-header-actions {
+  display: flex;
+  gap: 0.2rem;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .file-tree h2 {
@@ -107,9 +150,16 @@ main {
   color: #aa3bff;
 }
 
+.center-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid #333;
+}
+
 .editor-pane,
 .console-pane {
-  flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -117,7 +167,32 @@ main {
 }
 
 .editor-pane {
-  border-right: 1px solid #333;
+  flex: 1;
+  min-height: 0;
+}
+
+.console-pane {
+  flex: 0 0 220px;
+  border-top: 1px solid #333;
+}
+
+.side-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  max-width: 340px;
+}
+
+.side-panel-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  color: #666;
+  font-size: 0.85rem;
+  text-align: center;
 }
 
 .editor-toolbar {
@@ -165,16 +240,6 @@ main {
 }
 
 /* --- Debugger (Phases 4-7) --- */
-
-.editor-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.5rem;
-}
-
-.editor-actions button {
-  margin-top: 0;
-}
 
 .debug-button {
   background: #3a2350;
@@ -516,6 +581,13 @@ input[type="text"] {
   gap: 0.5rem;
   padding: 0.08rem 0;
   white-space: nowrap;
+}
+
+.timeline-duration {
+  color: #666;
+  min-width: 2.4rem;
+  text-align: right;
+  flex-shrink: 0;
 }
 
 .timeline-badge {
