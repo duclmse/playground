@@ -8,7 +8,7 @@ source ./lib.sh
 
 require_cmd cargo "Install Rust: https://rustup.rs"
 
-log "cargo test (crates/lua-vm: unit tests + conformance suite against conformance/fixtures)"
+log "cargo test (crates/lua-vm: unit tests + conformance suite against conformance/fixtures + conformance/expected)"
 cargo test --manifest-path "$ROOT/crates/lua-vm/Cargo.toml"
 
 if command -v npm >/dev/null 2>&1 && [ -d "$ROOT/node_modules" ]; then
