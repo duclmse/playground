@@ -39,16 +39,21 @@ loop was actually built, that its `step()` has no way to shrink its internal
 of piccolo 0.3.3 that adds both.
 
 Phases 4-7 (breakpoints, stepping, call stack, inspector, expression
-evaluation) and Phase 8's breakpoint-shaped features (conditional/hit-count/
-logpoints, exception-as-stop) have a complete, tested `DebugSession` engine
-in `crates/lua-vm/src/session.rs` and a typechecked TypeScript
-worker-protocol client in `apps/web/src/debug-session.ts` - but **no React
-UI wires either of them up yet**, so none of it has run in a real browser.
-Phase 8's coroutine debugging, profiler, and execution timeline are designed
-but not built. See
+evaluation) are fully built and **verified end-to-end in a real browser**:
+a `DebugSession` engine (`crates/lua-vm/src/session.rs`), a typechecked
+TypeScript worker-protocol client (`apps/web/src/debug-session.ts`), and a
+React UI (Monaco breakpoint gutter, call stack/locals/globals panels with
+lazy table expansion, watch list, frame-scoped REPL) driven end-to-end with
+Playwright against the running dev server. Phase 8's breakpoint-shaped
+features (conditional/hit-count/logpoints, exception-as-stop) and its
+profiler and execution timeline are engine-complete and tested but have no
+UI yet. Phase 8's coroutine debugging is designed but not built - real,
+non-trivial engine work (making call-stack/depth tracking thread-aware) that
+was deliberately not squeezed in alongside everything else, to avoid
+regressing the now-verified single-threaded debugger. See
 [phase-4-8-implementation.md](./phase-4-8-implementation.md) for the full
 breakdown, the engine-side findings that changed the design along the way,
-and exactly what a UI pass still needs to do.
+the Playwright verification transcript, and exactly what's left.
 
 What exists:
 
@@ -71,11 +76,13 @@ What exists:
   multi-file projects, and a host-side fuel-stepped execution loop that caps
   a run at 10M instructions so a runaway `while true do end` errors out
   instead of freezing the tab. Also `debug_events.rs` (Phase 3's debug
-  instrumentation, `debug_events(source) -> DebugEvent[]`) and `session.rs`
-  (Phases 4-8's `DebugSession`: breakpoints including conditional/hit-count/
-  logpoints, stepping, call stack, locals/globals/table inspection,
-  frame-scoped `evaluate`/`setVariable`). 33 unit tests plus the
-  conformance suite, all against the real engine - see
+  instrumentation, `debug_events(source) -> DebugEvent[]`, plus Phase 8's
+  capped `record_timeline`), `session.rs` (Phases 4-8's `DebugSession`:
+  breakpoints including conditional/hit-count/logpoints, stepping, call
+  stack, locals/globals/table inspection, frame-scoped `evaluate`/
+  `setVariable`), and `profiler.rs` (Phase 8's `profile()` ->
+  `FunctionStats`). 38 unit tests plus the conformance suite, all against
+  the real engine - see
   [phase-4-8-implementation.md](./phase-4-8-implementation.md) for what
   `DebugSession` does and doesn't cover.
 - `conformance/fixtures` (`.lua` source) and `conformance/expected`
@@ -93,9 +100,10 @@ What exists:
   files, choose the entry file), and client-only save/load via
   `localStorage` (per `risks.md` §4's persistence decision - no backend, no
   shareable links in v1). Also `debug-protocol.ts`/`debug-session.ts`/the
-  worker's debug-message handling: a complete, typechecked TypeScript
-  `DebugSession` client for the Rust engine above - not yet wired into any
-  React component (no breakpoint gutter, call stack panel, or variables
-  tree exist yet), so unverified in a real browser. See
-  [phase-4-8-implementation.md](./phase-4-8-implementation.md)'s "What a UI
-  pass needs to do" for the concrete remaining work.
+  worker's debug-message handling (a complete, typechecked TypeScript
+  `DebugSession` client for the Rust engine above) and `DebugPanel.tsx`/
+  `VariablesTree.tsx` (the debugger UI: Monaco breakpoint gutter, call
+  stack/locals/globals/watch/REPL panels) - driven end-to-end with
+  Playwright against the running dev server, not just typechecked. See
+  [phase-4-8-implementation.md](./phase-4-8-implementation.md)'s "Browser
+  verification" and "What a UI pass still needs to do" sections.

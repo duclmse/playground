@@ -163,3 +163,248 @@ main {
 .console-error {
   color: #e5534b;
 }
+
+/* --- Debugger (Phases 4-7) --- */
+
+.editor-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.editor-actions button {
+  margin-top: 0;
+}
+
+.debug-button {
+  background: #3a2350;
+  color: #e0c8ff;
+  border: 1px solid #aa3bff;
+}
+
+/* Monaco glyph-margin decorations for breakpoints/current line. */
+.breakpoint-glyph::before {
+  content: "●";
+  color: #e5534b;
+  font-size: 1rem;
+  margin-left: 5px;
+}
+
+.current-line-glyph::before {
+  content: "▶";
+  color: #f1c40f;
+  font-size: 0.85rem;
+  margin-left: 4px;
+}
+
+.current-line-highlight {
+  background: rgba(241, 196, 15, 0.12);
+}
+
+.debug-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  max-width: 340px;
+  padding: 0.75rem;
+  overflow-y: auto;
+  gap: 0.75rem;
+}
+
+.debug-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.debug-toolbar button {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.debug-toolbar button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.debug-stop {
+  background: #4a1f1f;
+  color: #ffb3b3;
+  border: 1px solid #e5534b;
+}
+
+.debug-status {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 4px;
+  background: #222;
+}
+
+.debug-status-paused {
+  color: #f1c40f;
+}
+
+.debug-status-terminated {
+  color: #e5534b;
+}
+
+.debug-section h3 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: #888;
+  margin: 0 0 0.35rem 0;
+}
+
+.call-stack {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.call-stack button {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #ddd;
+  padding: 0.2rem 0.3rem;
+  cursor: pointer;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.call-stack button.active {
+  background: #333;
+  color: #f1c40f;
+  border-radius: 3px;
+}
+
+.call-stack button:disabled {
+  color: #666;
+  cursor: default;
+}
+
+.variables-tree,
+.variables-tree.nested {
+  list-style: none;
+  margin: 0;
+  padding-left: 0.9rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.debug-section > .variables-tree {
+  padding-left: 0;
+}
+
+.variables-empty {
+  color: #666;
+  font-size: 0.8rem;
+  font-style: italic;
+}
+
+.variable-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.1rem 0;
+}
+
+.variable-row.expandable {
+  cursor: pointer;
+}
+
+.variable-arrow {
+  color: #888;
+  width: 0.8rem;
+  flex-shrink: 0;
+}
+
+.variable-name {
+  color: #7fb0ff;
+}
+
+.variable-display {
+  color: #ccc;
+  overflow-wrap: anywhere;
+}
+
+.watch-input-row {
+  display: flex;
+  gap: 0.3rem;
+  margin-bottom: 0.35rem;
+}
+
+.watch-input-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.watch-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.watch-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.1rem 0;
+}
+
+.watch-expr {
+  color: #7fb0ff;
+  flex-shrink: 0;
+}
+
+.watch-value {
+  color: #ccc;
+  overflow-wrap: anywhere;
+}
+
+.watch-error {
+  color: #e5534b;
+  overflow-wrap: anywhere;
+}
+
+.repl-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 100px;
+}
+
+.repl-history {
+  flex: 1;
+  overflow-y: auto;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  margin-bottom: 0.35rem;
+}
+
+.repl-input-line {
+  color: #888;
+}
+
+.repl-result {
+  color: #ccc;
+  padding-left: 0.7rem;
+}
+
+.repl-error {
+  color: #e5534b;
+  padding-left: 0.7rem;
+}
+
+input[type="text"] {
+  background: #1a1a1a;
+  border: 1px solid #444;
+  color: #eee;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.82rem;
+  border-radius: 3px;
+}

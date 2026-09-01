@@ -1,7 +1,10 @@
-import Editor from "@monaco-editor/react";
+import Editor, { type OnMount } from "@monaco-editor/react";
+import * as monacoEditor from "monaco-editor";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./monaco-setup";
 import type { WorkerEvent } from "./lua-worker";
+import { DebugSession, type StopEvent } from "./debug-session";
+import { DebugPanel } from "./DebugPanel";
 import { isValidFileName, loadProject, saveProject, type Project } from "./project";
 import "./App.css";
 
@@ -18,6 +21,20 @@ function runButtonLabel(status: Status): string {
   }
 }
 
+/**
+ * Maps an open file to the `source_id` `DebugSession.setBreakpoint` expects:
+ * the entry file uses its own name verbatim, but a `require()`d file is
+ * named after the *require argument*, not its virtual-FS filename (see
+ * debug-session.ts's `setBreakpoint` doc comment). This assumes the common
+ * `require("name")` <-> file `"name.lua"` convention the project's own
+ * default files use - a project that calls `require()` with something else
+ * for a given file needs its breakpoints set accordingly; that isn't
+ * something a filename alone can tell us.
+ */
+function sourceIdFor(fileName: string, entry: string): string {
+  return fileName === entry ? fileName : fileName.replace(/\.lua$/, "");
+}
+
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject());
   const [activeFile, setActiveFile] = useState<string>(
@@ -28,7 +45,22 @@ function App() {
   const [status, setStatus] = useState<Status>("loading");
   const workerRef = useRef<Worker | null>(null);
 
+  // ---- Debugger state (docs/debug-protocol.md's DebugSession, Phases 4-7) ----
+  const [breakpoints, setBreakpoints] = useState<Record<string, number[]>>({});
+  const breakpointIdsRef = useRef<Record<string, Record<number, number>>>({});
+  const [debugSession, setDebugSession] = useState<DebugSession | null>(null);
+  const [stopEvent, setStopEvent] = useState<StopEvent | null>(null);
+  const [debugBusy, setDebugBusy] = useState(false);
+  const editorRef = useRef<monacoEditor.editor.IStandaloneCodeEditor | null>(null);
+  const monacoRef = useRef<typeof monacoEditor | null>(null);
+  const decorationsRef = useRef<string[]>([]);
+  const activeFileRef = useRef(activeFile);
+  activeFileRef.current = activeFile;
+
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
+  const isTerminated = stopEvent
+    ? stopEvent.reason === "terminated" || stopEvent.reason === "exception"
+    : false;
 
   useEffect(() => {
     const worker = new Worker(new URL("./lua-worker.ts", import.meta.url), {
@@ -53,12 +85,136 @@ function App() {
   }, [project]);
 
   const run = () => {
-    if (!workerRef.current || status === "loading") return;
+    if (!workerRef.current || status === "loading" || debugSession) return;
     setStatus("running");
     setOutput("");
     setError(null);
     workerRef.current.postMessage({ type: "run", files: project.files, entry: project.entry });
   };
+
+  // ---- Debugger controls ----
+
+  /** Fetches the stack trace and, if the top frame is a known project file, switches to it. */
+  const focusStoppedFrame = async (session: DebugSession) => {
+    const frames = await session.getStackTrace();
+    const top = frames.find((f) => f.functionType !== "c");
+    if (top?.source && project.files[top.source] !== undefined) {
+      setActiveFile(top.source);
+    }
+  };
+
+  const appendDebugOutput = async (session: DebugSession) => {
+    const text = await session.takeOutput();
+    if (text) setOutput((o) => o + text);
+  };
+
+  const startDebugging = async () => {
+    if (!workerRef.current || status !== "ready" || debugSession) return;
+    setDebugBusy(true);
+    setOutput("");
+    setError(null);
+    const session = new DebugSession(workerRef.current);
+    await session.launch(project.files, project.entry);
+
+    const ids: Record<string, Record<number, number>> = {};
+    for (const [file, lines] of Object.entries(breakpoints)) {
+      const sourceId = sourceIdFor(file, project.entry);
+      ids[file] = {};
+      for (const line of lines) {
+        const bp = await session.setBreakpoint(sourceId, line);
+        ids[file][line] = bp.id;
+      }
+    }
+    breakpointIdsRef.current = ids;
+    setDebugSession(session);
+
+    const stop = await session.continue();
+    await appendDebugOutput(session);
+    setStopEvent(stop);
+    if (!(stop.reason === "terminated" || stop.reason === "exception")) {
+      await focusStoppedFrame(session);
+    }
+    setDebugBusy(false);
+  };
+
+  const doDebugAction = async (action: (s: DebugSession) => Promise<StopEvent>) => {
+    if (!debugSession || debugBusy) return;
+    setDebugBusy(true);
+    const stop = await action(debugSession);
+    await appendDebugOutput(debugSession);
+    setStopEvent(stop);
+    if (!(stop.reason === "terminated" || stop.reason === "exception")) {
+      await focusStoppedFrame(debugSession);
+    }
+    setDebugBusy(false);
+  };
+
+  const stopDebugging = () => {
+    debugSession?.dispose();
+    setDebugSession(null);
+    setStopEvent(null);
+    breakpointIdsRef.current = {};
+  };
+
+  /** Toggles a breakpoint from the gutter, keeping a live session in sync. */
+  const toggleBreakpoint = async (file: string, line: number) => {
+    const has = (breakpoints[file] ?? []).includes(line);
+    if (has) {
+      setBreakpoints((b) => ({ ...b, [file]: (b[file] ?? []).filter((l) => l !== line) }));
+      const id = breakpointIdsRef.current[file]?.[line];
+      if (id !== undefined && debugSession) {
+        await debugSession.removeBreakpoint(id);
+        delete breakpointIdsRef.current[file][line];
+      }
+    } else {
+      setBreakpoints((b) => ({
+        ...b,
+        [file]: [...(b[file] ?? []), line].sort((a, c) => a - c),
+      }));
+      if (debugSession) {
+        const bp = await debugSession.setBreakpoint(sourceIdFor(file, project.entry), line);
+        breakpointIdsRef.current[file] = { ...(breakpointIdsRef.current[file] ?? {}), [line]: bp.id };
+      }
+    }
+  };
+
+  const handleEditorMount: OnMount = (editor, monacoInstance) => {
+    editorRef.current = editor;
+    monacoRef.current = monacoInstance;
+    editor.onMouseDown((e) => {
+      if (
+        e.target.type === monacoInstance.editor.MouseTargetType.GUTTER_GLYPH_MARGIN &&
+        e.target.position
+      ) {
+        void toggleBreakpoint(activeFileRef.current, e.target.position.lineNumber);
+      }
+    });
+  };
+
+  // Breakpoint dots + current-line highlight for the active file.
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monacoInstance = monacoRef.current;
+    if (!editor || !monacoInstance) return;
+    const decorations: monacoEditor.editor.IModelDeltaDecoration[] = [];
+    for (const line of breakpoints[activeFile] ?? []) {
+      decorations.push({
+        range: new monacoInstance.Range(line, 1, line, 1),
+        options: { glyphMarginClassName: "breakpoint-glyph" },
+      });
+    }
+    if (stopEvent && !isTerminated && stopEvent.line != null) {
+      decorations.push({
+        range: new monacoInstance.Range(stopEvent.line, 1, stopEvent.line, 1),
+        options: {
+          isWholeLine: true,
+          className: "current-line-highlight",
+          glyphMarginClassName: "current-line-glyph",
+        },
+      });
+    }
+    decorationsRef.current = editor.deltaDecorations(decorationsRef.current, decorations);
+  }, [breakpoints, activeFile, stopEvent, isTerminated]);
 
   const updateActiveFileContent = (content: string) => {
     setProject((p) => ({ ...p, files: { ...p.files, [activeFile]: content } }));
@@ -179,22 +335,51 @@ function App() {
             path={activeFile}
             value={project.files[activeFile] ?? ""}
             onChange={(value) => updateActiveFileContent(value ?? "")}
+            onMount={handleEditorMount}
             options={{
               minimap: { enabled: false },
               fontSize: 14,
               automaticLayout: true,
+              glyphMargin: true,
+              readOnly: !!debugSession,
             }}
           />
-          <button type="button" onClick={run} disabled={status !== "ready"}>
-            {runButtonLabel(status)}
-          </button>
+          <div className="editor-actions">
+            <button type="button" onClick={run} disabled={status !== "ready" || !!debugSession}>
+              {runButtonLabel(status)}
+            </button>
+            {!debugSession && (
+              <button
+                type="button"
+                className="debug-button"
+                onClick={startDebugging}
+                disabled={status !== "ready"}
+              >
+                🐞 Debug
+              </button>
+            )}
+          </div>
         </section>
-        <section className="console-pane">
-          <h2>Console</h2>
-          <pre className={error ? "console-error" : "console-output"}>
-            {error ?? (output || "(no output yet)")}
-          </pre>
-        </section>
+        {debugSession && stopEvent ? (
+          <DebugPanel
+            session={debugSession}
+            stop={stopEvent}
+            isTerminated={isTerminated}
+            onContinue={() => doDebugAction((s) => s.continue())}
+            onStepOver={() => doDebugAction((s) => s.stepOver())}
+            onStepInto={() => doDebugAction((s) => s.stepInto())}
+            onStepOut={() => doDebugAction((s) => s.stepOut())}
+            onStop={stopDebugging}
+            onFrameSelected={() => {}}
+          />
+        ) : (
+          <section className="console-pane">
+            <h2>Console</h2>
+            <pre className={error ? "console-error" : "console-output"}>
+              {error ?? (output || "(no output yet)")}
+            </pre>
+          </section>
+        )}
       </main>
     </div>
   );

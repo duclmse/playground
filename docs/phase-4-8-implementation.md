@@ -10,26 +10,33 @@ design doc, in the same spirit as [risks.md](./risks.md).
 
 | Phase | Spec'd in                                                              | Status                                                             |
 | ----- | ----------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| 4     | Breakpoints, Monaco integration                                         | **Engine done, tested. UI not wired.**                             |
-| 5     | Call stack + stepping                                                   | **Engine done, tested. UI not wired.**                             |
-| 6     | Inspector (values, locals/globals/tables/metatables)                    | **Engine done, tested (upvalues excluded). UI not wired.**         |
-| 7     | Expression evaluation                                                   | **Engine done, tested (frame-scoped locals + globals). UI not wired.** |
+| 4     | Breakpoints, Monaco integration                                         | **Done, tested, verified in a real browser.**                      |
+| 5     | Call stack + stepping                                                   | **Done, tested, verified in a real browser.**                      |
+| 6     | Inspector (values, locals/globals/tables/metatables)                    | **Done, tested, verified in a real browser (upvalues excluded).**  |
+| 7     | Expression evaluation                                                   | **Done, tested, verified in a real browser.**                      |
 | 8     | Conditional/hit-count/logpoint breakpoints, exception breakpoints        | **Engine done, tested.**                                           |
-| 8     | Coroutine debugging, profiler, execution timeline                       | **Not built - designed below.**                                    |
+| 8     | Profiler                                                                 | **Engine done, tested. No UI.**                                    |
+| 8     | Execution timeline                                                       | **Engine done, tested (capped recording). No UI.**                 |
+| 8     | Coroutine debugging                                                      | **Not built - designed below.**                                    |
 
 "Engine" = `crates/vm` (fork) + `crates/lua-vm/src/session.rs` (the
-`DebugSession` struct), all covered by Rust tests running against the real
-piccolo-backed VM (`cargo test -p lua-vm session::`, 16 tests). "Wiring" =
-`apps/web/src/debug-protocol.ts` + `lua-worker.ts` + `debug-session.ts`, a
-complete worker-message-protocol implementation of
+`DebugSession` struct) + `crates/lua-vm/src/profiler.rs` +
+`crates/lua-vm/src/debug_events.rs`'s capped timeline addition, all covered
+by Rust tests running against the real piccolo-backed VM (`cargo test -p
+lua-vm`, 38 tests: 17 `session::`, 2 `profiler::`, 19 others). Phases 4-7 are
+also wired all the way through: `apps/web/src/debug-protocol.ts` +
+`lua-worker.ts` + `debug-session.ts` implement
 [debug-protocol.md](./debug-protocol.md)'s `DebugSession` TypeScript
-interface, typechecked and included in the production build - but **not
-called from any React component**, and therefore never exercised in a real
-browser. No Monaco breakpoint gutter, call stack panel, variables tree,
-step/continue buttons, or REPL/watch UI exist yet. That's the honest state:
-the hard, novel part (making piccolo debuggable at all) is done and tested;
-the UI is a bounded, well-specified remaining task with no open design
-questions left to resolve, listed at the end of this doc.
+interface over the worker message protocol, and `App.tsx` + `DebugPanel.tsx`
++ `VariablesTree.tsx` wire it into a real UI - a Monaco breakpoint gutter
+(click to toggle, red dot for set, yellow arrow for the paused line), call
+stack/locals/globals panels with lazy table+metatable expansion, a watch
+list, and a frame-scoped REPL. **Verified against the actual running app**
+with Playwright (breakpoint hit, locals/globals inspected, step over,
+watch + REPL evaluated, continue to completion, output displayed, error/
+exception path, and re-launching after Stop - see "Browser verification"
+below for the full transcript). The profiler and execution timeline have no
+UI yet - see "What a UI pass still needs to do."
 
 ## What the fork (`crates/vm`) added beyond Phase 3
 
@@ -179,6 +186,36 @@ so it's recorded here: a call stack view built on this will show one fewer
 frame than the *source* nesting suggests whenever tail calls are involved,
 which is correct, not confusing once you know to expect it.
 
+### A breakpoint-scoping bug found while wiring the UI (fixed)
+
+The first cut of `set_breakpoint` took only a line number - no file/chunk.
+`check_stop`'s `Continue` branch matched `bp.line == line` alone, so a
+breakpoint set while looking at one open file would also fire the first
+time *any other file* reached that same line number. Real for this
+product specifically because it supports multi-file projects
+(`require()` + a virtual FS): `set_breakpoint("lib.lua", 3)` and
+`main.lua`'s own line 3 coinciding is not a corner case, it's routine.
+Fixed by giving `Breakpoint`/`set_breakpoint` a `source_id` parameter
+(`debug-protocol.md`'s original `Breakpoint` shape already has
+`sourceId` - the first draft had just dropped it) and comparing
+`(source_id, line)`, not `line` alone. Caught only because a *second* bug
+- see below - initially made the regression test for this pass for the
+wrong reason, which is worth recording alongside the fix:
+
+**The `check_stop` dedup gate also only tracked line number, not
+position**, for an unrelated reason (avoiding double-counting a hit
+across the several opcodes one source line compiles to - see the
+`drive()`/`check_stop` code comments). Two chunks sharing a line number
+tripped this too: reaching line 3 in `main.lua` (no breakpoint there) set
+"last checked line" to 3, so arriving at line 3 in `lib.lua` moments
+later was wrongly treated as "no change, already checked" and skipped
+entirely - the opposite failure mode from the first bug (a real
+breakpoint silently *not* firing, rather than a wrong one firing), caught
+by the same regression test
+(`breakpoints_are_scoped_to_their_own_file_in_a_multi_file_project`) once
+both fixes landed together. Both now compare the full `(source, line)`
+pair.
+
 ### A pc-convention finding that affects step_out's exact stop line
 
 Phase 3 established that piccolo's reported "current line" is always *the
@@ -219,68 +256,112 @@ with the exact opcode-table reasoning in the test's own comment.
   reference nothing can resolve. Adding `get_function_info`/
   `get_thread_info` would follow the same pattern as `get_table_entries`.
 
-## Phase 8 items not built
+## Profiler (`crates/lua-vm/src/profiler.rs`)
 
-**Coroutine debugging.** `Executor` already has the right shape for this -
-`thread_stack: Vec<Thread<'gc>>` (confirmed reading `executor.rs`; this is
-what `current_running_thread()` reads the *top* of) - so `getThreads()`
+Built as designed above: `profile(source, chunk_name) -> Vec<FunctionStats>`
+runs a program to completion at `step_with_granularity(.., 1)`, tracking a
+call stack of `(function_id, start_instruction, child_instructions)` frames
+alongside the existing depth-transition detection `session.rs`/
+`debug_events.rs` already use. On a call, push a frame and increment that
+function's `calls`; on a return, pop it, add its duration to
+`total_instructions`, add `duration - child_instructions` to
+`self_instructions` (excluding time spent in what it called), and credit
+the duration to its caller's `child_instructions`. `totalTime`/`selfTime`
+are instruction counts, not wall-clock milliseconds - this codebase already
+treats instruction count as its timing proxy everywhere (`MAX_INSTRUCTIONS`,
+the runaway-loop guard), and it doesn't vary run to run for reasons that
+have nothing to do with the Lua program the way wall-clock time would (host
+load, JIT warmup - neither applies to a WASM-hosted tree-walk-adjacent VM
+run from a browser tab, but the general instability wall-clock timing has
+for this purpose does).
+
+A discovery that came for free from `FunctionPrototype.reference`
+(`FunctionRef::Named(name, line) | Expression(line) | Chunk`, populated by
+the parser independent of this round's local-variable compiler patch): a
+named function (`local function foo()`/`function foo()`) already carries
+its declared name at the prototype level, so `function_id` can be
+`"chunk:line name"` instead of a register-based placeholder - a nicer
+identifier than anything the locals patch produces, for free. 2 tests cover
+self-vs-total time attribution across a nested call and repeated calls to
+the same function accumulating correctly.
+
+## Execution timeline (`debug_events.rs`)
+
+Phase 3's `run_with_debug_events` already produces the full `line`/`call`/
+`return`/`exception`/`terminated` stream; the open design question
+`debug-protocol.md` leaves for a timeline feature is retention - an
+unbounded `Vec<DebugEvent>` doesn't bound memory for a script that runs
+long enough to emit hundreds of thousands of events. `record_timeline(source,
+chunk_name, max_events) -> Timeline` (wrapping a new
+`run_with_debug_events_capped` that Phase 3's original function is now a
+thin wrapper around, at `max_events: usize::MAX`) truncates recording once
+`max_events` is reached, exposing `Timeline.truncated: bool` so a caller
+knows the recording is partial - **the program still runs to completion (or
+its own error/instruction-limit stop) regardless of the cap**, only
+*recording* stops early, so `take_output()`/normal execution isn't affected
+by how small a UI sets the cap. 2 tests cover truncation kicking in exactly
+at the cap and not firing when the recording stays under it. No UI renders
+this yet - "per-function timeline visualization" is real design/build work
+of its own, not a small addition on top of the capped recording.
+
+## Phase 8 item not built: coroutine debugging
+
+`Executor` already has the right shape for this - `thread_stack:
+Vec<Thread<'gc>>` (confirmed reading `executor.rs`; this is what
+`current_running_thread()` reads the *top* of) - so `getThreads()`
 returning one entry per coroutine plus the main thread, and
 `debug_frames()`/`get_locals` etc. taking a `thread_id` instead of always
 targeting `current_running_thread()`, is a natural extension of the
-existing design, not a redesign. Not attempted here for the same reason as
-everything else in this section: real, non-trivial engine work
-(`step_with_granularity`'s call/return depth tracking would need to become
-per-thread, since a coroutine resume/yield changes the *active* thread
-without the main thread's own Lua-frame depth changing) that deserves its
-own implementation-and-test pass rather than a rushed addition.
+existing design, not a redesign. Not attempted here: real, non-trivial
+engine work (`step_with_granularity`'s call/return depth tracking would
+need to become per-thread, since a coroutine resume/yield changes the
+*active* thread without the main thread's own Lua-frame depth changing)
+that deserves its own implementation-and-test pass, not an addition
+squeezed in after everything else in this document - the risk of a rushed
+change here is regressing the now-verified single-threaded stepping/
+breakpoint logic, which matters more than closing this one remaining gap.
 
-**Profiler** (`FunctionStats`: calls/totalTime/selfTime/instructions).
-`debug-protocol.md` is right that this "falls out of CALL/RETURN/COUNT-
-equivalent events almost for free" - `DebugSession`'s `drive()` loop already
-observes every call/return transition and already counts consumed
-instructions (`consumed` in `drive()`, and `MAX_INSTRUCTIONS` accounting in
-`run_to_completion`). A profiler would run `continue()`-equivalent logic
-without ever actually stopping, accumulating a
-`HashMap<chunk_name, FunctionStats>` keyed by call-frame identity. Not
-built; would want its own always-runs-to-completion entry point rather than
-reusing `continue()`, since breakpoints and profiling are different modes
-("stop when interesting" vs. "never stop, just count").
+## Browser verification
 
-**Execution timeline.** Recording the `line`/`call`/`return` event stream
-Phase 3's `debug_events.rs` already produces, and rendering it, is mostly a
-UI/visualization task once `debug_events()` exists (it does, since Phase 3)
-- the interesting design question `debug-protocol.md` leaves open is
-*retention*: a real script can emit hundreds of thousands of events, and
-`debug_events()`'s current one-shot "run the whole thing and return every
-event" shape doesn't bound memory. A timeline feature would need a
-capped/downsampled ring buffer rather than the raw `Vec<DebugEvent>` Phase 3
-built for its (short, test-fixture-sized) spike scripts. Not built.
+Phases 4-7's UI was driven end-to-end with Playwright against the actual
+dev server (`npm run dev`), not just typechecked:
 
-## What a UI pass needs to do
+1. Clicked the Monaco glyph margin to set a breakpoint on the default
+   project's `for i = 1, 10 do` line, clicked "🐞 Debug".
+2. Confirmed the session paused at that exact line/breakpoint, and that
+   the call stack, locals (`greet` as an expandable table, `sum` = 0,
+   register-indexed temporaries for compiler internals), and globals
+   (the full stdlib table, each entry correctly marked expandable) all
+   rendered correctly.
+3. Clicked "Step Over", confirmed the line changed and locals updated to
+   reflect the new state.
+4. Added a watch expression (`sum`) and evaluated a REPL expression
+   (`sum + 100`) against the paused frame - both returned correct values.
+5. Clicked "Continue", confirmed the program ran to completion and the
+   console showed the real, correct output (`Hello, Lua Playground!` /
+   `sum 1..10 = 55`).
+6. Separately, edited the source to call `error(...)`, confirmed the debug
+   status correctly reports the exception, and confirmed a session can be
+   stopped and a new one launched cleanly afterward.
 
-Nothing below requires new engine design - it's wiring `debug-session.ts`
-(already complete and typechecked) into React, plus the usual UI work:
+## What a UI pass still needs to do
 
-1. **Breakpoints**: Monaco gutter click → `DebugSession.setBreakpoint`/
-   `removeBreakpoint`; red dot decoration for `verified`.
-2. **Run controls**: Continue/step over/into/out buttons calling the
-   matching `DebugSession` methods; yellow-arrow line decoration from each
-   `StopEvent.line`.
-3. **Call stack panel**: `getStackTrace()`, clickable frames that change
-   which frame index feeds the variables panel and `evaluate()`/
-   `setVariable()` calls.
-4. **Variables panel**: `getScopes()` → "Locals"/"Globals" sections,
-   `getLocals`/`getGlobals` for each, `getVariables(reference)` for lazy
-   table expansion, `getMetatable(reference)` for the metatable tree node
-   debug-protocol.md's inspector section describes.
-5. **Watch/REPL panel**: `evaluate(expression, frameIndex)`, re-run on every
-   stop for watches per debug-protocol.md#evaluation.
-6. **Conditional/hit-count/logpoint UI**: right-click a breakpoint to set
-   `setBreakpointCondition`/`setBreakpointHitCondition`/
-   `setBreakpointLogMessage` - the engine side is done and tested, this is
-   purely a context-menu/dialog.
+Everything above is built and verified. What's left, in descending order of
+value:
 
-Every one of these should get a real Playwright pass against the running
-app before being called done, per this repo's own standard (see
-`docs/risks.md` §8's WASM-load-time verification for the precedent) - none
-of the above has been exercised in an actual browser yet.
+1. **Profiler UI**: a way to trigger `profile()` and render `FunctionStats`
+   (a sortable table is enough - calls/total/self instructions per
+   function) - no engine work needed, purely a new panel.
+2. **Execution timeline UI**: `record_timeline()` exists; rendering it as a
+   per-function timeline (debug-protocol.md's own framing: "primarily an
+   educational/visualization feature") is unbuilt design+UI work.
+3. **Coroutine debugging**: needs the engine work described above before
+   any UI is meaningful.
+4. **`pause()`**: still not implemented (see "Known gaps" above) - would
+   need the Rust side to run in bounded bursts instead of one unbounded
+   `continue()` call.
+5. Smaller polish: upvalue inspection, function/thread/userdata expansion
+   in the variables tree (currently table-only), hover-evaluation in the
+   editor (debug-protocol.md mentions it as a third `evaluate()` surface
+   alongside watches/REPL, neither of which needed new engine work to add -
+   this one doesn't either, it's just unbuilt).

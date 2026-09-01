@@ -24,6 +24,7 @@ export type VariableInfo = {
 
 export type BreakpointInfo = {
   id: number;
+  sourceId: string;
   line: number;
   verified: boolean;
 };
@@ -46,7 +47,7 @@ export type DebugRequest =
   | { id: number; type: "debugStepOver" }
   | { id: number; type: "debugStepInto" }
   | { id: number; type: "debugStepOut" }
-  | { id: number; type: "debugSetBreakpoint"; line: number }
+  | { id: number; type: "debugSetBreakpoint"; sourceId: string; line: number }
   | { id: number; type: "debugRemoveBreakpoint"; breakpointId: number }
   | {
       id: number;

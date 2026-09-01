@@ -144,9 +144,17 @@ export class DebugSession {
     return stop as StopEvent;
   }
 
-  async setBreakpoint(line: number): Promise<BreakpointInfo> {
+  /**
+   * `sourceId` must match how this session names the file internally: the
+   * entry file's own name (as passed to `launch`), or - for a `require()`d
+   * file - the *require argument*, not the virtual-FS filename (e.g.
+   * `require("lib")` against `lib.lua` uses source id `"lib"`, not
+   * `"lib.lua"` - see `install_require` in crates/lua-vm/src/lib.rs).
+   */
+  async setBreakpoint(sourceId: string, line: number): Promise<BreakpointInfo> {
     const { breakpoint } = await this.send<Extract<WorkerEvent, { type: "debugBreakpoint" }>>({
       type: "debugSetBreakpoint",
+      sourceId,
       line,
     });
     return breakpoint;

@@ -85,11 +85,11 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
 
       case "debugSetBreakpoint": {
-        const bp = requireSession().set_breakpoint(message.line);
+        const bp = requireSession().set_breakpoint(message.sourceId, message.line);
         post({
           type: "debugBreakpoint",
           id: message.id,
-          breakpoint: { id: bp.id, line: bp.line, verified: bp.verified },
+          breakpoint: { id: bp.id, sourceId: bp.source_id, line: bp.line, verified: bp.verified },
         });
         return;
       }
