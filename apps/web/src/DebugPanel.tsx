@@ -48,6 +48,7 @@ export function DebugPanel({
   const [frames, setFrames] = useState<StackFrameInfo[]>([]);
   const [selectedFrame, setSelectedFrame] = useState(0);
   const [locals, setLocals] = useState<VariableInfo[]>([]);
+  const [upvalues, setUpvalues] = useState<VariableInfo[]>([]);
   const [globals, setGlobals] = useState<VariableInfo[]>([]);
   const [watches, setWatches] = useState<{ expression: string; result: EvalResultInfo | null }[]>([]);
   const [watchInput, setWatchInput] = useState("");
@@ -68,6 +69,7 @@ export function DebugPanel({
       setThreads([]);
       setFrames([]);
       setLocals([]);
+      setUpvalues([]);
       return;
     }
     void session.getThreads().then((ts) => {
@@ -76,6 +78,7 @@ export function DebugPanel({
       setSelectedThread(running);
       void session.getStackTrace(running).then(setFrames);
       void session.getLocals(running, 0).then(setLocals);
+      void session.getUpvalues(running, 0).then(setUpvalues);
     });
     void session.getGlobals().then(setGlobals);
     // Re-run every watch against the newly paused frame, per
@@ -117,12 +120,14 @@ export function DebugPanel({
     onFrameSelected(0);
     setFrames(await session.getStackTrace(threadId));
     setLocals(await session.getLocals(threadId, 0));
+    setUpvalues(await session.getUpvalues(threadId, 0));
   };
 
   const selectFrame = async (index: number) => {
     setSelectedFrame(index);
     onFrameSelected(index);
     setLocals(await session.getLocals(selectedThread, index));
+    setUpvalues(await session.getUpvalues(selectedThread, index));
   };
 
   const addWatch = () => {
@@ -221,6 +226,11 @@ export function DebugPanel({
       <div className="debug-section">
         <h3>Locals</h3>
         <VariablesTree session={session} variables={locals} />
+      </div>
+
+      <div className="debug-section">
+        <h3>Upvalues</h3>
+        <VariablesTree session={session} variables={upvalues} />
       </div>
 
       <div className="debug-section">

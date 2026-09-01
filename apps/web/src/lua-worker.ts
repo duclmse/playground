@@ -172,6 +172,19 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         post({ type: "debugVariables", id: message.id, variables });
         return;
       }
+      case "debugGetUpvalues": {
+        const variables = requireSession()
+          .get_upvalues(message.threadId, message.frameIndex)
+          .map((v) => ({
+            name: v.name,
+            valueType: v.value_type,
+            display: v.display,
+            expandable: v.expandable,
+            reference: v.reference ?? null,
+          }));
+        post({ type: "debugVariables", id: message.id, variables });
+        return;
+      }
       case "debugGetGlobals": {
         const variables = requireSession()
           .get_globals()

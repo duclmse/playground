@@ -119,6 +119,7 @@ export type DebugRequest =
   | { id: number; type: "debugGetThreads" }
   | { id: number; type: "debugGetStackTrace"; threadId: number }
   | { id: number; type: "debugGetLocals"; threadId: number; frameIndex: number }
+  | { id: number; type: "debugGetUpvalues"; threadId: number; frameIndex: number }
   | { id: number; type: "debugGetGlobals" }
   | { id: number; type: "debugGetTableEntries"; reference: number; start: number; count: number }
   | { id: number; type: "debugGetMetatable"; reference: number }

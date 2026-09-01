@@ -293,6 +293,16 @@ export class DebugSession {
     return variables;
   }
 
+  /** Upvalues captured by the closure running at `frameIndex` - see `session.rs`'s `get_upvalues` doc comment. */
+  async getUpvalues(threadId: number, frameIndex: number): Promise<VariableInfo[]> {
+    const { variables } = await this.send<Extract<WorkerEvent, { type: "debugVariables" }>>({
+      type: "debugGetUpvalues",
+      threadId,
+      frameIndex,
+    });
+    return variables;
+  }
+
   async getGlobals(): Promise<VariableInfo[]> {
     const { variables } = await this.send<Extract<WorkerEvent, { type: "debugVariables" }>>({
       type: "debugGetGlobals",
