@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import init, { execute_project, DebugSession } from "@lua-playground/runtime";
+import init, { execute_project, DebugSession, profile_project, record_timeline_project } from "@lua-playground/runtime";
 import type { DebugRequest, WorkerEvent } from "./debug-protocol";
 
 export type { WorkerEvent } from "./debug-protocol";
@@ -215,6 +215,36 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       case "debugTakeOutput": {
         const text = requireSession().take_output();
         post({ type: "debugOutput", id: message.id, text });
+        return;
+      }
+
+      case "profile": {
+        const names = Object.keys(message.files);
+        const contents = names.map((name) => message.files[name]);
+        const stats = profile_project(names, contents, message.entry).map((s) => ({
+          functionId: s.function_id,
+          calls: s.calls,
+          totalInstructions: s.total_instructions,
+          selfInstructions: s.self_instructions,
+        }));
+        post({ type: "profileResult", id: message.id, stats });
+        return;
+      }
+      case "recordTimeline": {
+        const names = Object.keys(message.files);
+        const contents = names.map((name) => message.files[name]);
+        const result = record_timeline_project(names, contents, message.entry, message.maxEvents);
+        const events = result.events.map((e) => ({
+          eventType: e.event_type,
+          source: e.source ?? null,
+          line: e.line ?? null,
+          local0: e.local0 ?? null,
+        }));
+        post({
+          type: "timelineResult",
+          id: message.id,
+          timeline: { events, truncated: result.truncated, error: result.error ?? null },
+        });
         return;
       }
     }

@@ -426,3 +426,136 @@ input[type="text"] {
   font-size: 0.82rem;
   border-radius: 3px;
 }
+
+/* --- Phase 8: profiler / execution timeline --- */
+
+.analysis-button {
+  background: #1f3a2e;
+  color: #8fe0b0;
+  border: 1px solid #2f7a52;
+}
+
+.analysis-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 0.75rem;
+  overflow: auto;
+}
+
+.analysis-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.analysis-header h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  color: #888;
+  margin: 0;
+}
+
+.analysis-empty {
+  color: #666;
+  font-style: italic;
+}
+
+.analysis-note {
+  color: #f1c40f;
+  font-size: 0.82rem;
+  margin: 0 0 0.5rem 0;
+}
+
+.profiler-table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  width: 100%;
+}
+
+.profiler-table th {
+  text-align: left;
+  color: #888;
+  font-weight: normal;
+  cursor: pointer;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid #333;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.profiler-table th:hover {
+  color: #ddd;
+}
+
+.profiler-table td {
+  padding: 0.25rem 0.6rem;
+  border-bottom: 1px solid #222;
+  color: #ccc;
+}
+
+.profiler-function-id {
+  color: #7fb0ff;
+}
+
+.timeline-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow-y: auto;
+}
+
+.timeline-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.08rem 0;
+  white-space: nowrap;
+}
+
+.timeline-badge {
+  display: inline-block;
+  min-width: 4.5rem;
+  text-align: center;
+  border-radius: 3px;
+  padding: 0.02rem 0.3rem;
+  font-size: 0.75rem;
+}
+
+.timeline-line {
+  background: #26344a;
+  color: #7fb0ff;
+}
+
+.timeline-call {
+  background: #1f3a2e;
+  color: #8fe0b0;
+}
+
+.timeline-return {
+  background: #3a2a1f;
+  color: #e0b08f;
+}
+
+.timeline-exception {
+  background: #4a1f1f;
+  color: #ffb3b3;
+}
+
+.timeline-terminated {
+  background: #333;
+  color: #aaa;
+}
+
+.timeline-location {
+  color: #999;
+}
+
+.timeline-local0 {
+  color: #666;
+}

@@ -46,6 +46,28 @@ export type EvalResultInfo = {
   display: string;
 };
 
+/** Phase 8 (docs/debug-protocol.md#advanced-profiler-phase-8): one entry of `profile()`. */
+export type FunctionStatsInfo = {
+  functionId: string;
+  calls: number;
+  totalInstructions: number;
+  selfInstructions: number;
+};
+
+/** Phase 8 (docs/debug-protocol.md#advanced-execution-timeline-phase-8): one entry of `recordTimeline()`. */
+export type TimelineEventInfo = {
+  eventType: string;
+  source: string | null;
+  line: number | null;
+  local0: string | null;
+};
+
+export type TimelineInfo = {
+  events: TimelineEventInfo[];
+  truncated: boolean;
+  error: string | null;
+};
+
 export type DebugRequest =
   | { type: "run"; files: Record<string, string>; entry: string }
   | { id: number; type: "debugLaunch"; files: Record<string, string>; entry: string }
@@ -94,7 +116,15 @@ export type DebugRequest =
       name: string;
       valueExpr: string;
     }
-  | { id: number; type: "debugTakeOutput" };
+  | { id: number; type: "debugTakeOutput" }
+  | { id: number; type: "profile"; files: Record<string, string>; entry: string }
+  | {
+      id: number;
+      type: "recordTimeline";
+      files: Record<string, string>;
+      entry: string;
+      maxEvents: number;
+    };
 
 export type WorkerEvent =
   | { type: "ready" }
@@ -109,4 +139,6 @@ export type WorkerEvent =
   | { type: "debugVariables"; id: number; variables: VariableInfo[] }
   | { type: "debugMetatable"; id: number; reference: number | null }
   | { type: "debugEvalResult"; id: number; result: EvalResultInfo }
-  | { type: "debugOutput"; id: number; text: string };
+  | { type: "debugOutput"; id: number; text: string }
+  | { type: "profileResult"; id: number; stats: FunctionStatsInfo[] }
+  | { type: "timelineResult"; id: number; timeline: TimelineInfo };

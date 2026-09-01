@@ -38,24 +38,26 @@ loop was actually built, that its `step()` has no way to shrink its internal
 64-opcode batch size either), so `crates/vm` is now a vendored, patched fork
 of piccolo 0.3.3 that adds both.
 
-Phases 4-7 (breakpoints, stepping, call stack, inspector, expression
-evaluation) and Phase 8's coroutine debugging are fully built and
-**verified end-to-end in a real browser**: a `DebugSession` engine
-(`crates/lua-vm/src/session.rs`), a typechecked TypeScript worker-protocol
-client (`apps/web/src/debug-session.ts`), and a React UI (Monaco breakpoint
-gutter, call stack/locals/globals panels with lazy table expansion, a
-thread selector for coroutines, watch list, frame-scoped REPL) driven
-end-to-end with Playwright against the running dev server - including a
-coroutine scenario with per-thread call stacks and locals correctly
-isolated from each other. Phase 8's remaining breakpoint-shaped features
+**All of Phases 4-8 are now fully built and verified end-to-end in a real
+browser**: a `DebugSession` engine (`crates/lua-vm/src/session.rs`), a
+`profiler.rs`/`debug_events.rs` analysis engine, typechecked TypeScript
+worker-protocol clients (`apps/web/src/debug-session.ts`/`analysis.ts`),
+and a React UI (Monaco breakpoint gutter, call stack/locals/globals panels
+with lazy table expansion, a thread selector for coroutines, watch list,
+frame-scoped REPL, a sortable profiler table, an execution-timeline event
+list) driven end-to-end with Playwright against the running dev server -
+including breakpoints/stepping/inspection/evaluation, a coroutine scenario
+with per-thread call stacks and locals correctly isolated, multi-file
+breakpoint scoping, and the profiler/timeline panels against a real
+`require()`-using project. Phase 8's remaining breakpoint-shaped features
 (conditional/hit-count/logpoints, exception-as-stop) are engine-complete
-and tested; its profiler and execution timeline are engine-complete and
-tested but have no UI yet. See
-[phase-4-8-implementation.md](./phase-4-8-implementation.md) for the full
-breakdown, the engine-side findings that changed the design along the way
-(including one initial "this needs a bigger rewrite" assessment that turned
-out wrong once actually attempted), the Playwright verification transcript,
-and exactly what's left.
+and tested. See [phase-4-8-implementation.md](./phase-4-8-implementation.md)
+for the full breakdown, the engine-side findings that changed the design
+along the way (including one initial "this needs a bigger rewrite"
+assessment that turned out wrong once actually attempted, and a real
+multi-file profiling bug found and fixed), the 28-assertion Playwright
+verification transcript, and the small remaining polish items (`pause()`,
+upvalue inspection, and a couple of others).
 
 What exists:
 
@@ -81,13 +83,13 @@ What exists:
   a run at 10M instructions so a runaway `while true do end` errors out
   instead of freezing the tab. Also `debug_events.rs` (Phase 3's debug
   instrumentation, `debug_events(source) -> DebugEvent[]`, plus Phase 8's
-  capped `record_timeline`), `session.rs` (Phases 4-8's `DebugSession`:
-  breakpoints including conditional/hit-count/logpoints, stepping, call
-  stack, locals/globals/table inspection, frame-scoped `evaluate`/
-  `setVariable`, and `get_threads`/thread-scoped inspection for coroutine
-  debugging), and `profiler.rs` (Phase 8's `profile()` -> `FunctionStats`).
-  40 unit tests plus the conformance suite, all against the real engine -
-  see
+  capped `record_timeline`/`record_timeline_project`), `session.rs`
+  (Phases 4-8's `DebugSession`: breakpoints including conditional/
+  hit-count/logpoints, stepping, call stack, locals/globals/table
+  inspection, frame-scoped `evaluate`/`setVariable`, and `get_threads`/
+  thread-scoped inspection for coroutine debugging), and `profiler.rs`
+  (Phase 8's `profile`/`profile_project` -> `FunctionStats`). 42 unit
+  tests plus the conformance suite, all against the real engine - see
   [phase-4-8-implementation.md](./phase-4-8-implementation.md) for what
   `DebugSession` does and doesn't cover.
 - `conformance/fixtures` (`.lua` source) and `conformance/expected`

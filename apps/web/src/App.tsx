@@ -3,10 +3,20 @@ import * as monacoEditor from "monaco-editor";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./monaco-setup";
 import type { WorkerEvent } from "./lua-worker";
+import type { FunctionStatsInfo, TimelineEventInfo } from "./debug-protocol";
+import { runProfile, runTimeline } from "./analysis";
 import { DebugSession, type StopEvent } from "./debug-session";
 import { DebugPanel } from "./DebugPanel";
+import { ProfilerPanel } from "./ProfilerPanel";
+import { TimelinePanel } from "./TimelinePanel";
 import { isValidFileName, loadProject, saveProject, type Project } from "./project";
 import "./App.css";
+
+const TIMELINE_MAX_EVENTS = 5000;
+
+type Analysis =
+  | { type: "profile"; stats: FunctionStatsInfo[] }
+  | { type: "timeline"; events: TimelineEventInfo[]; truncated: boolean };
 
 type Status = "loading" | "ready" | "running";
 
@@ -51,6 +61,8 @@ function App() {
   const [debugSession, setDebugSession] = useState<DebugSession | null>(null);
   const [stopEvent, setStopEvent] = useState<StopEvent | null>(null);
   const [debugBusy, setDebugBusy] = useState(false);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [analysisBusy, setAnalysisBusy] = useState(false);
   const editorRef = useRef<monacoEditor.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof monacoEditor | null>(null);
   const decorationsRef = useRef<string[]>([]);
@@ -87,9 +99,39 @@ function App() {
   const run = () => {
     if (!workerRef.current || status === "loading" || debugSession) return;
     setStatus("running");
+    setAnalysis(null);
     setOutput("");
     setError(null);
     workerRef.current.postMessage({ type: "run", files: project.files, entry: project.entry });
+  };
+
+  // ---- Phase 8: profiler / execution timeline ----
+
+  const runProfileClick = async () => {
+    if (!workerRef.current || status !== "ready" || debugSession || analysisBusy) return;
+    setAnalysisBusy(true);
+    try {
+      const stats = await runProfile(workerRef.current, project.files, project.entry);
+      setAnalysis({ type: "profile", stats });
+    } finally {
+      setAnalysisBusy(false);
+    }
+  };
+
+  const runTimelineClick = async () => {
+    if (!workerRef.current || status !== "ready" || debugSession || analysisBusy) return;
+    setAnalysisBusy(true);
+    try {
+      const timeline = await runTimeline(
+        workerRef.current,
+        project.files,
+        project.entry,
+        TIMELINE_MAX_EVENTS,
+      );
+      setAnalysis({ type: "timeline", events: timeline.events, truncated: timeline.truncated });
+    } finally {
+      setAnalysisBusy(false);
+    }
   };
 
   // ---- Debugger controls ----
@@ -117,6 +159,7 @@ function App() {
   const startDebugging = async () => {
     if (!workerRef.current || status !== "ready" || debugSession) return;
     setDebugBusy(true);
+    setAnalysis(null);
     setOutput("");
     setError(null);
     const session = new DebugSession(workerRef.current);
@@ -364,6 +407,28 @@ function App() {
                 🐞 Debug
               </button>
             )}
+            {!debugSession && (
+              <button
+                type="button"
+                className="analysis-button"
+                onClick={runProfileClick}
+                disabled={status !== "ready" || analysisBusy}
+                title="Phase 8: profile calls/instructions per function"
+              >
+                📊 Profile
+              </button>
+            )}
+            {!debugSession && (
+              <button
+                type="button"
+                className="analysis-button"
+                onClick={runTimelineClick}
+                disabled={status !== "ready" || analysisBusy}
+                title="Phase 8: record a capped execution timeline"
+              >
+                ⏱ Timeline
+              </button>
+            )}
           </div>
         </section>
         {debugSession && stopEvent ? (
@@ -377,6 +442,14 @@ function App() {
             onStepOut={() => doDebugAction((s) => s.stepOut())}
             onStop={stopDebugging}
             onFrameSelected={() => {}}
+          />
+        ) : analysis?.type === "profile" ? (
+          <ProfilerPanel stats={analysis.stats} onClose={() => setAnalysis(null)} />
+        ) : analysis?.type === "timeline" ? (
+          <TimelinePanel
+            events={analysis.events}
+            truncated={analysis.truncated}
+            onClose={() => setAnalysis(null)}
           />
         ) : (
           <section className="console-pane">
