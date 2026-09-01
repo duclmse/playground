@@ -41,20 +41,25 @@ export function defaultProject(): Project {
   };
 }
 
+/** Structural check shared by `loadProject` (localStorage) and `parseProjectFile` (an imported file). */
+function isProjectShaped(value: unknown): value is Project {
+  const p = value as Partial<Project> | null;
+  return (
+    !!p &&
+    typeof p.entry === "string" &&
+    typeof p.files === "object" &&
+    p.files !== null &&
+    Object.keys(p.files).length > 0 &&
+    Object.values(p.files).every(content => typeof content === "string")
+  );
+}
+
 export function loadProject(): Project {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return defaultProject();
-    const parsed = JSON.parse(raw) as Project;
-    if (
-      !parsed ||
-      typeof parsed.entry !== "string" ||
-      typeof parsed.files !== "object" ||
-      Object.keys(parsed.files).length === 0
-    ) {
-      return defaultProject();
-    }
-    return parsed;
+    const parsed: unknown = JSON.parse(raw);
+    return isProjectShaped(parsed) ? parsed : defaultProject();
   } catch {
     return defaultProject();
   }
@@ -67,6 +72,39 @@ export function saveProject(project: Project) {
     // localStorage unavailable (private mode, quota, etc.) - save is best
     // effort per risks.md §4's client-only persistence model; nothing else
     // in the app depends on it succeeding.
+  }
+}
+
+/**
+ * Downloads `project` as a single JSON file - the counterpart to importing
+ * a project back with `parseProjectFile`. There's no backend/shareable-link
+ * story here (risks.md §4), so this plus "import a directory" (App.tsx's
+ * `handleImportDirChange`, which only pulls in `.lua` files, not the entry
+ * pointer) are the two ways a project round-trips outside `localStorage`:
+ * this one preserves `entry` and works for a full backup/restore; that one
+ * is better for merging code from an existing folder on disk into the
+ * *current* project.
+ */
+export function downloadProject(project: Project) {
+  const blob = new Blob([JSON.stringify(project, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "lua-playground-project.json";
+    a.click();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** Parses an imported project file's text; `null` if it isn't project-shaped JSON. */
+export function parseProjectFile(text: string): Project | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isProjectShaped(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 

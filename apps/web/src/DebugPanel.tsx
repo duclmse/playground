@@ -147,13 +147,13 @@ export function DebugPanel({
   return (
     <section className="debug-panel">
       <div className="debug-toolbar">
-        <button type="button" onClick={onContinue} disabled={isTerminated || busy} title="Continue">
+        <button type="button" onClick={onContinue} disabled={isTerminated || busy} title="Continue (F5)">
           ▶ Continue
         </button>
         <button type="button" onClick={onPause} disabled={isTerminated || !busy} title="Pause">
           ⏸ Pause
         </button>
-        <button type="button" onClick={onStepOver} disabled={isTerminated || busy} title="Step Over">
+        <button type="button" onClick={onStepOver} disabled={isTerminated || busy} title="Step Over (F10)">
           ⤵ Over
         </button>
         <button type="button" onClick={onStepInto} disabled={isTerminated || busy} title="Step Into">

@@ -17,7 +17,14 @@ import {DebugSession, LAUNCHING_STOP_EVENT, type StopEvent} from "./debug-sessio
 import {DebugPanel} from "./DebugPanel";
 import {ProfilerPanel} from "./ProfilerPanel";
 import {TimelinePanel} from "./TimelinePanel";
-import {isValidFileName, loadProject, saveProject, type Project} from "./project";
+import {
+  downloadProject,
+  isValidFileName,
+  loadProject,
+  parseProjectFile,
+  saveProject,
+  type Project,
+} from "./project";
 import "./App.css";
 
 const TIMELINE_MAX_EVENTS = 5000;
@@ -114,6 +121,7 @@ function App() {
   const activeFileRef = useRef(activeFile);
   activeFileRef.current = activeFile;
   const dirInputRef = useRef<HTMLInputElement | null>(null);
+  const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const [paneSizes, setPaneSizes] = useState<PaneSizes>(loadPaneSizes);
   const [errorMarker, setErrorMarker] = useState<ErrorMarker | null>(null);
   const projectRef = useRef(project);
@@ -121,6 +129,12 @@ function App() {
 
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
   const isTerminated = stopEvent ? stopEvent.reason === "terminated" || stopEvent.reason === "exception" : false;
+  const debugSessionRef = useRef(debugSession);
+  debugSessionRef.current = debugSession;
+  const debugBusyRef = useRef(debugBusy);
+  debugBusyRef.current = debugBusy;
+  const isTerminatedRef = useRef(isTerminated);
+  isTerminatedRef.current = isTerminated;
 
   useEffect(() => {
     const worker = new Worker(new URL("./lua-worker.ts", import.meta.url), {
@@ -395,6 +409,64 @@ function App() {
     }
   };
 
+  // Keyboard shortcuts (F5 run/continue, F9 toggle breakpoint, F10 step
+  // over) - a mount-once window listener reading everything it needs
+  // through refs, rather than a `run`/`doDebugAction`/`toggleBreakpoint`
+  // dependency array: those three are redefined every render (closing over
+  // that render's `project`/`debugSession`/etc.), so re-registering the
+  // listener on every relevant change would work too, but a stale-closure
+  // effect bug earlier in this project (DebugPanel's `onFrameSelected`) came
+  // from exactly this class of mistake - refs updated inline (matching
+  // `activeFileRef`'s existing pattern) sidestep it entirely.
+  const runRef = useRef(run);
+  runRef.current = run;
+  const startDebuggingRef = useRef(startDebugging);
+  startDebuggingRef.current = startDebugging;
+  const doDebugActionRef = useRef(doDebugAction);
+  doDebugActionRef.current = doDebugAction;
+  const toggleBreakpointRef = useRef(toggleBreakpoint);
+  toggleBreakpointRef.current = toggleBreakpoint;
+  const hasBreakpointsRef = useRef(false);
+  hasBreakpointsRef.current = Object.values(breakpoints).some(lines => lines.length > 0);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Don't hijack F-keys while the user is typing in the Watch/REPL
+      // inputs (or any other text field).
+      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
+
+      if (e.key === "F5") {
+        e.preventDefault();
+        if (debugSessionRef.current) {
+          if (!debugBusyRef.current && !isTerminatedRef.current) {
+            void doDebugActionRef.current(s => s.continue());
+          }
+        } else if (hasBreakpointsRef.current) {
+          // Breakpoints only ever fire under a debug session (a plain Run
+          // ignores them entirely) - so if any are set, F5 should launch one
+          // instead of silently running straight past them.
+          void startDebuggingRef.current();
+        } else {
+          runRef.current();
+        }
+        return;
+      }
+      if (e.key === "F9") {
+        e.preventDefault();
+        const line = editorRef.current?.getPosition()?.lineNumber;
+        if (line != null) void toggleBreakpointRef.current(activeFileRef.current, line);
+        return;
+      }
+      if (e.key === "F10" && debugSessionRef.current && !debugBusyRef.current && !isTerminatedRef.current) {
+        e.preventDefault();
+        void doDebugActionRef.current(s => s.stepOver());
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   const handleEditorMount: OnMount = (editor, monacoInstance) => {
     editorRef.current = editor;
     monacoRef.current = monacoInstance;
@@ -572,12 +644,44 @@ function App() {
     setActiveFile(valid[0][0]);
   };
 
+  const exportProjectClick = () => downloadProject(project);
+
+  const importProjectClick = () => projectFileInputRef.current?.click();
+
+  /** Replaces the current project outright (unlike directory import, which merges .lua files in). */
+  const handleImportProjectChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+
+    const parsed = parseProjectFile(await file.text());
+    if (!parsed) {
+      window.alert("That file isn't a valid Lua Playground project export.");
+      return;
+    }
+    setProject(parsed);
+    setActiveFile(Object.keys(parsed.files)[0]);
+    setBreakpoints({});
+    breakpointIdsRef.current = {};
+    setOutput("");
+    setError(null);
+    setErrorMarker(null);
+    setAnalysis(null);
+  };
+
   return (
     <div className="playground">
       <header>
         <h1>Lua Playground</h1>
         <div className="header-actions">
-          <button type="button" className="run-button" onClick={run} disabled={status !== "ready" || !!debugSession}>
+          <button
+            type="button"
+            className="run-button"
+            onClick={run}
+            disabled={status !== "ready" || !!debugSession}
+            title="Run (F5)"
+          >
             {status === "ready" ? "▶" : "⏳"} {runButtonLabel(status)}
           </button>
           {!debugSession && (
@@ -615,6 +719,20 @@ function App() {
               <button
                 type="button"
                 className="icon-button"
+                onClick={exportProjectClick}
+                title="Download this project as a .json file">
+                ⬇
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={importProjectClick}
+                title="Load a project .json file (replaces the current project)">
+                ⬆
+              </button>
+              <button
+                type="button"
+                className="icon-button"
                 onClick={importDirectoryClick}
                 title="Import a directory of .lua files">
                 📁
@@ -632,6 +750,13 @@ function App() {
               webkitdirectory=""
               directory=""
               onChange={handleImportDirChange}
+            />
+            <input
+              ref={projectFileInputRef}
+              type="file"
+              className="visually-hidden"
+              accept="application/json,.json"
+              onChange={handleImportProjectChange}
             />
           </div>
           <ul>
