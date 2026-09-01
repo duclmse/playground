@@ -29,6 +29,12 @@ export type BreakpointInfo = {
   verified: boolean;
 };
 
+/** Phase 8 (docs/debug-protocol.md#advanced-coroutines-phase-8). */
+export type ThreadInfo = {
+  id: number;
+  status: string;
+};
+
 export type StopInfo = {
   reason: string;
   line: number | null;
@@ -67,15 +73,23 @@ export type DebugRequest =
       breakpointId: number;
       logMessage: string | null;
     }
-  | { id: number; type: "debugGetStackTrace" }
-  | { id: number; type: "debugGetLocals"; frameIndex: number }
+  | { id: number; type: "debugGetThreads" }
+  | { id: number; type: "debugGetStackTrace"; threadId: number }
+  | { id: number; type: "debugGetLocals"; threadId: number; frameIndex: number }
   | { id: number; type: "debugGetGlobals" }
   | { id: number; type: "debugGetTableEntries"; reference: number; start: number; count: number }
   | { id: number; type: "debugGetMetatable"; reference: number }
-  | { id: number; type: "debugEvaluate"; expression: string; frameIndex: number }
+  | {
+      id: number;
+      type: "debugEvaluate";
+      threadId: number;
+      expression: string;
+      frameIndex: number;
+    }
   | {
       id: number;
       type: "debugSetVariable";
+      threadId: number;
       frameIndex: number;
       name: string;
       valueExpr: string;
@@ -90,6 +104,7 @@ export type WorkerEvent =
   | { type: "debugStopped"; id: number; stop: StopInfo }
   | { type: "debugBreakpoint"; id: number; breakpoint: BreakpointInfo }
   | { type: "debugAck"; id: number }
+  | { type: "debugThreads"; id: number; threads: ThreadInfo[] }
   | { type: "debugStackTrace"; id: number; frames: StackFrameInfo[] }
   | { type: "debugVariables"; id: number; variables: VariableInfo[] }
   | { type: "debugMetatable"; id: number; reference: number | null }

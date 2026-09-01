@@ -5,7 +5,14 @@
 // already-complete `DebugSession` client (debug-session.ts); no debugging
 // logic lives in this file.
 import { useEffect, useState } from "react";
-import type { DebugSession, EvalResultInfo, StackFrameInfo, StopEvent, VariableInfo } from "./debug-session";
+import type {
+  DebugSession,
+  EvalResultInfo,
+  StackFrameInfo,
+  StopEvent,
+  ThreadInfo,
+  VariableInfo,
+} from "./debug-session";
 import { VariablesTree } from "./VariablesTree";
 
 export interface DebugPanelProps {
@@ -31,6 +38,8 @@ export function DebugPanel({
   onStop,
   onFrameSelected,
 }: DebugPanelProps) {
+  const [threads, setThreads] = useState<ThreadInfo[]>([]);
+  const [selectedThread, setSelectedThread] = useState(0);
   const [frames, setFrames] = useState<StackFrameInfo[]>([]);
   const [selectedFrame, setSelectedFrame] = useState(0);
   const [locals, setLocals] = useState<VariableInfo[]>([]);
@@ -40,19 +49,29 @@ export function DebugPanel({
   const [replInput, setReplInput] = useState("");
   const [replHistory, setReplHistory] = useState<{ expression: string; result: EvalResultInfo }[]>([]);
 
-  // Every new stop invalidates the previous frame/variable snapshot -
+  // Every new stop invalidates the previous thread/frame/variable snapshot -
   // matches how `DebugSession`'s Rust side resets its object registry on
   // every stop (see session.rs's `ObjectRegistry::reset` doc comment).
+  // Phase 8 (docs/debug-protocol.md#advanced-coroutines-phase-8): defaults
+  // to whichever thread `getThreads()` marks "running" - the thread that
+  // actually hit the breakpoint/step, which is a coroutine whenever the
+  // stop happened inside one, not always the main thread.
   useEffect(() => {
     setSelectedFrame(0);
     onFrameSelected(0);
     if (isTerminated) {
+      setThreads([]);
       setFrames([]);
       setLocals([]);
       return;
     }
-    void session.getStackTrace().then(setFrames);
-    void session.getLocals(0).then(setLocals);
+    void session.getThreads().then((ts) => {
+      setThreads(ts);
+      const running = ts.find((t) => t.status === "running")?.id ?? 0;
+      setSelectedThread(running);
+      void session.getStackTrace(running).then(setFrames);
+      void session.getLocals(running, 0).then(setLocals);
+    });
     void session.getGlobals().then(setGlobals);
     // Re-run every watch against the newly paused frame, per
     // docs/debug-protocol.md#evaluation ("Watch expressions - re-evaluated
@@ -65,25 +84,40 @@ export function DebugPanel({
   useEffect(() => {
     if (watches.length === 0 || isTerminated) return;
     let cancelled = false;
-    void Promise.all(watches.map((w) => session.evaluate(w.expression, selectedFrame))).then(
-      (results) => {
-        if (cancelled) return;
-        setWatches((current) => current.map((w, i) => ({ ...w, result: results[i] })));
-      },
-    );
+    void Promise.all(
+      watches.map((w) => session.evaluate(selectedThread, w.expression, selectedFrame)),
+    ).then((results) => {
+      if (cancelled) return;
+      setWatches((current) => current.map((w, i) => ({ ...w, result: results[i] })));
+    });
     return () => {
       cancelled = true;
     };
     // Only re-run when the *set* of watch expressions or the selected
-    // frame/stop changes - not every render (`watches` itself changes on
-    // every result update above, which would otherwise loop).
+    // thread/frame/stop changes - not every render (`watches` itself
+    // changes on every result update above, which would otherwise loop).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stop, selectedFrame, isTerminated, session, watches.map((w) => w.expression).join("|")]);
+  }, [
+    stop,
+    selectedThread,
+    selectedFrame,
+    isTerminated,
+    session,
+    watches.map((w) => w.expression).join("|"),
+  ]);
+
+  const selectThread = async (threadId: number) => {
+    setSelectedThread(threadId);
+    setSelectedFrame(0);
+    onFrameSelected(0);
+    setFrames(await session.getStackTrace(threadId));
+    setLocals(await session.getLocals(threadId, 0));
+  };
 
   const selectFrame = async (index: number) => {
     setSelectedFrame(index);
     onFrameSelected(index);
-    setLocals(await session.getLocals(index));
+    setLocals(await session.getLocals(selectedThread, index));
   };
 
   const addWatch = () => {
@@ -100,7 +134,7 @@ export function DebugPanel({
   const runRepl = async () => {
     const expression = replInput.trim();
     if (!expression || isTerminated) return;
-    const result = await session.evaluate(expression, selectedFrame);
+    const result = await session.evaluate(selectedThread, expression, selectedFrame);
     setReplHistory((h) => [...h, { expression, result }]);
     setReplInput("");
   };
@@ -136,6 +170,25 @@ export function DebugPanel({
           </span>
         )}
       </div>
+
+      {threads.length > 1 && (
+        <div className="debug-section">
+          <h3>Threads</h3>
+          <ul className="thread-list">
+            {threads.map((t) => (
+              <li key={t.id}>
+                <button
+                  type="button"
+                  className={t.id === selectedThread ? "active" : ""}
+                  onClick={() => selectThread(t.id)}
+                >
+                  {t.id === 0 ? "main" : `coroutine #${t.id}`} ({t.status})
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="debug-section">
         <h3>Call Stack</h3>

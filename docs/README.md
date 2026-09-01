@@ -39,21 +39,23 @@ loop was actually built, that its `step()` has no way to shrink its internal
 of piccolo 0.3.3 that adds both.
 
 Phases 4-7 (breakpoints, stepping, call stack, inspector, expression
-evaluation) are fully built and **verified end-to-end in a real browser**:
-a `DebugSession` engine (`crates/lua-vm/src/session.rs`), a typechecked
-TypeScript worker-protocol client (`apps/web/src/debug-session.ts`), and a
-React UI (Monaco breakpoint gutter, call stack/locals/globals panels with
-lazy table expansion, watch list, frame-scoped REPL) driven end-to-end with
-Playwright against the running dev server. Phase 8's breakpoint-shaped
-features (conditional/hit-count/logpoints, exception-as-stop) and its
-profiler and execution timeline are engine-complete and tested but have no
-UI yet. Phase 8's coroutine debugging is designed but not built - real,
-non-trivial engine work (making call-stack/depth tracking thread-aware) that
-was deliberately not squeezed in alongside everything else, to avoid
-regressing the now-verified single-threaded debugger. See
+evaluation) and Phase 8's coroutine debugging are fully built and
+**verified end-to-end in a real browser**: a `DebugSession` engine
+(`crates/lua-vm/src/session.rs`), a typechecked TypeScript worker-protocol
+client (`apps/web/src/debug-session.ts`), and a React UI (Monaco breakpoint
+gutter, call stack/locals/globals panels with lazy table expansion, a
+thread selector for coroutines, watch list, frame-scoped REPL) driven
+end-to-end with Playwright against the running dev server - including a
+coroutine scenario with per-thread call stacks and locals correctly
+isolated from each other. Phase 8's remaining breakpoint-shaped features
+(conditional/hit-count/logpoints, exception-as-stop) are engine-complete
+and tested; its profiler and execution timeline are engine-complete and
+tested but have no UI yet. See
 [phase-4-8-implementation.md](./phase-4-8-implementation.md) for the full
-breakdown, the engine-side findings that changed the design along the way,
-the Playwright verification transcript, and exactly what's left.
+breakdown, the engine-side findings that changed the design along the way
+(including one initial "this needs a bigger rewrite" assessment that turned
+out wrong once actually attempted), the Playwright verification transcript,
+and exactly what's left.
 
 What exists:
 
@@ -65,8 +67,10 @@ What exists:
   (parameterizes the internal opcode-batch size `step()` hardcodes to 64),
   `Thread::debug_snapshot`, `Thread::debug_lua_frame_depth`,
   `Thread::debug_frames` (the full call stack), `Thread::debug_read_register`
-  / `debug_write_register`, `FunctionPrototype::line_for_pc` /
-  `local_name_at`. See `crates/vm/README.md`'s fork notice,
+  / `debug_write_register`, `Executor::debug_thread_stack` (Phase 8:
+  coroutine debugging - the active thread nesting, not just the top),
+  `FunctionPrototype::line_for_pc` / `local_name_at`. See
+  `crates/vm/README.md`'s fork notice,
   `risks.md` §1, and [phase-4-8-implementation.md](./phase-4-8-implementation.md)
   for the full patch list and why each piece was needed.
 - `crates/lua-vm` - the piccolo-backed runtime (`run`/`run_named`/
@@ -80,9 +84,10 @@ What exists:
   capped `record_timeline`), `session.rs` (Phases 4-8's `DebugSession`:
   breakpoints including conditional/hit-count/logpoints, stepping, call
   stack, locals/globals/table inspection, frame-scoped `evaluate`/
-  `setVariable`), and `profiler.rs` (Phase 8's `profile()` ->
-  `FunctionStats`). 38 unit tests plus the conformance suite, all against
-  the real engine - see
+  `setVariable`, and `get_threads`/thread-scoped inspection for coroutine
+  debugging), and `profiler.rs` (Phase 8's `profile()` -> `FunctionStats`).
+  40 unit tests plus the conformance suite, all against the real engine -
+  see
   [phase-4-8-implementation.md](./phase-4-8-implementation.md) for what
   `DebugSession` does and doesn't cover.
 - `conformance/fixtures` (`.lua` source) and `conformance/expected`
@@ -103,7 +108,8 @@ What exists:
   worker's debug-message handling (a complete, typechecked TypeScript
   `DebugSession` client for the Rust engine above) and `DebugPanel.tsx`/
   `VariablesTree.tsx` (the debugger UI: Monaco breakpoint gutter, call
-  stack/locals/globals/watch/REPL panels) - driven end-to-end with
+  stack/locals/globals/watch/REPL panels, and a thread selector that
+  appears once a coroutine is on the resume chain) - driven end-to-end with
   Playwright against the running dev server, not just typechecked. See
   [phase-4-8-implementation.md](./phase-4-8-implementation.md)'s "Browser
   verification" and "What a UI pass still needs to do" sections.

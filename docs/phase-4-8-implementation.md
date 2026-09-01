@@ -15,27 +15,31 @@ design doc, in the same spirit as [risks.md](./risks.md).
 | 6     | Inspector (values, locals/globals/tables/metatables)                    | **Done, tested, verified in a real browser (upvalues excluded).**  |
 | 7     | Expression evaluation                                                   | **Done, tested, verified in a real browser.**                      |
 | 8     | Conditional/hit-count/logpoint breakpoints, exception breakpoints        | **Engine done, tested.**                                           |
+| 8     | Coroutine debugging                                                      | **Done, tested, verified in a real browser.**                      |
 | 8     | Profiler                                                                 | **Engine done, tested. No UI.**                                    |
 | 8     | Execution timeline                                                       | **Engine done, tested (capped recording). No UI.**                 |
-| 8     | Coroutine debugging                                                      | **Not built - designed below.**                                    |
 
 "Engine" = `crates/vm` (fork) + `crates/lua-vm/src/session.rs` (the
 `DebugSession` struct) + `crates/lua-vm/src/profiler.rs` +
 `crates/lua-vm/src/debug_events.rs`'s capped timeline addition, all covered
 by Rust tests running against the real piccolo-backed VM (`cargo test -p
-lua-vm`, 38 tests: 17 `session::`, 2 `profiler::`, 19 others). Phases 4-7 are
-also wired all the way through: `apps/web/src/debug-protocol.ts` +
-`lua-worker.ts` + `debug-session.ts` implement
+lua-vm`, 40 tests: 19 `session::`, 2 `profiler::`, 19 others). Phases 4-7 and
+Phase 8's coroutine debugging are also wired all the way through:
+`apps/web/src/debug-protocol.ts` + `lua-worker.ts` + `debug-session.ts`
+implement
 [debug-protocol.md](./debug-protocol.md)'s `DebugSession` TypeScript
 interface over the worker message protocol, and `App.tsx` + `DebugPanel.tsx`
 + `VariablesTree.tsx` wire it into a real UI - a Monaco breakpoint gutter
 (click to toggle, red dot for set, yellow arrow for the paused line), call
 stack/locals/globals panels with lazy table+metatable expansion, a watch
-list, and a frame-scoped REPL. **Verified against the actual running app**
-with Playwright (breakpoint hit, locals/globals inspected, step over,
-watch + REPL evaluated, continue to completion, output displayed, error/
-exception path, and re-launching after Stop - see "Browser verification"
-below for the full transcript). The profiler and execution timeline have no
+list, a frame-scoped REPL, and (Phase 8) a thread selector that appears
+once a coroutine is on the resume chain. **Verified against the actual
+running app** with Playwright (breakpoint hit, locals/globals inspected,
+step over, watch + REPL evaluated, continue to completion, output
+displayed, error/exception path, re-launching after Stop, and a coroutine
+scenario with per-thread call stacks/locals correctly isolated - see
+"Browser verification" below for the full transcript). The profiler and
+execution timeline have no
 UI yet - see "What a UI pass still needs to do."
 
 ## What the fork (`crates/vm`) added beyond Phase 3
@@ -304,22 +308,52 @@ at the cap and not firing when the recording stays under it. No UI renders
 this yet - "per-function timeline visualization" is real design/build work
 of its own, not a small addition on top of the capped recording.
 
-## Phase 8 item not built: coroutine debugging
+## Coroutine debugging (`Executor::debug_thread_stack`, `DebugSession::get_threads`)
 
-`Executor` already has the right shape for this - `thread_stack:
-Vec<Thread<'gc>>` (confirmed reading `executor.rs`; this is what
-`current_running_thread()` reads the *top* of) - so `getThreads()`
-returning one entry per coroutine plus the main thread, and
-`debug_frames()`/`get_locals` etc. taking a `thread_id` instead of always
-targeting `current_running_thread()`, is a natural extension of the
-existing design, not a redesign. Not attempted here: real, non-trivial
-engine work (`step_with_granularity`'s call/return depth tracking would
-need to become per-thread, since a coroutine resume/yield changes the
-*active* thread without the main thread's own Lua-frame depth changing)
-that deserves its own implementation-and-test pass, not an addition
-squeezed in after everything else in this document - the risk of a rushed
-change here is regressing the now-verified single-threaded stepping/
-breakpoint logic, which matters more than closing this one remaining gap.
+**This was initially assessed as out of scope for this pass** (an earlier
+revision of this document said as much, reasoning that stepping's call/
+return depth tracking would need to become per-thread first). That turned
+out to be overly pessimistic once actually attempted - worth correcting the
+record on, in the same spirit as this document's other "here's what we
+predicted vs. what was actually true" sections:
+
+- `Thread::debug_frames`/`debug_read_register`/`debug_write_register`/
+  `debug_lua_frame_depth` (from the Phase 4-7 work above) are already
+  methods on `Thread`, not `Executor` - they take *whichever* thread you
+  hand them. The only missing piece was a way to get a `Thread` other than
+  "the currently running one," which is a single small fork addition:
+  `Executor::debug_thread_stack()` (mirroring `current_running_thread`,
+  just returning the whole `thread_stack` instead of only its top).
+- Stepping needed **no changes at all**. `step_over`/`step_into`/`step_out`
+  compare `debug_lua_frame_depth()` snapshots of `current_running_thread()`
+  - and a coroutine resume/yield already *is* a change in which thread is
+    current, so "the active thread's depth" naturally tracks across
+  resume/yield boundaries without any thread-awareness added to the
+  stepping logic itself.
+
+What was added: `thread_id: u32` parameters on `get_stack_trace`,
+`get_locals`, `evaluate`, and `set_variable` (index into
+`debug_thread_stack()`, bottom-to-top, `0` = main - existing single-file
+tests all pass `0` unchanged, so this is additive, not a breaking change),
+`get_threads() -> Vec<ThreadInfo>` (`id`/`status`, `"running"` for the top
+of the stack, `"normal"` - Lua's own term for "resumed something and is
+waiting on it" - for everything below it), and `current_thread_id()` so a
+breakpoint's condition/log-message expression evaluates against whichever
+thread actually hit it, not always the main thread. 2 new tests cover
+`get_threads()` reporting both threads with the right statuses, and a
+coroutine's stack/locals being independently inspectable from (and
+correctly isolated from) the main thread's.
+
+**What this doesn't cover** (see `Executor::debug_thread_stack`'s doc
+comment for the full reasoning): only threads on the *active resume
+chain* at the current pause point are visible - a coroutine that's been
+created but never resumed, or one that has yielded and is sitting
+suspended waiting for a future resume, isn't on `thread_stack` and so isn't
+in `get_threads()`. Listing *every* coroutine a program has ever created
+would need the host to track `coroutine.create` calls itself; piccolo has
+no thread registry to read them back from. What's covered is the common
+debugging case - pausing while a `coroutine.resume()` call is on the
+stack - which is what the browser verification below exercises.
 
 ## Browser verification
 
@@ -343,6 +377,26 @@ dev server (`npm run dev`), not just typechecked:
 6. Separately, edited the source to call `error(...)`, confirmed the debug
    status correctly reports the exception, and confirmed a session can be
    stopped and a new one launched cleanly afterward.
+7. A coroutine scenario: `coroutine.create`/`resume` with a breakpoint
+   inside the coroutine's body. Confirmed the Threads panel appeared
+   showing both `main (normal)` and `coroutine #1 (running)`; the default-
+   selected (running) thread's call stack and locals showed the
+   coroutine's own frame and its local (`x = 42`); switching to `main` in
+   the thread selector showed *its* stack (paused at the `coroutine.resume`
+   call site) and correctly did *not* show the coroutine's local; and
+   continuing ran the program to completion with the correct output
+   (`42` / `after resume`).
+   (One real gotcha hit while writing this test, worth recording: typing
+   Lua source into Monaco via simulated keystrokes is unreliable for
+   anything with parens/`end`/indentation - Monaco's autoclose/auto-indent
+   mangled a `coroutine.create(function() ... end)` block into invalid
+   syntax, which then made the WASM module hit an internal panic
+   (`RuntimeError: unreachable`) on the resulting malformed program. Not a
+   session.rs bug - confirmed by reproducing the *exact* same source
+   string in a native Rust test, which passed cleanly. Seeding
+   `localStorage`'s project directly and reloading, rather than typing
+   through Monaco, avoided it and is the more reliable approach for any
+   future test that needs multi-line/nested Lua source in the editor.)
 
 ## What a UI pass still needs to do
 
@@ -355,13 +409,13 @@ value:
 2. **Execution timeline UI**: `record_timeline()` exists; rendering it as a
    per-function timeline (debug-protocol.md's own framing: "primarily an
    educational/visualization feature") is unbuilt design+UI work.
-3. **Coroutine debugging**: needs the engine work described above before
-   any UI is meaningful.
-4. **`pause()`**: still not implemented (see "Known gaps" above) - would
+3. **`pause()`**: still not implemented (see "Known gaps" above) - would
    need the Rust side to run in bounded bursts instead of one unbounded
    `continue()` call.
-5. Smaller polish: upvalue inspection, function/thread/userdata expansion
+4. Smaller polish: upvalue inspection, function/thread/userdata expansion
    in the variables tree (currently table-only), hover-evaluation in the
    editor (debug-protocol.md mentions it as a third `evaluate()` surface
    alongside watches/REPL, neither of which needed new engine work to add -
-   this one doesn't either, it's just unbuilt).
+   this one doesn't either, it's just unbuilt), and listing coroutines
+   that aren't currently on the active resume chain (see the coroutine
+   debugging section's "what this doesn't cover").

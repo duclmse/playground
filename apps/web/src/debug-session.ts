@@ -7,21 +7,22 @@
 // `crates/lua-vm/src/session.rs`'s `DebugSession` on the Rust side; this
 // file only translates between that and the worker message protocol.
 //
-// Not yet wired into any React component - see
-// docs/phase-4-8-implementation.md for what's built vs. what a UI still
-// needs to add (breakpoint gutter, call stack panel, variables tree,
-// step/continue controls, watch/REPL panel).
+// Wired into React by DebugPanel.tsx/VariablesTree.tsx/App.tsx - see
+// docs/phase-4-8-implementation.md for the browser-verified feature set
+// and what's still unbuilt (profiler/timeline UI, a thread selector for
+// coroutines, pause()).
 
 import type {
   BreakpointInfo,
   DebugRequest,
   EvalResultInfo,
   StackFrameInfo,
+  ThreadInfo,
   VariableInfo,
   WorkerEvent,
 } from "./debug-protocol";
 
-export type { BreakpointInfo, StackFrameInfo, VariableInfo, EvalResultInfo };
+export type { BreakpointInfo, StackFrameInfo, ThreadInfo, VariableInfo, EvalResultInfo };
 
 // Plain `Omit<DebugRequest, "id">` doesn't distribute over the union (it
 // collapses to the shape's *common* keys minus "id", which is why every
@@ -179,9 +180,27 @@ export class DebugSession {
     await this.send({ type: "debugSetBreakpointLogMessage", breakpointId, logMessage });
   }
 
-  async getStackTrace(): Promise<StackFrameInfo[]> {
+  /**
+   * Phase 8 (docs/debug-protocol.md#advanced-coroutines-phase-8): the
+   * active thread nesting at this pause point - `id: 0` is always the main
+   * thread; a coroutine currently on the resume chain gets a higher id.
+   * See `crates/lua-vm/src/session.rs`'s `Executor::debug_thread_stack` doc
+   * comment for exactly what this does and doesn't cover (only threads on
+   * the *active* resume chain, not every coroutine the program has ever
+   * created). `threadId` here is what `getStackTrace`/`getLocals`/
+   * `evaluate`/`setVariable`'s own `threadId` parameter expects.
+   */
+  async getThreads(): Promise<ThreadInfo[]> {
+    const { threads } = await this.send<Extract<WorkerEvent, { type: "debugThreads" }>>({
+      type: "debugGetThreads",
+    });
+    return threads;
+  }
+
+  async getStackTrace(threadId = 0): Promise<StackFrameInfo[]> {
     const { frames } = await this.send<Extract<WorkerEvent, { type: "debugStackTrace" }>>({
       type: "debugGetStackTrace",
+      threadId,
     });
     return frames;
   }
@@ -200,9 +219,10 @@ export class DebugSession {
     ];
   }
 
-  async getLocals(frameIndex: number): Promise<VariableInfo[]> {
+  async getLocals(threadId: number, frameIndex: number): Promise<VariableInfo[]> {
     const { variables } = await this.send<Extract<WorkerEvent, { type: "debugVariables" }>>({
       type: "debugGetLocals",
+      threadId,
       frameIndex,
     });
     return variables;
@@ -234,18 +254,25 @@ export class DebugSession {
     return metaRef;
   }
 
-  async evaluate(expression: string, frameIndex: number): Promise<EvalResultInfo> {
+  async evaluate(threadId: number, expression: string, frameIndex: number): Promise<EvalResultInfo> {
     const { result } = await this.send<Extract<WorkerEvent, { type: "debugEvalResult" }>>({
       type: "debugEvaluate",
+      threadId,
       expression,
       frameIndex,
     });
     return result;
   }
 
-  async setVariable(frameIndex: number, name: string, valueExpr: string): Promise<EvalResultInfo> {
+  async setVariable(
+    threadId: number,
+    frameIndex: number,
+    name: string,
+    valueExpr: string,
+  ): Promise<EvalResultInfo> {
     const { result } = await this.send<Extract<WorkerEvent, { type: "debugEvalResult" }>>({
       type: "debugSetVariable",
+      threadId,
       frameIndex,
       name,
       valueExpr,

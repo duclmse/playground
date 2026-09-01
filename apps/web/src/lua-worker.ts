@@ -120,9 +120,16 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
 
+      case "debugGetThreads": {
+        const threads = requireSession()
+          .get_threads()
+          .map((t) => ({ id: t.id, status: t.status }));
+        post({ type: "debugThreads", id: message.id, threads });
+        return;
+      }
       case "debugGetStackTrace": {
         const frames = requireSession()
-          .get_stack_trace()
+          .get_stack_trace(message.threadId)
           .map((f) => ({
             index: f.index,
             name: f.name,
@@ -135,7 +142,7 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
       case "debugGetLocals": {
         const variables = requireSession()
-          .get_locals(message.frameIndex)
+          .get_locals(message.threadId, message.frameIndex)
           .map((v) => ({
             name: v.name,
             valueType: v.value_type,
@@ -179,7 +186,11 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
 
       case "debugEvaluate": {
-        const result = requireSession().evaluate(message.expression, message.frameIndex);
+        const result = requireSession().evaluate(
+          message.threadId,
+          message.expression,
+          message.frameIndex,
+        );
         post({
           type: "debugEvalResult",
           id: message.id,
@@ -189,6 +200,7 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
       case "debugSetVariable": {
         const result = requireSession().set_variable(
+          message.threadId,
           message.frameIndex,
           message.name,
           message.valueExpr,

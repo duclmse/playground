@@ -257,11 +257,29 @@ main {
   margin: 0 0 0.35rem 0;
 }
 
-.call-stack {
+.call-stack,
+.thread-list {
   list-style: none;
   margin: 0;
   padding: 0;
   font-size: 0.85rem;
+}
+
+.thread-list button {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #ddd;
+  padding: 0.2rem 0.3rem;
+  cursor: pointer;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.thread-list button.active {
+  background: #2a3a4a;
+  color: #7fd0ff;
+  border-radius: 3px;
 }
 
 .call-stack button {

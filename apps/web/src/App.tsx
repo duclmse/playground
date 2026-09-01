@@ -94,9 +94,15 @@ function App() {
 
   // ---- Debugger controls ----
 
-  /** Fetches the stack trace and, if the top frame is a known project file, switches to it. */
+  /**
+   * Fetches the stack trace for whichever thread actually hit the
+   * stop - a coroutine, if the stop happened inside one (Phase 8) - and,
+   * if the top frame is a known project file, switches to it.
+   */
   const focusStoppedFrame = async (session: DebugSession) => {
-    const frames = await session.getStackTrace();
+    const threads = await session.getThreads();
+    const runningThread = threads.find((t) => t.status === "running")?.id ?? 0;
+    const frames = await session.getStackTrace(runningThread);
     const top = frames.find((f) => f.functionType !== "c");
     if (top?.source && project.files[top.source] !== undefined) {
       setActiveFile(top.source);
