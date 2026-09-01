@@ -28,19 +28,23 @@ and [risks.md](./risks.md#decision-log) for what that changed.
 ## Status
 
 MVP-1 slice implemented: Phases 0-2 of the roadmap (conformance harness,
-piccolo-backed Lua runtime compiled to WASM, playground UI) are built and
-verified end-to-end, including in a real browser. Phases 3-8 (the debugger)
-are explicitly deferred — `risks.md` §1 is resolved and concluded that
+piccolo-backed Lua runtime compiled to WASM, full playground UI — Monaco
+editor, multi-file virtual filesystem, console) are built and verified
+end-to-end, including in a real browser. Phases 3-8 (the debugger) are
+explicitly deferred — `risks.md` §1 is resolved and concluded that
 piccolo's public API has no frame/locals introspection surface, so a
 debugger needs a piccolo fork (or upstream contribution) before that work
 can start; see `risks.md` §1 and `roadmap.md` for the consequences.
 
 What exists:
 
-- `crates/lua-vm` — the piccolo-backed runtime (`run`/`run_named`), with a
-  sandboxed `print` and small host-added stdlib extensions
-  (`table.insert`/`concat`/`sort`, `xpcall`) that piccolo itself doesn't
-  ship. Unit-tested and conformance-tested.
+- `crates/lua-vm` — the piccolo-backed runtime (`run`/`run_named`/
+  `run_project`), with a sandboxed `print`, small host-added stdlib
+  extensions (`table.insert`/`concat`/`sort`, `xpcall`) that piccolo itself
+  doesn't ship, a `require()` backed by an in-memory virtual filesystem for
+  multi-file projects, and a host-side fuel-stepped execution loop that caps
+  a run at 10M instructions so a runaway `while true do end` errors out
+  instead of freezing the tab. Unit-tested and conformance-tested.
 - `conformance/fixtures` — a 10-fixture corpus diffed against real Lua
   5.5.1 output; see [conformance.md](./conformance.md)'s known-deviations
   ledger for what piccolo actually diverges on (confirmed by source
@@ -48,5 +52,9 @@ What exists:
   string pattern matching, no string metatable.
 - `packages/lua-runtime` — the `wasm-bindgen`-generated npm package wrapping
   `crates/lua-vm`.
-- `apps/web` — a Vite/React playground UI that runs the VM in a Web Worker,
-  per architecture.md's worker-isolation requirement.
+- `apps/web` — a Vite/React playground UI that runs the VM in a Web Worker
+  (per architecture.md's worker-isolation requirement), with a Monaco editor,
+  a file-tree sidebar for a multi-file virtual project (add/rename/delete
+  files, choose the entry file), and client-only save/load via
+  `localStorage` (per `risks.md` §4's persistence decision — no backend, no
+  shareable links in v1).

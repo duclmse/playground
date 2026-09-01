@@ -151,27 +151,53 @@ stating what happens by default before Phase 8 exists.
 
 ## 8. WASM load-time budget
 
-**MEASURED** (Phase 1-2 implementation, including the host stdlib
-extensions added during Phase 0 conformance work — `table.insert`/
-`concat`/`sort`, `xpcall`). `cargo build --release --target
-wasm32-unknown-unknown` on `crates/lua-vm` produces a 952.1 KB raw
-`.wasm`. After `wasm-bindgen --target web` + Vite's production build, the
-shipped asset is **696.71 KB (236.41 KB gzip)**. This is *without*
-`wasm-opt` — the Cargo.toml has no `wasm-opt`/`binaryen` post-processing
-step wired in yet, so there's real headroom left on the table; adding a
-`wasm-opt -O` pass (or `wasm-pack`'s built-in one) before shipping to real
-users is a cheap follow-up, not yet done.
+**MEASURED, twice.** First at end of Phase 1 (WASM runtime only), then
+re-measured after Phase 2 added Monaco — the numbers below are the current
+(Phase 2-complete) reality; the superseded Phase 1-only figures are kept for
+context.
 
-The original plan's recommendation still stands and is implemented in
-`apps/web`: the VM initializes inside a Web Worker
+**Phase 1 (WASM only, superseded):** `cargo build --release --target
+wasm32-unknown-unknown` on `crates/lua-vm` produced a 952.1 KB raw `.wasm`,
+shipping as 696.71 KB (236.41 KB gzip) after `wasm-bindgen --target web` +
+Vite's production build. Still without `wasm-opt` (see below).
+
+**Phase 2 (current, WASM + Monaco editor):** `npm run build` in `apps/web`
+now produces a **~15 MB `dist/` directory**. That figure is misleading on
+its own — most of it is Monaco's ~50 per-language syntax-highlighting
+chunks (`abap-*.js`, `julia-*.js`, `sql-*.js`, ...), which are code-split
+and load lazily only if a user opens that language; a Lua-only playground
+never fetches them. What actually loads eagerly on first paint:
+
+- `index-*.js` (React + Monaco's core editor + the WASM glue code, all
+  bundled together): **4.12 MB raw, 1.00 MB gzip**.
+- `lua_vm_bg-*.wasm`: **700 KB raw, 235.73 KB gzip** (essentially unchanged
+  from Phase 1 — `require()` and the fuel-stepped instruction-limit loop
+  added negligible size).
+- `lua-*.js` (the one Monaco language chunk actually needed): **3.46 KB
+  gzip**.
+- Total eager-load payload: **≈1.24 MB gzip**, not the 15 MB / 3.44 MB
+  figure you'd get by (incorrectly) summing every asset in `dist/`.
+
+This is *without* `wasm-opt` on the Rust side or Monaco's official bundler
+plugins (`monaco-editor-webpack-plugin` equivalent) on the JS side — both
+are real, cheap levers if 1.24 MB gzip ever becomes a complaint. The single
+biggest lever available is trimming Monaco's core bundle itself (it's ~4x
+the size of the WASM Lua runtime), not the WASM payload this section was
+originally scoped to track.
+
+The original plan's Web Worker recommendation still stands and is
+implemented in `apps/web`: the VM initializes inside a Web Worker
 (`src/lua-worker.ts`), off the UI thread, and the UI shows an explicit
 "loading" gate on the Run button rather than blocking initial page render —
-confirmed working via a real Playwright browser run.
+confirmed working via a real Playwright browser run in both dev and
+production-preview builds.
 
-236.41 KB gzip is comparable to a mid-size JS framework bundle, not
-negligible, but well within budget for a playground tool where the user has
-explicitly navigated to "go write Lua." No further action needed for MVP-1;
-`wasm-opt` is the natural next lever if load time becomes a complaint.
+≈1.24 MB gzip on first load is comparable to a mid-size JS app (most of it
+is Monaco, a known-heavy but known-quantity dependency, not something this
+project's own code bloated), and well within budget for a playground tool
+where the user has explicitly navigated to "go write Lua." No further
+action needed for MVP-1; `wasm-opt` and/or a lighter code editor are the
+natural next levers if load time becomes a real complaint.
 
 ## 9. Minor: citation accuracy in the original doc
 
