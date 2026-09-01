@@ -19,7 +19,10 @@ export interface DebugPanelProps {
   session: DebugSession;
   stop: StopEvent;
   isTerminated: boolean;
+  /** True while a debug action (continue/step) is in flight - see App.tsx's `debugBusy`. */
+  busy: boolean;
   onContinue: () => void;
+  onPause: () => void;
   onStepOver: () => void;
   onStepInto: () => void;
   onStepOut: () => void;
@@ -31,7 +34,9 @@ export function DebugPanel({
   session,
   stop,
   isTerminated,
+  busy,
   onContinue,
+  onPause,
   onStepOver,
   onStepInto,
   onStepOut,
@@ -142,16 +147,19 @@ export function DebugPanel({
   return (
     <section className="debug-panel">
       <div className="debug-toolbar">
-        <button type="button" onClick={onContinue} disabled={isTerminated} title="Continue">
+        <button type="button" onClick={onContinue} disabled={isTerminated || busy} title="Continue">
           ▶ Continue
         </button>
-        <button type="button" onClick={onStepOver} disabled={isTerminated} title="Step Over">
+        <button type="button" onClick={onPause} disabled={isTerminated || !busy} title="Pause">
+          ⏸ Pause
+        </button>
+        <button type="button" onClick={onStepOver} disabled={isTerminated || busy} title="Step Over">
           ⤵ Over
         </button>
-        <button type="button" onClick={onStepInto} disabled={isTerminated} title="Step Into">
+        <button type="button" onClick={onStepInto} disabled={isTerminated || busy} title="Step Into">
           ⤷ Into
         </button>
-        <button type="button" onClick={onStepOut} disabled={isTerminated} title="Step Out">
+        <button type="button" onClick={onStepOut} disabled={isTerminated || busy} title="Step Out">
           ⤴ Out
         </button>
         <button type="button" onClick={onStop} className="debug-stop" title="Stop debugging">
@@ -164,9 +172,11 @@ export function DebugPanel({
           <span className="debug-status-terminated">
             {stop.reason === "exception" ? `Error: ${stop.message}` : "Terminated"}
           </span>
+        ) : busy ? (
+          <span className="debug-status-running">Running…</span>
         ) : (
           <span className="debug-status-paused">
-            Paused ({stop.reason}) at line {stop.line}
+            {stop.reason === "paused" ? "Paused by user" : `Paused (${stop.reason})`} at line {stop.line}
           </span>
         )}
       </div>

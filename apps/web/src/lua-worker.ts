@@ -35,7 +35,13 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         const names = Object.keys(message.files);
         const contents = names.map((name) => message.files[name]);
         const result = execute_project(names, contents, message.entry);
-        post({ type: "result", output: result.output, error: result.error ?? null });
+        post({
+          type: "result",
+          output: result.output,
+          error: result.error ?? null,
+          errorSource: result.error_source ?? null,
+          errorLine: result.error_line ?? null,
+        });
         return;
       }
 
@@ -53,6 +59,19 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
           type: "debugStopped",
           id: message.id,
           stop: { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null },
+        });
+        return;
+      }
+      case "debugContinueBurst": {
+        const burst = requireSession().continue_burst(message.maxInstructions);
+        const stop = burst.stop;
+        post({
+          type: "debugBurst",
+          id: message.id,
+          stopped: burst.stopped,
+          stop: stop ? { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null } : null,
+          source: burst.source ?? null,
+          line: burst.line ?? null,
         });
         return;
       }

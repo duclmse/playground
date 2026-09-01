@@ -37,10 +37,45 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 type DebugRequestWithoutId = DistributiveOmit<Extract<DebugRequest, { id: number }>, "id">;
 
 export interface StopEvent {
-  reason: "breakpoint" | "step" | "exception" | "terminated";
+  reason: "breakpoint" | "step" | "exception" | "terminated" | "paused" | "running";
   line: number | null;
   message: string | null;
 }
+
+/**
+ * Placeholder `StopEvent` for the moment a session is launched but its
+ * first `continue()` hasn't resolved yet (see App.tsx's `startDebugging`).
+ * Without this, `DebugPanel` - gated on `debugSession && stopEvent` - can't
+ * render at all during that first call, so its Pause button doesn't exist
+ * yet either: the *only* time a user is guaranteed to be looking at a
+ * possibly-long-running `continue()` (right after clicking Debug) would be
+ * exactly the one time they have no way to pause it. `reason: "running"` is
+ * never actually shown - DebugPanel's status view checks `busy` before it
+ * ever reads `stop.reason` - it exists so `isTerminated` (neither
+ * "terminated" nor "exception") and the rest of DebugPanel's `stop`-reading
+ * effects see a well-formed, harmless value instead of a fake "step"/etc.
+ */
+export const LAUNCHING_STOP_EVENT: StopEvent = { reason: "running", line: null, message: null };
+
+/**
+ * Instructions per `continue()` burst (see `continue()`'s doc comment).
+ * Small enough that `pause()` takes effect within roughly one worker
+ * round-trip of being called; large enough that a normal (non-paused) run
+ * isn't dominated by round-trip overhead - most programs finish or hit a
+ * breakpoint in far fewer than this many opcodes, so they complete in a
+ * single burst anyway.
+ */
+const CONTINUE_BURST_SIZE = 200_000;
+
+/**
+ * Matches `crates/lua-vm`'s `MAX_INSTRUCTIONS` runaway-loop cap. A single
+ * `continue_burst` call has no notion of this - each one just runs its own
+ * `CONTINUE_BURST_SIZE` budget and reports back - so without a client-side
+ * running total, `continue()`'s burst loop would keep requesting bursts
+ * forever for a genuine `while true do end`, instead of eventually failing
+ * the same way a single unbounded `continue_()` call always has.
+ */
+const MAX_CONTINUE_INSTRUCTIONS = 10_000_000;
 
 /** Scope kinds per docs/debug-protocol.md#scopes--locals. */
 export type ScopeType = "local" | "global" | "register";
@@ -63,6 +98,7 @@ export class DebugSession {
     number,
     { resolve: (event: WorkerEvent) => void; reject: (err: Error) => void }
   >();
+  private pauseRequested = false;
 
   constructor(worker: Worker) {
     this.worker = worker;
@@ -102,26 +138,55 @@ export class DebugSession {
     await this.send({ type: "debugLaunch", files, entry });
   }
 
+  /**
+   * Drives the program in `CONTINUE_BURST_SIZE`-instruction bursts (each its
+   * own worker round-trip) instead of one unbounded `debugContinue` call, so
+   * `pause()` - which just flips a flag this loop checks between bursts -
+   * has something to interrupt. Per docs/phase-4-8-implementation.md's
+   * `pause()` design: "the driver stops calling step()"; here the driver is
+   * this loop, and "stops calling" means "stops requesting another burst."
+   * Resolves with a synthetic `{reason: "paused"}` StopEvent when that
+   * happens, or with the real stop once a breakpoint/step-target/exception/
+   * termination is actually reached, exactly as a single `debugContinue`
+   * call used to.
+   */
   async continue(): Promise<StopEvent> {
-    const { stop } = await this.send<Extract<WorkerEvent, { type: "debugStopped" }>>({
-      type: "debugContinue",
-    });
-    return stop as StopEvent;
+    this.pauseRequested = false;
+    let totalInstructions = 0;
+    for (;;) {
+      const burst = await this.send<Extract<WorkerEvent, { type: "debugBurst" }>>({
+        type: "debugContinueBurst",
+        maxInstructions: CONTINUE_BURST_SIZE,
+      });
+      if (burst.stopped) {
+        return burst.stop as StopEvent;
+      }
+      // Not stopped means this burst ran its full requested budget without
+      // hitting a real stop condition.
+      totalInstructions += CONTINUE_BURST_SIZE;
+      if (totalInstructions >= MAX_CONTINUE_INSTRUCTIONS) {
+        return {
+          reason: "exception",
+          line: burst.line,
+          message: "Execution exceeded instruction limit",
+        };
+      }
+      if (this.pauseRequested) {
+        this.pauseRequested = false;
+        return { reason: "paused", line: burst.line, message: null };
+      }
+    }
   }
 
-  // `pause()` has no separate worker message: piccolo's fuel-stepped model
-  // means "pause" is just "the driver stops calling step()" (per
-  // docs/debug-protocol.md#worker-message-protocol) - there is no
-  // long-running `continue()` call to interrupt mid-flight here, since
-  // `DebugSession::continue_()` on the Rust side runs to completion inside
-  // one synchronous call. A responsive pause button needs the Rust side to
-  // run in bounded bursts instead of one unbounded call - see
-  // docs/phase-4-8-implementation.md's "pause()" section for the design
-  // that would enable it; not implemented in this pass.
+  /**
+   * Requests that the in-flight `continue()` burst loop stop after its
+   * current burst instead of requesting another - see `continue()`'s doc
+   * comment. A no-op if nothing is running: the flag is reset at the start
+   * of every `continue()` call, so a stray `pause()` called outside one
+   * (e.g. while a step is in flight) has no lasting effect.
+   */
   async pause(): Promise<void> {
-    throw new Error(
-      "pause() is not implemented - continue() currently runs to completion in one call; see docs/phase-4-8-implementation.md",
-    );
+    this.pauseRequested = true;
   }
 
   async stepOver(): Promise<StopEvent> {

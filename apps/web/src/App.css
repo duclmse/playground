@@ -330,6 +330,10 @@ main {
   color: #f1c40f;
 }
 
+.debug-status-running {
+  color: #8fc4ff;
+}
+
 .debug-status-terminated {
   color: #e5534b;
 }

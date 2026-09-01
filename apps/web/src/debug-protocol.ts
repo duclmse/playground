@@ -91,6 +91,8 @@ export type DebugRequest =
   | { type: "run"; files: Record<string, string>; entry: string }
   | { id: number; type: "debugLaunch"; files: Record<string, string>; entry: string }
   | { id: number; type: "debugContinue" }
+  /** pause() support: run at most `maxInstructions` opcodes, see debug-session.ts's `continue()`. */
+  | { id: number; type: "debugContinueBurst"; maxInstructions: number }
   | { id: number; type: "debugStepOver" }
   | { id: number; type: "debugStepInto" }
   | { id: number; type: "debugStepOut" }
@@ -147,10 +149,25 @@ export type DebugRequest =
 
 export type WorkerEvent =
   | { type: "ready" }
-  | { type: "result"; output: string; error: string | null }
+  | {
+      type: "result";
+      output: string;
+      error: string | null;
+      /** Inline-diagnostics support: where `error` happened, if recoverable - see `ExecuteResult::error_source`. */
+      errorSource: string | null;
+      errorLine: number | null;
+    }
   | { type: "error"; id: number; message: string }
   | { type: "debugLaunched"; id: number }
   | { type: "debugStopped"; id: number; stop: StopInfo }
+  | {
+      type: "debugBurst";
+      id: number;
+      stopped: boolean;
+      stop: StopInfo | null;
+      source: string | null;
+      line: number | null;
+    }
   | { type: "debugBreakpoint"; id: number; breakpoint: BreakpointInfo }
   | { type: "debugAck"; id: number }
   | { type: "debugThreads"; id: number; threads: ThreadInfo[] }

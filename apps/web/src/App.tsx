@@ -13,7 +13,7 @@ import "./monaco-setup";
 import type {WorkerEvent} from "./lua-worker";
 import type {FunctionStatsInfo, TimelineEventInfo} from "./debug-protocol";
 import {runProfile, runTimeline} from "./analysis";
-import {DebugSession, type StopEvent} from "./debug-session";
+import {DebugSession, LAUNCHING_STOP_EVENT, type StopEvent} from "./debug-session";
 import {DebugPanel} from "./DebugPanel";
 import {ProfilerPanel} from "./ProfilerPanel";
 import {TimelinePanel} from "./TimelinePanel";
@@ -52,6 +52,25 @@ function runButtonLabel(status: Status): string {
 function sourceIdFor(fileName: string, entry: string): string {
   return fileName === entry ? fileName : fileName.replace(/\.lua$/, "");
 }
+
+/**
+ * Inverse of `sourceIdFor`: maps an error/stop's `source` (a `source_id`,
+ * per `sourceIdFor`'s doc comment) back to the open project file it names,
+ * for placing a Monaco marker on the right model. `null` if it doesn't
+ * resolve to any open file (e.g. the common-convention assumption
+ * `sourceIdFor` documents doesn't hold for this project).
+ */
+function fileNameForSourceId(
+  sourceId: string,
+  files: Record<string, string>,
+): string | null {
+  if (files[sourceId] !== undefined) return sourceId;
+  const withSuffix = `${sourceId}.lua`;
+  return files[withSuffix] !== undefined ? withSuffix : null;
+}
+
+/** An inline-diagnostics marker: where the last run/debug error happened. */
+type ErrorMarker = { source: string; line: number; message: string };
 
 /** User-resizable pane sizes (px), persisted so a reload keeps the layout. */
 type PaneSizes = {
@@ -96,6 +115,9 @@ function App() {
   activeFileRef.current = activeFile;
   const dirInputRef = useRef<HTMLInputElement | null>(null);
   const [paneSizes, setPaneSizes] = useState<PaneSizes>(loadPaneSizes);
+  const [errorMarker, setErrorMarker] = useState<ErrorMarker | null>(null);
+  const projectRef = useRef(project);
+  projectRef.current = project;
 
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
   const isTerminated = stopEvent ? stopEvent.reason === "terminated" || stopEvent.reason === "exception" : false;
@@ -111,6 +133,11 @@ function App() {
       } else if (message.type === "result") {
         setOutput(message.output);
         setError(message.error);
+        setErrorMarker(
+          message.errorSource && message.errorLine != null
+            ? { source: message.errorSource, line: message.errorLine, message: message.error ?? "Runtime error" }
+            : null,
+        );
         setStatus("ready");
       }
     };
@@ -178,6 +205,7 @@ function App() {
     setAnalysis(null);
     setOutput("");
     setError(null);
+    setErrorMarker(null);
     workerRef.current.postMessage({type: "run", files: project.files, entry: project.entry});
   };
 
@@ -210,21 +238,55 @@ function App() {
   /**
    * Fetches the stack trace for whichever thread actually hit the
    * stop - a coroutine, if the stop happened inside one (Phase 8) - and,
-   * if the top frame is a known project file, switches to it.
+   * if the top frame is a known project file, switches to it. Uses
+   * `fileNameForSourceId` (not a raw `project.files[top.source]` lookup)
+   * since `top.source` is a `source_id`: for a `require()`d file that's the
+   * bare require argument, not its `.lua` filename - a raw lookup silently
+   * failed to follow execution into a required file (found while wiring up
+   * inline diagnostics, which needed the same source_id -> filename mapping
+   * for a debug session's exception marker).
    */
   const focusStoppedFrame = async (session: DebugSession) => {
     const threads = await session.getThreads();
     const runningThread = threads.find(t => t.status === "running")?.id ?? 0;
     const frames = await session.getStackTrace(runningThread);
     const top = frames.find(f => f.functionType !== "c");
-    if (top?.source && project.files[top.source] !== undefined) {
-      setActiveFile(top.source);
-    }
+    const fileName = top?.source && fileNameForSourceId(top.source, project.files);
+    if (fileName) setActiveFile(fileName);
   };
 
   const appendDebugOutput = async (session: DebugSession) => {
     const text = await session.takeOutput();
     if (text) setOutput(o => o + text);
+  };
+
+  /**
+   * Shared post-stop handling for `startDebugging`/`doDebugAction`: records
+   * output/state, and either places an inline-diagnostics marker at the
+   * failing frame (an exception) or follows execution to wherever it's now
+   * paused (anything else, `terminated` included - `focusStoppedFrame` is a
+   * no-op there since there's no frame to follow).
+   */
+  const handleStopEvent = async (session: DebugSession, stop: StopEvent) => {
+    await appendDebugOutput(session);
+    setStopEvent(stop);
+    if (stop.reason === "exception") {
+      setErrorMarker(null);
+      const threads = await session.getThreads();
+      const runningThread = threads.find(t => t.status === "running")?.id ?? 0;
+      const frames = await session.getStackTrace(runningThread);
+      const top = frames.find(f => f.functionType !== "c");
+      const fileName = top?.source && fileNameForSourceId(top.source, project.files);
+      if (fileName && stop.line != null) {
+        setErrorMarker({ source: fileName, line: stop.line, message: stop.message ?? "Runtime error" });
+        setActiveFile(fileName);
+      }
+    } else {
+      setErrorMarker(null);
+      if (stop.reason !== "terminated") {
+        await focusStoppedFrame(session);
+      }
+    }
   };
 
   const startDebugging = async () => {
@@ -233,6 +295,7 @@ function App() {
     setAnalysis(null);
     setOutput("");
     setError(null);
+    setErrorMarker(null);
     const session = new DebugSession(workerRef.current);
     await session.launch(project.files, project.entry);
 
@@ -247,26 +310,51 @@ function App() {
     }
     breakpointIdsRef.current = ids;
     setDebugSession(session);
+    // Lets DebugPanel (and its Pause button) render immediately, instead of
+    // only after this first continue() resolves - see LAUNCHING_STOP_EVENT's
+    // doc comment for why that matters.
+    setStopEvent(LAUNCHING_STOP_EVENT);
 
-    const stop = await session.continue();
-    await appendDebugOutput(session);
-    setStopEvent(stop);
-    if (!(stop.reason === "terminated" || stop.reason === "exception")) {
-      await focusStoppedFrame(session);
+    try {
+      const stop = await session.continue();
+      await handleStopEvent(session, stop);
+    } finally {
+      setDebugBusy(false);
     }
-    setDebugBusy(false);
   };
 
+  /**
+   * `continue()` now runs in bursts (see debug-session.ts), so it can be
+   * in flight for a while - long enough that clicking Stop mid-`continue()`
+   * is a realistic, intended interaction, not just a rare race. Stopping
+   * disposes the session, which rejects this action's in-flight `send()`
+   * call; without the try/finally, that rejection would skip
+   * `setDebugBusy(false)` and leave every debug action permanently
+   * unusable (the busy guard never clearing) even after starting a fresh
+   * session.
+   */
   const doDebugAction = async (action: (s: DebugSession) => Promise<StopEvent>) => {
     if (!debugSession || debugBusy) return;
     setDebugBusy(true);
-    const stop = await action(debugSession);
-    await appendDebugOutput(debugSession);
-    setStopEvent(stop);
-    if (!(stop.reason === "terminated" || stop.reason === "exception")) {
-      await focusStoppedFrame(debugSession);
+    try {
+      const stop = await action(debugSession);
+      await handleStopEvent(debugSession, stop);
+    } catch {
+      // Most likely the session was disposed (Stop clicked) while this
+      // action was in flight - stopDebugging() already reset everything
+      // that matters; nothing else to do with a stale action's rejection.
+    } finally {
+      setDebugBusy(false);
     }
-    setDebugBusy(false);
+  };
+
+  /**
+   * Bypasses the `debugBusy` guard `doDebugAction` uses - `pause()` is only
+   * useful *while* a `continue()` burst loop has that flag set, so routing
+   * it through `doDebugAction` would always no-op. See `DebugSession.pause`.
+   */
+  const pauseDebugging = () => {
+    void debugSession?.pause();
   };
 
   const stopDebugging = () => {
@@ -341,6 +429,38 @@ function App() {
     }
     decorationsRef.current = editor.deltaDecorations(decorationsRef.current, decorations);
   }, [breakpoints, activeFile, stopEvent, isTerminated]);
+
+  // Inline error diagnostics: a Monaco marker (red squiggle) on whichever
+  // line/file `errorMarker` names - from a plain Run's `ExecuteResult` or a
+  // debug session's exception stop (see `handleStopEvent`). Reads
+  // `projectRef` rather than depending on `project` directly: `project`
+  // changes on every keystroke (a new `files` object each time), and this
+  // only needs to run when the marker itself changes, not on every edit.
+  useEffect(() => {
+    const monacoInstance = monacoRef.current;
+    if (!monacoInstance) return;
+    const currentProject = projectRef.current;
+    for (const fileName of Object.keys(currentProject.files)) {
+      const model = monacoInstance.editor.getModel(monacoInstance.Uri.parse(fileName));
+      if (model) monacoInstance.editor.setModelMarkers(model, "lua-runtime", []);
+    }
+    if (!errorMarker) return;
+    const fileName = fileNameForSourceId(errorMarker.source, currentProject.files);
+    const model = fileName && monacoInstance.editor.getModel(monacoInstance.Uri.parse(fileName));
+    if (!model) return;
+    const line = Math.min(Math.max(errorMarker.line, 1), model.getLineCount());
+    monacoInstance.editor.setModelMarkers(model, "lua-runtime", [
+      {
+        startLineNumber: line,
+        startColumn: 1,
+        endLineNumber: line,
+        endColumn: model.getLineMaxColumn(line),
+        message: errorMarker.message,
+        severity: monacoInstance.MarkerSeverity.Error,
+      },
+    ]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [errorMarker]);
 
   const updateActiveFileContent = (content: string) => {
     setProject(p => ({...p, files: {...p.files, [activeFile]: content}}));
@@ -585,7 +705,9 @@ function App() {
               session={debugSession}
               stop={stopEvent}
               isTerminated={isTerminated}
+              busy={debugBusy}
               onContinue={() => doDebugAction(s => s.continue())}
+              onPause={pauseDebugging}
               onStepOver={() => doDebugAction(s => s.stepOver())}
               onStepInto={() => doDebugAction(s => s.stepInto())}
               onStepOut={() => doDebugAction(s => s.stepOut())}
