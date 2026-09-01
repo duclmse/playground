@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
-import init, { execute } from "@lua-playground/runtime";
+import init, { execute_project } from "@lua-playground/runtime";
 
-export type WorkerRequest = { type: "run"; source: string };
+export type WorkerRequest = {
+  type: "run";
+  files: Record<string, string>;
+  entry: string;
+};
 export type WorkerEvent =
   | { type: "result"; output: string; error: string | null }
   | { type: "ready" };
@@ -20,7 +24,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   if (message.type !== "run") return;
 
   await ensureReady();
-  const result = execute(message.source);
+  const names = Object.keys(message.files);
+  const contents = names.map((name) => message.files[name]);
+  const result = execute_project(names, contents, message.entry);
   const response: WorkerEvent = {
     type: "result",
     output: result.output,

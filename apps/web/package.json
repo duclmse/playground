@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@lua-playground/runtime": "*",
+    "@monaco-editor/react": "^4.7.0",
+    "monaco-editor": "^0.56.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

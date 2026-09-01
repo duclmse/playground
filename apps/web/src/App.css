@@ -29,6 +29,84 @@ main {
   min-height: 0;
 }
 
+.file-tree {
+  width: 180px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0.75rem;
+  border-right: 1px solid #333;
+  overflow-y: auto;
+}
+
+.file-tree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.file-tree h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  color: #888;
+  margin: 0;
+}
+
+.file-tree ul {
+  list-style: none;
+  margin: 0.5rem 0 0 0;
+  padding: 0;
+}
+
+.file-tree li {
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+}
+
+.file-tree li.active {
+  background: rgba(170, 59, 255, 0.15);
+}
+
+.file-tree .file-name {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0.25rem 0.35rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.15rem 0.35rem;
+  color: #888;
+  font-size: 0.8rem;
+}
+
+.icon-button:hover {
+  color: inherit;
+}
+
+.entry-badge {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.15rem 0.2rem;
+  font-size: 0.7rem;
+  color: #444;
+}
+
+.entry-badge.is-entry {
+  color: #aa3bff;
+}
+
 .editor-pane,
 .console-pane {
   flex: 1;
@@ -42,12 +120,16 @@ main {
   border-right: 1px solid #333;
 }
 
-textarea {
-  flex: 1;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 0.9rem;
-  resize: none;
-  padding: 0.5rem;
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.active-file-name {
+  font-size: 0.85rem;
+  color: #888;
 }
 
 .editor-pane button {
