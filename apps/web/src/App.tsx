@@ -1,22 +1,29 @@
-import Editor, { type OnMount } from "@monaco-editor/react";
+import Editor, {type OnMount} from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import "./monaco-setup";
-import type { WorkerEvent } from "./lua-worker";
-import type { FunctionStatsInfo, TimelineEventInfo } from "./debug-protocol";
-import { runProfile, runTimeline } from "./analysis";
-import { DebugSession, type StopEvent } from "./debug-session";
-import { DebugPanel } from "./DebugPanel";
-import { ProfilerPanel } from "./ProfilerPanel";
-import { TimelinePanel } from "./TimelinePanel";
-import { isValidFileName, loadProject, saveProject, type Project } from "./project";
+import type {WorkerEvent} from "./lua-worker";
+import type {FunctionStatsInfo, TimelineEventInfo} from "./debug-protocol";
+import {runProfile, runTimeline} from "./analysis";
+import {DebugSession, type StopEvent} from "./debug-session";
+import {DebugPanel} from "./DebugPanel";
+import {ProfilerPanel} from "./ProfilerPanel";
+import {TimelinePanel} from "./TimelinePanel";
+import {isValidFileName, loadProject, saveProject, type Project} from "./project";
 import "./App.css";
 
 const TIMELINE_MAX_EVENTS = 5000;
 
 type Analysis =
-  | { type: "profile"; stats: FunctionStatsInfo[] }
-  | { type: "timeline"; events: TimelineEventInfo[]; truncated: boolean };
+  | {type: "profile"; stats: FunctionStatsInfo[]}
+  | {type: "timeline"; events: TimelineEventInfo[]; truncated: boolean};
 
 type Status = "loading" | "ready" | "running";
 
@@ -45,11 +52,29 @@ function sourceIdFor(fileName: string, entry: string): string {
   return fileName === entry ? fileName : fileName.replace(/\.lua$/, "");
 }
 
+/** User-resizable pane sizes (px), persisted so a reload keeps the layout. */
+type PaneSizes = {
+  fileTreeWidth: number;
+  consoleHeight: number;
+  sidePanelWidth: number;
+};
+
+const PANE_SIZES_KEY = "lua-playground:paneSizes";
+const DEFAULT_PANE_SIZES: PaneSizes = {fileTreeWidth: 180, consoleHeight: 220, sidePanelWidth: 320};
+
+function loadPaneSizes(): PaneSizes {
+  try {
+    const raw = localStorage.getItem(PANE_SIZES_KEY);
+    if (!raw) return DEFAULT_PANE_SIZES;
+    return {...DEFAULT_PANE_SIZES, ...JSON.parse(raw)};
+  } catch {
+    return DEFAULT_PANE_SIZES;
+  }
+}
+
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject());
-  const [activeFile, setActiveFile] = useState<string>(
-    () => Object.keys(loadProject().files)[0],
-  );
+  const [activeFile, setActiveFile] = useState<string>(() => Object.keys(loadProject().files)[0]);
   const [output, setOutput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>("loading");
@@ -69,11 +94,10 @@ function App() {
   const activeFileRef = useRef(activeFile);
   activeFileRef.current = activeFile;
   const dirInputRef = useRef<HTMLInputElement | null>(null);
+  const [paneSizes, setPaneSizes] = useState<PaneSizes>(loadPaneSizes);
 
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
-  const isTerminated = stopEvent
-    ? stopEvent.reason === "terminated" || stopEvent.reason === "exception"
-    : false;
+  const isTerminated = stopEvent ? stopEvent.reason === "terminated" || stopEvent.reason === "exception" : false;
 
   useEffect(() => {
     const worker = new Worker(new URL("./lua-worker.ts", import.meta.url), {
@@ -97,13 +121,57 @@ function App() {
     saveProject(project);
   }, [project]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(PANE_SIZES_KEY, JSON.stringify(paneSizes));
+    } catch {
+      // best-effort, same as saveProject - a private-mode/quota failure here
+      // just means the layout resets to defaults next load.
+    }
+  }, [paneSizes]);
+
+  /**
+   * Drags one pane's size (`key`) along `axis` between `min`/`max`, starting
+   * from the pointer position at mousedown. `direction` accounts for which
+   * side of the handle the resized pane is on: +1 when growing the pane
+   * means moving the handle away from the coordinate origin (down/right),
+   * -1 when it means moving toward it (e.g. the side-panel, which is *left*
+   * of the coordinate the mouse moves right into).
+   */
+  const startPaneResize = (
+    axis: "x" | "y",
+    key: keyof PaneSizes,
+    direction: 1 | -1,
+    min: number,
+    max: number,
+  ) => (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const start = axis === "x" ? e.clientX : e.clientY;
+    const startSize = paneSizes[key];
+    const onMove = (ev: globalThis.MouseEvent) => {
+      const current = axis === "x" ? ev.clientX : ev.clientY;
+      const next = Math.min(max, Math.max(min, startSize + direction * (current - start)));
+      setPaneSizes(p => ({...p, [key]: next}));
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
+    document.body.style.userSelect = "none";
+  };
+
   const run = () => {
     if (!workerRef.current || status === "loading" || debugSession) return;
     setStatus("running");
     setAnalysis(null);
     setOutput("");
     setError(null);
-    workerRef.current.postMessage({ type: "run", files: project.files, entry: project.entry });
+    workerRef.current.postMessage({type: "run", files: project.files, entry: project.entry});
   };
 
   // ---- Phase 8: profiler / execution timeline ----
@@ -113,7 +181,7 @@ function App() {
     setAnalysisBusy(true);
     try {
       const stats = await runProfile(workerRef.current, project.files, project.entry);
-      setAnalysis({ type: "profile", stats });
+      setAnalysis({type: "profile", stats});
     } finally {
       setAnalysisBusy(false);
     }
@@ -123,13 +191,8 @@ function App() {
     if (!workerRef.current || status !== "ready" || debugSession || analysisBusy) return;
     setAnalysisBusy(true);
     try {
-      const timeline = await runTimeline(
-        workerRef.current,
-        project.files,
-        project.entry,
-        TIMELINE_MAX_EVENTS,
-      );
-      setAnalysis({ type: "timeline", events: timeline.events, truncated: timeline.truncated });
+      const timeline = await runTimeline(workerRef.current, project.files, project.entry, TIMELINE_MAX_EVENTS);
+      setAnalysis({type: "timeline", events: timeline.events, truncated: timeline.truncated});
     } finally {
       setAnalysisBusy(false);
     }
@@ -144,9 +207,9 @@ function App() {
    */
   const focusStoppedFrame = async (session: DebugSession) => {
     const threads = await session.getThreads();
-    const runningThread = threads.find((t) => t.status === "running")?.id ?? 0;
+    const runningThread = threads.find(t => t.status === "running")?.id ?? 0;
     const frames = await session.getStackTrace(runningThread);
-    const top = frames.find((f) => f.functionType !== "c");
+    const top = frames.find(f => f.functionType !== "c");
     if (top?.source && project.files[top.source] !== undefined) {
       setActiveFile(top.source);
     }
@@ -154,7 +217,7 @@ function App() {
 
   const appendDebugOutput = async (session: DebugSession) => {
     const text = await session.takeOutput();
-    if (text) setOutput((o) => o + text);
+    if (text) setOutput(o => o + text);
   };
 
   const startDebugging = async () => {
@@ -210,20 +273,20 @@ function App() {
   const toggleBreakpoint = async (file: string, line: number) => {
     const has = (breakpoints[file] ?? []).includes(line);
     if (has) {
-      setBreakpoints((b) => ({ ...b, [file]: (b[file] ?? []).filter((l) => l !== line) }));
+      setBreakpoints(b => ({...b, [file]: (b[file] ?? []).filter(l => l !== line)}));
       const id = breakpointIdsRef.current[file]?.[line];
       if (id !== undefined && debugSession) {
         await debugSession.removeBreakpoint(id);
         delete breakpointIdsRef.current[file][line];
       }
     } else {
-      setBreakpoints((b) => ({
+      setBreakpoints(b => ({
         ...b,
         [file]: [...(b[file] ?? []), line].sort((a, c) => a - c),
       }));
       if (debugSession) {
         const bp = await debugSession.setBreakpoint(sourceIdFor(file, project.entry), line);
-        breakpointIdsRef.current[file] = { ...(breakpointIdsRef.current[file] ?? {}), [line]: bp.id };
+        breakpointIdsRef.current[file] = {...(breakpointIdsRef.current[file] ?? {}), [line]: bp.id};
       }
     }
   };
@@ -231,11 +294,8 @@ function App() {
   const handleEditorMount: OnMount = (editor, monacoInstance) => {
     editorRef.current = editor;
     monacoRef.current = monacoInstance;
-    editor.onMouseDown((e) => {
-      if (
-        e.target.type === monacoInstance.editor.MouseTargetType.GUTTER_GLYPH_MARGIN &&
-        e.target.position
-      ) {
+    editor.onMouseDown(e => {
+      if (e.target.type === monacoInstance.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && e.target.position) {
         void toggleBreakpoint(activeFileRef.current, e.target.position.lineNumber);
       }
     });
@@ -250,7 +310,7 @@ function App() {
     for (const line of breakpoints[activeFile] ?? []) {
       decorations.push({
         range: new monacoInstance.Range(line, 1, line, 1),
-        options: { glyphMarginClassName: "breakpoint-glyph" },
+        options: {glyphMarginClassName: "breakpoint-glyph"},
       });
     }
     if (stopEvent && !isTerminated && stopEvent.line != null) {
@@ -267,7 +327,7 @@ function App() {
   }, [breakpoints, activeFile, stopEvent, isTerminated]);
 
   const updateActiveFileContent = (content: string) => {
-    setProject((p) => ({ ...p, files: { ...p.files, [activeFile]: content } }));
+    setProject(p => ({...p, files: {...p.files, [activeFile]: content}}));
   };
 
   const addFile = () => {
@@ -281,7 +341,7 @@ function App() {
       window.alert(`'${name}' already exists.`);
       return;
     }
-    setProject((p) => ({ ...p, files: { ...p.files, [name]: "" } }));
+    setProject(p => ({...p, files: {...p.files, [name]: ""}}));
     setActiveFile(name);
   };
 
@@ -296,11 +356,11 @@ function App() {
       window.alert(`'${name}' already exists.`);
       return;
     }
-    setProject((p) => {
-      const files = { ...p.files };
+    setProject(p => {
+      const files = {...p.files};
       files[name] = files[activeFile];
       delete files[activeFile];
-      return { files, entry: p.entry === activeFile ? name : p.entry };
+      return {files, entry: p.entry === activeFile ? name : p.entry};
     });
     setActiveFile(name);
   };
@@ -311,22 +371,22 @@ function App() {
       return;
     }
     if (!window.confirm(`Delete '${name}'?`)) return;
-    setProject((p) => {
-      const files = { ...p.files };
+    setProject(p => {
+      const files = {...p.files};
       delete files[name];
       const entry = p.entry === name ? Object.keys(files)[0] : p.entry;
-      return { files, entry };
+      return {files, entry};
     });
     if (activeFile === name) {
-      setActiveFile((current) => {
-        const remaining = fileNames.filter((f) => f !== current);
+      setActiveFile(current => {
+        const remaining = fileNames.filter(f => f !== current);
         return remaining[0];
       });
     }
   };
 
   const setEntry = (name: string) => {
-    setProject((p) => ({ ...p, entry: name }));
+    setProject(p => ({...p, entry: name}));
   };
 
   const importDirectoryClick = () => dirInputRef.current?.click();
@@ -346,14 +406,14 @@ function App() {
     // directory later still fires a "change" event), since clearing
     // `.value` also clears the underlying FileList out from under any
     // reference still pointing at it.
-    const luaFiles = Array.from(input.files ?? []).filter((f) => f.name.endsWith(".lua"));
+    const luaFiles = Array.from(input.files ?? []).filter(f => f.name.endsWith(".lua"));
     input.value = "";
     const entries = await Promise.all(
-      luaFiles.map(async (f) => {
-        const relativePath = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+      luaFiles.map(async f => {
+        const relativePath = (f as File & {webkitRelativePath?: string}).webkitRelativePath || f.name;
         const path = relativePath.split("/").slice(1).join("/") || f.name;
         return [path, await f.text()] as const;
-      }),
+      })
     );
 
     if (entries.length === 0) {
@@ -367,12 +427,12 @@ function App() {
       window.alert(
         `Skipped ${invalid.length} file(s) with unsupported names (letters, digits, _, - and / only):\n${invalid
           .map(([p]) => p)
-          .join("\n")}`,
+          .join("\n")}`
       );
     }
     if (valid.length === 0) return;
 
-    setProject((p) => ({ ...p, files: { ...p.files, ...Object.fromEntries(valid) } }));
+    setProject(p => ({...p, files: {...p.files, ...Object.fromEntries(valid)}}));
     setActiveFile(valid[0][0]);
   };
 
@@ -380,23 +440,12 @@ function App() {
     <div className="playground">
       <header>
         <h1>Lua Playground</h1>
-        <span className="subtitle">Rust + piccolo, compiled to WebAssembly</span>
         <div className="header-actions">
-          <button
-            type="button"
-            className="run-button"
-            onClick={run}
-            disabled={status !== "ready" || !!debugSession}
-          >
+          <button type="button" className="run-button" onClick={run} disabled={status !== "ready" || !!debugSession}>
             {status === "ready" ? "▶" : "⏳"} {runButtonLabel(status)}
           </button>
           {!debugSession && (
-            <button
-              type="button"
-              className="debug-button"
-              onClick={startDebugging}
-              disabled={status !== "ready"}
-            >
+            <button type="button" className="debug-button" onClick={startDebugging} disabled={status !== "ready"}>
               🐞 Debug
             </button>
           )}
@@ -406,8 +455,7 @@ function App() {
               className="analysis-button"
               onClick={runProfileClick}
               disabled={status !== "ready" || analysisBusy}
-              title="Phase 8: profile calls/instructions per function"
-            >
+              title="Phase 8: profile calls/instructions per function">
               📊 Profile
             </button>
           )}
@@ -417,15 +465,14 @@ function App() {
               className="analysis-button"
               onClick={runTimelineClick}
               disabled={status !== "ready" || analysisBusy}
-              title="Phase 8: record a capped execution timeline"
-            >
+              title="Phase 8: record a capped execution timeline">
               ⏱ Timeline
             </button>
           )}
         </div>
       </header>
       <main>
-        <aside className="file-tree">
+        <aside className="file-tree" style={{width: paneSizes.fileTreeWidth}}>
           <div className="file-tree-header">
             <h2>Files</h2>
             <div className="file-tree-header-actions">
@@ -433,8 +480,7 @@ function App() {
                 type="button"
                 className="icon-button"
                 onClick={importDirectoryClick}
-                title="Import a directory of .lua files"
-              >
+                title="Import a directory of .lua files">
                 📁
               </button>
               <button type="button" className="icon-button" onClick={addFile} title="New file">
@@ -453,7 +499,7 @@ function App() {
             />
           </div>
           <ul>
-            {fileNames.map((name) => (
+            {fileNames.map(name => (
               <li key={name} className={name === activeFile ? "active" : ""}>
                 <button type="button" className="file-name" onClick={() => setActiveFile(name)}>
                   {name}
@@ -462,22 +508,20 @@ function App() {
                   type="button"
                   className={`entry-badge ${name === project.entry ? "is-entry" : ""}`}
                   onClick={() => setEntry(name)}
-                  title={name === project.entry ? "Entry file" : "Set as entry file"}
-                >
+                  title={name === project.entry ? "Entry file" : "Set as entry file"}>
                   ▶
                 </button>
-                <button
-                  type="button"
-                  className="icon-button"
-                  onClick={() => deleteFile(name)}
-                  title="Delete file"
-                >
+                <button type="button" className="icon-button" onClick={() => deleteFile(name)} title="Delete file">
                   ×
                 </button>
               </li>
             ))}
           </ul>
         </aside>
+        <div
+          className="resize-handle resize-handle-v"
+          onMouseDown={startPaneResize("x", "fileTreeWidth", 1, 140, 480)}
+        />
         <div className="center-pane">
           <section className="editor-pane">
             <div className="editor-toolbar">
@@ -495,10 +539,10 @@ function App() {
               theme="vs-dark"
               path={activeFile}
               value={project.files[activeFile] ?? ""}
-              onChange={(value) => updateActiveFileContent(value ?? "")}
+              onChange={value => updateActiveFileContent(value ?? "")}
               onMount={handleEditorMount}
               options={{
-                minimap: { enabled: false },
+                minimap: {enabled: false},
                 fontSize: 14,
                 automaticLayout: true,
                 glyphMargin: true,
@@ -506,34 +550,36 @@ function App() {
               }}
             />
           </section>
-          <section className="console-pane">
+          <div
+            className="resize-handle resize-handle-h"
+            onMouseDown={startPaneResize("y", "consoleHeight", -1, 80, 560)}
+          />
+          <section className="console-pane" style={{height: paneSizes.consoleHeight}}>
             <h2>Console</h2>
-            <pre className={error ? "console-error" : "console-output"}>
-              {error ?? (output || "(no output yet)")}
-            </pre>
+            <pre className={error ? "console-error" : "console-output"}>{error ?? (output || "(no output yet)")}</pre>
           </section>
         </div>
-        <aside className="side-panel">
+        <div
+          className="resize-handle resize-handle-v"
+          onMouseDown={startPaneResize("x", "sidePanelWidth", -1, 220, 640)}
+        />
+        <aside className="side-panel" style={{width: paneSizes.sidePanelWidth}}>
           {debugSession && stopEvent ? (
             <DebugPanel
               session={debugSession}
               stop={stopEvent}
               isTerminated={isTerminated}
-              onContinue={() => doDebugAction((s) => s.continue())}
-              onStepOver={() => doDebugAction((s) => s.stepOver())}
-              onStepInto={() => doDebugAction((s) => s.stepInto())}
-              onStepOut={() => doDebugAction((s) => s.stepOut())}
+              onContinue={() => doDebugAction(s => s.continue())}
+              onStepOver={() => doDebugAction(s => s.stepOver())}
+              onStepInto={() => doDebugAction(s => s.stepInto())}
+              onStepOut={() => doDebugAction(s => s.stepOut())}
               onStop={stopDebugging}
               onFrameSelected={() => {}}
             />
           ) : analysis?.type === "profile" ? (
             <ProfilerPanel stats={analysis.stats} onClose={() => setAnalysis(null)} />
           ) : analysis?.type === "timeline" ? (
-            <TimelinePanel
-              events={analysis.events}
-              truncated={analysis.truncated}
-              onClose={() => setAnalysis(null)}
-            />
+            <TimelinePanel events={analysis.events} truncated={analysis.truncated} onClose={() => setAnalysis(null)} />
           ) : (
             <div className="side-panel-placeholder">
               <p>Debug, Profile, or Timeline output shows up here.</p>

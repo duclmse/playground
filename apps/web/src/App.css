@@ -59,13 +59,32 @@ main {
 }
 
 .file-tree {
-  width: 180px;
+  box-sizing: border-box;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   padding: 0.75rem;
-  border-right: 1px solid #333;
   overflow-y: auto;
+}
+
+.resize-handle {
+  flex-shrink: 0;
+  background: #333;
+}
+
+.resize-handle:hover,
+.resize-handle.resizing {
+  background: #aa3bff;
+}
+
+.resize-handle-v {
+  width: 5px;
+  cursor: col-resize;
+}
+
+.resize-handle-h {
+  height: 5px;
+  cursor: row-resize;
 }
 
 .file-tree-header {
@@ -155,11 +174,11 @@ main {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  border-right: 1px solid #333;
 }
 
 .editor-pane,
 .console-pane {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -172,16 +191,16 @@ main {
 }
 
 .console-pane {
-  flex: 0 0 220px;
-  border-top: 1px solid #333;
+  flex: 0 0 auto;
+  min-height: 0;
 }
 
 .side-panel {
-  flex: 1;
+  box-sizing: border-box;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  min-width: 280px;
-  max-width: 340px;
+  min-width: 0;
 }
 
 .side-panel-placeholder {
