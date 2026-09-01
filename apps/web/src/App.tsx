@@ -1,14 +1,6 @@
 import Editor, {type OnMount} from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ChangeEvent,
-  type MouseEvent as ReactMouseEvent,
-} from "react";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import "./monaco-setup";
 import type {WorkerEvent} from "./lua-worker";
 import type {FunctionStatsInfo, TimelineEventInfo} from "./debug-protocol";
@@ -17,14 +9,10 @@ import {DebugSession, LAUNCHING_STOP_EVENT, type StopEvent} from "./debug-sessio
 import {DebugPanel} from "./DebugPanel";
 import {ProfilerPanel} from "./ProfilerPanel";
 import {TimelinePanel} from "./TimelinePanel";
-import {
-  downloadProject,
-  isValidFileName,
-  loadProject,
-  parseProjectFile,
-  saveProject,
-  type Project,
-} from "./project";
+import {usePaneResize} from "./usePaneResize";
+import {useKeyboardShortcuts} from "./useKeyboardShortcuts";
+import {useFileManagement} from "./useFileManagement";
+import {loadProject, saveProject, type Project} from "./project";
 import "./App.css";
 
 const TIMELINE_MAX_EVENTS = 5000;
@@ -80,25 +68,6 @@ function fileNameForSourceId(
 type ErrorMarker = { source: string; line: number; message: string };
 
 /** User-resizable pane sizes (px), persisted so a reload keeps the layout. */
-type PaneSizes = {
-  fileTreeWidth: number;
-  consoleHeight: number;
-  sidePanelWidth: number;
-};
-
-const PANE_SIZES_KEY = "lua-playground:paneSizes";
-const DEFAULT_PANE_SIZES: PaneSizes = {fileTreeWidth: 180, consoleHeight: 220, sidePanelWidth: 320};
-
-function loadPaneSizes(): PaneSizes {
-  try {
-    const raw = localStorage.getItem(PANE_SIZES_KEY);
-    if (!raw) return DEFAULT_PANE_SIZES;
-    return {...DEFAULT_PANE_SIZES, ...JSON.parse(raw)};
-  } catch {
-    return DEFAULT_PANE_SIZES;
-  }
-}
-
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject());
   const [activeFile, setActiveFile] = useState<string>(() => Object.keys(loadProject().files)[0]);
@@ -120,21 +89,13 @@ function App() {
   const decorationsRef = useRef<string[]>([]);
   const activeFileRef = useRef(activeFile);
   activeFileRef.current = activeFile;
-  const dirInputRef = useRef<HTMLInputElement | null>(null);
-  const projectFileInputRef = useRef<HTMLInputElement | null>(null);
-  const [paneSizes, setPaneSizes] = useState<PaneSizes>(loadPaneSizes);
+  const { paneSizes, startPaneResize } = usePaneResize();
   const [errorMarker, setErrorMarker] = useState<ErrorMarker | null>(null);
   const projectRef = useRef(project);
   projectRef.current = project;
 
   const fileNames = useMemo(() => Object.keys(project.files).sort(), [project.files]);
   const isTerminated = stopEvent ? stopEvent.reason === "terminated" || stopEvent.reason === "exception" : false;
-  const debugSessionRef = useRef(debugSession);
-  debugSessionRef.current = debugSession;
-  const debugBusyRef = useRef(debugBusy);
-  debugBusyRef.current = debugBusy;
-  const isTerminatedRef = useRef(isTerminated);
-  isTerminatedRef.current = isTerminated;
 
   useEffect(() => {
     const worker = new Worker(new URL("./lua-worker.ts", import.meta.url), {
@@ -162,56 +123,6 @@ function App() {
   useEffect(() => {
     saveProject(project);
   }, [project]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(PANE_SIZES_KEY, JSON.stringify(paneSizes));
-    } catch {
-      // best-effort, same as saveProject - a private-mode/quota failure here
-      // just means the layout resets to defaults next load.
-    }
-  }, [paneSizes]);
-
-  /**
-   * Drags one pane's size (`key`) along `axis` between `min`/`max`, starting
-   * from the pointer position at mousedown. `direction` accounts for which
-   * side of the handle the resized pane is on: +1 when growing the pane
-   * means moving the handle away from the coordinate origin (down/right),
-   * -1 when it means moving toward it (e.g. the side-panel, which is *left*
-   * of the coordinate the mouse moves right into).
-   */
-  const startPaneResize = (
-    axis: "x" | "y",
-    key: keyof PaneSizes,
-    direction: 1 | -1,
-    min: number,
-    max: number,
-  ) => (e: ReactMouseEvent) => {
-    e.preventDefault();
-    const start = axis === "x" ? e.clientX : e.clientY;
-    const startSize = paneSizes[key];
-    const onMove = (ev: globalThis.MouseEvent) => {
-      const current = axis === "x" ? ev.clientX : ev.clientY;
-      const next = Math.min(max, Math.max(min, startSize + direction * (current - start)));
-      setPaneSizes(p => ({...p, [key]: next}));
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      window.removeEventListener("blur", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-    // If the mouse button is released outside the browser window (or the
-    // window loses focus mid-drag, e.g. alt-tab), no "mouseup" ever reaches
-    // `document` - without this, the drag listeners and the resize cursor
-    // would stay stuck on indefinitely.
-    window.addEventListener("blur", onUp);
-    document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
-    document.body.style.userSelect = "none";
-  };
 
   const run = () => {
     if (!workerRef.current || status === "loading" || debugSession) return;
@@ -409,63 +320,18 @@ function App() {
     }
   };
 
-  // Keyboard shortcuts (F5 run/continue, F9 toggle breakpoint, F10 step
-  // over) - a mount-once window listener reading everything it needs
-  // through refs, rather than a `run`/`doDebugAction`/`toggleBreakpoint`
-  // dependency array: those three are redefined every render (closing over
-  // that render's `project`/`debugSession`/etc.), so re-registering the
-  // listener on every relevant change would work too, but a stale-closure
-  // effect bug earlier in this project (DebugPanel's `onFrameSelected`) came
-  // from exactly this class of mistake - refs updated inline (matching
-  // `activeFileRef`'s existing pattern) sidestep it entirely.
-  const runRef = useRef(run);
-  runRef.current = run;
-  const startDebuggingRef = useRef(startDebugging);
-  startDebuggingRef.current = startDebugging;
-  const doDebugActionRef = useRef(doDebugAction);
-  doDebugActionRef.current = doDebugAction;
-  const toggleBreakpointRef = useRef(toggleBreakpoint);
-  toggleBreakpointRef.current = toggleBreakpoint;
-  const hasBreakpointsRef = useRef(false);
-  hasBreakpointsRef.current = Object.values(breakpoints).some(lines => lines.length > 0);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      // Don't hijack F-keys while the user is typing in the Watch/REPL
-      // inputs (or any other text field).
-      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
-
-      if (e.key === "F5") {
-        e.preventDefault();
-        if (debugSessionRef.current) {
-          if (!debugBusyRef.current && !isTerminatedRef.current) {
-            void doDebugActionRef.current(s => s.continue());
-          }
-        } else if (hasBreakpointsRef.current) {
-          // Breakpoints only ever fire under a debug session (a plain Run
-          // ignores them entirely) - so if any are set, F5 should launch one
-          // instead of silently running straight past them.
-          void startDebuggingRef.current();
-        } else {
-          runRef.current();
-        }
-        return;
-      }
-      if (e.key === "F9") {
-        e.preventDefault();
-        const line = editorRef.current?.getPosition()?.lineNumber;
-        if (line != null) void toggleBreakpointRef.current(activeFileRef.current, line);
-        return;
-      }
-      if (e.key === "F10" && debugSessionRef.current && !debugBusyRef.current && !isTerminatedRef.current) {
-        e.preventDefault();
-        void doDebugActionRef.current(s => s.stepOver());
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  useKeyboardShortcuts({
+    run,
+    startDebugging,
+    doDebugAction,
+    toggleBreakpoint,
+    debugSession,
+    debugBusy,
+    isTerminated,
+    hasBreakpoints: Object.values(breakpoints).some(lines => lines.length > 0),
+    editorRef,
+    activeFileRef,
+  });
 
   const handleEditorMount: OnMount = (editor, monacoInstance) => {
     editorRef.current = editor;
@@ -538,137 +404,33 @@ function App() {
     setProject(p => ({...p, files: {...p.files, [activeFile]: content}}));
   };
 
-  const addFile = () => {
-    const name = window.prompt("New file name (e.g. utils.lua):");
-    if (!name) return;
-    if (!isValidFileName(name)) {
-      window.alert("File names must look like 'name.lua' (letters, digits, _ or -).");
-      return;
-    }
-    if (project.files[name] !== undefined) {
-      window.alert(`'${name}' already exists.`);
-      return;
-    }
-    setProject(p => ({...p, files: {...p.files, [name]: ""}}));
-    setActiveFile(name);
-  };
-
-  const renameActiveFile = () => {
-    const name = window.prompt("Rename file to:", activeFile);
-    if (!name || name === activeFile) return;
-    if (!isValidFileName(name)) {
-      window.alert("File names must look like 'name.lua' (letters, digits, _ or -).");
-      return;
-    }
-    if (project.files[name] !== undefined) {
-      window.alert(`'${name}' already exists.`);
-      return;
-    }
-    setProject(p => {
-      const files = {...p.files};
-      files[name] = files[activeFile];
-      delete files[activeFile];
-      return {files, entry: p.entry === activeFile ? name : p.entry};
-    });
-    setActiveFile(name);
-  };
-
-  const deleteFile = (name: string) => {
-    if (fileNames.length <= 1) {
-      window.alert("A project needs at least one file.");
-      return;
-    }
-    if (!window.confirm(`Delete '${name}'?`)) return;
-    setProject(p => {
-      const files = {...p.files};
-      delete files[name];
-      const entry = p.entry === name ? Object.keys(files)[0] : p.entry;
-      return {files, entry};
-    });
-    if (activeFile === name) {
-      setActiveFile(current => {
-        const remaining = fileNames.filter(f => f !== current);
-        return remaining[0];
-      });
-    }
-  };
-
-  const setEntry = (name: string) => {
-    setProject(p => ({...p, entry: name}));
-  };
-
-  const importDirectoryClick = () => dirInputRef.current?.click();
-
-  /**
-   * Imports every `.lua` file under a locally-picked directory into the
-   * (flat, string-keyed) virtual FS - see `isValidFileName`'s doc comment.
-   * The top-level folder name itself is dropped from each path so imported
-   * files land at the project root (`lib/utils.lua`, not
-   * `my-project/lib/utils.lua`); files whose path doesn't fit the
-   * `[A-Za-z0-9_-]` charset are skipped rather than silently mangled.
-   */
-  const handleImportDirChange = async (e: ChangeEvent<HTMLInputElement>) => {
-    const input = e.target;
-    // `input.files` is live - snapshot it into a plain array *before*
-    // resetting `input.value` below (needed so re-importing the same
-    // directory later still fires a "change" event), since clearing
-    // `.value` also clears the underlying FileList out from under any
-    // reference still pointing at it.
-    const luaFiles = Array.from(input.files ?? []).filter(f => f.name.endsWith(".lua"));
-    input.value = "";
-    const entries = await Promise.all(
-      luaFiles.map(async f => {
-        const relativePath = (f as File & {webkitRelativePath?: string}).webkitRelativePath || f.name;
-        const path = relativePath.split("/").slice(1).join("/") || f.name;
-        return [path, await f.text()] as const;
-      })
-    );
-
-    if (entries.length === 0) {
-      window.alert("No .lua files found in that directory.");
-      return;
-    }
-
-    const valid = entries.filter(([path]) => isValidFileName(path));
-    const invalid = entries.filter(([path]) => !isValidFileName(path));
-    if (invalid.length > 0) {
-      window.alert(
-        `Skipped ${invalid.length} file(s) with unsupported names (letters, digits, _, - and / only):\n${invalid
-          .map(([p]) => p)
-          .join("\n")}`
-      );
-    }
-    if (valid.length === 0) return;
-
-    setProject(p => ({...p, files: {...p.files, ...Object.fromEntries(valid)}}));
-    setActiveFile(valid[0][0]);
-  };
-
-  const exportProjectClick = () => downloadProject(project);
-
-  const importProjectClick = () => projectFileInputRef.current?.click();
-
-  /** Replaces the current project outright (unlike directory import, which merges .lua files in). */
-  const handleImportProjectChange = async (e: ChangeEvent<HTMLInputElement>) => {
-    const input = e.target;
-    const file = input.files?.[0];
-    input.value = "";
-    if (!file) return;
-
-    const parsed = parseProjectFile(await file.text());
-    if (!parsed) {
-      window.alert("That file isn't a valid Lua Playground project export.");
-      return;
-    }
-    setProject(parsed);
-    setActiveFile(Object.keys(parsed.files)[0]);
-    setBreakpoints({});
-    breakpointIdsRef.current = {};
-    setOutput("");
-    setError(null);
-    setErrorMarker(null);
-    setAnalysis(null);
-  };
+  const {
+    dirInputRef,
+    projectFileInputRef,
+    addFile,
+    renameActiveFile,
+    deleteFile,
+    setEntry,
+    importDirectoryClick,
+    handleImportDirChange,
+    exportProjectClick,
+    importProjectClick,
+    handleImportProjectChange,
+  } = useFileManagement({
+    project,
+    setProject,
+    activeFile,
+    setActiveFile,
+    fileNames,
+    onProjectImported: () => {
+      setBreakpoints({});
+      breakpointIdsRef.current = {};
+      setOutput("");
+      setError(null);
+      setErrorMarker(null);
+      setAnalysis(null);
+    },
+  });
 
   return (
     <div className="playground">
