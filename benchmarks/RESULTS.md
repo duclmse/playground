@@ -393,3 +393,31 @@ overhead on every single instruction. This confirms (rather than assumes)
 that `interp.rs`'s existing `match`-based loop is the right choice -
 worth measuring given tier 0 is deliberately the "not the fast tier" of
 this design, so it would have been easy to skip the check and guess wrong.
+
+## M7 (loop vectorization): a modest, honest win on a memory-bound loop
+
+`codegen.rs`'s `try_vectorize_elementwise_loop` (faster_lua.md §21) recognizes
+`for i = 0, n-1 do c[i] = a[i] + b[i] end` over `f64` arrays and emits
+Cranelift's `F64X2` vector type (2 lanes, NEON on this ARM64 host) instead of
+one scalar `fadd` per iteration. `benchmarks/vector_add.fl` (20,000,000
+elements) AOT-compiled with and without it (`FASTLUA_NO_VECTORIZE=1` disables
+the pattern match, for a controlled before/after):
+
+| Build | Time (mean, hyperfine) |
+|:---|---:|
+| Vectorized | ~119-126 ms |
+| Scalar (`FASTLUA_NO_VECTORIZE=1`) | ~127-138 ms |
+| LuaJIT | ~337 ms |
+
+Vectorization alone is a real but modest **~1.06-1.10×** - not the 2× a
+compute-bound loop would show. The honest reason: this loop is
+memory-bandwidth-bound (three 160MB arrays, read-read-write per element),
+the same class of finding M2's own bounds-check-elimination measurement
+already hit ("a memory-bandwidth-bound loop doesn't care about one
+well-predicted check") - halving the number of *arithmetic* instructions
+barely moves wall-clock time when the bottleneck is memory traffic, not
+computation. fastlua's typed, unboxed `Array<f64>` design is still what
+drives the **~2.8×** win over LuaJIT on this workload; vectorization is a
+real, verified addition on top of that (not a replacement for it), most
+valuable on compute-bound elementwise loops this specific benchmark doesn't
+happen to exercise.

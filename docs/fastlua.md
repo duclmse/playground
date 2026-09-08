@@ -225,6 +225,21 @@ allocation-site profiling yet, and it doesn't feed `fastlua build`'s AOT
 compile) - see `docs/fastlua-roadmap/m7.md` for the fuller design that
 would.
 
+## Loop vectorization (M7)
+
+`codegen.rs`'s `try_vectorize_elementwise_loop` recognizes exactly `for i =
+start, stop do out[i] = a[i] OP b[i] end` (step 1, `out`/`a`/`b` all
+`Array<f64>`, `OP` one of `+ - * /`) and emits Cranelift's own vector type
+(`F64X2`, portable IR - no hand-rolled per-ISA intrinsics) 2 lanes at a
+time, with a scalar tail for any odd leftover element and one whole-range
+bounds check up front instead of a per-element one. A narrow pattern
+match, not general auto-vectorization - matching M2's own bounds-check-
+elimination precedent. Measured a real but modest ~1.06-1.10× on
+`benchmarks/vector_add.fl`: that loop is memory-bandwidth-bound, not
+compute-bound, so halving the arithmetic instruction count doesn't halve
+wall-clock time - see `benchmarks/RESULTS.md`'s M7 section for the honest
+accounting.
+
 ## Language reference (M1-M3)
 
 ```
@@ -384,7 +399,7 @@ milestones:
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`) - see the sections above. Still open: loop vectorization, the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
+| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization - see the sections above. Still open: the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
 
 ## Trying it
 
