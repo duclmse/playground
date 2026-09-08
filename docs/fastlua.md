@@ -10,7 +10,7 @@ This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; fastlua doesn't run real Lua programs and isn't trying to.
 
-## Status: M4 (M0/M2 folded in)
+## Status: M5 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -21,9 +21,11 @@ constant folding, and function inlining. M3 added fixed-layout `struct`s and
 escape analysis + scalar replacement - verified at the IR level to remove heap
 allocation entirely for a struct that never leaves its function. M4 replaced the
 leak-everything runtime with a real garbage collector - see "GC (M4)" below for
-what it is and, just as importantly, what it deliberately isn't yet. No dynamic
-typing, no JIT tiers yet (every function still compiles to native code once,
-ahead of running it). See "Roadmap" below for what's next.
+what it is and, just as importantly, what it deliberately isn't yet. M5 added
+gradual typing - an explicit `any` type, checked at runtime, with zero cost for
+code that never uses it - see "Gradual typing (M5)" below. No JIT tiers yet
+(every function still compiles to native code once, ahead of running it). See
+"Roadmap" below for what's next.
 
 ### Early results
 
@@ -105,6 +107,29 @@ exit (forcing a final collection first for accuracy); `FASTLUA_GC_DEBUG=1`
 traces every collection cycle to stderr, including how many words its
 non-atomic tracing touched - both the same env-gated-diagnostic pattern as
 `FASTLUA_DUMP_CLIF`.
+
+## Gradual typing (M5)
+
+`any` (faster_lua.md §3-4): a value whose type is checked at runtime instead
+of compile time, for the boundaries where fully static typing doesn't fit -
+`function foo(x: any): any`, or `local x: any = expr`. Only `i64`/`f64`/`bool`
+are boxable so far (`Array`/`Struct` aren't yet - a clear compile error, not
+silently wrong behavior). A concrete value flowing into an `any`-typed slot
+gets boxed automatically (a small heap allocation - `value.rs`'s `{tag: i64,
+payload: i64}` pair, via the same allocator struct literals use); an `any`
+value flowing into a concrete-typed slot gets unboxed with a runtime type
+check that **traps** (a real crash, like an out-of-bounds array access) if
+the actual type doesn't match. `any` can't be used directly as an arithmetic
+operand yet - narrow it to a concrete type first (`local y: i64 = x`), then
+compute with `y`. Strict code (the only kind that existed before M5) is
+completely unaffected: boxing/unboxing only ever gets inserted where `any`
+appears in the source, so a program that never writes `any` compiles to
+*exactly* the same code as if M5 didn't exist - see
+`docs/fastlua-roadmap.md`'s M5 section for how this is verified. The trade-off
+is real and measured, not hidden: `benchmarks/RESULTS.md`'s M5 section shows
+a workload with an `any`-typed function boundary running ~7-10× slower than
+the identical strict version, almost entirely the cost of one heap allocation
+per call - the honest price of opting into dynamic behavior.
 
 ## Language reference (M1-M3)
 
@@ -247,7 +272,7 @@ milestones:
 | **M2** | **Optimizer passes (done)**          | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after.                                                                                                                                                                                                                         |
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
-| M5     | Gradual typing + dynamic mode        | `any`-typed values, runtime type checks, a boxed `Value` fallback path only for genuinely dynamic code - most code stays fully typed/unboxed.                                                                                                                                                                                                                                                                |
+| **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | M6     | Baseline + optimizing JIT tiers      | Bytecode interpreter tier 0, hot counters, tier-1 baseline JIT, tier-2 optimizing JIT with inline caches/speculation/deopt - only worth building once dynamic-mode code exists to benefit from it; the typed/AOT path from M1 doesn't need this.                                                                                                                                                             |
 | M7     | SIMD, PGO, polish                    | Vectorization, profile-guided recompilation, FFI.                                                                                                                                                                                                                                                                                                                                                            |
 

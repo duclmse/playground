@@ -322,3 +322,43 @@ back-to-back A/B against the immediately preceding commit: 12.5ms → 11.9ms
 user time, matching the aggregate. The full benchmark suite was re-run
 afterward to confirm no regression elsewhere: `fib` still beats LuaJIT
 (1.34×), `table_array` still beats it (1.73×).
+
+## M5 (gradual typing): the honest cost of opting in
+
+M5 (docs/fastlua-roadmap.md) added `any` - a runtime-checked type for
+values that don't fit fully static typing, boxed via `value.rs`'s plain
+`{tag, payload}` heap pair. Two things worth measuring separately: does
+strict code (everything before M5) pay anything for `any` existing at
+all, and how much does code that actually *uses* `any` cost compared to
+the strict equivalent.
+
+**Zero cost for strict code**: the full existing benchmark suite (`fib`,
+`gc_alloc`, `table_array`, `loop_sum`, `nested_loop`, `string_concat`) was
+re-run after M5 landed - every number matched pre-M5 runs within the same
+noise band already documented above. This isn't a coincidence to be
+reassured by: `typeck.rs`'s `coerce` only ever emits a `Box`/`Unbox` node
+when `Type::Any` is one of the two types involved, so a program that never
+writes `any` cannot produce one - confirmed structurally, not just by
+absence of a regression in this run.
+
+**The real cost of using `any`**: `benchmarks/any_strict.fl` and
+`any_dynamic.fl` are the identical workload (5,000,000 calls to a
+`+1`-and-accumulate function) with one difference - `any_dynamic.fl`'s
+function takes and returns `any` instead of `i64`, so every call boxes its
+argument (a real heap allocation) and unboxes its result (a runtime tag
+check that traps on mismatch):
+
+| Command | Mean [ms] | User [ms] |
+|:---|---:|---:|
+| `any_strict.fl` (typed) | 6.6-8.7 | 4.4-4.8 |
+| `any_dynamic.fl` (`any`) | 50.7-54.5 | 47.6-48.5 |
+
+The dynamic version is **~7-10× slower** - almost entirely the cost of one
+allocation per call (5,000,000 sixteen-byte boxes, each triggering the
+same bump-allocate/collect machinery `gc_alloc.fl` exercises above). This
+is the correct, expected cost of opting into dynamic behavior, not
+something to optimize away - the whole architectural bet (faster_lua.md
+§3-4) is that *most* code stays strict and pays none of this, and this
+benchmark is exactly the honest, falsifiable check on whether that promise
+holds - it does, for strict code, and the boundary genuinely costs what
+you'd expect for the one function that opts in.
