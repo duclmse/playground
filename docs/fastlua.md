@@ -11,17 +11,19 @@ browser debugger's Lua-*compatible* VM - see `docs/architecture.md`).
 Nothing there changes; fastlua doesn't run real Lua programs and isn't
 trying to.
 
-## Status: M2 (M0 mostly folded in)
+## Status: M3 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run -
-is implemented for a minimal subset: `i64`/`f64`/`bool`, functions, `if`,
-`while`, numeric `for`, and `Array<T>`. No structs, no dynamic typing, no
-JIT tiers (every function compiles to native code once, ahead of running
-it). M2 added real optimization work on top: `opt_level = "speed"`
-(Cranelift's own mid-end passes), array bounds checking (an M0 correctness
-fix - M1 shipped with none at all), a narrow bounds-check-elimination
-pattern, AST-level constant folding, and function inlining. See "Roadmap"
-below for what's next.
+is implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric
+`for`, and `Array<T>`. M2 added real optimization work: `opt_level =
+"speed"` (Cranelift's own mid-end passes), array bounds checking (an M0
+correctness fix - M1 shipped with none at all), a narrow bounds-check-
+elimination pattern, AST-level constant folding, and function inlining. M3
+added fixed-layout `struct`s and escape analysis + scalar replacement -
+verified at the IR level to remove heap allocation entirely for a struct
+that never leaves its function. No dynamic typing, no JIT tiers yet (every
+function still compiles to native code once, ahead of running it). See
+"Roadmap" below for what's next.
 
 ### Early results
 
@@ -37,7 +39,15 @@ well-predicted bounds check; neither benchmark calls anything inlining could
 help), not a sign the passes don't work - see `benchmarks/RESULTS.md` for
 the direct A/B evidence.
 
-## Language reference (M1)
+M3's scalar replacement has its own, more direct verification: dumping the
+emitted Cranelift IR (`FASTLUA_DUMP_CLIF=1 fastlua run ...`) for a `Point`
+struct that never escapes its function shows *zero* allocation, load, or
+store instructions - just `f64const`/`fmul`/`fadd`/`return` - versus a real
+`call` to the allocator when the same struct is passed to another function
+(`crates/fastlua/tests/programs.rs`'s
+`non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` pins this).
+
+## Language reference (M1-M3)
 
 ```
 function sum(a: Array<f64>): f64
@@ -57,8 +67,18 @@ function main(): f64
 end
 ```
 
-- **Types**: `i64`, `f64`, `bool`, `Array<T>`. Nothing else yet (no
-  i8/i16/i32/u8-u64/f32/string/struct/enum - see "Roadmap").
+- **Types**: `i64`, `f64`, `bool`, `Array<T>`, and named `struct`s.
+  Nothing else yet (no i8/i16/i32/u8-u64/f32/string/enum/generics - see
+  "Roadmap").
+- **`struct Name { field: Type, ... }`** (top-level, alongside functions):
+  `Name { field = expr, ... }` constructs one (fields in any order - they're
+  reordered to declaration order internally), `value.field` reads and
+  writes. Every field must be given in a literal - no partial
+  initialization/defaults in M3. Struct-typed locals that never leave their
+  function (never returned, passed to a call, stored into an array/another
+  struct, or reassigned as a whole) are compiled with **zero heap
+  allocation** at all - see "Early results" above - everything else is a
+  small, `fastlua_alloc`-backed (leaked, no GC yet) heap block.
 - **`local x: T = expr`**: type annotation is optional - `local x = 10`
   infers `i64`, `local y = 20.0` infers `f64` (the inferred type is simply
   the initializer's own type).
@@ -83,13 +103,14 @@ end
   matching `faster_lua.md` §8's "monomorphization over generic dispatch"
   philosophy). `a[i]` reads/writes, `#a` is the length. **Bounds-checked**
   (out-of-range or negative indices trap the process - a real crash, not a
-  catchable error, since M1/M2 have no exception mechanism yet). **No GC**
+  catchable error, since there's no exception mechanism yet). **No GC**
   - every array is a pointer to a small heap header (`runtime.rs`'s
-  `ArrayHeader`) allocated via `Box::leak`, for the life of the process.
-  This is called out here deliberately: it's M1's explicit, documented
-  scope (matching `faster_lua.md`'s own "Phase 1: No GC. No objects."
-  recommendation), not something to be surprised by later - a real GC is
-  M4 below.
+  `ArrayHeader`) allocated via `Box::leak`, for the life of the process
+  (structs that do escape are similarly leaked, via `fastlua_alloc`). This
+  is called out here deliberately: it's this project's explicit, documented
+  scope so far (matching `faster_lua.md`'s own "Phase 1: No GC. No
+  objects." recommendation), not something to be surprised by later - a
+  real GC is M4 below.
 - **Integer arithmetic wraps** on overflow (`iadd`/`isub`/`imul` - matching
   typical systems-language behavior); **integer division/modulo by zero
   traps** the process (confirmed empirically: Cranelift's `sdiv`/`srem`
@@ -173,7 +194,7 @@ these future milestones:
 |---|---|---|
 | **M1** | **Minimal typed compiler (done)** | This document's scope above. |
 | **M2** | **Optimizer passes (done)** | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after. |
-| M3 | Structs + real array allocation | Fixed-layout structs, a real array runtime (not a leaked `Vec`), escape analysis + scalar replacement so non-escaping structs/arrays skip allocation entirely. |
+| **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway. |
 | M4 | GC | Generational, bump-allocated young gen + incremental old gen - needed once M3 introduces real heap allocation the language controls. |
 | M5 | Gradual typing + dynamic mode | `any`-typed values, runtime type checks, a boxed `Value` fallback path only for genuinely dynamic code - most code stays fully typed/unboxed. |
 | M6 | Baseline + optimizing JIT tiers | Bytecode interpreter tier 0, hot counters, tier-1 baseline JIT, tier-2 optimizing JIT with inline caches/speculation/deopt - only worth building once dynamic-mode code exists to benefit from it; the typed/AOT path from M1 doesn't need this. |
@@ -185,4 +206,5 @@ these future milestones:
 cargo run -p fastlua -- run crates/fastlua/tests/fixtures/sum_array.fl
 cargo test -p fastlua
 scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # fastlua included wherever a matching .fl exists
+FASTLUA_DUMP_CLIF=1 cargo run -p fastlua -- run <file.fl>       # dump each function's Cranelift IR to stderr
 ```

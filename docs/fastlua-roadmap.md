@@ -141,7 +141,7 @@ eliminated).
 
 ---
 
-## M3 — Structs + real array allocation
+## M3 — Structs + escape analysis (done); real array allocation (deferred to M4)
 
 **Goal**: fixed-layout structs (§9) and escape analysis / scalar
 replacement (§12) so non-escaping allocations - a struct or array that
@@ -150,36 +150,74 @@ never leaves its function - skip heap allocation entirely.
 **Depends on**: M2 (escape analysis benefits from CSE/DCE already being in
 place to clean up after scalar replacement).
 
-- [ ] **Struct syntax**: `struct Name { field: Type, ... }` in the parser/
-      AST; struct literals (`Name { field = expr, ... }` or positional -
-      decide one); field access `value.field` (read and write).
-- [ ] **Struct type-checking**: register struct definitions in a symbol
-      table (alongside function signatures in `typeck.rs`), field-type
-      checking, field-access resolution.
-- [ ] **Struct codegen**: fixed-layout memory representation matching §9's
-      example (`header + field0 + field1 + ...`) - decide the header's
-      actual content given M3 doesn't have a GC yet (may be able to skip a
-      GC header entirely until M4, and add one then).
-- [ ] **Escape analysis** (§12): a conservative, function-local analysis -
-      does a struct/array's address ever get stored into another
-      struct/array, returned, or passed to a call that might retain it? If
-      never, it doesn't escape.
-- [ ] **Scalar replacement of aggregates** (§12, §34 - "Huge" impact): a
-      non-escaping struct's fields become individual SSA values (plain
-      Cranelift `Variable`s) instead of a heap allocation + loads/stores -
-      matches §12's `Point(1, 2)` example exactly.
+- [x] **Struct syntax**: `struct Name { field: Type, ... }` (top-level,
+      alongside functions); struct literals `Name { field = expr, ... }`
+      (named, any order - `typeck.rs` reorders to declaration order); field
+      access `value.field` (read via `ExprKind::Field`, write via
+      `AssignTarget::Field`, both added as a third case alongside the
+      existing `Index`/plain-name ones).
+- [x] **Struct type-checking**: struct names collected up front (so
+      mutually-referencing structs work - see `typeck.rs`'s `check()`
+      doc comment on why cycles aren't actually a size problem here), then
+      each struct's field types resolved; field-literal completeness
+      (every field required, no defaults in M3) and unknown-field/
+      non-struct-field-access errors covered by `typeck.rs`'s test module.
+- [x] **Struct codegen**: no header at all (simpler than the original
+      plan) - a struct is exactly `fields.len() * 8` raw bytes from
+      `runtime.rs`'s new `fastlua_alloc`, since every field's type/offset
+      is already fully resolved by `typeck.rs` (`field_index`) and
+      `codegen.rs` never needs to look anything up by name or struct
+      identity at codegen time.
+- [x] **Escape analysis** (§12): `escape.rs`'s `expr_leaks_local` -
+      deliberately narrow like the M2 bounds-check pattern (this project's
+      established style): eligible locals are exactly `local p = Struct {
+      ... }` literals, never reassigned as a whole (`is_reassigned_as_whole`),
+      and never used as a whole value anywhere except as the direct base of
+      a `.field` access (a function-call argument, a `return`, an array
+      element, or another struct's field all count as escaping).
+- [x] **Scalar replacement of aggregates** (§12, §34 - "Huge" impact):
+      `escape.rs`'s `scalar_replace` - an eligible struct's declaration
+      becomes N plain `Local` statements (one per field) and every
+      `Field{base: Local(id), ..}` becomes a direct `Local` reference; no
+      pointer, no allocation, no load/store survives for it at all.
+      **Verified at the IR level, not just behaviorally** (this
+      checklist's own original ask): `tests/programs.rs`'s
+      `non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` uses
+      a `FASTLUA_DUMP_CLIF` debug env var (`jit.rs`) to confirm the emitted
+      Cranelift IR for a non-escaping `Point` is bare
+      `f64const`/`fmul`/`fadd`/`return` - zero calls, zero stores - while
+      the escaping case in `structs.fl` still shows a real `call fn0(...)`
+      to the allocator. Bonus finding from the same dump: M2's inlining and
+      M3's escape analysis compose correctly - `structs.fl`'s
+      `dist_squared` gets inlined into `main`, and the escape analysis
+      (which runs before inlining, at the AST level) still correctly kept
+      `p` heap-allocated, since escaping is about *how a value's own
+      declaring function used it*, not about whether the callee later
+      happened to get inlined away.
 - [ ] Replace M1's "leaked `Vec` via a runtime call" arrays with a real
-      array runtime once structs establish the allocation/layout patterns
-      this needs (still no GC - see M4 - but at minimum stop leaking where
-      escape analysis proves it's unnecessary).
-- [ ] Benchmark: add a struct-heavy fixture (e.g. a `Point`/`Vec2` used
-      in a hot loop) to `benchmarks/` and confirm scalar replacement
-      removes the allocation (inspect generated CLIF/assembly, not just
-      wall-clock time, to actually verify the optimization fired).
+      array runtime - **deferred to M4 as originally conditioned** ("still
+      no GC - see M4"). Scalar-replacing *arrays* (as opposed to structs)
+      was considered and deliberately not attempted in M3: unlike a
+      struct's fixed, named fields, array elements are almost always
+      accessed with a variable index (a loop), which scalar replacement
+      fundamentally can't help with (only a small, all-constant-index
+      pattern could benefit, judged too narrow a win for the effort here).
+- [x] Verification via IR inspection - see the "Scalar replacement" item
+      above. A dedicated struct-heavy wall-clock benchmark in
+      `benchmarks/` was *not* added - deferred to M7's "fill out the full
+      benchmark suite as features land" item, since the IR-level proof is
+      the more direct, more convincing evidence for this specific
+      optimization (a benchmark's wall-clock delta would just be "however
+      long a single `fastlua_alloc` call costs vs. not calling it," which
+      the IR diff already shows unambiguously without needing hyperfine).
 
-**Files**: `ast.rs`, `types.rs`, `typeck.rs`, `codegen.rs` (struct support);
-new `crates/fastlua/src/escape.rs` (analysis) and `src/scalar_replace.rs`
-(the transform) or combined into `optimize.rs` from M2 if it's still small.
+**Files**: `ast.rs`, `types.rs`, `typeck.rs`, `codegen.rs`, `runtime.rs`
+(struct support - no separate header needed); new
+`crates/fastlua/src/escape.rs` (both escape analysis and the scalar-
+replacement transform - combined into one file rather than the originally
+sketched `escape.rs` + `scalar_replace.rs` split, since they're tightly
+coupled and the combined file is still under 250 lines); `jit.rs`'s
+`FASTLUA_DUMP_CLIF` debug hook.
 
 ---
 
@@ -378,7 +416,7 @@ gains users who need them, not as part of "beat LuaJIT."
 - [x] M1: shipped and measured (`docs/fastlua.md`, `benchmarks/RESULTS.md`)
 - [x] M0: bounds checking, div-by-zero, and integer-overflow behavior closed/documented; negative-length arrays still open
 - [x] M2: fastlua-level optimizer passes (opt_level=speed, constant folding, bounds-check elimination, inlining) - shipped and measured, honest flat result explained
-- [ ] M3: structs + escape analysis + scalar replacement
+- [x] M3: structs + escape analysis + scalar replacement - shipped and IR-verified; real (non-leaked) array allocation deferred to M4
 - [ ] M4: generational GC
 - [ ] M5: gradual typing + boxed dynamic-value fallback
 - [ ] M6: bytecode tier 0 + baseline/optimizing JIT tiers + deopt + OSR + inline caches
