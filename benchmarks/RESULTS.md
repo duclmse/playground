@@ -126,46 +126,79 @@ Full per-benchmark statistics (min/max/σ) from the M2 run:
 | `vm (this project)` | 294.8 ± 2.8 | 290.5 | 299.6 | 18.96 ± 4.51 |
 | `fastlua` | 15.6 ± 3.7 | 11.9 | 42.8 | 1.00 |
 
-## M4 (GC): a new, honest weak spot - allocation churn
+## M4 (GC): a weak spot found, then closed - allocation churn
 
 M4 (docs/fastlua-roadmap.md) replaced M1-M3's leak-everything runtime with
-a real collector (`crates/fastlua/src/gc.rs`) - see that file's doc
-comment for the scope call: conservative (stack-scanning) mark-sweep,
-single generation, one `std::alloc`-backed block per allocation, not the
-originally-sketched generational/bump-allocated design. `benchmarks/
-gc_alloc.{lua,fl}` is the new, dedicated allocation-churn benchmark this
-milestone's checklist asks for (§33's `08_gc` category) - a fresh,
-immediately-discarded 2-field object every iteration, 2,000,000
-iterations, nothing else.
+a real collector (`crates/fastlua/src/gc.rs`). `benchmarks/gc_alloc.
+{lua,fl}` is the dedicated allocation-churn benchmark this milestone's
+checklist asks for (§33's `08_gc` category) - a fresh, immediately-
+discarded 2-field object every iteration, 2,000,000 iterations, nothing
+else. This benchmark told two honest stories in a row, worth keeping both:
 
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `lua (reference)` | 202.4 ± 9.4 | 193.0 | 224.8 | 13.03 ± 3.27 |
-| `luajit` | 15.5 ± 3.8 | 11.9 | 38.6 | 1.00 |
-| `vm (this project)` | 490.8 ± 16.2 | 480.3 | 523.2 | 31.58 ± 7.85 |
-| `fastlua` | 123.1 ± 2.8 | 119.8 | 129.7 | 7.92 ± 1.96 |
+**First cut (`HashMap<usize, BlockInfo>` + one `std::alloc`/`dealloc` call
+per object)**:
 
-**This is a genuinely different result from `fib`/`table_array` above**,
-and worth stating plainly rather than burying: fastlua still beats
-reference Lua (1.6×) and this project's own dynamic VM (4×) here, but for
-the first time **loses to LuaJIT** (7.9× slower), on the one workload
-shape M4 introduced a real cost for. Two understood, expected reasons -
-this is the collector working as designed, not a bug:
+| Command | Mean [ms] | Relative |
+|:---|---:|---:|
+| `luajit` | 15.5 ± 3.8 | 1.00 |
+| `fastlua` | 123.1 ± 2.8 | 7.92 ± 1.96 |
 
-1. **Every collection is a full heap walk.** `gc.rs` is deliberately
-   single-generation mark-sweep (see its doc comment for why generational
-   pacing was descoped) - there's no young-generation fast path that
-   avoids rescanning long-lived data, so at steady state each of the many
-   collections this benchmark triggers re-marks the *entire* live set, not
-   just what changed since the last one. LuaJIT's generational GC (and
-   even reference Lua's incremental one) specifically avoids this.
-2. **Per-block bookkeeping overhead.** Every allocation is a `HashMap`
-   insert/lookup rather than a bump-pointer increment - the roadmap's
-   bump-allocated-arena item (deferred, see `gc.rs`) would remove this
-   entirely for the common case.
+For the first time, fastlua **lost to LuaJIT** - by 7.9×. Two understood
+causes, not a bug: (1) every collection walked the *entire* live set
+(single-generation mark-sweep, no young-gen fast path), and (2) every
+allocation paid for a hash + a general-purpose `alloc`/`dealloc` call
+instead of a bump-pointer increment.
 
-Both are the exact throughput costs the roadmap's deferred items (bump
-allocation, generational young/old split) exist to fix - this benchmark
-is what will show whether a future pass on those actually moves the
-number, the same honest, falsifiable-check role `table_array` played for
-M2's bounds-check elimination.
+**After a chunked bump-allocator rewrite** (same file, see its doc comment
+for the design - a handful of large chunks, each bump-allocated into
+sequentially; a chunk found to contain no reachable object after a
+collection gets its bump pointer reset and is reused whole, no
+malloc/free or hashing anywhere on the hot path):
+
+| Command | Mean [ms] | Relative |
+|:---|---:|---:|
+| `fastlua` | 15.7 ± 3.2 | 1.00 |
+| `luajit` | 16.1 ± 3.7 | 1.02 ± 0.32 |
+
+**fastlua now edges out LuaJIT** on the exact workload that used to lose
+by 7.9× - repeated runs put the two within noise of each other (sometimes
+one wins, sometimes the other), which given LuaJIT's GC has had 15+ years
+of tuning is itself the headline result, not a decisive win. Two changes
+got there, in order:
+
+1. **Fast, non-cryptographic hashing** for the (then still `HashMap`-based)
+   per-block registry cut the time from 123ms to ~69ms alone - hashing
+   2,000,000 pointer keys through the default SipHash was a real, avoidable
+   cost.
+2. **The chunked bump arena** (this file's current design) removed both
+   the hashing *and* the per-object `malloc`/`free` entirely, taking it the
+   rest of the way to 15.7ms.
+
+A real bug was caught and fixed along the way: the chunk-growth policy's
+first version computed its "try collecting again" threshold *after* a
+failed collection's forced growth, which made the threshold a fixed
+multiple ahead of actual capacity forever - collection silently stopped
+running at all after the second forced growth. Caught via
+`FASTLUA_GC_DEBUG=1`'s trace (a single `[gc] collect` line, once, for a
+20,000-iteration stress fixture that should trigger hundreds) before it
+reached this benchmark. Fixed by unconditionally attempting a collection
+whenever the current chunk fills, rather than gating it behind a
+capacity-vs-threshold check that doesn't account for reuse.
+
+**The honest trade-off this doesn't fix**: `table_array` (below) now costs
+more than it used to, because it never paid any GC tax before M4 (M1-M3
+just leaked its one 32 MB array). Real GC bookkeeping - even this fast -
+isn't free on a single large allocation:
+
+| Command | Mean [ms] | Relative |
+|:---|---:|---:|
+| `luajit` | 21.2 ± 3.7 | 1.00 |
+| `fastlua` | 26.7 ± 2.8 | 1.26 ± 0.25 |
+
+versus 15.6ms (beating LuaJIT 1.30×) before any GC existed. This is an
+accepted, understood cost of having a real collector at all, not something
+the bump-arena rewrite regressed - directly confirmed by benchmarking the
+*previous* (HashMap-based) M4 commit's own `table_array` time: 48.4ms, i.e.
+the bump arena is ~2× faster here too, just not enough to fully hide a
+32 MB zero-fill plus bookkeeping behind a benchmark that used to do none
+of that work at all.

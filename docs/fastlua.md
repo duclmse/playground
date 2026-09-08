@@ -49,32 +49,44 @@ store instructions - just `f64const`/`fmul`/`fadd`/`return` - versus a real
 (`crates/fastlua/tests/programs.rs`'s
 `non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` pins this).
 
-M4's GC is a genuinely different kind of result: `benchmarks/gc_alloc.fl`
-(pure allocation churn - a fresh, immediately-discarded struct every
-iteration) still beats reference Lua (1.6×) and this project's own VM
-(4×), but for the first time **loses to LuaJIT** (7.9× slower) - see
-`benchmarks/RESULTS.md`'s M4 section for the honest reason (a
-single-generation, non-bump-allocated collector doing a full heap walk on
-every collection) and what would need to change to close it.
+M4's GC produced two results worth keeping, in order. The first cut
+(`HashMap`-based bookkeeping, one `std::alloc`/`dealloc` call per object)
+lost to LuaJIT on `benchmarks/gc_alloc.fl` (pure allocation churn) by
+7.9× - a real, honest weak spot. A follow-up rewrite to a chunked bump
+allocator (same file, no hashing or per-object `malloc`/`free` on the hot
+path) closed that to roughly parity - repeated runs land within noise of
+each other, sometimes fastlua ahead, sometimes LuaJIT. See
+`benchmarks/RESULTS.md`'s M4 section for both sets of numbers and the two
+real bugs caught along the way. The honest remaining cost: `table_array`
+(one 32 MB allocation) now pays real GC overhead it never used to before
+M4 existed at all (1.26× LuaJIT, versus *beating* LuaJIT pre-GC) - an
+accepted trade-off of having a real collector, not a regression from the
+bump-arena rewrite (which is itself ~2× faster than the first cut on that
+same benchmark).
 
 ## GC (M4)
 
 A real collector, replacing M1-M3's `Box::leak`/`mem::forget`-everything
 runtime: `crates/fastlua/src/gc.rs`. **What it is**: a conservative
-(stack-scanning), single-generation mark-sweep collector - a plain
-`std::alloc`/`dealloc` block per allocation, no custom arena. Root-finding
-walks the native call stack (plus explicitly flushed callee-saved
-registers - see the file's doc comment for a real bug this caught) rather
-than using precise Cranelift stack maps; this is the same technique the
+(stack-scanning) mark-sweep collector over a **chunked bump arena** - a
+handful of large chunks, each bump-allocated into sequentially
+(`ptr = bump; bump += size`, no hashing, no per-object `malloc`/`free`); a
+chunk found to contain no reachable object after a collection has its
+bump pointer reset and is reused whole. Root-finding walks the native call
+stack (plus explicitly flushed callee-saved registers - see the file's doc
+comment for a real bug this caught) rather than using precise Cranelift
+stack maps; the root-scanning technique is the same one the
 Boehm-Demers-Weiser collector uses in production, not a toy shortcut.
-**What it deliberately isn't** (yet): the generational, bump-allocated,
-write-barrier-backed design `docs/fastlua-roadmap.md`'s M4 section
-originally sketched - descoped with reasoning recorded there, since
-getting a *correct* collector working was already the substantial part of
-this milestone, and generational pacing/bump allocation are throughput
-optimizations on top, not required for correctness. `FASTLUA_GC_STATS=1
-fastlua run <file.fl>` prints live block/byte counts at exit, the same
-env-gated-diagnostic pattern as `FASTLUA_DUMP_CLIF`.
+**What it deliberately isn't** (yet): true generations (a chunk with even
+one long-lived survivor keeps *all* its dead space until the whole chunk
+dies together - a documented fragmentation trade-off, not an oversight),
+promotion, or write barriers - descoped with reasoning recorded in
+`docs/fastlua-roadmap.md`'s M4 section, since getting a *correct* and
+*fast* collector working was already the substantial part of this
+milestone. `FASTLUA_GC_STATS=1 fastlua run <file.fl>` prints live
+block/byte counts at exit (forcing a final collection first for accuracy);
+`FASTLUA_GC_DEBUG=1` traces every collection cycle to stderr - both the
+same env-gated-diagnostic pattern as `FASTLUA_DUMP_CLIF`.
 
 ## Language reference (M1-M3)
 
@@ -221,7 +233,7 @@ these future milestones:
 | **M1** | **Minimal typed compiler (done)** | This document's scope above. |
 | **M2** | **Optimizer passes (done)** | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after. |
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway. |
-| **M4** | **GC (done, descoped)** | Conservative (stack-scanning) single-generation mark-sweep, not the originally-planned generational/bump-allocated design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the honest cost (loses to LuaJIT on pure allocation churn, for the first time). |
+| **M4** | **GC (done, descoped)** | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the honest before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity). |
 | M5 | Gradual typing + dynamic mode | `any`-typed values, runtime type checks, a boxed `Value` fallback path only for genuinely dynamic code - most code stays fully typed/unboxed. |
 | M6 | Baseline + optimizing JIT tiers | Bytecode interpreter tier 0, hot counters, tier-1 baseline JIT, tier-2 optimizing JIT with inline caches/speculation/deopt - only worth building once dynamic-mode code exists to benefit from it; the typed/AOT path from M1 doesn't need this. |
 | M7 | SIMD, PGO, polish | Vectorization, profile-guided recompilation, FFI. |
