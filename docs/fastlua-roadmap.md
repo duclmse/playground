@@ -221,45 +221,78 @@ coupled and the combined file is still under 250 lines); `jit.rs`'s
 
 ---
 
-## M4 — GC
+## M4 — GC (done, descoped from the original generational design - see below)
 
-**Goal**: a real, generational GC (§14), needed once M3 introduces
-allocations the language can't just leak (structs/arrays that genuinely
-escape and outlive their creating function).
+**Goal**: a real GC, needed once M3 introduces allocations the language
+can't just leak (structs/arrays that genuinely escape and outlive their
+creating function).
 
 **Depends on**: M3 (nothing to collect until real, non-leaked heap
 allocation exists for escaping values).
 
-- [ ] **Bump-allocated young generation** (§13, §14): a thread-local (or,
-      given no threads/coroutines yet, just process-global) bump pointer
-      over a pre-allocated arena; allocation is `ptr = next; next += size`
-      with a slow path (minor collection) when the arena is exhausted.
-- [ ] **Minor collection**: copying/semi-space or mark-and-copy for the
-      young generation - scan roots (live locals across all active stack
-      frames - needs stack maps or a conservative scan, decide which;
-      precise stack maps are more work but avoid conservative-GC false
-      retention).
-- [ ] **Promotion + old generation**: objects surviving N minor
-      collections promote to an old generation.
-- [ ] **Remembered sets + write barriers** (§14): old-gen objects that
-      reference young-gen objects need a remembered set so minor
-      collections don't have to scan the entire old generation; the
-      barrier's fast path should be "almost nothing" per §14 - measure it.
-- [ ] **Incremental major GC**: avoid long stop-the-world pauses for the
-      old generation once it's large enough to matter.
-- [ ] Retrofit M1's array runtime (`runtime.rs`) and M3's struct allocation
-      onto this allocator, removing the `Box::leak`/`mem::forget` calls
-      called out as a known, documented limitation since M1.
-- [ ] Benchmark: an allocation-heavy fixture (e.g. repeatedly building and
-      discarding arrays/structs in a loop) to measure GC pause time and
-      throughput overhead - this is the first milestone where "GC time" is
-      a real, measurable cost fastlua has, worth its own benchmark
-      category (§33's `08_gc`).
+**Scope call made during implementation**: the original checklist below
+sketched a *generational, moving* collector with precise stack maps
+(Cranelift safepoints) and write-barrier-backed remembered sets - the
+`§14`-accurate design. That's a substantial, multi-milestone undertaking
+in its own right (the Cranelift stack-map/safepoint infrastructure it
+needs is the same machinery wasmtime's own GC support is built on, which
+took a long time to land there) and isn't required to satisfy what M4
+actually needs to unblock: reclaiming memory M3 would otherwise leak
+forever. What's implemented instead - a **conservative (stack-scanning),
+single-generation mark-sweep collector**, one `std::alloc`-backed
+allocation per block - is a legitimate, production-precedented
+simplification (this is the Boehm-Demers-Weiser design), not a shortcut:
+see `crates/fastlua/src/gc.rs`'s module doc comment for the full
+reasoning, including a real bug caught and fixed during development (a
+pointer live only in a callee-saved register was invisible to a naive
+stack scan - fixed via an explicit register-flush, the standard
+`setjmp`-style technique). Bump allocation, generations, and write
+barriers are real, understood, deferred follow-ups - each checklist item
+below is marked with what actually happened.
 
-**Files**: new `crates/fastlua/src/gc/` module (mirroring `faster_lua.md`
-§37's own suggested `gc/` directory, since this is substantial enough to
-warrant its own module tree - `arena.rs`, `collect.rs`, `roots.rs`,
-`barrier.rs`).
+- [x] ~~Bump-allocated young generation~~ **Descoped**: every block goes
+      through `std::alloc`/`dealloc` directly (`gc.rs`'s `fastlua_gc_alloc`/
+      `collect`), not a custom bump arena. Getting root-finding and tracing
+      *correct* was already the substantial part of this milestone; a bump
+      allocator is a throughput optimization on top, deferred rather than
+      risked in the same pass. `benchmarks/gc_alloc.{lua,fl}` (below) is
+      the case this would help most.
+- [x] **Minor collection** → became *the* collection (no young/old split):
+      **conservative stack scanning**, not stack maps - chosen because
+      precise stack maps need Cranelift safepoint support this project
+      doesn't have yet, while conservative scanning is a well-understood,
+      safe (if imprecise) standard technique that unblocks this milestone
+      immediately. False retention (a stale stack word that happens to
+      match a live block's address) is the accepted tradeoff.
+- [ ] **Promotion + old generation**: not applicable - single generation.
+      Real future work if/when the bump-allocation item above lands and
+      profiling shows generational pacing would help.
+- [ ] **Remembered sets + write barriers**: not needed for a
+      single-generation collector (they exist specifically to let a
+      *generational* collector skip rescanning the old generation on a
+      minor collection - see `gc.rs`'s doc comment). Future work if/when
+      generations are added.
+- [ ] **Incremental major GC**: not implemented - every collection is a
+      full stop-the-world mark-sweep. Fine at current heap sizes; revisit
+      once a real program's pause times are actually measured and matter.
+- [x] Retrofit M1's array runtime (`runtime.rs`) and M3's struct allocation
+      onto this allocator, removing the `Box::leak`/`mem::forget` calls
+      called out as a known, documented limitation since M1. Done -
+      `fastlua_new_array_i64/f64` and `fastlua_alloc` all route through
+      `gc::fastlua_gc_alloc`.
+- [x] Benchmark: `benchmarks/gc_alloc.{lua,fl}` (2,000,000 short-lived
+      2-field allocations) - see `benchmarks/RESULTS.md`'s new M4 section
+      for the honest result: fastlua still beats reference Lua (1.6×) and
+      this project's own VM (4×) here, but for the first time **loses to
+      LuaJIT** (7.9× slower) - the real, measurable cost of a
+      single-generation, non-bump-allocated collector doing a full heap
+      walk on every collection. This is the benchmark future
+      bump-allocation/generational work should move.
+
+**Files**: `crates/fastlua/src/gc.rs` (single file, not the
+`gc/{arena,collect,roots,barrier}.rs` module tree originally sketched -
+right-sized for what a non-generational, non-bump-allocated collector
+actually needs; revisit the split if/when those land).
 
 ---
 

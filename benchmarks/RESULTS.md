@@ -125,3 +125,47 @@ Full per-benchmark statistics (min/max/σ) from the M2 run:
 | `luajit` | 20.2 ± 2.5 | 17.1 | 33.7 | 1.30 ± 0.35 |
 | `vm (this project)` | 294.8 ± 2.8 | 290.5 | 299.6 | 18.96 ± 4.51 |
 | `fastlua` | 15.6 ± 3.7 | 11.9 | 42.8 | 1.00 |
+
+## M4 (GC): a new, honest weak spot - allocation churn
+
+M4 (docs/fastlua-roadmap.md) replaced M1-M3's leak-everything runtime with
+a real collector (`crates/fastlua/src/gc.rs`) - see that file's doc
+comment for the scope call: conservative (stack-scanning) mark-sweep,
+single generation, one `std::alloc`-backed block per allocation, not the
+originally-sketched generational/bump-allocated design. `benchmarks/
+gc_alloc.{lua,fl}` is the new, dedicated allocation-churn benchmark this
+milestone's checklist asks for (§33's `08_gc` category) - a fresh,
+immediately-discarded 2-field object every iteration, 2,000,000
+iterations, nothing else.
+
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `lua (reference)` | 202.4 ± 9.4 | 193.0 | 224.8 | 13.03 ± 3.27 |
+| `luajit` | 15.5 ± 3.8 | 11.9 | 38.6 | 1.00 |
+| `vm (this project)` | 490.8 ± 16.2 | 480.3 | 523.2 | 31.58 ± 7.85 |
+| `fastlua` | 123.1 ± 2.8 | 119.8 | 129.7 | 7.92 ± 1.96 |
+
+**This is a genuinely different result from `fib`/`table_array` above**,
+and worth stating plainly rather than burying: fastlua still beats
+reference Lua (1.6×) and this project's own dynamic VM (4×) here, but for
+the first time **loses to LuaJIT** (7.9× slower), on the one workload
+shape M4 introduced a real cost for. Two understood, expected reasons -
+this is the collector working as designed, not a bug:
+
+1. **Every collection is a full heap walk.** `gc.rs` is deliberately
+   single-generation mark-sweep (see its doc comment for why generational
+   pacing was descoped) - there's no young-generation fast path that
+   avoids rescanning long-lived data, so at steady state each of the many
+   collections this benchmark triggers re-marks the *entire* live set, not
+   just what changed since the last one. LuaJIT's generational GC (and
+   even reference Lua's incremental one) specifically avoids this.
+2. **Per-block bookkeeping overhead.** Every allocation is a `HashMap`
+   insert/lookup rather than a bump-pointer increment - the roadmap's
+   bump-allocated-arena item (deferred, see `gc.rs`) would remove this
+   entirely for the common case.
+
+Both are the exact throughput costs the roadmap's deferred items (bump
+allocation, generational young/old split) exist to fix - this benchmark
+is what will show whether a future pass on those actually moves the
+number, the same honest, falsifiable-check role `table_array` played for
+M2's bounds-check elimination.

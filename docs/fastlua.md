@@ -11,7 +11,7 @@ browser debugger's Lua-*compatible* VM - see `docs/architecture.md`).
 Nothing there changes; fastlua doesn't run real Lua programs and isn't
 trying to.
 
-## Status: M3 (M0/M2 folded in)
+## Status: M4 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run -
 is implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric
@@ -21,9 +21,11 @@ correctness fix - M1 shipped with none at all), a narrow bounds-check-
 elimination pattern, AST-level constant folding, and function inlining. M3
 added fixed-layout `struct`s and escape analysis + scalar replacement -
 verified at the IR level to remove heap allocation entirely for a struct
-that never leaves its function. No dynamic typing, no JIT tiers yet (every
-function still compiles to native code once, ahead of running it). See
-"Roadmap" below for what's next.
+that never leaves its function. M4 replaced the leak-everything runtime
+with a real garbage collector - see "GC (M4)" below for what it is and,
+just as importantly, what it deliberately isn't yet. No dynamic typing, no
+JIT tiers yet (every function still compiles to native code once, ahead of
+running it). See "Roadmap" below for what's next.
 
 ### Early results
 
@@ -46,6 +48,33 @@ store instructions - just `f64const`/`fmul`/`fadd`/`return` - versus a real
 `call` to the allocator when the same struct is passed to another function
 (`crates/fastlua/tests/programs.rs`'s
 `non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` pins this).
+
+M4's GC is a genuinely different kind of result: `benchmarks/gc_alloc.fl`
+(pure allocation churn - a fresh, immediately-discarded struct every
+iteration) still beats reference Lua (1.6×) and this project's own VM
+(4×), but for the first time **loses to LuaJIT** (7.9× slower) - see
+`benchmarks/RESULTS.md`'s M4 section for the honest reason (a
+single-generation, non-bump-allocated collector doing a full heap walk on
+every collection) and what would need to change to close it.
+
+## GC (M4)
+
+A real collector, replacing M1-M3's `Box::leak`/`mem::forget`-everything
+runtime: `crates/fastlua/src/gc.rs`. **What it is**: a conservative
+(stack-scanning), single-generation mark-sweep collector - a plain
+`std::alloc`/`dealloc` block per allocation, no custom arena. Root-finding
+walks the native call stack (plus explicitly flushed callee-saved
+registers - see the file's doc comment for a real bug this caught) rather
+than using precise Cranelift stack maps; this is the same technique the
+Boehm-Demers-Weiser collector uses in production, not a toy shortcut.
+**What it deliberately isn't** (yet): the generational, bump-allocated,
+write-barrier-backed design `docs/fastlua-roadmap.md`'s M4 section
+originally sketched - descoped with reasoning recorded there, since
+getting a *correct* collector working was already the substantial part of
+this milestone, and generational pacing/bump allocation are throughput
+optimizations on top, not required for correctness. `FASTLUA_GC_STATS=1
+fastlua run <file.fl>` prints live block/byte counts at exit, the same
+env-gated-diagnostic pattern as `FASTLUA_DUMP_CLIF`.
 
 ## Language reference (M1-M3)
 
@@ -78,7 +107,8 @@ end
   function (never returned, passed to a call, stored into an array/another
   struct, or reassigned as a whole) are compiled with **zero heap
   allocation** at all - see "Early results" above - everything else is a
-  small, `fastlua_alloc`-backed (leaked, no GC yet) heap block.
+  small, `fastlua_alloc`-backed heap block, garbage-collected since M4
+  (see "GC (M4)" below).
 - **`local x: T = expr`**: type annotation is optional - `local x = 10`
   infers `i64`, `local y = 20.0` infers `f64` (the inferred type is simply
   the initializer's own type).
@@ -103,14 +133,10 @@ end
   matching `faster_lua.md` §8's "monomorphization over generic dispatch"
   philosophy). `a[i]` reads/writes, `#a` is the length. **Bounds-checked**
   (out-of-range or negative indices trap the process - a real crash, not a
-  catchable error, since there's no exception mechanism yet). **No GC**
-  - every array is a pointer to a small heap header (`runtime.rs`'s
-  `ArrayHeader`) allocated via `Box::leak`, for the life of the process
-  (structs that do escape are similarly leaked, via `fastlua_alloc`). This
-  is called out here deliberately: it's this project's explicit, documented
-  scope so far (matching `faster_lua.md`'s own "Phase 1: No GC. No
-  objects." recommendation), not something to be surprised by later - a
-  real GC is M4 below.
+  catchable error, since there's no exception mechanism yet). Every array
+  is a pointer to a small heap header (`runtime.rs`'s `ArrayHeader`),
+  garbage-collected since M4 (see "GC (M4)" below) - M1-M3 leaked every
+  allocation for the life of the process; that's no longer true.
 - **Integer arithmetic wraps** on overflow (`iadd`/`isub`/`imul` - matching
   typical systems-language behavior); **integer division/modulo by zero
   traps** the process (confirmed empirically: Cranelift's `sdiv`/`srem`
@@ -195,7 +221,7 @@ these future milestones:
 | **M1** | **Minimal typed compiler (done)** | This document's scope above. |
 | **M2** | **Optimizer passes (done)** | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after. |
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway. |
-| M4 | GC | Generational, bump-allocated young gen + incremental old gen - needed once M3 introduces real heap allocation the language controls. |
+| **M4** | **GC (done, descoped)** | Conservative (stack-scanning) single-generation mark-sweep, not the originally-planned generational/bump-allocated design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the honest cost (loses to LuaJIT on pure allocation churn, for the first time). |
 | M5 | Gradual typing + dynamic mode | `any`-typed values, runtime type checks, a boxed `Value` fallback path only for genuinely dynamic code - most code stays fully typed/unboxed. |
 | M6 | Baseline + optimizing JIT tiers | Bytecode interpreter tier 0, hot counters, tier-1 baseline JIT, tier-2 optimizing JIT with inline caches/speculation/deopt - only worth building once dynamic-mode code exists to benefit from it; the typed/AOT path from M1 doesn't need this. |
 | M7 | SIMD, PGO, polish | Vectorization, profile-guided recompilation, FFI. |
@@ -207,4 +233,6 @@ cargo run -p fastlua -- run crates/fastlua/tests/fixtures/sum_array.fl
 cargo test -p fastlua
 scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # fastlua included wherever a matching .fl exists
 FASTLUA_DUMP_CLIF=1 cargo run -p fastlua -- run <file.fl>       # dump each function's Cranelift IR to stderr
+FASTLUA_GC_STATS=1 cargo run -p fastlua -- run <file.fl>        # print live block/byte counts at exit
+FASTLUA_GC_DEBUG=1 cargo run -p fastlua -- run <file.fl>        # trace every collection cycle to stderr
 ```
