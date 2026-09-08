@@ -195,6 +195,23 @@ scalar instead of trapping. See
 guarded-native calls agree on the arithmetic) and proof the specialized
 variant is actually compiled (via `FASTLUA_DUMP_CLIF`).
 
+## AOT compilation (M7)
+
+`fastlua build program.fl -o program` compiles straight to a standalone
+executable instead of running in-process: `aot.rs` uses
+`cranelift-object`'s `ObjectModule` (vs. `run`'s `cranelift-jit`
+`JITModule`) to compile every function eagerly - no tiering, since a
+standalone binary has no interpreter to fall back to - then links the
+resulting object file against this crate's own `staticlib` build (the
+crate now also builds as one, exposing `runtime.rs`'s alloc/GC/print
+functions as `#[no_mangle]` symbols) via the system `cc`. A small
+hand-written C-ABI `main` calls the compiled fastlua `main` and prints its
+result. The produced binary is genuinely standalone (no dependency on the
+fastlua toolchain at runtime) and, with no interpreter warmup to pay,
+slightly *beats* the tiered JIT on `benchmarks/table_array.fl` while
+staying ~1.5x faster than LuaJIT. Only verified on macOS ARM64 so far -
+Linux linking may need extra system libraries not yet checked.
+
 ## Language reference (M1-M3)
 
 ```
@@ -282,10 +299,15 @@ types.rs (typed AST - every local resolved to a LocalId)
 codegen.rs (cranelift-frontend's FunctionBuilder - does SSA
             construction/phi-node placement for us)
    │
-jit.rs (cranelift-jit's JITModule - compiles + finalizes)
-   │
-native machine code, called directly
+jit.rs (cranelift-jit's JITModule - compiles + finalizes)      aot.rs (cranelift-object's ObjectModule)
+   │                                                               │
+native machine code, called directly                     .o -> `cc` -> standalone executable
 ```
+
+`run` and `build` share everything up to and including `types.rs`/`codegen.rs`
+- only the last step (which `cranelift-module` backend, and whether
+compilation is lazy/tiered vs. eager) differs. See "AOT compilation (M7)"
+below.
 
 **Why Cranelift, not a hand-written backend or LLVM**: pure Rust (no C++
 toolchain/bindgen to wire into this repo), a first-class JIT story
@@ -324,6 +346,11 @@ examples/tutorials found online:
   to `"none"` and never mentions this in its own docs; `with_flags` also sets
   `use_colocated_libcalls`/`is_pic` correctly for JIT use, which hand-building
   an `isa`/`Flags` pair and calling `JITBuilder::with_isa` directly does not.
+- `is_pic` must be the *opposite* between the two backends: the JIT path
+  wants `false` (it maps its own memory, no PIE requirement), but
+  `ObjectModule` (AOT, `aot.rs`) needs `true` - macOS's linker rejects text
+  relocations in a PIE main executable otherwise (`Illegal text-relocations`
+  at link time, not a runtime crash).
 
 ## Roadmap
 
@@ -344,7 +371,7 @@ milestones:
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| M7     | SIMD, PGO, polish                    | Vectorization, profile-guided recompilation, FFI.                                                                                                                                                                                                                                                                                                                                                            |
+| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`) - see "AOT compilation (M7)" above. Still open: loop vectorization, PGO, the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
 
 ## Trying it
 
@@ -352,7 +379,7 @@ milestones:
 cargo run -p fastlua -- run crates/fastlua/tests/fixtures/sum_array.fl
 cargo test -p fastlua
 scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # fastlua included wherever a matching .fl exists
-FASTLUA_DUMP_CLIF=1 cargo run -p fastlua -- run <file.fl>       # dump each function's Cranelift IR to stderr
-FASTLUA_GC_STATS=1 cargo run -p fastlua -- run <file.fl>        # print live block/byte counts at exit
-FASTLUA_GC_DEBUG=1 cargo run -p fastlua -- run <file.fl>        # trace every collection cycle to stderr
+
+fastlua run --dump-ir/--dump-asm/--jit-log/--target-info <file.fl>   # M7 tooling flags (see docs/fastlua-roadmap/m7.md)
+cargo build -p fastlua && ./target/debug/fastlua build <file.fl> -o <out>   # AOT: needs the sibling libfastlua.a `cargo build` produces
 ```
