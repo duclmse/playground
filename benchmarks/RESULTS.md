@@ -185,20 +185,37 @@ reached this benchmark. Fixed by unconditionally attempting a collection
 whenever the current chunk fills, rather than gating it behind a
 capacity-vs-threshold check that doesn't account for reuse.
 
-**The honest trade-off this doesn't fix**: `table_array` (below) now costs
-more than it used to, because it never paid any GC tax before M4 (M1-M3
-just leaked its one 32 MB array). Real GC bookkeeping - even this fast -
-isn't free on a single large allocation:
+**A second, different weak spot turned up next**: `table_array` (a single
+32 MB array) regressed from 15.6ms pre-GC (beating LuaJIT 1.30×) to ~27ms
+(1.26× *slower* than LuaJIT) after the bump-arena rewrite above. Isolating
+allocation from computation (`alloc_in_heap` for just the array vs. the
+fill/sum loops alone) showed the entire ~15ms difference was in
+allocation, not looping - and `FASTLUA_GC_DEBUG`'s trace confirmed exactly
+why: `words_scanned=4000000`. The array's data buffer briefly existed only
+as a live pointer on the native stack (a Rust local in `runtime.rs::new_array`,
+between allocating the 32 MB data buffer and the small header that stores
+its address) when the header's own allocation call happened to trigger a
+collection - so the tracer, having no way to know an `Array<i64>`/
+`Array<f64>` buffer can *never* contain a pointer, conservatively read and
+checked all 4,000,000 of its words for pointer-like values, one at a time.
+
+**Fix**: `gc.rs` gained a second allocation entry point,
+`fastlua_gc_alloc_atomic`, for blocks *provably* pointer-free - currently
+only an array's data buffer (its elements are always plain i64/f64
+scalars; array headers and struct instances, which can hold real pointers,
+still go through the normal path). The tracer still marks such a block
+reachable when found, but never reads its contents - an O(1) skip instead
+of an O(payload size) scan:
 
 | Command | Mean [ms] | Relative |
 |:---|---:|---:|
-| `luajit` | 21.2 ± 3.7 | 1.00 |
-| `fastlua` | 26.7 ± 2.8 | 1.26 ± 0.25 |
+| `fastlua` | 13.4 ± 3.3 | 1.00 |
+| `luajit` | 19.5 ± 3.2 | 1.46 ± 0.43 |
 
-versus 15.6ms (beating LuaJIT 1.30×) before any GC existed. This is an
-accepted, understood cost of having a real collector at all, not something
-the bump-arena rewrite regressed - directly confirmed by benchmarking the
-*previous* (HashMap-based) M4 commit's own `table_array` time: 48.4ms, i.e.
-the bump arena is ~2× faster here too, just not enough to fully hide a
-32 MB zero-fill plus bookkeeping behind a benchmark that used to do none
-of that work at all.
+fastlua now beats LuaJIT here again, by roughly the same margin as before
+any GC existed. This wasn't only a performance fix: conservatively tracing
+a scalar array's contents was also a latent *correctness* imprecision (a
+plain `i64`/`f64` value that happened to numerically match some other
+live block's address would have been treated as a real pointer, keeping
+that block alive for no reason) - marking scalar data atomic removes that
+possibility entirely, not just the cost of checking for it.
