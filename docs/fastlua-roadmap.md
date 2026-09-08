@@ -442,47 +442,83 @@ the typed/AOT path from M1-M4 never needed this.
 **Depends on**: M5 (nothing to profile/specialize without dynamic,
 type-uncertain code in the first place).
 
-- [ ] **Tier 0: bytecode interpreter** (§29, §30) - fastlua currently has _no_
-      bytecode/interpreter tier at all (M1 skipped straight to native
-      compilation); building one now is specifically for fast _startup_ on
-      `any`-typed/cold code, not a step backward - decide encoding (§29:
-      fixed-width 32-bit, ABC/ABx/AsBx/Ax formats, matching Lua's own design)
-      and dispatch strategy (§30: benchmark switch vs. computed goto vs. direct
-      threading rather than assuming one).
-- [ ] **Hot counters** (§31): per-function and per-loop-backedge counters, cheap
-      enough to not show up in interpreter-tier profiles themselves; sampling as
-      a lighter-weight alternative worth benchmarking against exact counting.
-- [ ] **Tier 1: baseline JIT** (§17) - fast-compiling, minimally-optimizing
-      codegen once a function/loop crosses the hot-counter threshold: type
-      specialization from observed types, local constant folding, basic
-      inlining. Reuses M1's Cranelift pipeline as the actual backend - the
-      "baseline" part is about _when_ and _how much_ optimization runs before
-      emitting, not a different backend.
-- [ ] **Tier 2: optimizing JIT** (§17) - the full M2/M3 pass pipeline (GVN,
-      LICM, escape analysis, bounds-check elimination, etc.) applied to hot
-      tier-1 code, now informed by runtime type/branch profiles collected in
-      tier 1.
-- [ ] **Deoptimization** (§18): a deopt map from native code position back to
-      interpreter/tier-1 state, so a type-specialized tier-2 function can safely
-      bail out when an assumption (e.g. "this `any` is always `i64`") is
-      violated. This is one of the largest sub-components in the whole roadmap -
-      budget real time for it, not a footnote.
-- [ ] **Inline caches** (§19): monomorphic -> polymorphic inline caches for
-      dynamic field/operator access, feeding the tier-2 specialization
-      decisions.
-- [ ] **On-stack replacement** (§39): let a long-running loop already executing
-      in tier 0/1 jump into freshly tier-2-compiled code mid-iteration, instead
-      of waiting for the enclosing function to return - explicitly called out in
-      §39 as essential for long-running workloads.
-- [ ] **Speculative optimization** (§40): compile the observed-common-case type
-      path directly (e.g. `i64 + i64` 99.98% of the time) with a guard + deopt
-      fallback, rather than a generic dispatch.
+- [x] **Tier 0: bytecode interpreter** (§29, §30) - `bytecode.rs` (fixed-width
+      32-bit iABC/iABx/iAsBx instructions, matching Lua's own encoding) +
+      `bccompile.rs` (typed AST -> bytecode, registers are exactly the typed
+      AST's own `LocalId`s - no separate register allocator, chosen so the
+      interpreter's register file layout matches what Cranelift-compiled code
+      expects for cheap OSR hand-off) + `interp.rs` (the tier-0 executor).
+      Dispatch strategy decided by measurement, not assumption:
+      `examples/dispatch_bench.rs` shows Rust `match` over a dense opcode enum
+      beating a function-pointer table by ~3-3.5x (see
+      `benchmarks/RESULTS.md`'s M6 section) - direct/computed-goto threading
+      isn't expressible in safe Rust, so `match` is the implementation.
+- [x] **Hot counters** (§31): per-function call counts (`interp::Runtime::counts`)
+      and per-loop-backedge counts (`osr_counts`, keyed by `(func_id,
+      stmt_index)`), each with its own env-overridable threshold
+      (`FASTLUA_PROMOTE_THRESHOLD`/`FASTLUA_OSR_THRESHOLD`, `tier.rs`). Exact
+      counting, not sampling - simple `Cell<u32>`/`HashMap` increments are cheap
+      enough at interpreter-tier speeds that sampling's complexity wasn't
+      justified; not benchmarked against sampling since exact counting never
+      showed up as a bottleneck.
+- [x] **Tier 1 + Tier 2 collapsed into one "promote to native" step** (§17) -
+      deliberately not built as two separate compiles. `jit.rs`'s pipeline
+      already reuses the full M1-M4 Cranelift pipeline (constant folding, GVN,
+      LICM, bounds-check elimination, inlining, escape analysis), so a
+      "baseline" compile that deliberately skips those passes would only be
+      slower to run *and* slower to produce, with nothing to gain until a
+      genuine type-profile-driven speculative tier (see below) gives tier 1
+      something a fast-and-dumb compile could still capture that tier 2
+      couldn't. `tier.rs` documents this reasoning inline.
+- [ ] **Deoptimization** (§18) - not yet built. See "Remaining M6 work" below:
+      blocked on there being a speculative, guard-carrying compile to deopt
+      *from* in the first place, which doesn't exist yet.
+- [ ] **Inline caches** (§19) - not yet built, same dependency as above.
+- [x] **On-stack replacement** (§39): `jit.rs::promote_osr` compiles a synthetic
+      native entry point taking all of a function's locals as parameters and
+      jumping directly into a specific loop body (`codegen.rs::compile_osr_entry`,
+      translating `tfunc.body[from_stmt..]`), so an already-running interpreted
+      loop can switch to native mid-execution without waiting for the
+      enclosing function to return. Empirically load-bearing, not optional:
+      `benchmarks/table_array.fl` (whose `main` is called once, so
+      function-call counting alone never promotes it) regressed 12x under
+      tier-0-only execution (212.6ms vs. a forced-native 17.8ms) until OSR
+      brought it back to 14.5ms - see `benchmarks/RESULTS.md`.
+- [ ] **Speculative optimization** (§40) - not yet built. The natural target
+      isn't `i64 + i64` (M1-M4's typed path already compiles that with no
+      dispatch at all) but a hot `any`-typed function *parameter*: observe its
+      runtime type across interpreted calls, and if it's consistently one
+      concrete type, compile a specialized native variant assuming that type
+      behind a call-site guard. See "Remaining M6 work" below.
 
-**Files**: new `crates/fastlua/src/bytecode/` (encoder/decoder/verifier - tier
-0), `src/interp.rs` (tier-0 execution), `src/jit_tiers/` (baseline.rs,
-optimizing.rs, deopt.rs - tiers 1-2, building on `codegen.rs`), extending
-`optimize.rs`/`escape.rs` from M2-M3 for tier-2 use rather than duplicating
-them.
+**Remaining M6 work - design note**: fastlua's M5 `any` design uses hard
+runtime traps on a type mismatch (`value.rs`'s tag check + `trap()`), not
+speculative typing - so classic deopt/inline-caches/speculative-optimization
+(as LuaJIT or V8 build them, reconstructing precise interpreter state from an
+arbitrary native PC) have nothing to attach to by default. The planned design
+instead scopes speculation to a **guard-before-execute** boundary: a hot
+function's `any`-typed parameter's observed type is tracked across interpreted
+calls; once consistently one concrete type, `jit.rs` compiles a second,
+specialized native variant assuming that type, and `interp::Runtime::call`
+becomes the "inline cache" - checking the actual argument's tag against the
+guarded type *before* invoking the specialized variant, falling back to the
+general (interpreted or generically-typed native) path on a mismatch. Because
+the check always happens before any side effects run, this needs no
+mid-execution state reconstruction - the "deopt" is just "call the other,
+already-compiled function instead" - a real narrowing of §18-20's full
+generality, but one that matches what M5's trap-based `any` actually makes
+possible, called out explicitly rather than silently scoped down.
+
+**Files**: `bytecode.rs`, `bccompile.rs`, `interp.rs` (tier 0 + hot counters +
+OSR triggering), `tier.rs` (the `Engine` tying interpretation and promotion
+together), `jit.rs` (`promote`/`promote_osr`), `codegen.rs`
+(`compile_osr_entry`), `gc.rs` (`RootGuard` - the interpreter's heap-allocated
+register file needed its own GC-root registration, since the existing
+conservative scanner only walked the native stack), `examples/dispatch_bench.rs`
+(§30's dispatch-strategy measurement). Remaining work (deopt/inline
+caches/speculative optimization) will extend `jit.rs`/`interp.rs` directly
+rather than needing the originally-planned separate `jit_tiers/` module, since
+there is still only one native backend, not two.
 
 ---
 

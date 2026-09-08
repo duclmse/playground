@@ -362,3 +362,34 @@ something to optimize away - the whole architectural bet (faster_lua.md
 benchmark is exactly the honest, falsifiable check on whether that promise
 holds - it does, for strict code, and the boundary genuinely costs what
 you'd expect for the one function that opts in.
+
+## M6 (tiering): dispatch strategy, measured not assumed
+
+faster_lua.md §30 asks to "benchmark switch vs. computed goto vs. direct
+threading rather than assuming one" for the bytecode interpreter's opcode
+dispatch. Rust has no computed goto, so the real choice was between a
+`match` over the opcode enum (what `interp.rs` uses) and a function-
+pointer table indexed by opcode ("direct threading"'s closest Rust
+equivalent). Rather than building a second full ~46-opcode interpreter
+just to compare dispatch styles, `examples/dispatch_bench.rs` isolates the
+question: a synthetic tight counting loop (multiply-accumulate + a
+backward conditional jump - the same shape `benchmarks/table_array.fl`'s
+hot loop has) run through both a `match`-based dispatch loop and a
+function-pointer-table one, identical instruction encoding and identical
+per-opcode work either way.
+
+| Dispatch strategy | Time (200,000,000 iterations) |
+|:---|---:|
+| `match` (switch) | ~1.0-1.2s |
+| Function-pointer table | ~3.3-3.8s |
+
+`match` dispatch won by **~3-3.5×**, consistently across repeated runs -
+not a close call. The likely reason: LLVM (via rustc) compiles a `match`
+over a dense, `#[repr(u8)]`-style enum into an actual jump table, and can
+still inline the tiny per-arm logic directly into the dispatch loop;
+calling *through* a function pointer is a real indirect call the compiler
+can't see through or inline, paying branch-prediction and call/return
+overhead on every single instruction. This confirms (rather than assumes)
+that `interp.rs`'s existing `match`-based loop is the right choice -
+worth measuring given tier 0 is deliberately the "not the fast tier" of
+this design, so it would have been easy to skip the check and guess wrong.

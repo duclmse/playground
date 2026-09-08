@@ -10,7 +10,7 @@ This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; fastlua doesn't run real Lua programs and isn't trying to.
 
-## Status: M5 (M0/M2 folded in)
+## Status: M6 in progress (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -23,9 +23,13 @@ allocation entirely for a struct that never leaves its function. M4 replaced the
 leak-everything runtime with a real garbage collector - see "GC (M4)" below for
 what it is and, just as importantly, what it deliberately isn't yet. M5 added
 gradual typing - an explicit `any` type, checked at runtime, with zero cost for
-code that never uses it - see "Gradual typing (M5)" below. No JIT tiers yet
-(every function still compiles to native code once, ahead of running it). See
-"Roadmap" below for what's next.
+code that never uses it - see "Gradual typing (M5)" below. M6 added tiered
+execution - a tier-0 bytecode interpreter, hot-counter-driven promotion to
+native code, and on-stack replacement - so a program starts running
+immediately instead of paying M1-M5's whole-program AOT compile before its
+first instruction; see "Tiered execution (M6)" below for what's done and what
+`faster_lua.md`'s deopt/inline-cache/speculative-optimization items still need.
+See "Roadmap" below for what's next.
 
 ### Early results
 
@@ -130,6 +134,48 @@ is real and measured, not hidden: `benchmarks/RESULTS.md`'s M5 section shows
 a workload with an `any`-typed function boundary running ~7-10× slower than
 the identical strict version, almost entirely the cost of one heap allocation
 per call - the honest price of opting into dynamic behavior.
+
+## Tiered execution (M6)
+
+Every function starts out **interpreted**, not compiled: `bccompile.rs`
+lowers each typed function to fixed-width 32-bit bytecode (`bytecode.rs` -
+Lua's own iABC/iABx/iAsBx instruction shapes) whose registers are exactly
+the typed AST's own `LocalId`s, and `interp.rs` executes that bytecode
+directly. Two independent hot counters (`FASTLUA_PROMOTE_THRESHOLD`,
+default 200 calls; `FASTLUA_OSR_THRESHOLD`, default 50 loop backedges)
+decide when to compile a native version: a function crossing the call
+threshold gets promoted (`jit.rs::promote`) via the exact same M1-M4
+Cranelift pipeline that used to run for every function up front, and a
+loop crossing the backedge threshold in a function that hasn't promoted
+yet gets **on-stack replacement** (`jit.rs::promote_osr`) - a synthetic
+native entry point that takes every local as a parameter and jumps
+straight into that loop's body, so an already-running interpreted loop
+can switch to native mid-iteration rather than waiting for its enclosing
+function to return. OSR isn't a nice-to-have here: a `main`-shaped
+program (called once, its real work all inside one loop) never crosses
+the call-count threshold at all, and `benchmarks/RESULTS.md`'s M6 section
+shows the 12x regression that results without it.
+
+There is deliberately only one native tier, not two: `faster_lua.md`'s
+"tier 1 baseline JIT" / "tier 2 optimizing JIT" split exists to trade
+compile speed for code quality once, then again once more information is
+available. Since `jit.rs` already runs M1-M4's full pipeline (GVN, LICM,
+escape analysis, bounds-check elimination, inlining) on every promotion,
+a deliberately-worse "baseline" compile would have nothing to be a faster
+version *of* - it would just be slower to write and slower to run, with
+no follow-up recompile currently designed to improve on it.
+
+**Not yet built**: deoptimization, inline caches, and speculative
+optimization (`faster_lua.md` §18-20, §40). These need a speculative,
+guard-carrying native compile to fall back *from*, which doesn't exist
+yet - M5's `any` is checked with a hard runtime trap, not a speculative
+guess. The planned shape (see `docs/fastlua-roadmap.md`'s M6 section) is
+narrower than a full VM's deopt machinery: observe a hot function's
+`any`-typed parameter's runtime type across interpreted calls, and once
+it's consistently one concrete type, compile a specialized variant behind
+a call-site tag check - a guard that runs *before* any side effects, so
+falling back on a mismatch is just "call the other, already-compiled
+function," not mid-execution state reconstruction.
 
 ## Language reference (M1-M3)
 
@@ -273,7 +319,7 @@ milestones:
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
-| M6     | Baseline + optimizing JIT tiers      | Bytecode interpreter tier 0, hot counters, tier-1 baseline JIT, tier-2 optimizing JIT with inline caches/speculation/deopt - only worth building once dynamic-mode code exists to benefit from it; the typed/AOT path from M1 doesn't need this.                                                                                                                                                             |
+| **M6** | **Tiered execution (in progress)**   | Bytecode interpreter tier 0, hot counters, and on-stack replacement are done - see "Tiered execution (M6)" above. Deoptimization, inline caches, and speculative `any`-parameter specialization are not yet built - see `docs/fastlua-roadmap.md`'s M6 section for the design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | M7     | SIMD, PGO, polish                    | Vectorization, profile-guided recompilation, FFI.                                                                                                                                                                                                                                                                                                                                                            |
 
 ## Trying it
