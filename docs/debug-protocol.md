@@ -1,13 +1,15 @@
 # Debug Protocol & Engine
 
-This is the internal contract between the UI and the debug engine. It's
-modeled on Debug Adapter Protocol (DAP) concepts - not implementing DAP
-itself in v1, but shaped so that exposing a DAP server later (letting VS
-Code/Neovim attach to an in-browser session) is additive rather than a
-rewrite. See [architecture.md](./architecture.md) for where this sits in the
-layer stack, and [risks.md](./risks.md) for the open question underneath all
-of this section: how much of piccolo's dispatch loop needs to be
-instrumented (or forked) to produce the events described below.
+This is the internal contract between the browser UI and the debug engine
+(`DebugSession`, reached over the worker/wasm boundary). It's modeled on
+Debug Adapter Protocol (DAP) concepts, which paid off directly: a real,
+separate DAP server (native, stdio-based, for VS Code/any DAP client) now
+exists at `crates/dap-server` as an additive translation layer over the same
+`DebugSession`, not a rewrite - see [dap-server.md](./dap-server.md). See
+[architecture.md](./architecture.md) for where this sits in the layer stack,
+and [risks.md](./risks.md) for the open question underneath all of this
+section: how much of piccolo's dispatch loop needs to be instrumented (or
+forked) to produce the events described below.
 
 ## DebugSession interface
 
@@ -419,10 +421,14 @@ feature, not required for core debugging.
 
 ## DAP alignment
 
-Not implemented in v1, but the API surface above is deliberately shaped
-after DAP's core requests (`initialize`, `launch`, `setBreakpoints`,
-`threads`, `stackTrace`, `scopes`, `variables`, `continue`, `next`,
-`stepIn`, `stepOut`, `evaluate`, `setVariable`, `pause`, `disconnect`) so
-that exposing an actual DAP server later - letting external editors attach
-to a session - is a translation layer on top of `DebugSession`, not a
-redesign.
+The API surface above was deliberately shaped after DAP's core requests
+(`initialize`, `launch`, `setBreakpoints`, `threads`, `stackTrace`,
+`scopes`, `variables`, `continue`, `next`, `stepIn`, `stepOut`, `evaluate`,
+`setVariable`, `pause`, `disconnect`) specifically so that exposing an
+actual DAP server later - letting external editors attach to a session -
+could be additive rather than a redesign. That's now built: `crates/
+dap-server` is a native binary that links `lua-vm` directly (bypassing this
+browser protocol entirely - it's a separate consumer of the same
+`DebugSession`) and speaks real DAP over stdio, for VS Code/any DAP client.
+See [dap-server.md](./dap-server.md) for its design, v1 scope, and what's
+still deferred.
