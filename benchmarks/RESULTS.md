@@ -421,3 +421,51 @@ drives the **~2.8×** win over LuaJIT on this workload; vectorization is a
 real, verified addition on top of that (not a replacement for it), most
 valuable on compute-bound elementwise loops this specific benchmark doesn't
 happen to exercise.
+
+## M7 (full benchmark suite): three new categories, and an honest gap analysis
+
+`faster_lua.md` §33 asks for 15 benchmark categories. fastlua's actual
+language surface (no strings, no hash tables, no coroutines, no I/O - see
+`docs/fastlua.md`) makes several of them structurally unreachable, not just
+unwritten: `06_strings`, `07_hashmaps`, `09_coroutines`, `11_json`, and
+`15_http` all need a language feature fastlua doesn't have. `10_parser`
+(compiler throughput, not runtime performance) is out of scope for "beat
+LuaJIT" per se. `02_fib`, `05_arrays`, and `08_gc` already exist
+(`fib.fl`/`table_array.fl`/`vector_add.fl`, `gc_alloc.fl`). This pass adds
+the three genuinely new, implementable categories: `03_function_calls`,
+`04_objects` (structs stand in for fastlua's lack of classes/methods), and
+`14_matrix`.
+
+| Benchmark | fastlua | LuaJIT | Lua (ref) | fastlua vs. LuaJIT |
+|:---|---:|---:|---:|---:|
+| `function_calls.fl` (10M non-inlined calls) | 14.8 ms | 37.3 ms | 743 ms | **2.51× faster** |
+| `matrix.fl` (120×120 multiply) | 7.1 ms | 8.2 ms | 37.7 ms | **1.14× faster** |
+| `objects.fl` (2M struct alloc + field access) | 19.0 ms | 13.0 ms | 313 ms | **0.68× (LuaJIT wins)** |
+
+`objects.fl` is the honest exception: LuaJIT's table allocator/GC beats
+fastlua's simpler conservative bump-arena collector (M4) on pure small-object
+allocation churn - the same shape of result M4's own `gc_alloc.fl` benchmark
+already found (~7-10× slower for the *dynamic*-boundary case; here, in the
+fully strict case, the gap is much smaller but still real) and explicitly
+didn't try to close by building the originally-planned generational
+collector. Not a regression to chase down - a documented, expected
+consequence of M4's own descoping decision.
+
+**Memory** (`/usr/bin/time -l`'s peak RSS, macOS): fastlua uses meaningfully
+more than LuaJIT on all three - `function_calls.fl` 4.55MB vs. 1.87MB,
+`objects.fl` 4.60MB vs. 1.87MB, `matrix.fl` 5.19MB vs. 2.54MB. Likely
+Cranelift's own JIT infrastructure plus the GC's chunked bump-arena
+allocating larger regions up front than LuaJIT's much leaner design - not
+investigated further this pass, but reported honestly per §33's own "report
+memory, not just time" framing.
+
+**p95 latency** (`function_calls.fl`, 50-run `hyperfine --export-json`):
+fastlua 19.4ms vs. LuaJIT 43.9ms - the same ~2.5× gap as the mean, i.e. no
+hidden tail-latency problem masked by a good average here.
+
+**Scope note on automation**: `scripts/benchmark.sh` reports mean/stddev/
+min/max (via hyperfine) for every benchmark automatically, which is real
+warmup+steady-state signal, but does *not* yet automate peak-memory or p95
+extraction for every category - the numbers above were captured manually
+for these three new benchmarks specifically. Extending the script to do
+this for the whole suite is real, valid future work, not done this pass.

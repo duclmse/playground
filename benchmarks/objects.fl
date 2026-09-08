@@ -1,0 +1,42 @@
+-- faster_lua.md §33's "04_objects" category: struct allocation + field
+-- access under GC pressure (this repo's stand-in for object-oriented
+-- workloads - fastlua has no classes/methods yet, see docs/fastlua.md).
+-- `dist_squared` is padded past M2's INLINE_MAX_STMTS so `p` genuinely
+-- escapes into a real allocation (M4's GC), rather than being scalar-
+-- replaced away by M3's escape analysis.
+struct Point { x: f64, y: f64 }
+
+function dist_squared(p: Point): f64
+    local s1 = p.x * p.x
+    local s2 = s1 + 0.0
+    local s3 = s2 + 0.0
+    local s4 = s3 + 0.0
+    local s5 = s4 + 0.0
+    local s6 = s5 + 0.0
+    local s7 = s6 + 0.0
+    local s8 = s7 + 0.0
+    local s9 = s8 + 0.0
+    local s10 = s9 + 0.0
+    local s11 = s10 + 0.0
+    local s12 = s11 + 0.0
+    local s13 = s12 + 0.0
+    local s14 = s13 + 0.0
+    local s15 = s14 + 0.0
+    local s16 = s15 + 0.0
+    local s17 = s16 + 0.0
+    local s18 = s17 + 0.0
+    local s19 = s18 + 0.0
+    local s20 = s19 + 0.0
+    return s20 + p.y * p.y
+end
+
+function main(): f64
+    local total = 0.0
+    local i = 0
+    while i < 2000000 do
+        local p = Point { x = i, y = i }
+        total = total + dist_squared(p)
+        i = i + 1
+    end
+    return total
+end

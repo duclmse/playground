@@ -23,7 +23,7 @@ they land; update the "Early results" section of `docs/fastlua.md` and
 - [fastlua-roadmap/m4.md](fastlua-roadmap/m4.md) — GC (done, descoped)
 - [fastlua-roadmap/m5.md](fastlua-roadmap/m5.md) — Gradual typing + dynamic mode (done)
 - [fastlua-roadmap/m6.md](fastlua-roadmap/m6.md) — Tiered execution (done)
-- [fastlua-roadmap/m7.md](fastlua-roadmap/m7.md) — SIMD, PGO, AOT, FFI, tooling (in progress)
+- [fastlua-roadmap/m7.md](fastlua-roadmap/m7.md) — SIMD, PGO, AOT, FFI, tooling (done, scoped)
 
 ## Summary checklist (one line per milestone)
 
@@ -43,4 +43,8 @@ they land; update the "Early results" section of `docs/fastlua.md` and
       specialization (inline-cache guard + guard-before-execute "deopt") -
       shipped; tier 1/baseline and tier 2/optimizing deliberately collapsed
       into one native tier - see M6 doc for why
-- [ ] M7: SIMD, PGO, AOT binaries, FFI, profiling tools, full benchmark suite
+- [x] M7: SIMD (elementwise `f64` vectorization), profile-guided warm-start,
+      AOT binaries (`fastlua build`), FFI (`extern function`), profiling
+      tools, and 3 new benchmark categories - shipped; 5 of the doc's 15
+      benchmark categories are structurally unreachable given fastlua's
+      language (no strings/hashmaps/coroutines/JSON/HTTP) - see M7 doc

@@ -10,7 +10,7 @@ This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; fastlua doesn't run real Lua programs and isn't trying to.
 
-## Status: M6 (M0/M2 folded in)
+## Status: M7 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -29,8 +29,11 @@ native code, on-stack replacement, and a scoped-down deopt/inline-cache/
 speculative-optimization mechanism for hot `any`-typed function parameters -
 so a program starts running immediately instead of paying M1-M5's
 whole-program AOT compile before its first instruction; see "Tiered execution
-(M6)" below for what that scoping looks like and why. See "Roadmap" below for
-what's next.
+(M6)" below for what that scoping looks like and why. M7 added ahead-of-time
+compilation to a real standalone executable (`fastlua build`), FFI
+(`extern function`), loop vectorization for elementwise `f64` array ops,
+profile-guided warm-start, and profiling/introspection CLI tooling - see the
+M7 sections below. See "Roadmap" below for what's next.
 
 ### Early results
 
@@ -399,7 +402,7 @@ milestones:
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization - see the sections above. Still open: the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
+| **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/fastlua-roadmap/m7.md` for the honest gap analysis on the benchmark categories fastlua's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
 
 ## Trying it
 
