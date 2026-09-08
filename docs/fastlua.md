@@ -10,7 +10,7 @@ This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; fastlua doesn't run real Lua programs and isn't trying to.
 
-## Status: M6 in progress (M0/M2 folded in)
+## Status: M6 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -25,11 +25,12 @@ what it is and, just as importantly, what it deliberately isn't yet. M5 added
 gradual typing - an explicit `any` type, checked at runtime, with zero cost for
 code that never uses it - see "Gradual typing (M5)" below. M6 added tiered
 execution - a tier-0 bytecode interpreter, hot-counter-driven promotion to
-native code, and on-stack replacement - so a program starts running
-immediately instead of paying M1-M5's whole-program AOT compile before its
-first instruction; see "Tiered execution (M6)" below for what's done and what
-`faster_lua.md`'s deopt/inline-cache/speculative-optimization items still need.
-See "Roadmap" below for what's next.
+native code, on-stack replacement, and a scoped-down deopt/inline-cache/
+speculative-optimization mechanism for hot `any`-typed function parameters -
+so a program starts running immediately instead of paying M1-M5's
+whole-program AOT compile before its first instruction; see "Tiered execution
+(M6)" below for what that scoping looks like and why. See "Roadmap" below for
+what's next.
 
 ### Early results
 
@@ -165,17 +166,34 @@ a deliberately-worse "baseline" compile would have nothing to be a faster
 version *of* - it would just be slower to write and slower to run, with
 no follow-up recompile currently designed to improve on it.
 
-**Not yet built**: deoptimization, inline caches, and speculative
-optimization (`faster_lua.md` §18-20, §40). These need a speculative,
-guard-carrying native compile to fall back *from*, which doesn't exist
-yet - M5's `any` is checked with a hard runtime trap, not a speculative
-guess. The planned shape (see `docs/fastlua-roadmap.md`'s M6 section) is
-narrower than a full VM's deopt machinery: observe a hot function's
-`any`-typed parameter's runtime type across interpreted calls, and once
-it's consistently one concrete type, compile a specialized variant behind
-a call-site tag check - a guard that runs *before* any side effects, so
-falling back on a mismatch is just "call the other, already-compiled
-function," not mid-execution state reconstruction.
+**Speculative `any`-parameter specialization** is M6's answer to
+`faster_lua.md`'s deoptimization/inline-caches/speculative-optimization
+items (§18-20, §40), deliberately scoped down rather than built as a
+general VM deopt mechanism - M5's `any` is checked with a hard runtime
+trap, not a speculative guess, so there's no arbitrary native PC to
+reconstruct interpreter state from. `jit::speculative_candidate` looks for
+a hot function's `any`-typed parameter used *exclusively* as the
+immediate operand of one `Unbox` targeting one concrete type throughout
+the whole function body (the shape ordinary code like `local y: i64 = x`
+already produces) - anything looser (returned as `any`, passed to another
+`any` slot, narrowed to more than one type, or reassigned) is left
+un-specialized rather than guessed at. Once eligible and called often
+enough with a matching argument (`FASTLUA_SPECULATIVE_THRESHOLD`, default
+30), `jit::specialize` compiles a variant with that parameter narrowed to
+its concrete type, and `interp::Runtime::try_speculative` becomes the
+inline cache: it checks the actual argument's tag against the guarded
+type *before every call*, dispatching to the specialized native variant
+only on a match and falling through to the general (interpreted or
+generically-typed native) path otherwise - the "deopt" is just that
+fallthrough, not mid-execution state reconstruction, since the guard
+always runs before any side effects. The guard is load-bearing for
+*correctness*, not just performance: skipping it would let a
+wrong-shaped `any` argument's boxed pointer be reinterpreted as a raw
+scalar instead of trapping. See
+`tests/fixtures/speculative_any_param.fl` and its two tests in
+`tests/programs.rs` for both a correctness check (interpreted-general and
+guarded-native calls agree on the arithmetic) and proof the specialized
+variant is actually compiled (via `FASTLUA_DUMP_CLIF`).
 
 ## Language reference (M1-M3)
 
@@ -319,7 +337,7 @@ milestones:
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
-| **M6** | **Tiered execution (in progress)**   | Bytecode interpreter tier 0, hot counters, and on-stack replacement are done - see "Tiered execution (M6)" above. Deoptimization, inline caches, and speculative `any`-parameter specialization are not yet built - see `docs/fastlua-roadmap.md`'s M6 section for the design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
+| **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | M7     | SIMD, PGO, polish                    | Vectorization, profile-guided recompilation, FFI.                                                                                                                                                                                                                                                                                                                                                            |
 
 ## Trying it

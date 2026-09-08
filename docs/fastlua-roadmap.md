@@ -470,10 +470,6 @@ type-uncertain code in the first place).
       genuine type-profile-driven speculative tier (see below) gives tier 1
       something a fast-and-dumb compile could still capture that tier 2
       couldn't. `tier.rs` documents this reasoning inline.
-- [ ] **Deoptimization** (§18) - not yet built. See "Remaining M6 work" below:
-      blocked on there being a speculative, guard-carrying compile to deopt
-      *from* in the first place, which doesn't exist yet.
-- [ ] **Inline caches** (§19) - not yet built, same dependency as above.
 - [x] **On-stack replacement** (§39): `jit.rs::promote_osr` compiles a synthetic
       native entry point taking all of a function's locals as parameters and
       jumping directly into a specific loop body (`codegen.rs::compile_osr_entry`,
@@ -484,41 +480,65 @@ type-uncertain code in the first place).
       function-call counting alone never promotes it) regressed 12x under
       tier-0-only execution (212.6ms vs. a forced-native 17.8ms) until OSR
       brought it back to 14.5ms - see `benchmarks/RESULTS.md`.
-- [ ] **Speculative optimization** (§40) - not yet built. The natural target
-      isn't `i64 + i64` (M1-M4's typed path already compiles that with no
-      dispatch at all) but a hot `any`-typed function *parameter*: observe its
-      runtime type across interpreted calls, and if it's consistently one
-      concrete type, compile a specialized native variant assuming that type
-      behind a call-site guard. See "Remaining M6 work" below.
+- [x] **Speculative optimization** (§40), **inline caches** (§19) and
+      **deoptimization** (§18) - scoped down together (see "Speculative `any`-
+      parameter specialization" below) into one narrower, coherent mechanism
+      that matches what M5's trap-based `any` actually makes possible, rather
+      than the three being separately built pieces of a general deopt VM:
+      `jit::speculative_candidate` statically finds a hot function's `any`
+      parameter that's always immediately narrowed to one concrete type,
+      `interp::Runtime::try_speculative` is the inline cache (the call-site tag
+      guard, checked before every call), `jit::promote_speculative`/
+      `jit::specialize` compile the guarded native variant, and "deopt" is
+      simply falling through to the already-existing general path on a guard
+      miss - no mid-execution state reconstruction needed, since the guard
+      always runs before any side effects. Verified both for correctness
+      (`tests/speculative_any_parameter_specializes_and_stays_correct` runs the
+      same arithmetic through the interpreted-general and guarded-native paths
+      and checks they agree) and for "this actually happened, not just would
+      have been correct either way"
+      (`..._is_visible_in_dumped_ir` asserts the specialized variant shows up
+      in `FASTLUA_DUMP_CLIF`'s output).
 
-**Remaining M6 work - design note**: fastlua's M5 `any` design uses hard
-runtime traps on a type mismatch (`value.rs`'s tag check + `trap()`), not
-speculative typing - so classic deopt/inline-caches/speculative-optimization
-(as LuaJIT or V8 build them, reconstructing precise interpreter state from an
-arbitrary native PC) have nothing to attach to by default. The planned design
-instead scopes speculation to a **guard-before-execute** boundary: a hot
-function's `any`-typed parameter's observed type is tracked across interpreted
-calls; once consistently one concrete type, `jit.rs` compiles a second,
-specialized native variant assuming that type, and `interp::Runtime::call`
-becomes the "inline cache" - checking the actual argument's tag against the
-guarded type *before* invoking the specialized variant, falling back to the
-general (interpreted or generically-typed native) path on a mismatch. Because
-the check always happens before any side effects run, this needs no
-mid-execution state reconstruction - the "deopt" is just "call the other,
-already-compiled function instead" - a real narrowing of §18-20's full
-generality, but one that matches what M5's trap-based `any` actually makes
-possible, called out explicitly rather than silently scoped down.
+**Speculative `any`-parameter specialization - design note**: fastlua's M5
+`any` design uses hard runtime traps on a type mismatch (`value.rs`'s tag
+check + `trap()`), not speculative typing - so classic deopt/inline-caches/
+speculative-optimization (as LuaJIT or V8 build them, reconstructing precise
+interpreter state from an arbitrary native PC) have nothing to attach to by
+default. The design that got built instead scopes speculation to a
+**guard-before-execute** boundary and a **structurally-provable** candidate,
+not a probabilistic guess: `jit::speculative_candidate` only accepts a
+function whose `any` parameter is used *exclusively* as the immediate operand
+of `Unbox(_, T)` for one single `T` throughout the whole body (never returned
+as `any`, never passed to another `any` slot, never reassigned) - the
+"narrow immediately at the top of the function" shape `typeck.rs`'s own
+`coerce` already produces for ordinary code like `local y: i64 = x`.
+`jit::specialize` then rewrites the parameter's declared type to `T` and
+deletes those now-redundant `Unbox` nodes outright (`interp::Runtime`'s guard
+has already proven the tag matches before this compiled variant is ever
+called - keeping the `Unbox` would just recheck something already checked).
+The guard itself is load-bearing for *correctness*, not merely an
+optimization: calling the specialized variant with a mismatched argument
+would silently reinterpret a boxed pointer's bits as a raw scalar instead of
+trapping, so `interp::Runtime::try_speculative` checks the actual argument's
+tag on *every* call, unconditionally, before ever dispatching to a compiled
+specialized pointer. What's deliberately out of scope: more than one
+speculatable parameter per function (a plain "first `any` param found" cut,
+not a fundamental limit), and any parameter whose uses are looser than
+uniform immediate narrowing (correctly left un-specialized, not guessed at).
 
 **Files**: `bytecode.rs`, `bccompile.rs`, `interp.rs` (tier 0 + hot counters +
-OSR triggering), `tier.rs` (the `Engine` tying interpretation and promotion
-together), `jit.rs` (`promote`/`promote_osr`), `codegen.rs`
+OSR triggering + `try_speculative`'s inline-cache guard), `tier.rs` (the
+`Engine` tying interpretation and promotion together, including the
+speculative-candidate map built from `jit::speculative_candidate`), `jit.rs`
+(`promote`/`promote_osr`/`promote_speculative`/`specialize`), `codegen.rs`
 (`compile_osr_entry`), `gc.rs` (`RootGuard` - the interpreter's heap-allocated
 register file needed its own GC-root registration, since the existing
 conservative scanner only walked the native stack), `examples/dispatch_bench.rs`
-(§30's dispatch-strategy measurement). Remaining work (deopt/inline
-caches/speculative optimization) will extend `jit.rs`/`interp.rs` directly
-rather than needing the originally-planned separate `jit_tiers/` module, since
-there is still only one native backend, not two.
+(§30's dispatch-strategy measurement). No separate `jit_tiers/` module was
+needed, matching M6's own "Tier 1 + Tier 2 collapsed" reasoning above - there
+is still only one native backend, not two, speculative specialization
+included.
 
 ---
 
