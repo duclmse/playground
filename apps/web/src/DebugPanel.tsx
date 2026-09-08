@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import type {
   DebugSession,
   EvalResultInfo,
+  MemoryStatsInfo,
   StackFrameInfo,
   StopEvent,
   ThreadInfo,
@@ -52,6 +53,7 @@ export function DebugPanel({
   const [globals, setGlobals] = useState<VariableInfo[]>([]);
   const [watches, setWatches] = useState<{ expression: string; result: EvalResultInfo | null }[]>([]);
   const [watchInput, setWatchInput] = useState("");
+  const [memoryStats, setMemoryStats] = useState<MemoryStatsInfo | null>(null);
   const [replInput, setReplInput] = useState("");
   const [replHistory, setReplHistory] = useState<{ expression: string; result: EvalResultInfo }[]>([]);
 
@@ -70,6 +72,7 @@ export function DebugPanel({
       setFrames([]);
       setLocals([]);
       setUpvalues([]);
+      setMemoryStats(null);
       return;
     }
     void session.getThreads().then((ts) => {
@@ -81,6 +84,7 @@ export function DebugPanel({
       void session.getUpvalues(running, 0).then(setUpvalues);
     });
     void session.getGlobals().then(setGlobals);
+    void session.getMemoryStats().then(setMemoryStats);
     // Re-run every watch against the newly paused frame, per
     // docs/debug-protocol.md#evaluation ("Watch expressions - re-evaluated
     // on every stop").
@@ -147,6 +151,31 @@ export function DebugPanel({
     const result = await session.evaluate(selectedThread, expression, selectedFrame);
     setReplHistory((h) => [...h, { expression, result }]);
     setReplInput("");
+  };
+
+  /**
+   * After a successful `setVariable` from a Locals/Upvalues row: refresh
+   * both lists (the edit could have been to either, and either can
+   * reference the other) and re-run every watch, since a watch expression
+   * may reference the variable that just changed.
+   */
+  const refreshAfterEdit = async () => {
+    const [newLocals, newUpvalues] = await Promise.all([
+      session.getLocals(selectedThread, selectedFrame),
+      session.getUpvalues(selectedThread, selectedFrame),
+    ]);
+    setLocals(newLocals);
+    setUpvalues(newUpvalues);
+    if (watches.length > 0) {
+      const results = await Promise.all(
+        watches.map((w) => session.evaluate(selectedThread, w.expression, selectedFrame)),
+      );
+      setWatches((current) => current.map((w, i) => ({ ...w, result: results[i] })));
+    }
+  };
+
+  const forceGc = async () => {
+    setMemoryStats(await session.forceGc());
   };
 
   return (
@@ -225,17 +254,60 @@ export function DebugPanel({
 
       <div className="debug-section">
         <h3>Locals</h3>
-        <VariablesTree session={session} variables={locals} />
+        <VariablesTree
+          session={session}
+          variables={locals}
+          editable
+          threadId={selectedThread}
+          frameIndex={selectedFrame}
+          onEdited={refreshAfterEdit}
+        />
       </div>
 
       <div className="debug-section">
         <h3>Upvalues</h3>
-        <VariablesTree session={session} variables={upvalues} />
+        <VariablesTree
+          session={session}
+          variables={upvalues}
+          editable
+          threadId={selectedThread}
+          frameIndex={selectedFrame}
+          onEdited={refreshAfterEdit}
+        />
       </div>
 
       <div className="debug-section">
         <h3>Globals</h3>
         <VariablesTree session={session} variables={globals} />
+      </div>
+
+      <div className="debug-section">
+        <h3>Memory</h3>
+        {memoryStats ? (
+          <dl className="memory-stats">
+            <div className="memory-stat-row">
+              <dt>Total</dt>
+              <dd>{(memoryStats.totalAllocation / 1024).toFixed(1)} KB</dd>
+            </div>
+            <div className="memory-stat-row">
+              <dt>GC-managed</dt>
+              <dd>{(memoryStats.gcAllocation / 1024).toFixed(1)} KB</dd>
+            </div>
+            <div className="memory-stat-row">
+              <dt>External</dt>
+              <dd>{(memoryStats.externalAllocation / 1024).toFixed(1)} KB</dd>
+            </div>
+            <div className="memory-stat-row">
+              <dt>Allocation debt</dt>
+              <dd>{memoryStats.allocationDebt.toFixed(1)}</dd>
+            </div>
+          </dl>
+        ) : (
+          <div className="variables-empty">(none)</div>
+        )}
+        <button type="button" onClick={forceGc} disabled={isTerminated}>
+          Force GC
+        </button>
       </div>
 
       <div className="debug-section">

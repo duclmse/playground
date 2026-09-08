@@ -17,13 +17,21 @@ import {
   type BreakpointInfo,
   type DebugRequest,
   type EvalResultInfo,
+  type MemoryStatsInfo,
   type StackFrameInfo,
   type ThreadInfo,
   type VariableInfo,
   type WorkerEvent,
 } from "./debug-protocol";
 
-export type { BreakpointInfo, StackFrameInfo, ThreadInfo, VariableInfo, EvalResultInfo };
+export type {
+  BreakpointInfo,
+  StackFrameInfo,
+  ThreadInfo,
+  VariableInfo,
+  EvalResultInfo,
+  MemoryStatsInfo,
+};
 
 // Plain `Omit<DebugRequest, "id">` doesn't distribute over the union (it
 // collapses to the shape's *common* keys minus "id", which is why every
@@ -361,5 +369,21 @@ export class DebugSession {
       type: "debugTakeOutput",
     });
     return text;
+  }
+
+  /** Live allocation/GC stats for the paused program - see `DebugSession::get_memory_stats`. */
+  async getMemoryStats(): Promise<MemoryStatsInfo> {
+    const { stats } = await this.send<Extract<WorkerEvent, { type: "debugMemoryStats" }>>({
+      type: "debugGetMemoryStats",
+    });
+    return stats;
+  }
+
+  /** Forces a full GC cycle, then returns the resulting stats (saves a round trip). */
+  async forceGc(): Promise<MemoryStatsInfo> {
+    const { stats } = await this.send<Extract<WorkerEvent, { type: "debugMemoryStats" }>>({
+      type: "debugForceGc",
+    });
+    return stats;
   }
 }

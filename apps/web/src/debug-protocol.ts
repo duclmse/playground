@@ -63,6 +63,14 @@ export type EvalResultInfo = {
   display: string;
 };
 
+/** Live allocation/GC stats for a paused session - see `DebugSession::get_memory_stats`. */
+export type MemoryStatsInfo = {
+  totalAllocation: number;
+  gcAllocation: number;
+  externalAllocation: number;
+  allocationDebt: number;
+};
+
 /** Phase 8 (docs/debug-protocol.md#advanced-profiler-phase-8): one entry of `profile()`. */
 export type FunctionStatsInfo = {
   functionId: string;
@@ -139,6 +147,8 @@ export type DebugRequest =
       valueExpr: string;
     }
   | { id: number; type: "debugTakeOutput" }
+  | { id: number; type: "debugGetMemoryStats" }
+  | { id: number; type: "debugForceGc" }
   | { id: number; type: "profile"; files: Record<string, string>; entry: string }
   | {
       id: number;
@@ -177,5 +187,6 @@ export type WorkerEvent =
   | { type: "debugMetatable"; id: number; reference: number | null }
   | { type: "debugEvalResult"; id: number; result: EvalResultInfo }
   | { type: "debugOutput"; id: number; text: string }
+  | { type: "debugMemoryStats"; id: number; stats: MemoryStatsInfo }
   | { type: "profileResult"; id: number; stats: FunctionStatsInfo[] }
   | { type: "timelineResult"; id: number; timeline: TimelineInfo };

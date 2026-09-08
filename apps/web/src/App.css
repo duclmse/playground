@@ -436,6 +436,52 @@ main {
   overflow-wrap: anywhere;
 }
 
+.variable-display.editable {
+  cursor: text;
+  border-bottom: 1px dotted #666;
+}
+
+.variable-display.editable:hover {
+  color: #fff;
+  border-bottom-color: #aaa;
+}
+
+.variable-edit-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.variable-edit-error {
+  color: #e5534b;
+  font-size: 0.78rem;
+  padding: 0.1rem 0 0.2rem 1.2rem;
+  overflow-wrap: anywhere;
+}
+
+.memory-stats {
+  margin: 0 0 0.4rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.memory-stat-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.05rem 0;
+}
+
+.memory-stat-row dt {
+  color: #888;
+}
+
+.memory-stat-row dd {
+  margin: 0;
+  color: #ccc;
+}
+
 .watch-input-row {
   display: flex;
   gap: 0.3rem;

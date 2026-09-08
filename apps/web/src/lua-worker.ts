@@ -249,6 +249,35 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         post({ type: "debugOutput", id: message.id, text });
         return;
       }
+      case "debugGetMemoryStats": {
+        const stats = requireSession().get_memory_stats();
+        post({
+          type: "debugMemoryStats",
+          id: message.id,
+          stats: {
+            totalAllocation: stats.total_allocation,
+            gcAllocation: stats.gc_allocation,
+            externalAllocation: stats.external_allocation,
+            allocationDebt: stats.allocation_debt,
+          },
+        });
+        return;
+      }
+      case "debugForceGc": {
+        requireSession().force_gc();
+        const stats = requireSession().get_memory_stats();
+        post({
+          type: "debugMemoryStats",
+          id: message.id,
+          stats: {
+            totalAllocation: stats.total_allocation,
+            gcAllocation: stats.gc_allocation,
+            externalAllocation: stats.external_allocation,
+            allocationDebt: stats.allocation_debt,
+          },
+        });
+        return;
+      }
 
       case "profile": {
         const names = Object.keys(message.files);

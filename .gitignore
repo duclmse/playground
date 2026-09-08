@@ -10,6 +10,9 @@ packages/lua-runtime/pkg/
 # App build output
 dist/
 
+# Screenshots from apps/web/e2e/verify-debugger-features.mjs
+apps/web/e2e/screenshots/
+
 # Editor / OS
 .DS_Store
 *.log
