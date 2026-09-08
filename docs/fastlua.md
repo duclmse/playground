@@ -58,14 +58,19 @@ being conservatively scanned after briefly existing as a stack root
 mid-allocation. Fixing that (marking a scalar array's data buffer as
 provably pointer-free, so the collector never scans its contents at all - see
 "GC (M4)" below) brought `table_array` back to *beating* LuaJIT (1.46×),
-matching or exceeding the pre-GC number. A final pass removed
-provably-redundant bounds checks from the hottest per-allocation function
-(`Chunk::carve`), closing `gc_alloc`'s remaining gap too - fastlua now
-edges out LuaJIT on both benchmarks more often than not on repeated runs.
-A matching attempt at marking *structs* atomic (not just arrays) measured
-out as a net loss and was reverted - a genuine non-finding, not silently
-dropped. See `benchmarks/RESULTS.md`'s M4 section for all the numbers and
-the bugs (and non-wins) caught along the way.
+matching or exceeding the pre-GC number. Removing provably-redundant
+bounds checks from the hottest per-allocation function (`Chunk::carve`)
+looked like a further win but, on rigorous re-measurement (10 rounds,
+30+ samples each), turned out to be a genuine dead heat with LuaJIT - an
+earlier draft of this section overstated it, corrected here rather than
+left standing. A matching attempt at marking *structs* atomic (not just
+arrays) measured out as a net loss and was reverted - both real, recorded
+non-findings, not silently dropped. What actually broke the tie: `gc.rs`
+stopped bulk-zeroing a whole chunk on every reuse, since struct/header
+allocations never needed it (only array data does - see "GC (M4)" below)
+- fastlua now wins 10/10 rounds on both wall-clock and CPU time, a clear,
+non-overlapping gap. See `benchmarks/RESULTS.md`'s M4 section for every
+number and the bugs (and non-wins) caught along the way.
 
 ## GC (M4)
 
@@ -84,8 +89,12 @@ in production, not a toy shortcut. An array's data buffer is allocated via
 plain `i64`/`f64` scalars, provably never GC pointers, so a collection marks
 such a block reachable when found but never reads its contents, avoiding an
 O(payload size) conservative scan (array headers and struct instances, which
-can hold real pointers, still go through the normal, fully-traced path). **What
-it deliberately isn't** (yet): true generations (a chunk with even one
+can hold real pointers, still go through the normal, fully-traced path).
+Struct payloads and array headers also skip zero-initialization - every
+caller always overwrites every byte immediately (`typeck.rs` enforces this
+for structs), so pre-zeroing is pure waste; array *data* buffers still get
+zeroed, since fastlua's language semantics promise unwritten elements read
+as zero. **What it deliberately isn't** (yet): true generations (a chunk with even one
 long-lived survivor keeps *all* its dead space until the whole chunk dies
 together - a documented fragmentation trade-off, not an oversight), promotion,
 or write barriers - descoped with reasoning recorded in

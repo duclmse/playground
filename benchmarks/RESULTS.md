@@ -236,13 +236,22 @@ ALIGN` bits - so Rust's slice/Vec bounds checks on every write were pure,
 provably-unnecessary overhead, not a real safety margin. Removing them
 (with a `debug_assert!` left in place, and a doc comment spelling out
 *why* it's provably safe, not just probably fine) took User CPU time from
-~13.5-14.8ms to ~12.5-13.2ms - fastlua now edges out LuaJIT more often
-than not on repeated runs:
+~13.5-14.8ms to ~12.5-13.2ms.
+
+Re-measured rigorously afterward (10 independent hyperfine rounds, 30+
+samples each, comparing parsed JSON medians/user-time rather than eyeballing
+single summary lines - a single round's "X ran faster" line was too noisy
+to trust at this scale): this landed as a genuine **dead heat**, not a
+win - user time averaged 13.09ms (fastlua) vs. 13.10ms (LuaJIT) across the
+10 rounds, and win-count was a literal coin flip (5/10 each). Recorded
+here plainly because an earlier draft of this section overstated it as
+"edges out LuaJIT more often than not" from a smaller, luckier sample -
+worth being honest about a corrected claim, not just first-try results.
 
 | Command | Mean [ms] | User [ms] | Relative |
 |:---|---:|---:|---:|
-| `fastlua` | 14.9 | 8.9-13.2 (workload-dependent) | 1.00 |
-| `luajit` | 16.6 | ~12.5-13.0 | 1.03-1.12 |
+| `fastlua` | 14.9 | ~13.1 | 1.00 |
+| `luajit` | 16.6 | ~13.1 | ~1.00 (statistical tie) |
 
 **Tried and reverted**: marking a struct type atomic when none of its
 fields are `Array`/`Struct`-typed (the same idea that fixed `table_array`,
@@ -265,3 +274,51 @@ has no such cost to eliminate. The general technique remains sound (and
 where tracing the block would have actually cost something, which this
 benchmark's struct doesn't provide. Worth recording as a genuine,
 measured non-finding, not silently dropped.
+
+## Breaking the tie: stop zero-initializing memory that's always fully overwritten
+
+With `gc_alloc` a genuine dead heat, one more real trade-off closed it
+decisively: `gc.rs` no longer bulk-zeroes a whole chunk on every reuse.
+The insight: `fastlua_gc_alloc` (struct payloads, array headers) never
+needed that zero-fill in the first place - `typeck.rs` hard-errors on a
+struct literal that doesn't initialize every field, and an array header's
+two fields are always written immediately after allocation, so nothing
+can ever observe the "before" state. Only `fastlua_gc_alloc_atomic` (array
+*data* buffers) keeps a real zero guarantee, since fastlua's language
+semantics document that an unwritten array element reads as zero - a
+guarantee user code can depend on, unlike the allocator's own internal
+bookkeeping. `gc_alloc.fl` is 100% struct allocations, so this was exactly
+the workload this optimization targets.
+
+This is a genuine trade-off, not a free win, and worth stating precisely:
+it couples `gc.rs` to `typeck.rs`'s "every struct field is always
+initialized" invariant. If a future language feature ever relaxes that
+(partial initialization, an unsafe/FFI escape hatch), that feature would
+need to either zero its own memory or route through
+`fastlua_gc_alloc_atomic` instead - the failure mode if this invariant is
+ever violated is still memory-safe, just wasteful (the conservative tracer
+might read a stale word that happens to look like a pointer and
+over-retain some unrelated block, never a dangling pointer). Verified with
+a dedicated regression test
+(`array_data_reads_as_zero_even_after_many_collections_reuse_the_chunk`)
+that deliberately pollutes a chunk with non-zero data via one array, then
+confirms a very next array's unwritten elements still read back as exactly
+zero - confirmed to actually catch a broken wiring by temporarily
+reverting the fix and watching the test fail with a wildly wrong sum
+before restoring it.
+
+Re-measured the same rigorous way as the dead-heat finding above (10
+independent rounds, 30+ samples each, parsed JSON):
+
+| Metric | fastlua | LuaJIT | fastlua wins |
+|:---|---:|---:|---:|
+| Median wall-clock (avg of 10 rounds) | 13.62ms | 14.39ms | 10/10 rounds |
+| User CPU time (avg of 10 rounds) | 11.96ms | 12.69ms | 10/10 rounds |
+
+A decisive, consistent win this time - fastlua's user time (11.8-12.1ms
+across all 10 rounds) and LuaJIT's (12.5-12.9ms) don't even overlap.
+Directly confirmed as attributable to this specific change via a
+back-to-back A/B against the immediately preceding commit: 12.5ms → 11.9ms
+user time, matching the aggregate. The full benchmark suite was re-run
+afterward to confirm no regression elsewhere: `fib` still beats LuaJIT
+(1.34×), `table_array` still beats it (1.73×).
