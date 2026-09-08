@@ -212,6 +212,19 @@ slightly *beats* the tiered JIT on `benchmarks/table_array.fl` while
 staying ~1.5x faster than LuaJIT. Only verified on macOS ARM64 so far -
 Linux linking may need extra system libraries not yet checked.
 
+## Profile-guided warm-start (M7)
+
+`fastlua run --profile-out app.prof app.fl` records which functions
+actually got promoted/speculatively-specialized during that run (reusing
+M6's own tiering state - no new instrumentation); `fastlua run
+--profile-in app.prof app.fl` (a later run of the same program) preloads
+that list at startup, skipping the interpreted warm-up that produced it
+the first time. A real, working slice of `faster_lua.md` §23's larger PGO
+vision - not the full one (no type-distribution/branch-probability/
+allocation-site profiling yet, and it doesn't feed `fastlua build`'s AOT
+compile) - see `docs/fastlua-roadmap/m7.md` for the fuller design that
+would.
+
 ## Language reference (M1-M3)
 
 ```
@@ -371,7 +384,7 @@ milestones:
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`) - see "AOT compilation (M7)" above. Still open: loop vectorization, PGO, the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
+| **M7** | **SIMD, PGO, polish (in progress)**  | Done: profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`) - see the sections above. Still open: loop vectorization, the full 15-category benchmark suite - see `docs/fastlua-roadmap/m7.md`. |
 
 ## Trying it
 
