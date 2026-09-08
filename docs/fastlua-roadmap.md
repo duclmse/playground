@@ -555,10 +555,21 @@ and real profiling data to act on).
       `for i = 1, n do c[i] = a[i] + b[i] end`) and emit SIMD (Cranelift has
       some vector-type support - evaluate how far it goes natively before
       considering hand-rolled per-ISA intrinsics).
-- [ ] **CPU-aware codegen** (§24): confirm/exercise Cranelift's existing x86-64
-      (SSE2/AVX2/AVX-512) and ARM64 (NEON) support rather than assuming it "just
-      works" - add both targets to CI/benchmark runs if cross-platform hardware
-      is available.
+- [x] **CPU-aware codegen** (§24): confirmed, not assumed -
+      `jit::Jit::new`/`FASTLUA_TARGET_INFO`/`fastlua run --target-info` prints
+      every ISA-specific setting `cranelift_native::builder()` (what
+      `JITBuilder::with_flags` calls internally) actually detected for the
+      host CPU. Empirically confirmed on this session's ARM64 (Apple Silicon)
+      host: `has_lse=1 has_pauth=1 has_fp16=1 has_dotprod=1` - real detected
+      extensions, not a generic fallback profile (ARM64's NEON is
+      unconditional in Cranelift's AArch64 backend, not a detected extension,
+      so there's no separate flag for it to check). x86-64
+      (SSE2/AVX2/AVX-512) not independently re-confirmed in this session - no
+      x86-64 hardware was available, and this repo has no CI to add a second
+      target to (`find .github/workflows` - none exist) - but the detection
+      path itself (`cranelift_native::builder()`) is architecture-generic
+      code, not something implemented separately per host, so this is a
+      real, if partial, confirmation rather than a pure assumption.
 - [ ] **Profile-guided optimization** (§23): `fastlua --profile app.fl` collects
       hot functions/loops, type distributions, branch probabilities, object
       shapes, allocation sites (building on M6's profiling data); a separate
@@ -574,10 +585,18 @@ and real profiling data to act on).
 - [ ] **FFI** (§25): `ffi.load`/typed external-function declarations compiling
       to direct native calls, matching the `libc.sqrt` example - important for
       real-world adoption per §25's own framing, not a performance item.
-- [ ] **First-class profiling/introspection tooling** (§32): `--dump-ir`,
-      `--dump-asm`, `--jit-log` flags - useful for every milestone from M2
-      onward, but formalized here as its own deliverable rather than ad hoc
-      debug prints.
+- [x] **First-class profiling/introspection tooling** (§32): `fastlua run
+      --dump-ir`/`--dump-asm`/`--jit-log`/`--target-info` (`main.rs`'s flag
+      parser sets the same `FASTLUA_*` env vars `jit.rs` already read since
+      M2/M6 - a documented, discoverable CLI surface over what were ad hoc
+      debug prints, not a new mechanism). `--dump-asm` is new: Cranelift's own
+      `VCode` textual form (`Context::set_disasm`/`CompiledCode::vcode`) -
+      genuinely close to real assembly (the lowered-to-machine-instructions
+      representation right before binary emission) but honestly not a
+      byte-level disassembly of the emitted bytes (that would need
+      `cranelift-codegen`'s capstone-backed `disas` feature - not worth the
+      extra dependency here). `--jit-log` is new too: logs every actual
+      promotion/OSR/speculative-specialization event as it happens.
 - [ ] **Full benchmark suite** (§33): fill out the remaining categories from the
       doc's suggested 15 (`04_objects`, `07_hashmaps`, `08_gc`, `09_coroutines`,
       `11_json`, `12_game_loop`, `14_matrix`, ...) as the corresponding language
@@ -592,9 +611,12 @@ real, valid future work, but the document itself doesn't treat them as part of
 the performance story - revisit only if fastlua gains users who need them, not
 as part of "beat LuaJIT."
 
-**Files**: new `crates/fastlua/src/vectorize.rs`, `src/pgo.rs`, `src/ffi.rs`,
-`src/tools/` (dump-ir/dump-asm/profile CLI subcommands),
-`crates/fastlua/Cargo.toml` (add `cranelift-object`).
+**Files**: `main.rs` (CLI flag parsing - no separate `src/tools/` module ended
+up needed, since the flags just set the existing `FASTLUA_*` env vars
+`jit.rs` reads), `jit.rs` (`--dump-asm`'s `VCode` dump, `--jit-log`'s
+promotion tracing, `--target-info`'s ISA introspection). Still to add: new
+`crates/fastlua/src/vectorize.rs`, `src/pgo.rs`, `src/ffi.rs`,
+`crates/fastlua/Cargo.toml` (add `cranelift-object` for AOT).
 
 ---
 
@@ -608,8 +630,12 @@ as part of "beat LuaJIT."
       result explained
 - [x] M3: structs + escape analysis + scalar replacement - shipped and
       IR-verified; real (non-leaked) array allocation deferred to M4
-- [ ] M4: generational GC
-- [ ] M5: gradual typing + boxed dynamic-value fallback
-- [ ] M6: bytecode tier 0 + baseline/optimizing JIT tiers + deopt + OSR + inline
-      caches
+- [x] M4: GC - shipped, descoped to conservative mark-sweep over a chunked
+      bump arena (not generational) - see M4 section for the scope call
+- [x] M5: gradual typing + boxed dynamic-value fallback - shipped, scoped to
+      `i64`/`f64`/`bool` payloads only
+- [x] M6: bytecode tier 0 + hot counters + OSR + speculative `any`-parameter
+      specialization (inline-cache guard + guard-before-execute "deopt") -
+      shipped; tier 1/baseline and tier 2/optimizing deliberately collapsed
+      into one native tier - see M6 section for why
 - [ ] M7: SIMD, PGO, AOT binaries, FFI, profiling tools, full benchmark suite
