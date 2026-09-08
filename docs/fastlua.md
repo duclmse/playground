@@ -257,6 +257,12 @@ end
   the process (confirmed empirically: Cranelift's `sdiv`/`srem` already do this
   on this target, no extra check needed in `codegen.rs`).
 - **Comments**: `-- like this`, to the end of the line (matches Lua).
+- **`extern function name(params): T`** (M7 §25 FFI): declares a native
+  symbol already loaded in the process (typically libc/libm), resolved via
+  `dlsym` - no body, and `name` is also the C symbol name. Calling one
+  compiles to a plain direct call, same as calling a fastlua function. Only
+  `i64`/`f64`/`bool` cross the FFI boundary; no explicit per-library
+  `ffi.load` - resolution is against the process's global symbol table.
 
 ## Architecture
 
