@@ -327,6 +327,15 @@ found later.
       scanned after it was briefly discovered as a stack root mid-allocation.
       The atomic-allocation fix above removed that scan entirely; `table_array`
       now beats LuaJIT again (1.46×), matching or exceeding the pre-GC number.
+      A final pass removed provably-redundant bounds checks from
+      `Chunk::carve` (the hottest function in the file - called once per
+      allocation) and closed `gc_alloc`'s remaining ~5-17% gap; a matching
+      attempt to mark provably-pointer-free *structs* atomic (not just
+      arrays) was implemented, measured to make `gc_alloc` slightly
+      *slower* (its `Point` struct is only 2 words - too small to have any
+      real trace cost to eliminate, so the extra bookkeeping was a net
+      loss), and reverted - a genuine, recorded non-finding, not silently
+      dropped. See `benchmarks/RESULTS.md`'s M4 section for both results.
 
 **Files**: `crates/fastlua/src/gc.rs` (single file, not the
 `gc/{arena,collect,roots,barrier}.rs` module tree originally sketched -

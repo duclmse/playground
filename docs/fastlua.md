@@ -58,8 +58,14 @@ being conservatively scanned after briefly existing as a stack root
 mid-allocation. Fixing that (marking a scalar array's data buffer as
 provably pointer-free, so the collector never scans its contents at all - see
 "GC (M4)" below) brought `table_array` back to *beating* LuaJIT (1.46×),
-matching or exceeding the pre-GC number. See `benchmarks/RESULTS.md`'s M4
-section for all three sets of numbers and the bugs caught along the way.
+matching or exceeding the pre-GC number. A final pass removed
+provably-redundant bounds checks from the hottest per-allocation function
+(`Chunk::carve`), closing `gc_alloc`'s remaining gap too - fastlua now
+edges out LuaJIT on both benchmarks more often than not on repeated runs.
+A matching attempt at marking *structs* atomic (not just arrays) measured
+out as a net loss and was reverted - a genuine non-finding, not silently
+dropped. See `benchmarks/RESULTS.md`'s M4 section for all the numbers and
+the bugs (and non-wins) caught along the way.
 
 ## GC (M4)
 

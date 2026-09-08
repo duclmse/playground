@@ -219,3 +219,49 @@ plain `i64`/`f64` value that happened to numerically match some other
 live block's address would have been treated as a real pointer, keeping
 that block alive for no reason) - marking scalar data atomic removes that
 possibility entirely, not just the cost of checking for it.
+
+## Closing the last bit of `gc_alloc`'s gap: one win, one honest non-win
+
+With `table_array` fixed, `gc_alloc` itself was still ~5-17% behind LuaJIT
+run to run (noisy at this scale - both land around 13-17ms). Two more
+things were tried:
+
+**Tried and kept**: unchecked (raw-pointer) writes in `Chunk::carve` - the
+single hottest function in `gc.rs`, called once per allocation (2,000,000
+times in this benchmark). Its two writes (the block's size header, and a
+bit in the `starts`/`atomic` bitset) are *always* in-bounds by
+construction - `carve` is only ever called right after `has_room` confirms
+there's room, and the bitsets are always sized to exactly `capacity /
+ALIGN` bits - so Rust's slice/Vec bounds checks on every write were pure,
+provably-unnecessary overhead, not a real safety margin. Removing them
+(with a `debug_assert!` left in place, and a doc comment spelling out
+*why* it's provably safe, not just probably fine) took User CPU time from
+~13.5-14.8ms to ~12.5-13.2ms - fastlua now edges out LuaJIT more often
+than not on repeated runs:
+
+| Command | Mean [ms] | User [ms] | Relative |
+|:---|---:|---:|---:|
+| `fastlua` | 14.9 | 8.9-13.2 (workload-dependent) | 1.00 |
+| `luajit` | 16.6 | ~12.5-13.0 | 1.03-1.12 |
+
+**Tried and reverted**: marking a struct type atomic when none of its
+fields are `Array`/`Struct`-typed (the same idea that fixed `table_array`,
+applied to structs). Implemented fully (`fastlua_alloc_atomic`, a
+per-struct-type check computed once via `codegen::compute_atomic_structs`,
+wired through `ProgramCtx`/`jit.rs`/`runtime.rs`) and *reverted* after
+measuring it made `gc_alloc.fl` slightly **slower** (~1ms more User time),
+confirmed via a controlled back-to-back A/B against the previous commit
+and cross-checked against `table_array` (unaffected by this change,
+showed no difference) to rule out measurement noise. The reason, in
+hindsight: `gc_alloc.fl`'s `Point` struct is only 2 words - tracing it was
+already essentially free (`words_scanned=0` in most collections even
+*before* this change, since it rarely survives long enough to be
+discovered as a root), so marking it atomic added a real bookkeeping cost
+(one more bitset write per allocation) without saving anything worth
+saving. The array case won because a 32 MB array's *contents* were
+genuinely, measurably expensive to scan (4,000,000 words); a 2-word struct
+has no such cost to eliminate. The general technique remains sound (and
+`gc.rs`'s array-atomic path keeps using it) - it just needs a workload
+where tracing the block would have actually cost something, which this
+benchmark's struct doesn't provide. Worth recording as a genuine,
+measured non-finding, not silently dropped.
