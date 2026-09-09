@@ -1,4 +1,4 @@
--- fastlua equivalent of fib.lua - same problem size (fib(32)), for a
+-- sol equivalent of fib.lua - same problem size (fib(32)), for a
 -- direct comparison of typed/native-compiled recursion against reference
 -- Lua/LuaJIT/this repo's dynamic VM.
 function fib(n: i64): i64

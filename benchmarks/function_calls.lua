@@ -1,4 +1,4 @@
--- Reference-Lua/LuaJIT equivalent of function_calls.fl - see that file.
+-- Reference-Lua/LuaJIT equivalent of function_calls.sol - see that file.
 local function work(x)
     local a1 = x + 1
     local a2 = a1 + 1

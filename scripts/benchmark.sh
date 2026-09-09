@@ -7,7 +7,7 @@
 # way for every implementation - a fair, real-world "run this program"
 # comparison rather than an internal-clock micro-measurement.
 #
-# Usage: scripts/benchmark.sh [--export-markdown FILE]
+# Usage: scripts/benchmark.sh [--filter NAME] [--export-markdown FILE]
 set -euo pipefail
 # Resolve --export-markdown's path relative to the caller's original
 # working directory, before `cd`-ing into scripts/ below - otherwise a
@@ -22,12 +22,27 @@ require_cmd hyperfine "Install with: brew install hyperfine (or see https://gith
 require_cmd lua "Install a reference Lua interpreter, e.g.: brew install lua"
 
 EXPORT_MARKDOWN=""
-if [ "${1:-}" = "--export-markdown" ]; then
-  EXPORT_MARKDOWN="${2:?--export-markdown requires a file path}"
-  case "$EXPORT_MARKDOWN" in
-    /*) : ;; # already absolute
-    *) EXPORT_MARKDOWN="$ORIG_PWD/$EXPORT_MARKDOWN" ;;
+FILTER=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --export-markdown)
+      EXPORT_MARKDOWN="${2:?--export-markdown requires a file path}"
+      case "$EXPORT_MARKDOWN" in
+        /*) : ;; # already absolute
+        *) EXPORT_MARKDOWN="$ORIG_PWD/$EXPORT_MARKDOWN" ;;
+      esac
+      shift 2
+      ;;
+    --filter)
+      FILTER="${2:?--filter requires a benchmark name}"
+      shift 2
+      ;;
+    *)
+      die "usage: $0 [--filter NAME] [--export-markdown FILE]"
+      ;;
   esac
+done
+if [ -n "$EXPORT_MARKDOWN" ]; then
   : > "$EXPORT_MARKDOWN"
 fi
 
@@ -35,38 +50,48 @@ log "Building crates/vm's interpreter example in release mode"
 cargo build --release --example interpreter --manifest-path "$ROOT/crates/vm/Cargo.toml"
 VM_BIN="$ROOT/crates/vm/target/release/examples/interpreter"
 
-log "Building crates/fastlua in release mode"
-cargo build --release --manifest-path "$ROOT/crates/fastlua/Cargo.toml"
-FASTLUA_BIN="$ROOT/crates/fastlua/target/release/fastlua"
+log "Building crates/sol in release mode"
+cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
+SOL_BIN="$ROOT/crates/sol/target/release/sol"
 
-LUAJIT_BIN=""
-if command -v luajit >/dev/null 2>&1; then
-  LUAJIT_BIN="$(command -v luajit)"
-  log "LuaJIT found - including it as a bonus reference point"
-else
-  log "LuaJIT not found - comparing lua and vm only (install luajit to add it)"
-fi
+LUA_RUNTIMES=(lua)
+LUA_RUNTIME_VERSIONS=("$(lua -v 2>&1 | head -n 1)")
+for runtime in lua5.5 lua5.4 lua5.3 lua5.2 lua5.1 luajit luau; do
+  if command -v "$runtime" >/dev/null 2>&1; then
+    version="$("$runtime" -v 2>&1 | head -n 1)"
+    seen=0
+    for known_version in "${LUA_RUNTIME_VERSIONS[@]}"; do
+      [ "$version" = "$known_version" ] && seen=1
+    done
+    if [ "$seen" -eq 0 ]; then
+      LUA_RUNTIMES+=("$runtime")
+      LUA_RUNTIME_VERSIONS+=("$version")
+    fi
+  fi
+done
+log "Lua runtimes: ${LUA_RUNTIMES[*]}"
 
 for script in "$ROOT"/benchmarks/*.lua; do
   name="$(basename "$script" .lua)"
-  log "Benchmark: $name"
-  args=(
-    --warmup 3
-    --min-runs 10
-    -n "lua (reference)" "lua '$script'"
-  )
-  if [ -n "$LUAJIT_BIN" ]; then
-    args+=(-n "luajit" "'$LUAJIT_BIN' '$script'")
+  if [ -n "$FILTER" ] && [ "$name" != "$FILTER" ]; then
+    continue
   fi
+  log "Benchmark: $name"
+  args=(--warmup 3 --min-runs 10)
+  for runtime in "${LUA_RUNTIMES[@]}"; do
+    label="$runtime"
+    [ "$runtime" = "lua" ] && label="lua (reference)"
+    args+=(-n "$label" "'$runtime' '$script'")
+  done
   args+=(-n "vm (this project)" "'$VM_BIN' '$script'")
-  # If a same-named .fl program exists (fastlua - M1 of faster_lua.md's
-  # roadmap, see docs/fastlua.md), include it too - the whole reason for
-  # writing these fastlua programs in the first place is to get an honest,
-  # reproducible answer on whether the typed/native-compiled path is
-  # actually winning on the workload it's supposed to be best at.
-  fl_script="$ROOT/benchmarks/$name.fl"
-  if [ -f "$fl_script" ]; then
-    args+=(-n "fastlua" "'$FASTLUA_BIN' run '$fl_script'")
+  # If a same-named .sol program exists (Sol's typed compilation path - see
+  # docs/sol.md), include it too - the whole reason for writing these Sol
+  # programs in the first place is to get an honest, reproducible answer on
+  # whether the typed/native-compiled path is actually winning on the workload
+  # it's supposed to be best at.
+  sol_script="$ROOT/benchmarks/$name.sol"
+  if [ -f "$sol_script" ]; then
+    args+=(-n "sol" "'$SOL_BIN' run '$sol_script'")
   fi
 
   if [ -n "$EXPORT_MARKDOWN" ]; then

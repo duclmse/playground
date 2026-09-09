@@ -1,5 +1,5 @@
--- M5 (docs/fastlua-roadmap.md): the strict-mode baseline for measuring
--- gradual typing's actual cost - see any_dynamic.fl for the identical
+-- M5 (docs/sol-roadmap.md): the strict-mode baseline for measuring
+-- gradual typing's actual cost - see any_dynamic.sol for the identical
 -- workload with an `any`-typed function boundary in the hot path.
 function compute(x: i64): i64
     return x + 1

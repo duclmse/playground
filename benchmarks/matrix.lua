@@ -1,4 +1,4 @@
--- Reference-Lua/LuaJIT equivalent of matrix.fl - see that file.
+-- Reference-Lua/LuaJIT equivalent of matrix.sol - see that file.
 local n = 120
 local size = n * n
 local a = {}

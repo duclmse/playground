@@ -1,6 +1,6 @@
 -- faster_lua.md §33's "04_objects" category: struct allocation + field
 -- access under GC pressure (this repo's stand-in for object-oriented
--- workloads - fastlua has no classes/methods yet, see docs/fastlua.md).
+-- workloads - sol has no classes/methods yet, see docs/sol.md).
 -- `dist_squared` is padded past M2's INLINE_MAX_STMTS so `p` genuinely
 -- escapes into a real allocation (M4's GC), rather than being scalar-
 -- replaced away by M3's escape analysis.

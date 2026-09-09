@@ -1,4 +1,4 @@
--- fastlua equivalent of gc_alloc.lua - see that file's comment. `p` is
+-- sol equivalent of gc_alloc.lua - see that file's comment. `p` is
 -- assigned from a function call, not a struct literal, so M3's escape
 -- analysis (which only recognizes direct struct-literal initializers)
 -- never considers it a scalar-replacement candidate: every iteration

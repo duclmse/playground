@@ -1,4 +1,4 @@
--- M5 (docs/fastlua-roadmap.md): identical workload to any_strict.fl, but
+-- M5 (docs/sol-roadmap.md): identical workload to any_strict.sol, but
 -- `compute` takes and returns `any` instead of `i64` - every call boxes
 -- its argument (a real heap allocation - see value.rs) and unboxes its
 -- result (a runtime tag check), the honest cost of opting into gradual

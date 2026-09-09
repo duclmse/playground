@@ -1,4 +1,4 @@
--- M4 GC benchmark (docs/fastlua-roadmap.md's "own benchmark category"
+-- M4 GC benchmark (docs/sol-roadmap.md's "own benchmark category"
 -- ask): pure allocation churn - a fresh, short-lived table every
 -- iteration, immediately discarded. Exercises each implementation's
 -- allocator + collector, not arithmetic throughput.

@@ -1,5 +1,5 @@
--- Reference-Lua/LuaJIT equivalent of objects.fl - a table stands in for
--- fastlua's struct (Lua's only aggregate type).
+-- Reference-Lua/LuaJIT equivalent of objects.sol - a table stands in for
+-- sol's struct (Lua's only aggregate type).
 local function dist_squared(p)
     local s1 = p.x * p.x
     local s2 = s1 + 0.0

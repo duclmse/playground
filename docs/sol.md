@@ -1,6 +1,6 @@
-# fastlua
+# Sol
 
-`crates/fastlua` is a typed, Lua-like language compiled straight to native code
+`crates/sol` is a typed, Lua-compatible language compiled straight to native code
 via [Cranelift](https://cranelift.dev/). It's a from-scratch answer to
 `faster_lua.md` (repo root): can a Lua-like language beat LuaJIT on typed
 numeric/data-oriented workloads by leaning on static types and native
@@ -8,7 +8,8 @@ compilation instead of trying to out-optimize a dynamic interpreter?
 
 This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
-changes; fastlua doesn't run real Lua programs and isn't trying to.
+changes; Sol accepts both `.lua` and `.sol` source files. Lua's fully dynamic
+runtime features remain an incremental compatibility target.
 
 ## Status: M8 (M0/M2 folded in)
 
@@ -30,12 +31,12 @@ speculative-optimization mechanism for hot `any`-typed function parameters -
 so a program starts running immediately instead of paying M1-M5's
 whole-program AOT compile before its first instruction; see "Tiered execution
 (M6)" below for what that scoping looks like and why. M7 added ahead-of-time
-compilation to a real standalone executable (`fastlua build`), FFI
+compilation to a real standalone executable (`sol build`), FFI
 (`extern function`), loop vectorization for elementwise `f64` array ops,
 profile-guided warm-start, and profiling/introspection CLI tooling - see the
-M7 sections below. M8 added `fastlua run --profile-time` (a real wall-clock
-profiler) and `fastlua debug` (a call-boundary REPL debugger), both via a
-zero-cost-when-disabled mechanism - `fastlua run` with no debug/profile
+M7 sections below. M8 added `sol run --profile-time` (a real wall-clock
+profiler) and `sol debug` (a call-boundary REPL debugger), both via a
+zero-cost-when-disabled mechanism - `sol run` with no debug/profile
 flags is a provably different, unaffected compiled path, not a
 runtime-disabled one - see "Debugging and profiling (M8)" below. See
 "Roadmap" below for what's next.
@@ -44,7 +45,7 @@ runtime-disabled one - see "Debugging and profiling (M8)" below. See
 
 From `benchmarks/RESULTS.md` (hyperfine, whole-process wall time - see that file
 for full methodology, the M1→M2 comparison, and caveats): on the two workloads
-fastlua currently has equivalent programs for, it beats not just reference Lua
+sol currently has equivalent programs for, it beats not just reference Lua
 (3.8-8.5×) and this repo's own dynamic VM (19-40×), but **LuaJIT** (1.15-1.30×).
 Encouraging, not conclusive: two workloads, one machine. Notably, M2's optimizer
 work didn't move either benchmark's wall-clock time (within measurement noise) -
@@ -54,21 +55,21 @@ anything inlining could help), not a sign the passes don't work - see
 `benchmarks/RESULTS.md` for the direct A/B evidence.
 
 M3's scalar replacement has its own, more direct verification: dumping the
-emitted Cranelift IR (`FASTLUA_DUMP_CLIF=1 fastlua run ...`) for a `Point`
+emitted Cranelift IR (`SOL_DUMP_CLIF=1 sol run ...`) for a `Point`
 struct that never escapes its function shows _zero_ allocation, load, or store
 instructions - just `f64const`/`fmul`/`fadd`/`return` - versus a real `call` to
 the allocator when the same struct is passed to another function
-(`crates/fastlua/tests/programs.rs`'s
+(`crates/sol/tests/programs.rs`'s
 `non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` pins this).
 
 M4's GC went through three results worth keeping, in order. The first cut
 (`HashMap`-based bookkeeping, one `std::alloc`/`dealloc` call per object) lost
-to LuaJIT on `benchmarks/gc_alloc.fl` (pure allocation churn) by 7.9× - a real,
+to LuaJIT on `benchmarks/gc_alloc.sol` (pure allocation churn) by 7.9× - a real,
 honest weak spot. A follow-up rewrite to a chunked bump allocator (same file, no
 hashing or per-object `malloc`/`free` on the hot path) closed that to roughly
 parity. That rewrite then exposed a *different* cost on `table_array` (one
 32 MB allocation): 1.26× slower than LuaJIT, versus *beating* it pre-GC -
-`FASTLUA_GC_DEBUG` traced it to the array's entire 4,000,000-word data buffer
+`SOL_GC_DEBUG` traced it to the array's entire 4,000,000-word data buffer
 being conservatively scanned after briefly existing as a stack root
 mid-allocation. Fixing that (marking a scalar array's data buffer as
 provably pointer-free, so the collector never scans its contents at all - see
@@ -83,14 +84,14 @@ arrays) measured out as a net loss and was reverted - both real, recorded
 non-findings, not silently dropped. What actually broke the tie: `gc.rs`
 stopped bulk-zeroing a whole chunk on every reuse, since struct/header
 allocations never needed it (only array data does - see "GC (M4)" below)
-- fastlua now wins 10/10 rounds on both wall-clock and CPU time, a clear,
+- sol now wins 10/10 rounds on both wall-clock and CPU time, a clear,
 non-overlapping gap. See `benchmarks/RESULTS.md`'s M4 section for every
 number and the bugs (and non-wins) caught along the way.
 
 ## GC (M4)
 
 A real collector, replacing M1-M3's `Box::leak`/`mem::forget`-everything
-runtime: `crates/fastlua/src/gc.rs`. **What it is**: a conservative
+runtime: `crates/sol/src/gc.rs`. **What it is**: a conservative
 (stack-scanning) mark-sweep collector over a **chunked bump arena** - a handful
 of large chunks, each bump-allocated into sequentially
 (`ptr = bump; bump += size`, no hashing, no per-object `malloc`/`free`); a chunk
@@ -100,7 +101,7 @@ explicitly flushed callee-saved registers - see the file's doc comment for a
 real bug this caught) rather than using precise Cranelift stack maps; the
 root-scanning technique is the same one the Boehm-Demers-Weiser collector uses
 in production, not a toy shortcut. An array's data buffer is allocated via
-`fastlua_gc_alloc_atomic`, not `fastlua_gc_alloc` - its elements are always
+`sol_gc_alloc_atomic`, not `sol_gc_alloc` - its elements are always
 plain `i64`/`f64` scalars, provably never GC pointers, so a collection marks
 such a block reachable when found but never reads its contents, avoiding an
 O(payload size) conservative scan (array headers and struct instances, which
@@ -108,18 +109,18 @@ can hold real pointers, still go through the normal, fully-traced path).
 Struct payloads and array headers also skip zero-initialization - every
 caller always overwrites every byte immediately (`typeck.rs` enforces this
 for structs), so pre-zeroing is pure waste; array *data* buffers still get
-zeroed, since fastlua's language semantics promise unwritten elements read
+zeroed, since sol's language semantics promise unwritten elements read
 as zero. **What it deliberately isn't** (yet): true generations (a chunk with even one
 long-lived survivor keeps *all* its dead space until the whole chunk dies
 together - a documented fragmentation trade-off, not an oversight), promotion,
 or write barriers - descoped with reasoning recorded in
-`docs/fastlua-roadmap.md`'s M4 section, since getting a *correct* and *fast*
+`docs/sol-roadmap.md`'s M4 section, since getting a *correct* and *fast*
 collector working was already the substantial part of this milestone.
-`FASTLUA_GC_STATS=1 fastlua run <file.fl>` prints live block/byte counts at
-exit (forcing a final collection first for accuracy); `FASTLUA_GC_DEBUG=1`
+`SOL_GC_STATS=1 sol run <file.sol>` prints live block/byte counts at
+exit (forcing a final collection first for accuracy); `SOL_GC_DEBUG=1`
 traces every collection cycle to stderr, including how many words its
 non-atomic tracing touched - both the same env-gated-diagnostic pattern as
-`FASTLUA_DUMP_CLIF`.
+`SOL_DUMP_CLIF`.
 
 ## Gradual typing (M5)
 
@@ -138,7 +139,7 @@ compute with `y`. Strict code (the only kind that existed before M5) is
 completely unaffected: boxing/unboxing only ever gets inserted where `any`
 appears in the source, so a program that never writes `any` compiles to
 *exactly* the same code as if M5 didn't exist - see
-`docs/fastlua-roadmap.md`'s M5 section for how this is verified. The trade-off
+`docs/sol-roadmap.md`'s M5 section for how this is verified. The trade-off
 is real and measured, not hidden: `benchmarks/RESULTS.md`'s M5 section shows
 a workload with an `any`-typed function boundary running ~7-10× slower than
 the identical strict version, almost entirely the cost of one heap allocation
@@ -150,8 +151,8 @@ Every function starts out **interpreted**, not compiled: `bccompile.rs`
 lowers each typed function to fixed-width 32-bit bytecode (`bytecode.rs` -
 Lua's own iABC/iABx/iAsBx instruction shapes) whose registers are exactly
 the typed AST's own `LocalId`s, and `interp.rs` executes that bytecode
-directly. Two independent hot counters (`FASTLUA_PROMOTE_THRESHOLD`,
-default 200 calls; `FASTLUA_OSR_THRESHOLD`, default 50 loop backedges)
+directly. Two independent hot counters (`SOL_PROMOTE_THRESHOLD`,
+default 200 calls; `SOL_OSR_THRESHOLD`, default 50 loop backedges)
 decide when to compile a native version: a function crossing the call
 threshold gets promoted (`jit.rs::promote`) via the exact same M1-M4
 Cranelift pipeline that used to run for every function up front, and a
@@ -186,7 +187,7 @@ the whole function body (the shape ordinary code like `local y: i64 = x`
 already produces) - anything looser (returned as `any`, passed to another
 `any` slot, narrowed to more than one type, or reassigned) is left
 un-specialized rather than guessed at. Once eligible and called often
-enough with a matching argument (`FASTLUA_SPECULATIVE_THRESHOLD`, default
+enough with a matching argument (`SOL_SPECULATIVE_THRESHOLD`, default
 30), `jit::specialize` compiles a variant with that parameter narrowed to
 its concrete type, and `interp::Runtime::try_speculative` becomes the
 inline cache: it checks the actual argument's tag against the guarded
@@ -198,14 +199,14 @@ always runs before any side effects. The guard is load-bearing for
 *correctness*, not just performance: skipping it would let a
 wrong-shaped `any` argument's boxed pointer be reinterpreted as a raw
 scalar instead of trapping. See
-`tests/fixtures/speculative_any_param.fl` and its two tests in
+`tests/fixtures/speculative_any_param.sol` and its two tests in
 `tests/programs.rs` for both a correctness check (interpreted-general and
 guarded-native calls agree on the arithmetic) and proof the specialized
-variant is actually compiled (via `FASTLUA_DUMP_CLIF`).
+variant is actually compiled (via `SOL_DUMP_CLIF`).
 
 ## AOT compilation (M7)
 
-`fastlua build program.fl -o program` compiles straight to a standalone
+`sol build program.sol -o program` compiles straight to a standalone
 executable instead of running in-process: `aot.rs` uses
 `cranelift-object`'s `ObjectModule` (vs. `run`'s `cranelift-jit`
 `JITModule`) to compile every function eagerly - no tiering, since a
@@ -213,24 +214,24 @@ standalone binary has no interpreter to fall back to - then links the
 resulting object file against this crate's own `staticlib` build (the
 crate now also builds as one, exposing `runtime.rs`'s alloc/GC/print
 functions as `#[no_mangle]` symbols) via the system `cc`. A small
-hand-written C-ABI `main` calls the compiled fastlua `main` and prints its
+hand-written C-ABI `main` calls the compiled sol `main` and prints its
 result. The produced binary is genuinely standalone (no dependency on the
-fastlua toolchain at runtime) and, with no interpreter warmup to pay,
-slightly *beats* the tiered JIT on `benchmarks/table_array.fl` while
+sol toolchain at runtime) and, with no interpreter warmup to pay,
+slightly *beats* the tiered JIT on `benchmarks/table_array.sol` while
 staying ~1.5x faster than LuaJIT. Only verified on macOS ARM64 so far -
 Linux linking may need extra system libraries not yet checked.
 
 ## Profile-guided warm-start (M7)
 
-`fastlua run --profile-out app.prof app.fl` records which functions
+`sol run --profile-out app.prof app.sol` records which functions
 actually got promoted/speculatively-specialized during that run (reusing
-M6's own tiering state - no new instrumentation); `fastlua run
---profile-in app.prof app.fl` (a later run of the same program) preloads
+M6's own tiering state - no new instrumentation); `sol run
+--profile-in app.prof app.sol` (a later run of the same program) preloads
 that list at startup, skipping the interpreted warm-up that produced it
 the first time. A real, working slice of `faster_lua.md` §23's larger PGO
 vision - not the full one (no type-distribution/branch-probability/
-allocation-site profiling yet, and it doesn't feed `fastlua build`'s AOT
-compile) - see `docs/fastlua-roadmap/m7.md` for the fuller design that
+allocation-site profiling yet, and it doesn't feed `sol build`'s AOT
+compile) - see `docs/sol-roadmap/m7.md` for the fuller design that
 would.
 
 ## Loop vectorization (M7)
@@ -243,7 +244,7 @@ time, with a scalar tail for any odd leftover element and one whole-range
 bounds check up front instead of a per-element one. A narrow pattern
 match, not general auto-vectorization - matching M2's own bounds-check-
 elimination precedent. Measured a real but modest ~1.06-1.10× on
-`benchmarks/vector_add.fl`: that loop is memory-bandwidth-bound, not
+`benchmarks/vector_add.sol`: that loop is memory-bandwidth-bound, not
 compute-bound, so halving the arithmetic instruction count doesn't halve
 wall-clock time - see `benchmarks/RESULTS.md`'s M7 section for the honest
 accounting.
@@ -253,23 +254,23 @@ accounting.
 `interp::Runtime`/`tier::Engine` are generic over `H: interp::Hooks`
 (default `()`) - a trait with two empty-by-default methods
 (`on_call_enter`/`on_call_exit`) that `Runtime::call` invokes around every
-call, whatever tier ends up handling it. `fastlua run`'s only code path
+call, whatever tier ends up handling it. `sol run`'s only code path
 instantiates `Engine<()>`, whose hook calls are the no-op `()` impl and
 inline away entirely - a genuinely different compiled function from any
 real hooks implementation, not a runtime-checked flag. This is the
 mechanism behind both new commands:
 
-- **`fastlua run --profile-time <out>`**: `profile.rs`'s `TimingHooks`
+- **`sol run --profile-time <out>`**: `profile.rs`'s `TimingHooks`
   times every call, reporting inclusive wall time (including callees) and
   call count per function. Honest limitation, confirmed empirically: it
   only sees calls routed through `Runtime::call` - once a function is
   promoted to native and recurses via Cranelift's own direct call
-  instruction, those calls are invisible (`fib.fl` showed 221 calls to
+  instruction, those calls are invisible (`fib.sol` showed 221 calls to
   `fib` once promoted vs. the true ~7 million with promotion disabled).
   Avoiding that cost is exactly what keeps the *disabled* path free -
   instrumenting native call sites too would need either two compiled
   versions of every function or a runtime branch inside JIT'd code.
-- **`fastlua debug <file.fl>`**: `debug.rs`'s `DebugHooks` is a REPL
+- **`sol debug <file.sol>`**: `debug.rs`'s `DebugHooks` is a REPL
   debugger - `break <fn>` / `continue` / `step` / `backtrace` / `quit` -
   pausing at function-call boundaries. Works uniformly across every tier
   (interpreted or promoted) since the hook wraps the call boundary itself,
@@ -284,7 +285,7 @@ mechanism behind both new commands:
 Verified via both a structural argument (different monomorphizations) and
 an empirical one: `benchmarks/RESULTS.md`'s M8 section compares the pre-M8
 and post-M8 binaries on four benchmark shapes, all within measurement
-noise - see `docs/fastlua-roadmap/m8.md` for the full writeup.
+noise - see `docs/sol-roadmap/m8.md` for the full writeup.
 
 ## Language reference (M1-M3)
 
@@ -315,13 +316,13 @@ end
   M3. Struct-typed locals that never leave their function (never returned,
   passed to a call, stored into an array/another struct, or reassigned as a
   whole) are compiled with **zero heap allocation** at all - see "Early results"
-  above - everything else is a small, `fastlua_alloc`-backed heap block,
+  above - everything else is a small, `sol_alloc`-backed heap block,
   garbage-collected since M4 (see "GC (M4)" below).
 - **`local x: T = expr`**: type annotation is optional - `local x = 10` infers
   `i64`, `local y = 20.0` infers `f64` (the inferred type is simply the
   initializer's own type).
 - **Every function must declare a return type.** M1 has no `void` functions. The
-  entry point `fastlua run` looks for is always a niladic `main`, whose return
+  entry point `sol run` looks for is always a niladic `main`, whose return
   value is printed - there's no `print`/I/O builtin in the language itself in
   M1, so this is the only way a program produces an observable result.
 - **Implicit `i64 -> f64` widening**: wherever an `i64` value appears where
@@ -351,14 +352,14 @@ end
 - **`extern function name(params): T`** (M7 §25 FFI): declares a native
   symbol already loaded in the process (typically libc/libm), resolved via
   `dlsym` - no body, and `name` is also the C symbol name. Calling one
-  compiles to a plain direct call, same as calling a fastlua function. Only
+  compiles to a plain direct call, same as calling a sol function. Only
   `i64`/`f64`/`bool` cross the FFI boundary; no explicit per-library
   `ffi.load` - resolution is against the process's global symbol table.
 
 ## Architecture
 
 ```
-source (.fl)
+source (.sol)
    │
 lexer.rs (logos)
    │
@@ -397,7 +398,7 @@ specifics worth recording since they're easy to get wrong from older
 examples/tutorials found online:
 
 - `FunctionBuilder::declare_var(ty)` **returns** its own `Variable` (it no
-  longer takes a caller-chosen one). fastlua keeps its own `LocalId -> Variable`
+  longer takes a caller-chosen one). sol keeps its own `LocalId -> Variable`
   mapping (`codegen.rs`'s `vars: Vec<Variable>`, built once per function) rather
   than assuming any particular numbering.
 - `FunctionBuilder::finalize` now takes a `TargetFrontendConfig` argument
@@ -428,7 +429,7 @@ examples/tutorials found online:
 
 ## Roadmap
 
-See [fastlua-roadmap.md](./fastlua-roadmap.md) for the detailed, checklist-level
+See [sol-roadmap.md](./sol-roadmap.md) for the detailed, checklist-level
 plan (including a known correctness gap - M1's array indexing has no bounds
 checking at all - queued as M0). Summary:
 
@@ -442,22 +443,22 @@ milestones:
 | **M1** | **Minimal typed compiler (done)**    | This document's scope above.                                                                                                                                                                                                                                                                                                                                                                                 |
 | **M2** | **Optimizer passes (done)**          | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after.                                                                                                                                                                                                                         |
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
-| **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/fastlua-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring fastlua's pre-GC win on `table_array`). |
-| **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
-| **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/fastlua-roadmap/m7.md` for the honest gap analysis on the benchmark categories fastlua's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
-| **M8** | **Debugging + profiling (done, scoped)** | `fastlua run --profile-time` and `fastlua debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/fastlua-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
+| **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/sol-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring sol's pre-GC win on `table_array`). |
+| **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/sol-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
+| **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/sol-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
+| **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`sol build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/sol-roadmap/m7.md` for the honest gap analysis on the benchmark categories sol's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
+| **M8** | **Debugging + profiling (done, scoped)** | `sol run --profile-time` and `sol debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/sol-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
 
 ## Trying it
 
 ```
-cargo run -p fastlua -- run crates/fastlua/tests/fixtures/sum_array.fl
-cargo test -p fastlua
-scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # fastlua included wherever a matching .fl exists
+cargo run --manifest-path crates/sol/Cargo.toml -- run crates/sol/tests/fixtures/extension_probe.sol
+cargo test --manifest-path crates/sol/Cargo.toml
+scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # Sol is included wherever a matching .sol or legacy .sol exists
 
-fastlua run --dump-ir/--dump-asm/--jit-log/--target-info <file.fl>   # M7 tooling flags (see docs/fastlua-roadmap/m7.md)
-cargo build -p fastlua && ./target/debug/fastlua build <file.fl> -o <out>   # AOT: needs the sibling libfastlua.a `cargo build` produces
+sol run --dump-ir/--dump-asm/--jit-log/--target-info <file.lua|file.sol>   # M7 tooling flags (see docs/sol-roadmap/m7.md)
+cargo build --manifest-path crates/sol/Cargo.toml && ./crates/sol/target/debug/sol build <file.lua|file.sol> -o <out>   # AOT: needs the sibling libsol.a `cargo build` produces
 
-fastlua run --profile-time report.txt <file.fl>   # M8: wall-clock profile (see docs/fastlua-roadmap/m8.md)
-fastlua debug <file.fl>                           # M8: call-boundary REPL debugger (break/continue/step/backtrace/quit)
+sol run --profile-time report.txt <file.lua|file.sol>   # M8: wall-clock profile (see docs/sol-roadmap/m8.md)
+sol debug <file.lua|file.sol>                           # M8: call-boundary REPL debugger (break/continue/step/backtrace/quit)
 ```
