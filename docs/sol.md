@@ -307,8 +307,11 @@ function main(): f64
 end
 ```
 
-- **Types**: `i64`, `f64`, `bool`, `Array<T>`, and named `struct`s. Nothing else
-  yet (no i8/i16/i32/u8-u64/f32/string/enum/generics - see "Roadmap").
+- **Types**: `i64`, `f64`, `bool`, `Array<T>`, named `struct`s, and typed
+  top-level function values. Use `fn(Args) -> Return` (or the equivalent
+  `fn(Args): Return`) in annotations, then assign a top-level function and
+  call it through the typed local. Closures, nested functions, and function
+  returns remain on the roadmap.
 - **`struct Name { field: Type, ... }`** (top-level, alongside functions):
   `Name { field = expr, ... }` constructs one (fields in any order - they're
   reordered to declaration order internally), `value.field` reads and writes.
@@ -321,6 +324,13 @@ end
 - **`local x: T = expr`**: type annotation is optional - `local x = 10` infers
   `i64`, `local y = 20.0` infers `f64` (the inferred type is simply the
   initializer's own type).
+- **Blocks**: `do ... end` and `{ ... }` both create a lexical scope for local
+  declarations. Braces are a statement-level form, so `Name { field = expr }`
+  remains a struct literal.
+
+Run `scripts/test-lua55-suite.sh` to execute every top-level case from a local
+`lua-5.5.1-tests` checkout through Sol. It reports unsupported Lua facilities
+as failures and retains per-case logs when `SOL_LUA55_RESULTS_DIR` is set.
 - **Every function must declare a return type.** M1 has no `void` functions. The
   entry point `sol run` looks for is always a niladic `main`, whose return
   value is printed - there's no `print`/I/O builtin in the language itself in
@@ -448,6 +458,7 @@ milestones:
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/sol-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`sol build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/sol-roadmap/m7.md` for the honest gap analysis on the benchmark categories sol's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
 | **M8** | **Debugging + profiling (done, scoped)** | `sol run --profile-time` and `sol debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/sol-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
+| **M9+** | **Language and runtime expansion (planned)** | Typed tables/maps, closures, modules, richer static and gradual types, dynamic Lua compatibility, precise generational GC, debugger/profiler upgrades, and benchmark release gates. The ordered design and acceptance criteria are in `docs/sol-roadmap/m9.md`. |
 
 ## Trying it
 
