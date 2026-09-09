@@ -1,7 +1,9 @@
 # fastlua implementation plan & milestone checklist
 
 Detailed, checkbox-level breakdown of `faster_lua.md`'s architecture into the
-M1-M7 roadmap summarized in `docs/fastlua.md`. Each milestone doc (below)
+M1-M7 roadmap summarized in `docs/fastlua.md`, plus M8 (debugging/profiling,
+a standing requirement the user added mid-session, not from `faster_lua.md`
+itself). Each milestone doc (below)
 lists its goal, which `faster_lua.md` sections it covers, its dependencies, a
 concrete task checklist, and the files it touches. M1 is done; this is the
 strict, ordered plan for the rest, per the standing project goal ("check
@@ -24,6 +26,7 @@ they land; update the "Early results" section of `docs/fastlua.md` and
 - [fastlua-roadmap/m5.md](fastlua-roadmap/m5.md) — Gradual typing + dynamic mode (done)
 - [fastlua-roadmap/m6.md](fastlua-roadmap/m6.md) — Tiered execution (done)
 - [fastlua-roadmap/m7.md](fastlua-roadmap/m7.md) — SIMD, PGO, AOT, FFI, tooling (done, scoped)
+- [fastlua-roadmap/m8.md](fastlua-roadmap/m8.md) — Debugging + profiling, zero-overhead-when-disabled (done, scoped)
 
 ## Summary checklist (one line per milestone)
 
@@ -48,3 +51,9 @@ they land; update the "Early results" section of `docs/fastlua.md` and
       tools, and 3 new benchmark categories - shipped; 5 of the doc's 15
       benchmark categories are structurally unreachable given fastlua's
       language (no strings/hashmaps/coroutines/JSON/HTTP) - see M7 doc
+- [x] M8: `fastlua run --profile-time`/`fastlua debug`, both via a
+      zero-cost-when-disabled `interp::Hooks` generic (`fastlua run` alone
+      is provably unaffected - a different monomorphization, not a runtime
+      branch) - scoped to call-boundary granularity, not per-source-line
+      stepping; see M8 doc for the honest limits (native-to-native calls
+      invisible to the profiler, no live variable inspection)

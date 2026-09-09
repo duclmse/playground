@@ -10,7 +10,7 @@ This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
 debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; fastlua doesn't run real Lua programs and isn't trying to.
 
-## Status: M7 (M0/M2 folded in)
+## Status: M8 (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -33,7 +33,12 @@ whole-program AOT compile before its first instruction; see "Tiered execution
 compilation to a real standalone executable (`fastlua build`), FFI
 (`extern function`), loop vectorization for elementwise `f64` array ops,
 profile-guided warm-start, and profiling/introspection CLI tooling - see the
-M7 sections below. See "Roadmap" below for what's next.
+M7 sections below. M8 added `fastlua run --profile-time` (a real wall-clock
+profiler) and `fastlua debug` (a call-boundary REPL debugger), both via a
+zero-cost-when-disabled mechanism - `fastlua run` with no debug/profile
+flags is a provably different, unaffected compiled path, not a
+runtime-disabled one - see "Debugging and profiling (M8)" below. See
+"Roadmap" below for what's next.
 
 ### Early results
 
@@ -243,6 +248,44 @@ compute-bound, so halving the arithmetic instruction count doesn't halve
 wall-clock time - see `benchmarks/RESULTS.md`'s M7 section for the honest
 accounting.
 
+## Debugging and profiling (M8)
+
+`interp::Runtime`/`tier::Engine` are generic over `H: interp::Hooks`
+(default `()`) - a trait with two empty-by-default methods
+(`on_call_enter`/`on_call_exit`) that `Runtime::call` invokes around every
+call, whatever tier ends up handling it. `fastlua run`'s only code path
+instantiates `Engine<()>`, whose hook calls are the no-op `()` impl and
+inline away entirely - a genuinely different compiled function from any
+real hooks implementation, not a runtime-checked flag. This is the
+mechanism behind both new commands:
+
+- **`fastlua run --profile-time <out>`**: `profile.rs`'s `TimingHooks`
+  times every call, reporting inclusive wall time (including callees) and
+  call count per function. Honest limitation, confirmed empirically: it
+  only sees calls routed through `Runtime::call` - once a function is
+  promoted to native and recurses via Cranelift's own direct call
+  instruction, those calls are invisible (`fib.fl` showed 221 calls to
+  `fib` once promoted vs. the true ~7 million with promotion disabled).
+  Avoiding that cost is exactly what keeps the *disabled* path free -
+  instrumenting native call sites too would need either two compiled
+  versions of every function or a runtime branch inside JIT'd code.
+- **`fastlua debug <file.fl>`**: `debug.rs`'s `DebugHooks` is a REPL
+  debugger - `break <fn>` / `continue` / `step` / `backtrace` / `quit` -
+  pausing at function-call boundaries. Works uniformly across every tier
+  (interpreted or promoted) since the hook wraps the call boundary itself,
+  before tier dispatch. Scoped to call-boundary granularity, not
+  per-source-line stepping (real line-level breakpoints need source lines
+  threaded through the typed AST into bytecode, complicated by M2/M3's
+  optimizer passes reordering statements after type-checking - a
+  substantially larger undertaking); `args`/return values print as raw
+  `u64` bits, not type-formatted, since there's no live type info at a
+  call boundary.
+
+Verified via both a structural argument (different monomorphizations) and
+an empirical one: `benchmarks/RESULTS.md`'s M8 section compares the pre-M8
+and post-M8 binaries on four benchmark shapes, all within measurement
+noise - see `docs/fastlua-roadmap/m8.md` for the full writeup.
+
 ## Language reference (M1-M3)
 
 ```
@@ -403,6 +446,7 @@ milestones:
 | **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/fastlua-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/fastlua-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`fastlua build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/fastlua-roadmap/m7.md` for the honest gap analysis on the benchmark categories fastlua's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
+| **M8** | **Debugging + profiling (done, scoped)** | `fastlua run --profile-time` and `fastlua debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/fastlua-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
 
 ## Trying it
 
@@ -413,4 +457,7 @@ scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # fastlua include
 
 fastlua run --dump-ir/--dump-asm/--jit-log/--target-info <file.fl>   # M7 tooling flags (see docs/fastlua-roadmap/m7.md)
 cargo build -p fastlua && ./target/debug/fastlua build <file.fl> -o <out>   # AOT: needs the sibling libfastlua.a `cargo build` produces
+
+fastlua run --profile-time report.txt <file.fl>   # M8: wall-clock profile (see docs/fastlua-roadmap/m8.md)
+fastlua debug <file.fl>                           # M8: call-boundary REPL debugger (break/continue/step/backtrace/quit)
 ```

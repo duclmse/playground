@@ -469,3 +469,37 @@ warmup+steady-state signal, but does *not* yet automate peak-memory or p95
 extraction for every category - the numbers above were captured manually
 for these three new benchmarks specifically. Extending the script to do
 this for the whole suite is real, valid future work, not done this pass.
+
+## M8 (debugging + profiling): proving the zero-overhead-when-disabled constraint
+
+M8 added `fastlua run --profile-time`/`fastlua debug` via `interp::Hooks`, a
+trait `Runtime`/`Engine` are now generic over (default `()`, the no-op
+`fastlua run` always uses - see `docs/fastlua.md`'s M8 section for the
+mechanism). The hard requirement was that `fastlua run` with no debug/profile
+flags must not regress. Checked both structurally (a different
+monomorphization, not a runtime branch - see the doc) and empirically: built
+the pre-M8 and post-M8 binaries from the same machine, same release profile,
+and compared four benchmark shapes chosen to stress the exact code path the
+new `Hooks` calls wrap (`Runtime::call`):
+
+| Benchmark | Stresses | before-M8 | after-M8 | Δ |
+|:---|:---|---:|---:|---:|
+| `function_calls.fl` | call-boundary traffic (the most directly exposed to `Hooks`) | 18.1 ms | 16.7 ms | within noise |
+| `fib.fl` | recursive `Runtime::call` traffic pre-promotion | 15.5 ms | 16.4 ms | within noise |
+| `table_array.fl` | array/loop-heavy, few calls | 15.8 ms | 16.4 ms | within noise |
+| `objects.fl` | struct allocation + calls together | 19.9 ms | 19.4 ms | within noise |
+
+Every comparison lands inside the run-to-run standard deviation, in both
+directions - no measurable regression. `fastlua run` against LuaJIT
+afterward: still **~1.3×** faster on `table_array.fl`, confirming M8 didn't
+erode the headline claim.
+
+**Profiler accuracy caveat, measured not assumed**: `--profile-time` only
+sees calls routed through `Runtime::call`. `fib.fl` at default thresholds
+(fib promotes to native quickly) reported **221** calls to `fib`; the same
+run with `FASTLUA_PROMOTE_THRESHOLD` raised so `fib` never promotes reported
+the true **7,049,155**. This isn't a bug - it's the direct, honest
+consequence of the design that keeps the *disabled* path free: instrumenting
+native-to-native calls too would need either two compiled versions of every
+function or a runtime branch inside JIT'd code, both real costs the
+zero-overhead constraint rules out.
