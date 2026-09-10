@@ -11,7 +11,7 @@ debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; Sol accepts both `.lua` and `.sol` source files. Lua's fully dynamic
 runtime features remain an incremental compatibility target.
 
-## Status: M8 (M0/M2 folded in)
+## Status: M11 in progress (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -38,7 +38,11 @@ M7 sections below. M8 added `sol run --profile-time` (a real wall-clock
 profiler) and `sol debug` (a call-boundary REPL debugger), both via a
 zero-cost-when-disabled mechanism - `sol run` with no debug/profile
 flags is a provably different, unaffected compiled path, not a
-runtime-disabled one - see "Debugging and profiling (M8)" below. See
+runtime-disabled one - see "Debugging and profiling (M8)" below. M9-M10 added
+structured diagnostics, typed-IR verification, structural records,
+`Map<i64, i64>`, and allocation-free typed iteration. M11 now has typed module
+graphs and zero-allocation lambda lifting for immutable, nonescaping nested
+functions; escaping captured environments remain deliberately rejected. See
 "Roadmap" below for what's next.
 
 ### Feature matrix
@@ -54,6 +58,8 @@ unboxed representation.
 | Nominal structs | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
 | Structural records | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
 | `Map<i64, i64>`, literals, `pairs` | yes | yes | yes | yes | yes | not yet | Lua tables / `pairs` |
+| Nonescaping immutable closures | yes | direct lifted call | yes | yes | yes | not yet | separate heap closures |
+| Typed modules and exported records | yes | yes | yes | yes | yes | `.lua` boundary not yet | `require` is separate |
 | Source diagnostics | token spans | n/a | function line | function line | function line | n/a | parser locations |
 | Debug/profiling hooks | n/a | call + source line | promotion events | OSR events | n/a | visible dynamic ops | not yet |
 
@@ -331,9 +337,21 @@ end
 
 - **Types**: `i64`, `f64`, `bool`, `Array<T>`, named `struct`s, and typed
   top-level function values. Use `fn(Args) -> Return` (or the equivalent
-  `fn(Args): Return`) in annotations, then assign a top-level function and
-  call it through the typed local. Closures, nested functions, and function
-  returns remain on the roadmap.
+  `fn(Args): Return`) in annotations. Top-level and stateless nested functions
+  can be assigned and called through typed locals. A nested function may also
+  capture immutable `i64`, `f64`, `bool`, or `string` locals when all calls are
+  direct; capture conversion adds unboxed parameters and allocates no closure
+  object. Escaping captured functions and mutable shared captures are rejected
+  until their two-word code/environment representation and precise GC layout
+  are available.
+- **Modules**: `import math.pipeline` resolves `math/pipeline.sol` relative to
+  the importer, then falls back to `.lua`. `export function` and `export
+  struct` define the typed interface. Qualified calls, annotations, and struct
+  constructors are supported. The compiler loads a canonical dependency graph,
+  rejects missing/private/indirect/cyclic imports, and runs typed top-level
+  initializers once in dependency order before root `main`. A typed `.sol`
+  import of a dynamic `.lua` interface remains an explicit future `any`
+  boundary rather than silently sharing Sol's unboxed representation.
 - **`struct Name { field: Type, ... }`** (top-level, alongside functions):
   `Name { field = expr, ... }` constructs one (fields in any order - they're
   reordered to declaration order internally), `value.field` reads and writes.

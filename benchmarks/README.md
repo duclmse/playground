@@ -35,6 +35,8 @@ automatically if present, otherwise skipped.
 | `table_array.lua`   | Table array-part write-then-read throughput                                          |
 | `string_concat.lua` | String allocation/GC pressure (repeated `..` concatenation - deliberately quadratic) |
 | `nested_loop.lua`   | A second, larger raw-throughput data point (9M iterations via nested loops)          |
+| `function_calls.lua` | Direct, non-inlined function-call overhead                                           |
+| `function_calls_closure.lua` | Escaping closure-call overhead with one captured value                      |
 
 ## Results (one measured run, Apple Silicon Mac; regenerate for your own hardware)
 
