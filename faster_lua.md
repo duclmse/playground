@@ -1419,38 +1419,38 @@ Those are much more important.
 I'd build it approximately like this:
 
 ```
-              ┌──────────────────────┐
-              │      Frontend        │
-              │ lexer/parser/types   │
-              └──────────┬───────────┘
-                         │
-                         ▼
-              ┌──────────────────────┐
-              │      Typed AST       │
-              └──────────┬───────────┘
-                         │
-                         ▼
-              ┌──────────────────────┐
-              │       SSA IR         │
-              ├──────────────────────┤
-              │ types                │
-              │ CFG                  │
-              │ basic blocks         │
-              │ phi nodes            │
-              └──────────┬───────────┘
-                         │
-              ┌──────────┴───────────┐
-              ▼                      ▼
-        Bytecode backend        Optimizer
-              │                      │
-              ▼                      ▼
-         Interpreter            optimized SSA
-                                     │
-                                     ▼
-                                JIT backend
-                                     │
-                                     ▼
-                              Native machine code
+    ┌──────────────────────┐
+    │      Frontend        │
+    │ lexer/parser/types   │
+    └──────────┬───────────┘
+                │
+                ▼
+    ┌──────────────────────┐
+    │      Typed AST       │
+    └──────────┬───────────┘
+               │
+               ▼
+    ┌──────────────────────┐
+    │       SSA IR         │
+    ├──────────────────────┤
+    │ types                │
+    │ CFG                  │
+    │ basic blocks         │
+    │ phi nodes            │
+    └──────────┬───────────┘
+               │
+    ┌──────────┴────────────┐
+    ▼                       ▼
+Bytecode backend        Optimizer
+    │                       │
+    ▼                       ▼
+Interpreter             Optimized SSA
+                            │
+                            ▼
+                        JIT backend
+                            │
+                            ▼
+                        Native machine code
 ```
 
 ---

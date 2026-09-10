@@ -11,6 +11,12 @@ require_cmd cargo "Install Rust: https://rustup.rs"
 log "cargo test (crates/lua-vm: unit tests + conformance suite against conformance/fixtures + conformance/expected)"
 cargo test --manifest-path "$ROOT/crates/lua-vm/Cargo.toml"
 
+log "Lua 5.5 corpus-manifest regression checks"
+"$ROOT/scripts/test-lua55-manifest.sh"
+
+log "Sol supported Lua conformance profile"
+"$ROOT/scripts/test-sol-conformance.sh"
+
 if command -v npm >/dev/null 2>&1 && [ -d "$ROOT/node_modules" ]; then
   log "apps/web typecheck + build (smoke test)"
   (cd "$ROOT" && npm run build --workspace=apps/web)

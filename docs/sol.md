@@ -329,8 +329,11 @@ end
   remains a struct literal.
 
 Run `scripts/test-lua55-suite.sh` to execute every top-level case from a local
-`lua-5.5.1-tests` checkout through Sol. It reports unsupported Lua facilities
-as failures and retains per-case logs when `SOL_LUA55_RESULTS_DIR` is set.
+`lua-5.5.1-tests` checkout through Sol. Its checked manifest reports pending
+language features separately from declared host-required C API, CLI, native
+module, filesystem, and locale cases; it retains per-case logs when
+`SOL_LUA55_RESULTS_DIR` is set. The staged compatibility plan and reference
+runner are in `docs/sol-roadmap/m13-lua-compat.md` and `tests/lua55/README.md`.
 - **Every function must declare a return type.** M1 has no `void` functions. The
   entry point `sol run` looks for is always a niladic `main`, whose return
   value is printed - there's no `print`/I/O builtin in the language itself in

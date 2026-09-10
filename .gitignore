@@ -16,3 +16,5 @@ apps/web/e2e/screenshots/
 # Editor / OS
 .DS_Store
 *.log
+lua-5.5.1-tests/
+lua-5.5.1-tests.tar.gz

@@ -1,0 +1,248 @@
+# Lua 5.5.1 top-level test inventory.
+#
+# This is intentionally a small TOML subset read by scripts/test-lua55-suite.sh.
+# Every *.lua file in the upstream checkout must have exactly one [[case]] row.
+# `pending` means a Sol language/runtime feature is missing. `host-required`
+# means the upstream test exercises an executable, C API, native module, or
+# filesystem/locale capability that Sol has not elected to expose.
+
+version = 1
+upstream = "Lua 5.5.1"
+
+[[case]]
+path = "all.lua"
+category = "distribution-driver"
+status = "host-required"
+requires = ["standalone-cli", "c-api", "native-modules", "filesystem", "locale", "readline"]
+note = "Drives the distribution suite and validates the reference executable environment."
+
+[[case]]
+path = "api.lua"
+category = "c-api"
+status = "host-required"
+requires = ["c-api", "ltests"]
+note = "Exercises Lua's internal C API test library."
+
+[[case]]
+path = "attrib.lua"
+category = "attributes-and-close"
+status = "pending"
+requires = []
+note = "Needs Lua attributes, to-be-closed locals, tables, functions, and errors."
+
+[[case]]
+path = "big.lua"
+category = "stress"
+status = "pending"
+requires = []
+note = "Large dynamic program and coroutine stress after core runtime support."
+
+[[case]]
+path = "bitwise.lua"
+category = "operators"
+status = "pending"
+requires = []
+note = "Needs dynamic values and Lua numeric coercion beyond typed operator fixtures."
+
+[[case]]
+path = "bwcoercion.lua"
+category = "numeric-coercion"
+status = "pending"
+requires = []
+note = "Needs Lua integer/float/string coercion and global declarations."
+
+[[case]]
+path = "calls.lua"
+category = "calls"
+status = "pending"
+requires = []
+note = "Needs dynamic functions, tables, multi-results, protected errors, and metatables."
+
+[[case]]
+path = "closure.lua"
+category = "closures"
+status = "pending"
+requires = []
+note = "Needs heap closures, shared upvalues, GC, and dynamic tables."
+
+[[case]]
+path = "code.lua"
+category = "loading-and-dumping"
+status = "host-required"
+requires = ["binary-chunks", "c-api"]
+note = "Exercises Lua binary chunks and internal test hooks."
+
+[[case]]
+path = "constructs.lua"
+category = "control-flow"
+status = "pending"
+requires = []
+note = "Needs Lua expression lists, tables, closures, and generic iteration."
+
+[[case]]
+path = "coroutine.lua"
+category = "coroutines"
+status = "pending"
+requires = []
+note = "Owned resumable frames are scheduled for L7."
+
+[[case]]
+path = "cstack.lua"
+category = "c-api"
+status = "host-required"
+requires = ["c-api", "ltests"]
+note = "Measures Lua C-stack behavior through the internal test library."
+
+[[case]]
+path = "db.lua"
+category = "debug-library"
+status = "pending"
+requires = ["debug-library"]
+note = "Dynamic debug-library semantics are capability-gated after the core runtime."
+
+[[case]]
+path = "errors.lua"
+category = "errors"
+status = "pending"
+requires = []
+note = "Needs dynamic errors, loading, stack traces, and protected calls."
+
+[[case]]
+path = "events.lua"
+category = "metatables"
+status = "pending"
+requires = []
+note = "Needs the full metatable event protocol."
+
+[[case]]
+path = "files.lua"
+category = "filesystem"
+status = "host-required"
+requires = ["io", "os", "filesystem", "dev-full", "locale"]
+note = "Validates host file and locale behavior, including /dev/full."
+
+[[case]]
+path = "gc.lua"
+category = "garbage-collection"
+status = "pending"
+requires = []
+note = "Needs precise roots, finalizers, weak tables, and Lua GC APIs."
+
+[[case]]
+path = "gengc.lua"
+category = "garbage-collection"
+status = "pending"
+requires = []
+note = "Needs a documented Lua-compatible generational GC surface."
+
+[[case]]
+path = "goto.lua"
+category = "control-flow"
+status = "pending"
+requires = []
+note = "Needs dynamic globals, labels, goto validation, and runtime libraries."
+
+[[case]]
+path = "heavy.lua"
+category = "stress"
+status = "pending"
+requires = []
+note = "Long-running dynamic allocation and table stress."
+
+[[case]]
+path = "literals.lua"
+category = "syntax-and-values"
+status = "pending"
+requires = []
+note = "Needs byte-oriented source, full literals, globals, and runtime string behavior."
+
+[[case]]
+path = "locals.lua"
+category = "scope-and-attributes"
+status = "pending"
+requires = []
+note = "Needs Lua scopes, globals, close attributes, and dynamic closures."
+
+[[case]]
+path = "main.lua"
+category = "standalone-cli"
+status = "host-required"
+requires = ["standalone-cli", "shell", "filesystem", "stdin"]
+note = "Tests the Lua executable's command-line, stdin, and shell behavior."
+
+[[case]]
+path = "math.lua"
+category = "math-library"
+status = "pending"
+requires = []
+note = "Needs the Lua math library and dynamic numeric semantics."
+
+[[case]]
+path = "memerr.lua"
+category = "c-api"
+status = "host-required"
+requires = ["c-api", "allocation-failure-injection", "ltests"]
+note = "Injects allocation errors through Lua's internal C test API."
+
+[[case]]
+path = "nextvar.lua"
+category = "tables-and-globals"
+status = "pending"
+requires = []
+note = "Needs table identity, next, raw operations, globals, and iteration rules."
+
+[[case]]
+path = "pm.lua"
+category = "package-library"
+status = "pending"
+requires = ["package-loader"]
+note = "Needs the sandboxed package/require implementation and module cache."
+
+[[case]]
+path = "sort.lua"
+category = "table-library"
+status = "pending"
+requires = []
+note = "Needs dynamic tables, callbacks, errors, and table.sort semantics."
+
+[[case]]
+path = "strings.lua"
+category = "string-library"
+status = "pending"
+requires = ["locale"]
+note = "Needs Lua strings, patterns, packing, formatting, and locale-sensitive cases."
+
+[[case]]
+path = "tpack.lua"
+category = "tables-and-multireturn"
+status = "pending"
+requires = []
+note = "Needs table.pack/unpack and expression-list result adjustment."
+
+[[case]]
+path = "tracegc.lua"
+category = "garbage-collection"
+status = "host-required"
+requires = ["native-modules", "tracegc-module"]
+note = "Loads the suite's native tracegc module."
+
+[[case]]
+path = "utf8.lua"
+category = "utf8-library"
+status = "pending"
+requires = []
+note = "Needs the complete Lua utf8 library over byte strings."
+
+[[case]]
+path = "vararg.lua"
+category = "varargs"
+status = "pending"
+requires = []
+note = "Needs dynamic vararg packs, closures, and multi-result propagation."
+
+[[case]]
+path = "verybig.lua"
+category = "stress"
+status = "pending"
+requires = []
+note = "Large dynamic program and resource stress after baseline compatibility."

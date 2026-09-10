@@ -1,0 +1,36 @@
+# Top-level *.lua paths in the Lua 5.5.1 test archive.
+# Keep this list in sync with the pinned upstream archive and manifest.toml.
+all.lua
+api.lua
+attrib.lua
+big.lua
+bitwise.lua
+bwcoercion.lua
+calls.lua
+closure.lua
+code.lua
+constructs.lua
+coroutine.lua
+cstack.lua
+db.lua
+errors.lua
+events.lua
+files.lua
+gc.lua
+gengc.lua
+goto.lua
+heavy.lua
+literals.lua
+locals.lua
+main.lua
+math.lua
+memerr.lua
+nextvar.lua
+pm.lua
+sort.lua
+strings.lua
+tpack.lua
+tracegc.lua
+utf8.lua
+vararg.lua
+verybig.lua
