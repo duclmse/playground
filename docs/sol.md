@@ -11,7 +11,7 @@ debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; Sol accepts both `.lua` and `.sol` source files. Lua's fully dynamic
 runtime features remain an incremental compatibility target.
 
-## Status: M11 in progress (M0/M2 folded in)
+## Status: M12 in progress (M0/M2 folded in)
 
 M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
 implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
@@ -42,7 +42,10 @@ runtime-disabled one - see "Debugging and profiling (M8)" below. M9-M10 added
 structured diagnostics, typed-IR verification, structural records,
 `Map<i64, i64>`, and allocation-free typed iteration. M11 now has typed module
 graphs and zero-allocation lambda lifting for immutable, nonescaping nested
-functions; escaping captured environments remain deliberately rejected. See
+functions; escaping captured environments remain deliberately rejected. M12
+adds exported/qualified type aliases, explicit `is`/`as` narrowing,
+identity-preserving `any` boxes for typed reference values, and the first
+monomorphized collection algorithm (`map` over `Array<i64>`). See
 "Roadmap" below for what's next.
 
 ### Feature matrix
@@ -60,6 +63,8 @@ unboxed representation.
 | `Map<i64, i64>`, literals, `pairs` | yes | yes | yes | yes | yes | not yet | Lua tables / `pairs` |
 | Nonescaping immutable closures | yes | direct lifted call | yes | yes | yes | not yet | separate heap closures |
 | Typed modules and exported records | yes | yes | yes | yes | yes | `.lua` boundary not yet | `require` is separate |
+| Type aliases and `is`/`as` narrowing | yes | yes | yes | yes | yes | checked tags | separate dynamic types |
+| `map(Array<i64>, fn(i64)->i64)` | yes | specialized | specialized | specialized | specialized | no boxing | Lua library `map` absent |
 | Source diagnostics | token spans | n/a | function line | function line | function line | n/a | parser locations |
 | Debug/profiling hooks | n/a | call + source line | promotion events | OSR events | n/a | visible dynamic ops | not yet |
 
@@ -154,16 +159,17 @@ non-atomic tracing touched - both the same env-gated-diagnostic pattern as
 
 `any` (faster_lua.md §3-4): a value whose type is checked at runtime instead
 of compile time, for the boundaries where fully static typing doesn't fit -
-`function foo(x: any): any`, or `local x: any = expr`. Only `i64`/`f64`/`bool`
-are boxable so far (`Array`/`Struct` aren't yet - a clear compile error, not
-silently wrong behavior). A concrete value flowing into an `any`-typed slot
+`function foo(x: any): any`, or `local x: any = expr`. Scalars, nil, strings,
+arrays, records, maps, and stateless function pointers can be boxed; reference
+payloads keep their original pointer identity. A concrete value flowing into an `any`-typed slot
 gets boxed automatically (a small heap allocation - `value.rs`'s `{tag: i64,
 payload: i64}` pair, via the same allocator struct literals use); an `any`
 value flowing into a concrete-typed slot gets unboxed with a runtime type
 check that **traps** (a real crash, like an out-of-bounds array access) if
-the actual type doesn't match. `any` can't be used directly as an arithmetic
-operand yet - narrow it to a concrete type first (`local y: i64 = x`), then
-compute with `y`. Strict code (the only kind that existed before M5) is
+the actual type doesn't match. Dynamic arithmetic, comparison, truth,
+negation, and concatenation have explicit slow paths. `if x is Point then`
+refines `x` on the true branch; `x as Point` is the explicit checked-cast form.
+Dynamic indexing/calls/fields still require narrowing first. Strict code is
 completely unaffected: boxing/unboxing only ever gets inserted where `any`
 appears in the source, so a program that never writes `any` compiles to
 *exactly* the same code as if M5 didn't exist - see
@@ -497,11 +503,11 @@ milestones:
 | **M2** | **Optimizer passes (done)**          | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after.                                                                                                                                                                                                                         |
 | **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
 | **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/sol-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring sol's pre-GC win on `table_array`). |
-| **M5** | **Gradual typing (done, scoped)**    | Explicit `any` type, boxed `i64`/`f64`/`bool` only (not yet `Array`/`Struct`/`Nil`), runtime-checked at typed/`any` boundaries - see `docs/sol-roadmap.md`'s M5 section for the scope call, and `benchmarks/RESULTS.md` for the honest cost (~7-10× slower than strict for a workload that boxes on every call - the real, measured price of opting in). |
+| **M5** | **Gradual typing (done, expanded by M12)** | Explicit `any` type with runtime-checked boundaries. M12 extends boxes from scalars to nil, strings, arrays, records, maps, and stateless functions while preserving reference identity, and adds `is`/`as` narrowing. |
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/sol-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`sol build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/sol-roadmap/m7.md` for the honest gap analysis on the benchmark categories sol's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
 | **M8** | **Debugging + profiling (done, scoped)** | `sol run --profile-time` and `sol debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/sol-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
-| **M9+** | **Language and runtime expansion (in progress)** | M9 token spans, structured diagnostics, typed-IR verification, source-aware call debugging, and strict compiler gates are implemented. M10 now includes structural records and `Map<i64, i64>` literals/access/resize/iteration across bytecode, JIT, OSR, and AOT; pointer-bearing maps remain gated on precise GC layouts. The ordered design and acceptance criteria are in `docs/sol-roadmap/m9.md`. |
+| **M9+** | **Language and runtime expansion (in progress)** | M9 diagnostics/invariants, M10 structural records/maps/iteration, M11 nonescaping closures/modules, and M12 aliases, narrowing, reference `any` boxes, and specialized array `map` are implemented in scoped vertical slices. Enums, unions, user generics, escaping closure environments, and the typed/dynamic Lua module boundary remain open. |
 
 ## Trying it
 
