@@ -41,6 +41,28 @@ flags is a provably different, unaffected compiled path, not a
 runtime-disabled one - see "Debugging and profiling (M8)" below. See
 "Roadmap" below for what's next.
 
+### Feature matrix
+
+This matrix records implemented execution paths; “separate” means the `.lua`
+runtime provides Lua semantics without routing values through typed Sol's
+unboxed representation.
+
+| Feature | Parser | Bytecode | JIT | OSR | AOT | `any` boundary | `.lua` compatibility |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Scalars, control flow, functions | yes | yes | yes | yes | yes | scalar boxing | separate dynamic values |
+| `Array<i64/f64>` and `ipairs` | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables / `ipairs` |
+| Nominal structs | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
+| Structural records | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
+| `Map<i64, i64>`, literals, `pairs` | yes | yes | yes | yes | yes | not yet | Lua tables / `pairs` |
+| Source diagnostics | token spans | n/a | function line | function line | function line | n/a | parser locations |
+| Debug/profiling hooks | n/a | call + source line | promotion events | OSR events | n/a | visible dynamic ops | not yet |
+
+Typed map traversal order is intentionally unspecified. `ipairs(Array<T>)`
+uses Sol's zero-based array indices. Missing typed-map keys currently read as
+the value type's zero value. M10 deliberately restricts typed maps to
+`Map<i64, i64>` until precise GC entry layouts and write barriers make
+pointer-bearing keys and values safe.
+
 ### Early results
 
 From `benchmarks/RESULTS.md` (hyperfine, whole-process wall time - see that file
@@ -461,7 +483,7 @@ milestones:
 | **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/sol-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
 | **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`sol build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/sol-roadmap/m7.md` for the honest gap analysis on the benchmark categories sol's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
 | **M8** | **Debugging + profiling (done, scoped)** | `sol run --profile-time` and `sol debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/sol-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
-| **M9+** | **Language and runtime expansion (planned)** | Typed tables/maps, closures, modules, richer static and gradual types, dynamic Lua compatibility, precise generational GC, debugger/profiler upgrades, and benchmark release gates. The ordered design and acceptance criteria are in `docs/sol-roadmap/m9.md`. |
+| **M9+** | **Language and runtime expansion (in progress)** | M9 token spans, structured diagnostics, typed-IR verification, source-aware call debugging, and strict compiler gates are implemented. M10 now includes structural records and `Map<i64, i64>` literals/access/resize/iteration across bytecode, JIT, OSR, and AOT; pointer-bearing maps remain gated on precise GC layouts. The ordered design and acceptance criteria are in `docs/sol-roadmap/m9.md`. |
 
 ## Trying it
 
@@ -475,4 +497,5 @@ cargo build --manifest-path crates/sol/Cargo.toml && ./crates/sol/target/debug/s
 
 sol run --profile-time report.txt <file.lua|file.sol>   # M8: wall-clock profile (see docs/sol-roadmap/m8.md)
 sol debug <file.lua|file.sol>                           # M8: call-boundary REPL debugger (break/continue/step/backtrace/quit)
+sol run --diagnostic-format json <file.lua|file.sol>    # M9: editor-friendly structured diagnostics
 ```
