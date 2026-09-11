@@ -1,23 +1,27 @@
-# M13 — Lua 5.5 compatibility without regressing typed Sol
+# Lua 5.5 compatibility without regressing typed Sol
 
-**Goal:** make a useful, measured subset of Lua 5.5 programs run unchanged as
+> Status: an interpreter-first subset is implemented. The checked corpus
+> manifest and this document identify supported and open behavior.
+
+**Purpose:** make a useful, measured subset of Lua 5.5 programs run unchanged as
 `.lua` while retaining Sol's actual end goal: `.sol` code has static types,
 unboxed data, a shared SSA optimizer, and native AOT/JIT execution. Lua
 compatibility is a runtime and migration boundary, not a reason to lower every
 Sol program to a boxed Lua VM.
 
-This document refines M13 in [m9.md](m9.md) into an implementation and test
+This document refines the dynamic compatibility section of the
+[feature delivery plan](delivery-plan.md) into an implementation and test
 plan. It follows the intent in [faster_lua.md](../../faster_lua.md): build a
 typed, specialized compiler with one optimization IR for AOT and JIT, and make
 performance claims only for named workloads on named hardware.
 
 ## Current evidence and scope
 
-`scripts/test-lua55-suite.sh lua-5.5.1-tests` currently runs all 34 top-level
-Lua 5.5.1 test files through Sol and reports **0 passed, 34 failed**. The first
-failure (`all.lua`) is meaningful: the upstream test suite uses Lua 5.5's
-`global` declarations, which Sol does not parse. The result is a baseline, not a
-claim that the test suite is a single ready-made Sol acceptance test.
+The checked manifest currently classifies all 34 top-level Lua 5.5.1 cases:
+26 remain semantic `pending` cases and 8 are explicitly `host-required`.
+Focused fixtures now cover implemented parser/runtime slices, but no complete
+upstream case has been promoted to `pass`; the result remains a baseline, not a
+claim that the suite is a single ready-made Sol acceptance test.
 
 The upstream suite also exercises a Lua executable, its C API, dynamically
 loaded C modules, a terminal/readline fallback, host files such as `/dev/full`,
@@ -67,7 +71,7 @@ adapted Sol fixture where one exists. Valid statuses are:
 - `host-required`: requires an intentionally unavailable capability; the runner
   checks that it is skipped with that reason.
 - `pending`: a known semantic feature is missing. The entry names its owning
-  milestone and issue/fixture.
+  feature area and issue/fixture.
 - `diverges`: an intentional, documented difference with a migration path.
 
 `fail` is never an accepted release status. A case that cannot yet run must be
@@ -121,11 +125,11 @@ report can tell a missing Sol feature from an unavailable host facility.
 - [x] Make source loading byte-oriented. Preserve arbitrary bytes in string
       literals, comments, long brackets, and diagnostics; source positions are
       byte offsets plus line/column, not UTF-8 `String` indexes.
-- [ ] Add Lua lexical forms: decimal/hex/hex-float numerals, escapes and long
+- [x] Add Lua lexical forms: decimal/hex/hex-float numerals, escapes and long
       strings/comments, Unicode escape handling where Lua specifies it, and all
       punctuation/operator tokens. Retain the stricter typed lexer rules for
       `.sol` where they intentionally differ.
-- [ ] Parse all Lua statement and expression forms: `local`, global assignment,
+- [~] Parse all Lua statement and expression forms: `local`, global assignment,
       `do`/`end`, labels and `goto`, numeric and generic `for`, `repeat`, table
       constructors, indexing/field access, method definitions and calls,
       anonymous/local/nested functions, vararg expressions, call-statement
@@ -136,8 +140,8 @@ report can tell a missing Sol feature from an unavailable host facility.
 - [x] Parse local, nested, anonymous, and named-vararg (`...name`) functions;
       reject a vararg expression outside its enclosing vararg function.
 - [x] Parse Lua labels/gotos, generic `for` loops, and multi-value returns.
-      These nodes remain execution-gated until bytecode scope validation and
-      dynamic call frames arrive in L2–L4.
+      Same-block labels/gotos and general iterator triples now execute; complete
+      goto scope-entry validation remains open.
 - [x] Parse Lua 5.5 `global` declarations in `.lua` only, including attributes
       and const diagnostics. Reject the same spelling in `.sol` with a useful
       source span and migration suggestion.
@@ -184,7 +188,7 @@ reference Lua for the non-library portions of the L1 corpus group.
 - [~] Implement heap tables with Lua array and hash parts, `nil` deletion,
       stable object identity, length behavior, resize policy, and mutation write
       barriers.
-- [ ] Implement table constructors with keyed, array, and computed-key fields;
+- [x] Implement table constructors with keyed, array, and computed-key fields;
       expand the final expression according to Lua multi-result rules.
 - [~] Implement assignment targets and expression lists left-to-right with Lua
       adjustment rules: only the final call/vararg expands; surplus values are
@@ -192,7 +196,9 @@ reference Lua for the non-library portions of the L1 corpus group.
 - [~] Implement `next`, `pairs`, `ipairs`, raw get/set/equality/length, and the
       base/table APIs needed by the core corpus. Define invalidation behavior
       for table mutation during iteration and test it against reference Lua.
-- [ ] Keep typed `Map<K,V>`, records, and arrays from M10 separate. A dynamic
+      Iterator triples and numeric integer/float key canonicalization are
+      implemented; mutation-during-iteration oracle coverage remains open.
+- [ ] Keep typed `Map<K,V>`, records, and arrays separate. A dynamic
       table becomes one only through checked conversion that validates keys,
       fields, values, and absence/presence rules.
 
@@ -203,7 +209,7 @@ assignment/return cases.
 ## L4 — Functions, closures, varargs, and protected execution
 
 **Purpose:** make normal dynamic Lua programs executable without weakening typed
-top-level function values from M9.
+typed top-level function values.
 
 - [~] Compile Lua closures with heap environment cells for captured locals.
       Closing an upvalue at scope exit must preserve a single shared cell across
@@ -213,10 +219,13 @@ top-level function values from M9.
       construction, and parenthesized-expression truncation sites.
 - [~] Implement `pcall`, `xpcall`, `error`, `assert`, and `select`, preserving
       error values and a bounded, useful stack trace. Add recursion/instruction
-      budgets before host-exposed sandbox use.
-- [ ] Specify tail-call behavior. Begin with semantically correct frames; only
-      elide them after stack traces and protected calls retain Lua-visible
-      behavior.
+      budgets before host-exposed sandbox use. Recursion, instruction/backedge,
+      and heap table/closure allocation budgets are enforced; exact byte and
+      environment accounting awaits the dynamic GC allocator.
+- [x] Specify tail-call behavior. Calls in tail position currently use ordinary
+      bounded frames (no frame elision), preserving protected-call errors and
+      stack traces. Proper-tail-call optimization remains a performance/fidelity
+      follow-up and must retain those observables when added.
 - [ ] Implement the `.sol` bridge for calling dynamic functions as `any` and
       checked conversion to a typed function signature. Enforce arity/result
       checks at the bridge; do not let `LuaValue` appear in typed IR absent an
@@ -230,16 +239,21 @@ upvalues and final-expression result expansion.
 
 **Purpose:** provide the Lua object protocol and the portable library subset.
 
-- [ ] Implement per-value/type metatables and table metatables. Start with
+- [~] Implement per-value/type metatables and table metatables. Table
+      metatables dispatch
       `__index`, `__newindex`, `__call`, `__tostring`, `__len`, and `__pairs`;
-      then arithmetic, concatenation, comparison, and equality lookup in Lua's
-      documented order.
-- [ ] Use metatable/table version counters for dynamic inline caches. Each cache
+      arithmetic, bitwise, concatenation, comparison, and equality lookup is
+      also implemented. Per-type metatables and remaining edge-order rules are
+      open.
+- [~] Use metatable/table version counters for dynamic inline caches. Mutation
+      counters are maintained now. Each future cache
       guards receiver kind, table shape, metatable identity, and version; any
       miss or mutation takes the generic bytecode path.
-- [ ] Implement deterministic base, table, string, math, and utf8 slices with
-      per-function tests. Match Lua's errors and edge cases before adding a
-      faster implementation.
+- [~] Implement deterministic base, table, string, math, and utf8 slices with
+      per-function tests. Focused base/string support plus table
+      `concat`/`insert`/`remove`/`pack`/`unpack` and core numeric math functions
+      are present, along with `utf8.len`/`char`/`codepoint`. Sorting and broader
+      string/math/utf8 edge cases remain.
 - [ ] Implement a sandboxed `package`/`require`: deterministic search paths,
       module cache, cyclic-load behavior, and an explicit host-provided loader
       interface. Native loaders remain off by default.
@@ -254,7 +268,7 @@ oracle; every omitted library entry has a documented capability status.
 
 **Purpose:** make the new reference-heavy runtime safe before optimizing it.
 
-- [ ] Advance the M14 work required for dynamic values: layout descriptors for
+- [ ] Implement the precise-GC work required for dynamic values: layout descriptors for
       tables, strings, closures, upvalue cells, iterator state, errors, and
       coroutine frames; compiler/VM root stacks; and write barriers on every
       reference store.
@@ -327,14 +341,14 @@ the workload, machine, compiler revision, warm-up policy, and comparison.
    source of trustworthy oracles and honest exclusions.
 2. Deliver L1–L4 in order. Tables depend on dynamic values; closures and
    multiple returns depend on bytecode frames and table construction semantics.
-3. Deliver L5 and the M14 subset in L6 before coroutines. Metatables add runtime
+3. Deliver L5 and the precise-GC subset in L6 before coroutines. Metatables add runtime
    indirection and GC adds reference density, both of which coroutine suspension
    must preserve.
 4. Treat L7 and L8 as separate releases. No dynamic JIT cache, native code, or
    broader capability profile is a prerequisite for claiming a correct
    interpreter compatibility tier.
 
-The first implementation change after this plan should be L0's manifest and
-reproducible reference runner, followed by the L1 fixture that parses Lua 5.5
-`global` declarations. That order makes subsequent feature work measurable and
-keeps `.sol`'s typed compiler independent throughout.
+The manifest, reproducible reference runner, and initial Lua 5.5 `global`
+fixture are implemented. Continue from the earliest unchecked dependency in
+this document; keep every added behavior measurable and keep `.sol`'s typed
+compiler independent throughout.

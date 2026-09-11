@@ -1,0 +1,15 @@
+[package]
+name = "bytecode-to-sol"
+version = "0.1.0"
+edition = "2021"
+description = "Best-effort Sol-style decompiler for Sol instruction words and Lua binary chunks"
+
+[lib]
+name = "bytecode_to_sol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bytecode-to-sol"
+path = "src/main.rs"
+
+[dependencies]

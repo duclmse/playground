@@ -2,7 +2,7 @@
 
 [manifest.toml](manifest.toml) maps every top-level file in the pinned Lua
 5.5.1 test checkout to one of the compatibility outcomes defined in
-[the M13 plan](../../docs/sol-roadmap/m13-lua-compat.md). It is deliberately
+[the Lua compatibility feature document](../../docs/features/lua-compatibility.md). It is deliberately
 separate from `crates/sol/tests/fixtures/lua55`: those are small, focused
 fixtures that can move through Sol's bytecode, JIT, OSR, and AOT tests as a
 feature becomes supported.

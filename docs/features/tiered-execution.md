@@ -1,11 +1,14 @@
-# M6 — Baseline + optimizing JIT tiers
+# Tiered execution
 
-**Goal**: tiered compilation (§17) - only worth building once M5's dynamic mode
-gives sol code that can actually benefit from profile-guided specialization;
-the typed/AOT path from M1-M4 never needed this.
+> Status: bytecode startup, hot counters, OSR, and a single native promotion
+> tier are implemented.
 
-**Depends on**: M5 (nothing to profile/specialize without dynamic,
-type-uncertain code in the first place).
+**Purpose**: provide tiered compilation (§17) for code that benefits from
+runtime profiles and specialization. Fully typed AOT code does not require
+tiering.
+
+**Prerequisite**: dynamic values provide type-uncertain behavior to profile and
+specialize.
 
 - [x] **Tier 0: bytecode interpreter** (§29, §30) - `bytecode.rs` (fixed-width
       32-bit iABC/iABx/iAsBx instructions, matching Lua's own encoding) +
@@ -16,7 +19,7 @@ type-uncertain code in the first place).
       Dispatch strategy decided by measurement, not assumption:
       `examples/dispatch_bench.rs` shows Rust `match` over a dense opcode enum
       beating a function-pointer table by ~3-3.5x (see
-      `benchmarks/RESULTS.md`'s M6 section) - direct/computed-goto threading
+      `benchmarks/RESULTS.md`'s tiering section) - direct/computed-goto threading
       isn't expressible in safe Rust, so `match` is the implementation.
 - [x] **Hot counters** (§31): per-function call counts (`interp::Runtime::counts`)
       and per-loop-backedge counts (`osr_counts`, keyed by `(func_id,
@@ -28,7 +31,7 @@ type-uncertain code in the first place).
       showed up as a bottleneck.
 - [x] **Tier 1 + Tier 2 collapsed into one "promote to native" step** (§17) -
       deliberately not built as two separate compiles. `jit.rs`'s pipeline
-      already reuses the full M1-M4 Cranelift pipeline (constant folding, GVN,
+      already reuses the full typed Cranelift pipeline (constant folding, GVN,
       LICM, bounds-check elimination, inlining, escape analysis), so a
       "baseline" compile that deliberately skips those passes would only be
       slower to run *and* slower to produce, with nothing to gain until a
@@ -48,7 +51,7 @@ type-uncertain code in the first place).
 - [x] **Speculative optimization** (§40), **inline caches** (§19) and
       **deoptimization** (§18) - scoped down together (see "Speculative `any`-
       parameter specialization" below) into one narrower, coherent mechanism
-      that matches what M5's trap-based `any` actually makes possible, rather
+      that matches what trap-based `any` actually makes possible, rather
       than the three being separately built pieces of a general deopt VM:
       `jit::speculative_candidate` statically finds a hot function's `any`
       parameter that's always immediately narrowed to one concrete type,
@@ -65,7 +68,7 @@ type-uncertain code in the first place).
       (`..._is_visible_in_dumped_ir` asserts the specialized variant shows up
       in `SOL_DUMP_CLIF`'s output).
 
-**Speculative `any`-parameter specialization - design note**: sol's M5
+**Speculative `any`-parameter specialization - design note**: Sol's
 `any` design uses hard runtime traps on a type mismatch (`value.rs`'s tag
 check + `trap()`), not speculative typing - so classic deopt/inline-caches/
 speculative-optimization (as LuaJIT or V8 build them, reconstructing precise
@@ -101,6 +104,6 @@ speculative-candidate map built from `jit::speculative_candidate`), `jit.rs`
 register file needed its own GC-root registration, since the existing
 conservative scanner only walked the native stack), `examples/dispatch_bench.rs`
 (§30's dispatch-strategy measurement). No separate `jit_tiers/` module was
-needed, matching M6's own "Tier 1 + Tier 2 collapsed" reasoning above - there
+needed, matching the "Tier 1 + Tier 2 collapsed" reasoning above - there
 is still only one native backend, not two, speculative specialization
 included.

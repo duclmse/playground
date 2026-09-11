@@ -1,17 +1,20 @@
-# M7 — SIMD, PGO, polish (done, scoped)
+# Native toolchain and performance tooling
 
-**Goal**: the remaining items `faster_lua.md` frames as the actual
+> Status: SIMD specialization, profile-guided warm start, AOT, FFI, and
+> introspection tooling are implemented with the platform limits below.
+
+**Purpose**: implement the remaining items `faster_lua.md` frames as the actual
 differentiators for beating LuaJIT specifically on numeric workloads (§21,
 §41-42), plus practical-adoption features (§23, §25).
 
-**Depends on**: M6 (vectorization and PGO both want a mature optimizer pipeline
-and real profiling data to act on).
+**Prerequisite**: vectorization and PGO require a mature optimizer pipeline
+and real profiling data to act on.
 
 - [x] **Loop vectorization** (§21): `codegen.rs`'s
       `try_vectorize_elementwise_loop` recognizes exactly `for i = start,
       stop do out[i] = a[i] OP b[i] end` (step 1, `out`/`a`/`b` all
       `Array<f64>`, `OP` one of `+ - * /`) - a narrow pattern match, not
-      general auto-vectorization, matching M2's own bounds-check-
+      general auto-vectorization, matching the optimizer's bounds-check-
       elimination precedent. Emits Cranelift's own vector type (`F64X2` -
       portable IR, no hand-rolled per-ISA intrinsics needed; lowers to
       NEON on this session's ARM64 host, and should lower to SSE2 on
@@ -25,7 +28,7 @@ and real profiling data to act on).
       but modest ~1.06-1.10× on `benchmarks/vector_add.sol` - the loop is
       memory-bandwidth-bound, not compute-bound, so halving arithmetic
       instruction count doesn't halve wall-clock time; see
-      `benchmarks/RESULTS.md`'s M7 section for the honest accounting.
+      `benchmarks/RESULTS.md`'s native-toolchain section for the honest accounting.
 - [x] **CPU-aware codegen** (§24): confirmed, not assumed -
       `jit::Jit::new`/`SOL_TARGET_INFO`/`sol run --target-info` prints
       every ISA-specific setting `cranelift_native::builder()` (what
@@ -44,7 +47,7 @@ and real profiling data to act on).
 - [x] **Profile-guided optimization** (§23), scoped down: `sol run
       --profile-out <file>` dumps which functions actually got promoted/
       speculatively-specialized during that run (`tier::Engine::dump_profile`,
-      reusing M6's own live tiering state - `interp::Runtime::
+      reusing the live tiering state - `interp::Runtime::
       native_function_ids`/`specialized_speculative_ids`, no new tracking
       needed); `sol run --profile-in <file>` preloads that list at
       startup (`jit::promote`/`promote_speculative` called immediately,
@@ -55,7 +58,7 @@ and real profiling data to act on).
       profiling, and it doesn't yet feed `sol build`'s eager AOT
       compile at all, since AOT has no warm-up to skip and no
       speculative-guard mechanism of its own to inform - see "Remaining
-      M7 work" for what a real AOT-targeted PGO would need). Verified:
+      remaining work section for what a real AOT-targeted PGO would need). Verified:
       forcing `SOL_PROMOTE_THRESHOLD` impossibly high on the *replay*
       run and confirming (via `--jit-log`) that the profile alone still
       promotes `fib`/`main` immediately.
@@ -90,13 +93,13 @@ and real profiling data to act on).
       table-returning style: no explicit per-library `dlopen` (resolution
       is against the process's already-loaded global symbol table, which
       always includes libc/libm), and only `i64`/`f64`/`bool` cross the FFI
-      boundary (matching M5's own scalar-only boxing precedent). Verified
+      boundary (matching the original scalar-boxing precedent). Verified
       calling real `sqrt`/`pow` from both the interpreter and
       promoted-native tiers (`tests/fixtures/ffi_libm.sol`).
 - [x] **First-class profiling/introspection tooling** (§32): `sol run
       --dump-ir`/`--dump-asm`/`--jit-log`/`--target-info` (`main.rs`'s flag
       parser sets the same `SOL_*` env vars `jit.rs` already read since
-      M2/M6 - a documented, discoverable CLI surface over what were ad hoc
+      optimization and tiering work - a documented, discoverable CLI surface over what were ad hoc
       debug prints, not a new mechanism). `--dump-asm` is new: Cranelift's own
       `VCode` textual form (`Context::set_disasm`/`CompiledCode::vcode`) -
       genuinely close to real assembly (the lowered-to-machine-instructions
@@ -114,19 +117,19 @@ and real profiling data to act on).
       language feature sol doesn't have (no strings, no hash tables, no
       coroutines, no I/O - see `docs/sol.md`). `10_parser` (compiler
       throughput) is out of scope for "beat LuaJIT" per se. Results (see
-      `benchmarks/RESULTS.md`'s M7 section): sol beats LuaJIT by
+      `benchmarks/RESULTS.md`'s native-toolchain section): Sol beats LuaJIT by
       **2.51×** on `function_calls` and **1.14×** on `matrix`, but LuaJIT
       wins `objects` by **1.46×** - an honest exception, not swept under
       the rug: LuaJIT's table allocator beats sol's simpler
-      conservative GC (M4's own descoping decision) on pure small-struct
+      conservative GC on pure small-struct
       allocation churn. Also reports peak RSS and p95 latency for the three
       new benchmarks (sol uses ~2-2.5× the memory LuaJIT does, not yet
       investigated) - `scripts/benchmark.sh` itself doesn't automate these
       two metrics for the whole suite yet, a real scope cut, not silently
       dropped.
 
-**Remaining M7 work - AOT-targeted PGO design note**: a fuller §23 would let
-`sol build --profile app.prof app.sol` bake M6's speculative-`any`-
+**Remaining work - AOT-targeted PGO design note**: a fuller §23 would let
+`sol build --profile app.prof app.sol` bake speculative-`any`-
 parameter specialization into the *eager* AOT compile (which today just
 emits the general, always-boxed-check path for `any` parameters, with no
 tiering to specialize into). The natural shape: compile a function with a
@@ -136,7 +139,7 @@ general block (today's path) - rather than the JIT's two-separate-
 compiled-functions-plus-runtime-dispatch approach, since AOT has no
 `interp::Runtime` object to hold a guard in. Not built this pass.
 
-**Explicitly out of scope even after M7** (per `faster_lua.md` §26-27's own
+**Explicitly out of scope** (per `faster_lua.md` §26-27's own
 framing as "architecture, not the optimization strategy", and §35's explicit
 deprioritization): stackless coroutines and structured exception handling are
 real, valid future work, but the document itself doesn't treat them as part of
@@ -157,4 +160,4 @@ against `runtime.rs` as a real staticlib), `runtime.rs`
 `codegen.rs` (`try_vectorize_elementwise_loop`, `detect_vectorizable_loop`),
 `benchmarks/{function_calls,objects,matrix}.{fl,lua}`. No separate
 `src/ffi.rs`, `src/tools/`, `src/pgo.rs`, or `src/vectorize.rs` module
-ended up needed - every M7 item extended an existing file.
+ended up needed - every item extended an existing file.

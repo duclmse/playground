@@ -1,8 +1,11 @@
-# M1 — Minimal typed compiler (done)
+# Typed compiler pipeline
 
-**Goal**: prove the core architectural bet (typed values, SSA via Cranelift,
+> Status: implemented.
+
+**Purpose**: prove the core architectural bet (typed values, SSA via Cranelift,
 straight-to-native compilation) works at all, on the smallest useful language
-slice. See `docs/sol.md` for the full language reference and
+slice. See [the language specification](../spec/README.md) for observable
+behavior, `docs/sol.md` for the architecture overview, and
 `benchmarks/RESULTS.md` for results.
 
 - [x] Lexer (`lexer.rs`, `logos`) - keywords, identifiers, int/float literals,
@@ -19,14 +22,14 @@ slice. See `docs/sol.md` for the full language reference and
 - [x] Codegen to Cranelift IR via `cranelift-frontend`'s `FunctionBuilder`
       (`codegen.rs`) - arithmetic, comparisons, non-short-circuiting `and`/`or`,
       `if`/`while`/numeric-`for` control flow, function calls, array load/store
-      (unchecked - see M0).
+      (bounds checking is covered by [Safety and correctness](safety.md)).
 - [x] Array runtime support (`runtime.rs`) - `ArrayHeader`, leaked `Vec`-backed
-      allocation, no GC (documented M1 scope).
+      allocation; the current collector is documented in
+      [Memory management](memory-management.md).
 - [x] JIT execution (`jit.rs`, `cranelift-jit`) - declare/compile/finalize every
       function, call `main`, print its return value (`main.rs`).
 - [x] Unit tests (`typeck.rs`'s `#[cfg(test)]`) + integration tests
       (`tests/programs.rs`) spawning the real binary.
 - [x] Two `.sol` benchmarks (`benchmarks/fib.sol`, `table_array.sol`) wired into
       `scripts/benchmark.sh`.
-- [x] `docs/sol.md` - language reference, architecture, Cranelift API notes,
-      roadmap summary.
+- [x] `docs/sol.md` - architecture overview and Cranelift API notes.

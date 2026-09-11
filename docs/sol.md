@@ -11,42 +11,31 @@ debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
 changes; Sol accepts both `.lua` and `.sol` source files. Lua's fully dynamic
 runtime features remain an incremental compatibility target.
 
-## Status: M12 in progress (M0/M2 folded in)
+## Status
 
-M1 - lexer → parser → typed AST → type-check → Cranelift IR → JIT → run - is
-implemented for `i64`/`f64`/`bool`, functions, `if`/`while`/numeric `for`, and
-`Array<T>`. M2 added real optimization work: `opt_level = "speed"` (Cranelift's
-own mid-end passes), array bounds checking (an M0 correctness fix - M1 shipped
-with none at all), a narrow bounds-check- elimination pattern, AST-level
-constant folding, and function inlining. M3 added fixed-layout `struct`s and
-escape analysis + scalar replacement - verified at the IR level to remove heap
-allocation entirely for a struct that never leaves its function. M4 replaced the
-leak-everything runtime with a real garbage collector - see "GC (M4)" below for
-what it is and, just as importantly, what it deliberately isn't yet. M5 added
-gradual typing - an explicit `any` type, checked at runtime, with zero cost for
-code that never uses it - see "Gradual typing (M5)" below. M6 added tiered
-execution - a tier-0 bytecode interpreter, hot-counter-driven promotion to
-native code, on-stack replacement, and a scoped-down deopt/inline-cache/
-speculative-optimization mechanism for hot `any`-typed function parameters -
-so a program starts running immediately instead of paying M1-M5's
-whole-program AOT compile before its first instruction; see "Tiered execution
-(M6)" below for what that scoping looks like and why. M7 added ahead-of-time
-compilation to a real standalone executable (`sol build`), FFI
-(`extern function`), loop vectorization for elementwise `f64` array ops,
-profile-guided warm-start, and profiling/introspection CLI tooling - see the
-M7 sections below. M8 added `sol run --profile-time` (a real wall-clock
-profiler) and `sol debug` (a call-boundary REPL debugger), both via a
-zero-cost-when-disabled mechanism - `sol run` with no debug/profile
-flags is a provably different, unaffected compiled path, not a
-runtime-disabled one - see "Debugging and profiling (M8)" below. M9-M10 added
-structured diagnostics, typed-IR verification, structural records,
-`Map<i64, i64>`, and allocation-free typed iteration. M11 now has typed module
-graphs and zero-allocation lambda lifting for immutable, nonescaping nested
-functions; escaping captured environments remain deliberately rejected. M12
-adds exported/qualified type aliases, explicit `is`/`as` narrowing,
-identity-preserving `any` boxes for typed reference values, and the first
-monomorphized collection algorithm (`map` over `Array<i64>`). See
-"Roadmap" below for what's next.
+The typed pipeline—lexer, parser, typed AST, validation, optimization,
+bytecode, Cranelift JIT/OSR, and AOT—is implemented. Its language surface
+includes scalars and strings, arrays, nominal structs, structural records,
+scalar-valued maps, typed iteration, type aliases, stateless function values,
+nonescaping captured functions, and multi-file typed modules. Safety checks,
+escape analysis/scalar replacement, conservative garbage collection, gradual
+`any` values with explicit `is`/`as` narrowing, and a specialized array `map`
+path are integrated across the applicable execution tiers.
+
+The native toolchain provides `sol build`, scalar FFI, elementwise `f64`
+vectorization, profile-guided warm start, introspection flags, wall-clock
+profiling, and call-boundary debugging. Uninstrumented execution uses a
+different generic monomorphization and contains no debug/profile runtime
+branch.
+
+Lua compatibility is an interpreter-first, byte-oriented dynamic runtime kept
+separate from typed Sol. A useful subset of tables, closures/upvalues,
+varargs/multiple results, iteration, protected calls, metatables, budgets, and
+portable libraries is implemented. Complete libraries, coroutines, precise
+dynamic GC, escaping typed closure environments, richer static algebraic types,
+and the typed/dynamic module bridge remain open. See the [feature
+documentation](features/README.md) for implementation status and the
+[language specification](spec/README.md) for observable behavior.
 
 ### Feature matrix
 
@@ -57,37 +46,37 @@ unboxed representation.
 | Feature | Parser | Bytecode | JIT | OSR | AOT | `any` boundary | `.lua` compatibility |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Scalars, control flow, functions | yes | yes | yes | yes | yes | scalar boxing | separate dynamic values |
-| `Array<i64/f64>` and `ipairs` | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables / `ipairs` |
-| Nominal structs | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
-| Structural records | yes | yes | yes | yes | yes | no aggregate boxing | Lua tables |
-| `Map<i64, i64>`, literals, `pairs` | yes | yes | yes | yes | yes | not yet | Lua tables / `pairs` |
-| Nonescaping immutable closures | yes | direct lifted call | yes | yes | yes | not yet | separate heap closures |
+| `Array<i64/f64>` and `ipairs` | yes | yes | yes | yes | yes | identity-preserving reference box | Lua tables / `ipairs` |
+| Nominal structs | yes | yes | yes | yes | yes | identity-preserving reference box | Lua tables |
+| Structural records | yes | yes | yes | yes | yes | identity-preserving reference box | Lua tables |
+| `Map<i64, i64/f64/bool>`, literals, `pairs` | yes | yes | yes | yes | yes | identity-preserving reference box | Lua tables / iterator triples |
+| Nonescaping captured closures | yes | direct lifted call | yes | yes | yes | not yet | separate heap closures |
 | Typed modules and exported records | yes | yes | yes | yes | yes | `.lua` boundary not yet | `require` is separate |
 | Type aliases and `is`/`as` narrowing | yes | yes | yes | yes | yes | checked tags | separate dynamic types |
 | `map(Array<i64>, fn(i64)->i64)` | yes | specialized | specialized | specialized | specialized | no boxing | Lua library `map` absent |
-| Source diagnostics | token spans | n/a | function line | function line | function line | n/a | parser locations |
+| Source diagnostics | token spans | function declaration ranges | function declaration ranges | function declaration ranges | function declaration ranges | n/a | parser locations |
 | Debug/profiling hooks | n/a | call + source line | promotion events | OSR events | n/a | visible dynamic ops | not yet |
 
 Typed map traversal order is intentionally unspecified. `ipairs(Array<T>)`
 uses Sol's zero-based array indices. Missing typed-map keys currently read as
-the value type's zero value. M10 deliberately restricts typed maps to
-`Map<i64, i64>` until precise GC entry layouts and write barriers make
-pointer-bearing keys and values safe.
+the value type's zero value. Maps support unboxed `i64`, `f64`, and `bool`
+values. Keys remain `i64`, and pointer-bearing keys/values remain rejected until
+precise GC entry layouts and write barriers make them safe.
 
 ### Early results
 
 From `benchmarks/RESULTS.md` (hyperfine, whole-process wall time - see that file
-for full methodology, the M1→M2 comparison, and caveats): on the two workloads
+for full methodology, the initial-to-optimized comparison, and caveats): on the two workloads
 sol currently has equivalent programs for, it beats not just reference Lua
 (3.8-8.5×) and this repo's own dynamic VM (19-40×), but **LuaJIT** (1.15-1.30×).
-Encouraging, not conclusive: two workloads, one machine. Notably, M2's optimizer
+Encouraging, not conclusive: two workloads, one machine. Notably, the optimizer
 work didn't move either benchmark's wall-clock time (within measurement noise) -
 both are documented, understood non-findings (a memory-bandwidth-bound loop
 doesn't care about one well-predicted bounds check; neither benchmark calls
 anything inlining could help), not a sign the passes don't work - see
 `benchmarks/RESULTS.md` for the direct A/B evidence.
 
-M3's scalar replacement has its own, more direct verification: dumping the
+Scalar replacement has its own, more direct verification: dumping the
 emitted Cranelift IR (`SOL_DUMP_CLIF=1 sol run ...`) for a `Point`
 struct that never escapes its function shows _zero_ allocation, load, or store
 instructions - just `f64const`/`fmul`/`fadd`/`return` - versus a real `call` to
@@ -95,7 +84,7 @@ the allocator when the same struct is passed to another function
 (`crates/sol/tests/programs.rs`'s
 `non_escaping_struct_local_has_no_allocation_in_the_emitted_ir` pins this).
 
-M4's GC went through three results worth keeping, in order. The first cut
+The GC went through three results worth keeping, in order. The first cut
 (`HashMap`-based bookkeeping, one `std::alloc`/`dealloc` call per object) lost
 to LuaJIT on `benchmarks/gc_alloc.sol` (pure allocation churn) by 7.9× - a real,
 honest weak spot. A follow-up rewrite to a chunked bump allocator (same file, no
@@ -106,7 +95,7 @@ parity. That rewrite then exposed a *different* cost on `table_array` (one
 being conservatively scanned after briefly existing as a stack root
 mid-allocation. Fixing that (marking a scalar array's data buffer as
 provably pointer-free, so the collector never scans its contents at all - see
-"GC (M4)" below) brought `table_array` back to *beating* LuaJIT (1.46×),
+"Memory management" below) brought `table_array` back to *beating* LuaJIT (1.46×),
 matching or exceeding the pre-GC number. Removing provably-redundant
 bounds checks from the hottest per-allocation function (`Chunk::carve`)
 looked like a further win but, on rigorous re-measurement (10 rounds,
@@ -116,14 +105,14 @@ left standing. A matching attempt at marking *structs* atomic (not just
 arrays) measured out as a net loss and was reverted - both real, recorded
 non-findings, not silently dropped. What actually broke the tie: `gc.rs`
 stopped bulk-zeroing a whole chunk on every reuse, since struct/header
-allocations never needed it (only array data does - see "GC (M4)" below)
-- sol now wins 10/10 rounds on both wall-clock and CPU time, a clear,
-non-overlapping gap. See `benchmarks/RESULTS.md`'s M4 section for every
+allocations never needed it (only array data does - see "Memory management" below)
+- Sol now wins 10/10 rounds on both wall-clock and CPU time, a clear,
+non-overlapping gap. See `benchmarks/RESULTS.md`'s collector section for every
 number and the bugs (and non-wins) caught along the way.
 
-## GC (M4)
+## Memory management
 
-A real collector, replacing M1-M3's `Box::leak`/`mem::forget`-everything
+A real collector, replacing the initial `Box::leak`/`mem::forget`-everything
 runtime: `crates/sol/src/gc.rs`. **What it is**: a conservative
 (stack-scanning) mark-sweep collector over a **chunked bump arena** - a handful
 of large chunks, each bump-allocated into sequentially
@@ -146,16 +135,16 @@ zeroed, since sol's language semantics promise unwritten elements read
 as zero. **What it deliberately isn't** (yet): true generations (a chunk with even one
 long-lived survivor keeps *all* its dead space until the whole chunk dies
 together - a documented fragmentation trade-off, not an oversight), promotion,
-or write barriers - descoped with reasoning recorded in
-`docs/sol-roadmap.md`'s M4 section, since getting a *correct* and *fast*
-collector working was already the substantial part of this milestone.
+or write barriers. The scope decision is recorded in [the memory-management
+feature document](features/memory-management.md); getting a *correct* and
+*fast* collector working was already the substantial part of this work.
 `SOL_GC_STATS=1 sol run <file.sol>` prints live block/byte counts at
 exit (forcing a final collection first for accuracy); `SOL_GC_DEBUG=1`
 traces every collection cycle to stderr, including how many words its
 non-atomic tracing touched - both the same env-gated-diagnostic pattern as
 `SOL_DUMP_CLIF`.
 
-## Gradual typing (M5)
+## Gradual typing
 
 `any` (faster_lua.md §3-4): a value whose type is checked at runtime instead
 of compile time, for the boundaries where fully static typing doesn't fit -
@@ -172,14 +161,15 @@ refines `x` on the true branch; `x as Point` is the explicit checked-cast form.
 Dynamic indexing/calls/fields still require narrowing first. Strict code is
 completely unaffected: boxing/unboxing only ever gets inserted where `any`
 appears in the source, so a program that never writes `any` compiles to
-*exactly* the same code as if M5 didn't exist - see
-`docs/sol-roadmap.md`'s M5 section for how this is verified. The trade-off
-is real and measured, not hidden: `benchmarks/RESULTS.md`'s M5 section shows
+*exactly* the same code as if gradual-typing support did not exist - see
+[the gradual-typing feature document](features/gradual-typing.md) for how this
+is verified. The trade-off is real and measured, not hidden:
+`benchmarks/RESULTS.md` shows
 a workload with an `any`-typed function boundary running ~7-10× slower than
 the identical strict version, almost entirely the cost of one heap allocation
 per call - the honest price of opting into dynamic behavior.
 
-## Tiered execution (M6)
+## Tiered execution
 
 Every function starts out **interpreted**, not compiled: `bccompile.rs`
 lowers each typed function to fixed-width 32-bit bytecode (`bytecode.rs` -
@@ -188,7 +178,7 @@ the typed AST's own `LocalId`s, and `interp.rs` executes that bytecode
 directly. Two independent hot counters (`SOL_PROMOTE_THRESHOLD`,
 default 200 calls; `SOL_OSR_THRESHOLD`, default 50 loop backedges)
 decide when to compile a native version: a function crossing the call
-threshold gets promoted (`jit.rs::promote`) via the exact same M1-M4
+threshold gets promoted (`jit.rs::promote`) via the same typed
 Cranelift pipeline that used to run for every function up front, and a
 loop crossing the backedge threshold in a function that hasn't promoted
 yet gets **on-stack replacement** (`jit.rs::promote_osr`) - a synthetic
@@ -197,22 +187,22 @@ straight into that loop's body, so an already-running interpreted loop
 can switch to native mid-iteration rather than waiting for its enclosing
 function to return. OSR isn't a nice-to-have here: a `main`-shaped
 program (called once, its real work all inside one loop) never crosses
-the call-count threshold at all, and `benchmarks/RESULTS.md`'s M6 section
+the call-count threshold at all, and `benchmarks/RESULTS.md`'s tiering section
 shows the 12x regression that results without it.
 
 There is deliberately only one native tier, not two: `faster_lua.md`'s
 "tier 1 baseline JIT" / "tier 2 optimizing JIT" split exists to trade
 compile speed for code quality once, then again once more information is
-available. Since `jit.rs` already runs M1-M4's full pipeline (GVN, LICM,
+available. Since `jit.rs` already runs the full pipeline (GVN, LICM,
 escape analysis, bounds-check elimination, inlining) on every promotion,
 a deliberately-worse "baseline" compile would have nothing to be a faster
 version *of* - it would just be slower to write and slower to run, with
 no follow-up recompile currently designed to improve on it.
 
-**Speculative `any`-parameter specialization** is M6's answer to
+**Speculative `any`-parameter specialization** handles
 `faster_lua.md`'s deoptimization/inline-caches/speculative-optimization
 items (§18-20, §40), deliberately scoped down rather than built as a
-general VM deopt mechanism - M5's `any` is checked with a hard runtime
+general VM deopt mechanism - `any` is checked with a hard runtime
 trap, not a speculative guess, so there's no arbitrary native PC to
 reconstruct interpreter state from. `jit::speculative_candidate` looks for
 a hot function's `any`-typed parameter used *exclusively* as the
@@ -238,7 +228,7 @@ scalar instead of trapping. See
 guarded-native calls agree on the arithmetic) and proof the specialized
 variant is actually compiled (via `SOL_DUMP_CLIF`).
 
-## AOT compilation (M7)
+## AOT compilation
 
 `sol build program.sol -o program` compiles straight to a standalone
 executable instead of running in-process: `aot.rs` uses
@@ -255,20 +245,21 @@ slightly *beats* the tiered JIT on `benchmarks/table_array.sol` while
 staying ~1.5x faster than LuaJIT. Only verified on macOS ARM64 so far -
 Linux linking may need extra system libraries not yet checked.
 
-## Profile-guided warm-start (M7)
+## Profile-guided warm-start
 
 `sol run --profile-out app.prof app.sol` records which functions
 actually got promoted/speculatively-specialized during that run (reusing
-M6's own tiering state - no new instrumentation); `sol run
+the existing tiering state - no new instrumentation); `sol run
 --profile-in app.prof app.sol` (a later run of the same program) preloads
 that list at startup, skipping the interpreted warm-up that produced it
 the first time. A real, working slice of `faster_lua.md` §23's larger PGO
 vision - not the full one (no type-distribution/branch-probability/
 allocation-site profiling yet, and it doesn't feed `sol build`'s AOT
-compile) - see `docs/sol-roadmap/m7.md` for the fuller design that
+compile) - see [the native-toolchain feature document](features/native-toolchain.md)
+for the fuller design that
 would.
 
-## Loop vectorization (M7)
+## Loop vectorization
 
 `codegen.rs`'s `try_vectorize_elementwise_loop` recognizes exactly `for i =
 start, stop do out[i] = a[i] OP b[i] end` (step 1, `out`/`a`/`b` all
@@ -276,14 +267,14 @@ start, stop do out[i] = a[i] OP b[i] end` (step 1, `out`/`a`/`b` all
 (`F64X2`, portable IR - no hand-rolled per-ISA intrinsics) 2 lanes at a
 time, with a scalar tail for any odd leftover element and one whole-range
 bounds check up front instead of a per-element one. A narrow pattern
-match, not general auto-vectorization - matching M2's own bounds-check-
+match, not general auto-vectorization - matching the optimizer's bounds-check-
 elimination precedent. Measured a real but modest ~1.06-1.10× on
 `benchmarks/vector_add.sol`: that loop is memory-bandwidth-bound, not
 compute-bound, so halving the arithmetic instruction count doesn't halve
-wall-clock time - see `benchmarks/RESULTS.md`'s M7 section for the honest
+wall-clock time - see `benchmarks/RESULTS.md`'s vectorization section for the honest
 accounting.
 
-## Debugging and profiling (M8)
+## Debugging and profiling
 
 `interp::Runtime`/`tier::Engine` are generic over `H: interp::Hooks`
 (default `()`) - a trait with two empty-by-default methods
@@ -310,18 +301,22 @@ mechanism behind both new commands:
   (interpreted or promoted) since the hook wraps the call boundary itself,
   before tier dispatch. Scoped to call-boundary granularity, not
   per-source-line stepping (real line-level breakpoints need source lines
-  threaded through the typed AST into bytecode, complicated by M2/M3's
+  threaded through the typed AST into bytecode, complicated by optimizer and escape-analysis
   optimizer passes reordering statements after type-checking - a
   substantially larger undertaking); `args`/return values print as raw
   `u64` bits, not type-formatted, since there's no live type info at a
   call boundary.
 
 Verified via both a structural argument (different monomorphizations) and
-an empirical one: `benchmarks/RESULTS.md`'s M8 section compares the pre-M8
-and post-M8 binaries on four benchmark shapes, all within measurement
-noise - see `docs/sol-roadmap/m8.md` for the full writeup.
+an empirical one: `benchmarks/RESULTS.md`'s debugging section compares
+uninstrumented binaries on four benchmark shapes, all within measurement
+noise - see [the debugging feature document](features/debugging-and-profiling.md)
+for the full writeup.
 
-## Language reference (M1-M3)
+## Language overview
+
+The normative reference is [`docs/spec/`](spec/README.md). This section is a
+compact usage overview.
 
 ```
 function sum(a: Array<f64>): f64
@@ -341,15 +336,19 @@ function main(): f64
 end
 ```
 
+- **Function declarations**: `fn` is a shorter Sol-only alias for `function`,
+  including `export fn`, `extern fn`, and `local fn`. In `.lua` source, `fn`
+  remains an ordinary identifier for compatibility.
 - **Types**: `i64`, `f64`, `bool`, `Array<T>`, named `struct`s, and typed
   top-level function values. Use `fn(Args) -> Return` (or the equivalent
   `fn(Args): Return`) in annotations. Top-level and stateless nested functions
   can be assigned and called through typed locals. A nested function may also
-  capture immutable `i64`, `f64`, `bool`, or `string` locals when all calls are
-  direct; capture conversion adds unboxed parameters and allocates no closure
-  object. Escaping captured functions and mutable shared captures are rejected
-  until their two-word code/environment representation and precise GC layout
-  are available.
+  capture `i64`, `f64`, `bool`, or `string` locals when all calls are direct;
+  capture conversion passes the current value as an unboxed parameter and
+  allocates no closure object, so an enclosing reassignment is observed by the
+  next call. Escaping captured functions and assignments from inside a closure
+  remain rejected until their two-word code/environment representation and
+  precise GC layout are available.
 - **Modules**: `import math.pipeline` resolves `math/pipeline.sol` relative to
   the importer, then falls back to `.lua`. `export function` and `export
   struct` define the typed interface. Qualified calls, annotations, and struct
@@ -362,11 +361,11 @@ end
   `Name { field = expr, ... }` constructs one (fields in any order - they're
   reordered to declaration order internally), `value.field` reads and writes.
   Every field must be given in a literal - no partial initialization/defaults in
-  M3. Struct-typed locals that never leave their function (never returned,
+  the struct implementation. Struct-typed locals that never leave their function (never returned,
   passed to a call, stored into an array/another struct, or reassigned as a
   whole) are compiled with **zero heap allocation** at all - see "Early results"
   above - everything else is a small, `sol_alloc`-backed heap block,
-  garbage-collected since M4 (see "GC (M4)" below).
+  garbage-collected (see "Memory management" below).
 - **`local x: T = expr`**: type annotation is optional - `local x = 10` infers
   `i64`, `local y = 20.0` infers `f64` (the inferred type is simply the
   initializer's own type).
@@ -379,11 +378,18 @@ Run `scripts/test-lua55-suite.sh` to execute every top-level case from a local
 language features separately from declared host-required C API, CLI, native
 module, filesystem, and locale cases; it retains per-case logs when
 `SOL_LUA55_RESULTS_DIR` is set. The staged compatibility plan and reference
-runner are in `docs/sol-roadmap/m13-lua-compat.md` and `tests/lua55/README.md`.
-- **Every function must declare a return type.** M1 has no `void` functions. The
+runner are in [the Lua compatibility feature document](features/lua-compatibility.md)
+and `tests/lua55/README.md`.
+- **Dynamic `.lua` execution** uses a separate `LuaValue` interpreter with byte
+  strings, tables, closures/shared environments, varargs/multiple results,
+  iterator triples, protected calls, same-block labels/gotos, table
+  metatables, and focused base/string/table/math/utf8 libraries. Recursion,
+  instruction/backedge, and heap-object allocation budgets are enforced. This
+  does not box or add runtime branches to ordinary typed `.sol` code.
+- **Every function must declare a return type.** Sol has no `void` functions. The
   entry point `sol run` looks for is always a niladic `main`, whose return
   value is printed - there's no `print`/I/O builtin in the language itself in
-  M1, so this is the only way a program produces an observable result.
+  typed core, so this is the only way a typed program produces an observable result.
 - **Implicit `i64 -> f64` widening**: wherever an `i64` value appears where
   `f64` is expected (arithmetic with an `f64` operand, assignment to an
   `f64`-typed slot, an `f64` call argument/return), it's silently widened. Every
@@ -391,9 +397,9 @@ runner are in `docs/sol-roadmap/m13-lua-compat.md` and `tests/lua55/README.md`.
   `f64 -> i64`, and never coerces `Bool`/`Array`. `%` (modulo) is integer-only
   (Cranelift has no float-remainder instruction, and it's rare enough on floats
   not to be worth a runtime helper yet).
-- **`and`/`or` do not short-circuit** in M1 - both operands are always evaluated
-  (a plain bitwise and/or on their boolean representation). A documented
-  simplification, not an oversight.
+- **`and`/`or` short-circuit** in bytecode and native code. Sol also lowers
+  compound `value is Type and value.field ...` conditions as nested branches,
+  making the narrowed local available to the right operand and the body.
 - **Arrays**: `new_array_i64(n)` / `new_array_f64(n)` are the only way to
   construct one (not user-callable-looking generics - monomorphic builtins,
   matching `faster_lua.md` §8's "monomorphization over generic dispatch"
@@ -401,14 +407,14 @@ runner are in `docs/sol-roadmap/m13-lua-compat.md` and `tests/lua55/README.md`.
   (out-of-range or negative indices trap the process - a real crash, not a
   catchable error, since there's no exception mechanism yet). Every array is a
   pointer to a small heap header (`runtime.rs`'s `ArrayHeader`),
-  garbage-collected since M4 (see "GC (M4)" below) - M1-M3 leaked every
-  allocation for the life of the process; that's no longer true.
+  garbage-collected (see "Memory management" below); the original runtime's
+  process-lifetime leaks no longer apply.
 - **Integer arithmetic wraps** on overflow (`iadd`/`isub`/`imul` - matching
   typical systems-language behavior); **integer division/modulo by zero traps**
   the process (confirmed empirically: Cranelift's `sdiv`/`srem` already do this
   on this target, no extra check needed in `codegen.rs`).
 - **Comments**: `-- like this`, to the end of the line (matches Lua).
-- **`extern function name(params): T`** (M7 §25 FFI): declares a native
+- **`extern function name(params): T`** (`faster_lua.md` §25 FFI): declares a native
   symbol already loaded in the process (typically libc/libm), resolved via
   `dlsym` - no body, and `name` is also the C symbol name. Calling one
   compiles to a plain direct call, same as calling a sol function. Only
@@ -440,7 +446,7 @@ native machine code, called directly                     .o -> `cc` -> standalon
 
 `run` and `build` share everything up to and including `types.rs`/`codegen.rs`
 - only the last step (which `cranelift-module` backend, and whether
-compilation is lazy/tiered vs. eager) differs. See "AOT compilation (M7)"
+compilation is lazy/tiered vs. eager) differs. See "AOT compilation"
 below.
 
 **Why Cranelift, not a hand-written backend or LLVM**: pure Rust (no C++
@@ -486,28 +492,19 @@ examples/tutorials found online:
   relocations in a PIE main executable otherwise (`Illegal text-relocations`
   at link time, not a runtime crash).
 
-## Roadmap
+## Documentation map
 
-See [sol-roadmap.md](./sol-roadmap.md) for the detailed, checklist-level
-plan (including a known correctness gap - M1's array indexing has no bounds
-checking at all - queued as M0). Summary:
+The [feature index](features/README.md) links implementation rationale, status,
+verification notes, and remaining work. The [language specification](spec/README.md)
+defines observable behavior without tying it to a delivery sequence.
 
-M1 is deliberately the smallest useful slice - `faster_lua.md`'s own closing
-section ("If I were building it with you") recommends starting here before
-anything else. The rest of the document's architecture maps to these future
-milestones:
-
-| #      | Milestone                            | Scope                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **M1** | **Minimal typed compiler (done)**    | This document's scope above.                                                                                                                                                                                                                                                                                                                                                                                 |
-| **M2** | **Optimizer passes (done)**          | `opt_level = "speed"`, array bounds checking + a narrow elimination pattern, AST-level constant folding, function inlining. See `benchmarks/RESULTS.md` for the honest before/after.                                                                                                                                                                                                                         |
-| **M3** | **Structs + escape analysis (done)** | Fixed-layout structs, escape analysis + scalar replacement of aggregates - IR-verified to remove heap allocation entirely for a non-escaping struct. A real (non-leaked) array runtime is deferred to M4, which needs a GC anyway.                                                                                                                                                                           |
-| **M4** | **GC (done, descoped)**              | Conservative (stack-scanning) mark-sweep over a chunked bump arena, not the originally-planned generational/write-barrier design - see `docs/sol-roadmap.md`'s M4 section for the scope call and reasoning, and `benchmarks/RESULTS.md` for the full before/after (an initial `HashMap`-based cut lost to LuaJIT 7.9× on pure allocation churn; the bump-arena rewrite closed that to roughly parity; an atomic-allocation fix for scalar array data then fixed a second regression it exposed, restoring sol's pre-GC win on `table_array`). |
-| **M5** | **Gradual typing (done, expanded by M12)** | Explicit `any` type with runtime-checked boundaries. M12 extends boxes from scalars to nil, strings, arrays, records, maps, and stateless functions while preserving reference identity, and adds `is`/`as` narrowing. |
-| **M6** | **Tiered execution (done, scoped)**  | Bytecode interpreter tier 0, hot counters, on-stack replacement, and a scoped-down deopt/inline-cache/speculative-optimization mechanism for hot `any`-typed function parameters - see "Tiered execution (M6)" above and `docs/sol-roadmap.md`'s M6 section for the full design and why M5's trap-based `any` narrows their scope from a full VM's deopt machinery. |
-| **M7** | **SIMD, PGO, polish (done, scoped)** | Profiling/introspection CLI flags, CPU-codegen confirmation, FFI (`extern function`), AOT compilation to a standalone executable (`sol build`), profile-guided warm-start (`--profile-out`/`--profile-in`), loop vectorization, and 3 new benchmark categories - see the sections above and `docs/sol-roadmap/m7.md` for the honest gap analysis on the benchmark categories sol's language can't reach yet (strings/hashmaps/coroutines/JSON/HTTP). |
-| **M8** | **Debugging + profiling (done, scoped)** | `sol run --profile-time` and `sol debug`, both zero-cost when unused (a generic `Hooks` trait, not a runtime flag) - see "Debugging and profiling (M8)" above and `docs/sol-roadmap/m8.md` for the honest limits (native-to-native calls invisible to the profiler, no per-line stepping or live variable inspection). |
-| **M9+** | **Language and runtime expansion (in progress)** | M9 diagnostics/invariants, M10 structural records/maps/iteration, M11 nonescaping closures/modules, and M12 aliases, narrowing, reference `any` boxes, and specialized array `map` are implemented in scoped vertical slices. Enums, unions, user generics, escaping closure environments, and the typed/dynamic Lua module boundary remain open. |
+| Area | Implementation document |
+| --- | --- |
+| Compiler and correctness | [Compiler pipeline](features/compiler-pipeline.md), [safety](features/safety.md), [optimization](features/optimization.md) |
+| Data and memory | [Records and escape analysis](features/records-and-escape-analysis.md), [memory management](features/memory-management.md) |
+| Dynamic boundaries and execution | [Gradual typing](features/gradual-typing.md), [tiered execution](features/tiered-execution.md) |
+| Native tooling | [Native toolchain](features/native-toolchain.md), [debugging and profiling](features/debugging-and-profiling.md) |
+| Language/runtime expansion | [Feature delivery plan](features/delivery-plan.md), [Lua compatibility](features/lua-compatibility.md) |
 
 ## Trying it
 
@@ -516,10 +513,10 @@ cargo run --manifest-path crates/sol/Cargo.toml -- run crates/sol/tests/fixtures
 cargo test --manifest-path crates/sol/Cargo.toml
 scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # Sol is included wherever a matching .sol or legacy .sol exists
 
-sol run --dump-ir/--dump-asm/--jit-log/--target-info <file.lua|file.sol>   # M7 tooling flags (see docs/sol-roadmap/m7.md)
+sol run --dump-ir/--dump-asm/--jit-log/--target-info <file.lua|file.sol>   # compiler introspection
 cargo build --manifest-path crates/sol/Cargo.toml && ./crates/sol/target/debug/sol build <file.lua|file.sol> -o <out>   # AOT: needs the sibling libsol.a `cargo build` produces
 
-sol run --profile-time report.txt <file.lua|file.sol>   # M8: wall-clock profile (see docs/sol-roadmap/m8.md)
-sol debug <file.lua|file.sol>                           # M8: call-boundary REPL debugger (break/continue/step/backtrace/quit)
-sol run --diagnostic-format json <file.lua|file.sol>    # M9: editor-friendly structured diagnostics
+sol run --profile-time report.txt <file.lua|file.sol>   # wall-clock profile
+sol debug <file.lua|file.sol>                           # call-boundary REPL debugger (break/continue/step/backtrace/quit)
+sol run --diagnostic-format json <file.lua|file.sol>    # editor-friendly structured diagnostics
 ```

@@ -15,7 +15,7 @@ end
 
 function main(): f64
     local total = 0.0
-    for i = 0, 1999999 do
+    for i = 1, 2000000 do
         local t = make(i)
         total = total + t.x + t.y
     end

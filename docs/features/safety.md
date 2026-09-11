@@ -1,9 +1,12 @@
-# M0 — Correctness fixes (mostly done, folded into the M2 work session)
+# Safety and correctness
 
-**Goal**: close known M1 safety/correctness gaps discovered after shipping it,
+> Status: implemented, with any remaining limitations called out below.
+
+**Purpose**: close safety and correctness gaps discovered in the initial typed
+compiler,
 before building more on top of a foundation with holes in it.
 
-**Depends on**: M1 (done).
+**Prerequisite**: the typed compiler pipeline.
 
 - [x] **Array bounds checking.** Added in `codegen.rs`'s `array_elem_addr`: an
       unsigned `index >= len` compare (catches negative indices too, since they
@@ -14,9 +17,11 @@ before building more on top of a foundation with holes in it.
       allocation - see `tests/programs.rs`'s
       `out_of_bounds_array_access_traps_instead_of_reading_garbage` and
       `negative_array_index_traps`.
-- [ ] **Negative/zero-length arrays.** Still open - `runtime.rs`'s `new_array`
-      clamps `len` to `>= 0` silently (`len.max(0)`) rather than trapping on a
-      negative length. Not yet done.
+- [x] **Negative/zero-length arrays.** Zero-length arrays remain valid and own
+      a one-byte atomic backing allocation; negative lengths and lengths whose
+      eight-byte element storage calculation overflows now abort consistently
+      through bytecode, native promotion, and AOT instead of being silently
+      clamped to zero.
 - [x] **Division/modulo by zero.** Confirmed empirically (not just assumed):
       Cranelift's `sdiv`/`srem` already trap on a zero divisor on this target -
       no extra check needed in `codegen.rs`. Documented in `docs/sol.md`'s

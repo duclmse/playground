@@ -1,14 +1,17 @@
-# M9+ — Language, runtime, and tooling expansion
+# Feature delivery plan
 
-**Goal**: make Sol useful for multi-file, data-oriented applications while
+> Status: compiler foundations, typed data, nonescaping closures/modules,
+> explicit dynamic narrowing, and an interpreter-first Lua subset are
+> implemented. The unchecked items below remain planned.
+
+**Purpose**: make Sol useful for multi-file, data-oriented applications while
 preserving its defining property: fully typed hot paths use unboxed values and
 specialized native code. Lua compatibility belongs at explicit dynamic
 boundaries; it must not turn ordinary `.sol` code into a boxed Lua VM.
 
-This plan continues after M8. The numbered phases below are implementation
-order, not a promise that every phase ships in one release. A phase may be
-split into reviewable changes, but its acceptance criteria must be complete
-before the next dependent phase begins.
+The feature areas below are ordered by dependency, not by release number. An
+area may be split into reviewable changes, but its acceptance criteria must be
+complete before dependent work relies on it.
 
 ## Design rules
 
@@ -33,14 +36,14 @@ before the next dependent phase begins.
 
 ```mermaid
 flowchart LR
-  A[M9: source spans and diagnostics] --> B[M10: typed tables and iterators]
-  B --> C[M11: closures and modules]
-  B --> D[M12: type-system expansion]
-  C --> E[M13: dynamic Lua compatibility]
+  A[Source spans and diagnostics] --> B[Typed tables and iterators]
+  B --> C[Closures and modules]
+  B --> D[Type-system expansion]
+  C --> E[Dynamic Lua compatibility]
   D --> E
-  E --> F[M14: precise and generational GC]
-  F --> G[M15: profiling, debugger, optimizer]
-  G --> H[M16: benchmark and release gates]
+  E --> F[Precise and generational GC]
+  F --> G[Profiler, debugger, optimizer]
+  G --> H[Benchmark and release gates]
 ```
 
 ## Shared delivery checklist
@@ -60,7 +63,7 @@ flowchart LR
 - [x] Preserve the existing zero-overhead rule: code built for `sol run` with
       no debugging/profiling flags contains no hooks or runtime flag branches.
 
-## M9 — Diagnostics, source maps, and compiler invariants
+## Diagnostics, source maps, and compiler invariants
 
 **Why first**: tables, closures, generics, and modules multiply the number of
 places a type error can arise. Good spans and IR validation keep later work
@@ -70,21 +73,23 @@ debuggable rather than relying on compiler crashes or raw register numbers.
 
 - [ ] Replace line-only locations with `Span { file, start, end, line, column
       }`; preserve UTF-8 byte offsets while reporting human-readable columns.
-- [ ] Attach spans to declarations, expressions, calls, fields, and branches.
-      Store function/file mappings in bytecode and native compilation metadata.
+- [~] Attach spans to declarations, expressions, calls, fields, and branches.
+      Function declaration byte ranges now survive AST, typed IR, bytecode, and
+      native compilation metadata; expression/branch and per-instruction maps
+      remain open.
 - [x] Define `Diagnostic { severity, code, primary_span, labels, notes }` and
       render source excerpts for CLI errors. `--diagnostic-format json`
       exposes the machine-readable form, including source file and span.
 - [x] Add a typed-IR verifier and run it after type checking and each AST
       optimizer pass, before bytecode generation or Cranelift lowering.
 - [x] Make `sol debug` show source locations at call boundaries. Preserve the
-      M8 call-boundary debugger until per-line execution metadata is complete.
+      call-boundary debugger until per-line execution metadata is complete.
 
 ### Acceptance criteria
 
 - [ ] A type mismatch reports the declaration and conflicting expression with
       file, line, column, and a concise coercion explanation.
-- [ ] An error originating in an imported module identifies that module rather
+- [x] An error originating in an imported module identifies that module rather
       than the importing call site alone.
 - [x] Deliberately malformed typed IR is rejected by a unit test before it
       reaches Cranelift.
@@ -92,7 +97,7 @@ debuggable rather than relying on compiler crashes or raw register numbers.
       on them. Lexer and parser failures now expose tested `ELEX001` and
       `EPARSE001` codes; type-checker codes remain open.
 
-## M10 — Typed tables, records, maps, and generic iteration
+## Typed tables, records, maps, and generic iteration
 
 **Goal**: add the data model needed for real programs without giving up
 fixed-layout field access or contiguous typed arrays.
@@ -102,8 +107,8 @@ fixed-layout field access or contiguous typed arrays.
 - [x] Keep `struct` as a fixed-layout, nominal record. Add structural record
       literals and annotations for ergonomic data:
       `local p: { x: f64, y: f64 } = { x = 1.0, y = 2.0 }`.
-- [~] Add `Map<K, V>` for hash maps. The first monomorphic specialization is
-      `Map<i64, i64>`. Other scalar variants, strings, and interned-symbol
+- [~] Add `Map<K, V>` for hash maps. The implemented monomorphic family is
+      `Map<i64, V>` for unboxed `i64`, `f64`, and `bool` values. Strings and interned-symbol
       keys remain open; mutable/identity-dependent keys stay rejected until
       their equality semantics are explicit.
 - [x] Add typed table literals only when an expected type is available. Empty
@@ -120,7 +125,7 @@ fixed-layout field access or contiguous typed arrays.
 - [x] Add record and scalar map types to AST/type checking, type equality, type
       formatting, bytecode signatures, and native ABI lowering.
 - [~] Implement a monomorphic `Map<K,V>` layout: the open-addressing scalar
-      `Map<i64, i64>` specialization has capacity, length, occupancy bytes,
+      `Map<i64, i64/f64/bool>` specializations have capacity, length, occupancy bytes,
       key storage, and value storage. Other specializations remain open.
       Hash/equality specialization for additional key types remains open.
 - [~] Add write barriers and precise layout descriptors for map entries before
@@ -141,17 +146,18 @@ fixed-layout field access or contiguous typed arrays.
       Record allocation/scalar replacement must stay no slower than the
       current struct benchmark within measurement noise.
 
-## M11 — Closures, captured state, and modules
+## Closures, captured state, and modules
 
 **Goal**: make functions composable across files while retaining direct calls
 and stack allocation whenever captures do not escape.
 
 ### Closures
 
-- [~] Parse nested functions and capture analysis. Immutable scalar/string
-      captures are lambda-lifted by value. Mutable captures and types that
-      cannot cross the typed closure boundary are classified and rejected with
-      targeted diagnostics until shared cells land.
+- [~] Parse nested functions and capture analysis. Scalar/string captures are
+      lambda-lifted by passing their current value at each direct call, so an
+      enclosing reassignment is observed without allocation. Assignments from
+      inside a closure and types that cannot cross the typed closure boundary
+      remain rejected with targeted diagnostics until shared cells land.
 - [~] Introduce typed function values and closure values. `fn(Args) -> Return`
       is implemented, including stateless nested functions (which lower to an
       ordinary code pointer). Capturing escaping values still need the second,
@@ -173,14 +179,14 @@ and stack allocation whenever captures do not escape.
 - [~] Build a module graph before type checking. Missing modules, duplicate
       exports, private references, indirect imports, and import cycles report
       source files/lines. Nominal struct references can be qualified across
-      modules; general alias/type-cycle analysis depends on M12 aliases.
+      modules; general alias/type-cycle analysis depends on type aliases.
 - [~] Cache each canonical module's parsed interface in the in-memory graph so
       diamond imports parse and compile once. A reusable type-checked interface
       cache remains open. Add a stable interface file
       format only after the in-memory graph is correct.
 - [~] Compile typed module top-level initializers in dependency order and invoke
       each once before root `main`. Importing a dynamic `.lua` interface from
-      typed Sol and cyclic dynamic Lua partial initialization remain M12/M13
+      typed Sol and cyclic dynamic Lua partial initialization remain dynamic
       boundary work.
 
 ### Acceptance criteria
@@ -193,7 +199,7 @@ and stack allocation whenever captures do not escape.
       `function_calls_closure` (escaping Lua closure) separately. A typed Sol
       escaping-closure counterpart remains gated on heap environments.
 
-## M12 — Type-system expansion and explicit dynamic narrowing
+## Type-system expansion and explicit dynamic narrowing
 
 **Goal**: express useful program structure statically and make `.lua` migration
 predictable.
@@ -210,7 +216,8 @@ predictable.
       collection specializations remain open.
 - [x] Function types and typed callbacks for top-level Sol functions. Both
       `fn(Args) -> Return` and `fn(Args): Return` annotations work through
-      bytecode, the JIT, and AOT; closures and collection APIs remain M10/M11.
+      bytecode, the JIT, and AOT; capturing closures and broader collection APIs
+      remain follow-up work.
 - [ ] Union types only when the exhaustiveness and representation rules are
       clear. Do not make arbitrary unions silently become `any`.
 
@@ -220,16 +227,17 @@ predictable.
       stateless function values while preserving reference identity. Capturing
       closures and dynamic Lua tables remain in their separate runtime layer.
 - [~] Add type tests and narrowing: `if x is Point then ... end` refines a
-      directly-tested local on the true edge, and `x as Point` performs an
-      explicit checked cast. Compound-condition and else-edge refinement remain
-      open.
+      directly-tested local on the true edge, `x as Point` performs an explicit
+      checked cast, and chained `x is Point and x.field ...` guards preserve
+      short-circuiting while narrowing the right side and body. `or`, negated,
+      and else-edge refinement remain open.
 - [~] Define dynamic operation dispatch tables for `any`: arithmetic,
       comparison, indexing, call, field access, and concatenation. Each slow
       operation has an observable type error, never undefined behavior.
       Arithmetic, comparison, truth, negation, and concatenation are present;
       indexing, calls, and fields require narrowing first.
 - [~] Record scalar type distributions at dynamic function-call boundaries.
-      Existing M6 guards select monomorphic native variants and fall back to
+      Existing tier guards select monomorphic native variants and fall back to
       generic execution on a failed guard; aggregate and per-operation profiles
       remain open.
 
@@ -242,25 +250,27 @@ predictable.
       guard before typed use.
 - [x] Type-narrowing fixtures agree across bytecode, JIT, OSR, and AOT.
 
-## M13 — Dynamic Lua compatibility layer
+## Dynamic Lua compatibility layer
 
 **Goal**: support the highest-value Lua runtime features behind `any` and
 untyped `.lua` boundaries, without weakening typed semantics.
 
 The implementation order, upstream Lua 5.5.1 corpus triage, capability
 profiles, and typed-performance gates are defined in
-[m13-lua-compat.md](m13-lua-compat.md).
+[Lua compatibility](lua-compatibility.md).
 
 ### Ordered scope
 
-- [ ] Dynamic tables with array and hash parts, `nil` deletion, `#`, `next`,
+- [~] Dynamic tables with array and hash parts, `nil` deletion, `#`, `next`,
       `pairs`, `ipairs`, and multiple assignment/return behavior.
-- [ ] Lua function calls with varargs, multi-return propagation, `pcall`,
+- [~] Lua function calls with varargs, multi-return propagation, `pcall`,
       `xpcall`, `error`, and stack traces.
-- [ ] Metatables: implement `__index`, `__newindex`, `__call`, `__tostring`
-      first; then arithmetic/comparison metamethods with a documented lookup
-      order and cache invalidation model.
-- [ ] Standard-library slices: base, `table`, `string`, `math`, `utf8`, and a
+- [~] Metatables: `__index`, `__newindex`, `__call`, `__tostring`, `__len`,
+      `__pairs`, arithmetic, concatenation, equality, and comparison dispatch
+      are present; complete per-type metatables and cache lookup rules remain.
+- [~] Standard-library slices: focused base/string, table sequence operations,
+      core numeric math, and initial utf8 functions are present. Complete
+      `table`, `string`, `math`, `utf8`, and a
       sandboxed `package`/`require`. Keep OS/IO capability-gated and absent
       from deterministic builds unless explicitly enabled.
 - [ ] Coroutines last: define heap-owned stacks/frames, yielding through the
@@ -272,15 +282,17 @@ profiles, and typed-performance gates are defined in
 
 - [ ] Disallow implicit conversion from dynamic table to typed record/map.
       Provide checked conversion APIs that validate every required field/key.
-- [ ] Track metatable version counters. Invalidate inline caches on mutation;
-      guard cache entries in native code.
-- [ ] Add recursion, allocation, and instruction budgets for sandboxed Lua
+- [~] Track metatable version counters. Tables now increment versions on raw
+      mutation and metatable replacement; inline caches and their guards remain.
+- [~] Add recursion, allocation, and instruction budgets for sandboxed Lua
       execution. Expose host capabilities explicitly instead of inheriting OS
-      access from the compiler process.
-- [ ] Add an oracle harness that runs each compatibility fixture on installed
+      access from the compiler process. Recursion, instruction/backedge, and
+      heap table/closure allocation budgets are enforced; byte-string and
+      environment accounting will become exact with the dynamic GC allocator.
+- [x] Add an oracle harness that runs each compatibility fixture on installed
       Lua and Sol, with an allowlisted deviations ledger.
 
-## M14 — Precise and generational memory management
+## Precise and generational memory management
 
 **Goal**: make object-heavy programs predictable and safe as tables, closures,
 and coroutines increase pointer density.
@@ -321,7 +333,7 @@ updatable handle or a pinned allocation.
       without regressing existing typed numeric and allocation benchmarks beyond
       measurement noise.
 
-## M15 — Debugger, profiler, and optimizer upgrades
+## Debugger, profiler, and optimizer upgrades
 
 - [ ] Extend source maps through bytecode and optimized native code; support
       line breakpoints, stepping, typed local inspection, and DAP integration.
@@ -333,7 +345,7 @@ updatable handle or a pinned allocation.
 - [ ] Add optimization reports that explain why a value was boxed, why a map
       did not specialize, or why an allocation did not scalar-replace.
 
-## M16 — Benchmark and release gates
+## Benchmark and release gates
 
 - [ ] Extend `scripts/benchmark.sh` with named workloads for maps, closures,
       modules, dynamic tables, JSON-like data, string processing, coroutines,

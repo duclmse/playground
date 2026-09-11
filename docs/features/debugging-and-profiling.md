@@ -1,9 +1,12 @@
-# M8 — Debugging + profiling (zero-overhead-when-disabled)
+# Debugging and profiling
 
-**Goal**: give sol developers real introspection tools - step-debugging
+> Status: call-boundary debugging and wall-clock profiling are implemented with
+> zero overhead in uninstrumented runs.
+
+**Purpose**: give Sol developers real introspection tools - step-debugging
 and time-profiling - without weakening the "beats LuaJIT" promise for
 anyone who isn't using them. Not in `faster_lua.md` itself; a standing
-requirement the user added mid-M7 session.
+requirement added after the native toolchain work.
 
 **Hard constraint**: `sol run <file.sol>` (no debug/profile flags) must
 not regress. Enforced structurally, not just tested: `interp::Runtime`/
@@ -12,12 +15,12 @@ not regress. Enforced structurally, not just tested: `interp::Runtime`/
 `()`'s `Hooks` impl has empty method bodies that inline away entirely, a
 genuinely different compiled function from `Engine<TimingHooks>`
 (`--profile-time`) or `Engine<DebugHooks>` (`debug`), not a runtime-checked
-branch. Verified empirically too: `benchmarks/RESULTS.md`'s M8 section
-compares the pre-M8 binary against the post-M8 one on 4 benchmark shapes
+branch. Verified empirically too: `benchmarks/RESULTS.md`'s debugging section
+compares uninstrumented binaries on four benchmark shapes
 (call-heavy, recursion-heavy, array-heavy, alloc-heavy) - all within
 measurement noise, no regression in either direction.
 
-**Depends on**: M6/M7 (the tiered `Runtime`/`Engine` this hooks into).
+**Prerequisite**: the tiered `Runtime`/`Engine` and native toolchain.
 
 - [x] **Profiling** (`sol run --profile-time <out>`, `profile.rs`):
       `TimingHooks` wraps every `Runtime::call` with `Instant::now()`,
@@ -43,7 +46,7 @@ measurement noise, no regression in either direction.
       to force tier-0-only execution. **Scoped down, documented**: call-
       boundary granularity only, not per-source-line - real line-level
       breakpoints would need source line numbers threaded through the
-      typed AST into bytecode, complicated by M2/M3's optimizer passes
+      typed AST into bytecode, complicated by optimizer and escape-analysis passes
       reordering/rewriting statements after type-checking (a substantially
       larger undertaking, not attempted this pass). `args`/return values
       print as raw `u64` bits, not type-formatted (no live type info at a
@@ -59,7 +62,7 @@ server matching `crates/dap-server`'s existing pattern for the Lua VM
 built in - a comparable investment for sol is real, valid future work,
 not attempted here given the size of everything else this session already
 covered); allocation/object-shape profiling (§23's fuller PGO vision,
-already noted as open in M7).
+already noted as open in the native-toolchain document).
 
 **Files**: `interp.rs` (`Hooks` trait, `Runtime<'a, H: Hooks = ()>`),
 `tier.rs` (`Engine<H: interp::Hooks = ()>`, `hooks()`/`name_of` accessors),

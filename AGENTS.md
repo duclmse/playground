@@ -5,7 +5,10 @@ This repository contains two related but independent Lua efforts:
 - `crates/lua-vm` is the browser runtime, built on the vendored `crates/vm`
   (a patched Piccolo fork) and compiled to WebAssembly for `apps/web`.
 - `crates/sol` is a separate typed, native-oriented Sol compiler/JIT. Its
-  compatibility and delivery plan is in `docs/sol-roadmap.md`.
+  implementation status is in `docs/features/` and its language contract is
+  in `docs/spec/`.
+- `crates/bytecode-to-sol` is an independent recovery-oriented decompiler for
+  raw Sol instruction words and version-matched Lua binary chunks.
 
 Do not assume a change to one runtime applies to the other. Keep their
 semantics, tests, and documentation separate unless a task explicitly spans
@@ -22,7 +25,9 @@ both.
 - `crates/dap-server` — native Debug Adapter Protocol server using `lua-vm`.
 - `crates/sol` — standalone Cargo crate with compiler, interpreter, JIT, AOT,
   and Lua-compatibility fixtures.
-- `docs` — architecture, protocol, conformance, and roadmap documents.
+- `crates/bytecode-to-sol` — standalone library/CLI that emits annotated
+  Sol-style register code from Sol bytecode or `luac` listings/chunks.
+- `docs` — architecture, protocol, conformance, feature, and specification documents.
 - `tests/lua55` — Lua 5.5 corpus manifest and reference-oracle metadata.
 
 ## Commands
@@ -33,6 +38,7 @@ manifest:
 ```sh
 cargo test --manifest-path crates/lua-vm/Cargo.toml
 cargo test --manifest-path crates/sol/Cargo.toml
+cargo test --manifest-path crates/bytecode-to-sol/Cargo.toml
 cargo test --manifest-path crates/dap-server/Cargo.toml
 ```
 
@@ -62,7 +68,8 @@ system Lua executable as its oracle.
 ## Change guidelines
 
 - Read the applicable document before changing a subsystem: `docs/README.md`
-  for the browser/debugger, `docs/sol.md` and `docs/sol-roadmap.md` for Sol.
+  for the browser/debugger; `docs/sol.md`, `docs/features/`, and `docs/spec/`
+  for Sol.
 - Keep the browser runtime sandboxed: host filesystem, OS, and native loading
   capabilities must stay explicit.
 - Keep Sol's typed and dynamic representations separate. `.lua` compatibility

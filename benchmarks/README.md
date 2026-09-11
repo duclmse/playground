@@ -14,13 +14,16 @@ warmup runs per command, reporting mean ± standard deviation. This is a
 whole-program comparison (how long does `lua script.lua` actually take to run),
 not an internal-clock microbenchmark, so interpreter startup cost is included
 identically for every implementation - a fair basis for comparison since that's
-how all three are actually invoked.
+how all three are actually invoked. After the individual Hyperfine reports, the
+runner prints one consolidated table with every benchmark/runtime mean, standard
+deviation, and runtime-to-Sol ratio. Markdown exports include the same summary.
 
 Run it yourself:
 
 ```
 scripts/benchmark.sh                                   # prints to stdout
 scripts/benchmark.sh --export-markdown results.md       # also writes a report
+scripts/test-sol-benchmarks.sh                          # coverage + output check
 ```
 
 Requires `cargo`, `hyperfine`, and a `lua` binary on `PATH`; `luajit` is used
@@ -37,6 +40,16 @@ automatically if present, otherwise skipped.
 | `nested_loop.lua`   | A second, larger raw-throughput data point (9M iterations via nested loops)          |
 | `function_calls.lua` | Direct, non-inlined function-call overhead                                           |
 | `function_calls_closure.lua` | Escaping closure-call overhead with one captured value                      |
+| `gc_alloc.lua`      | Short-lived record/table allocation and collection pressure                         |
+| `hashmap_lookup.lua` | Integer-keyed map/table lookup throughput                                          |
+| `matrix.lua`        | Dense matrix multiplication over flat numeric arrays                                 |
+| `objects.lua`       | Record/table allocation and field access                                             |
+
+Every Lua benchmark has a same-named typed Sol equivalent except
+`function_calls_closure.lua`, whose returned closure requires the heap-backed
+captured environments that Sol deliberately still rejects. `any_strict.sol`,
+`any_dynamic.sol`, and `vector_add.sol` are typed-only measurements and are
+included by the runner in a separate Sol-only pass.
 
 ## Results (one measured run, Apple Silicon Mac; regenerate for your own hardware)
 

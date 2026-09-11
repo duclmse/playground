@@ -1,31 +1,32 @@
-# M5 — Gradual typing + dynamic mode (done, scoped to scalars)
+# Gradual typing
 
-**Goal**: `any`-typed values and a boxed fallback path for genuinely dynamic
+> Status: explicit `any` values and the documented narrowing/value families are
+> implemented; remaining dynamic operations are listed below.
+
+**Purpose**: provide `any`-typed values and a boxed fallback path for genuinely dynamic
 code (§3, §4), without forcing every program to pay for it - most code stays
 fully typed/unboxed exactly as today.
 
-**Depends on**: M4 (a dynamic `Value` needs a real GC - it's exactly the kind of
-boxed, heap-referencing type M1-M3 avoided needing).
+**Prerequisite**: a dynamic `Value` needs a real GC because it is a boxed,
+heap-referencing type.
 
-**Scope call made during implementation**: the checklist below is fully
-satisfied for `i64`/`f64`/`bool` - M5's smallest useful slice, matching M1's
-own "start with the minimum" precedent. Boxing an `Array`/`Struct` value, a
-full tagged union with `Nil`, and using `any` directly as an arithmetic
-operand (rather than only at typed/`any` *boundaries* - assignment, call
-argument, return) are real, deliberately deferred future work - each
-checklist item below says exactly what's in scope now.
+**Scope**: the initial implementation supported only `i64`/`f64`/`bool`.
+Current `any` boxes also cover nil, strings, arrays, records, maps, and
+stateless functions while preserving reference identity. Capturing typed
+closures and Lua dynamic tables retain their separate runtime representations.
+Direct dynamic arithmetic, comparison, truth, negation, and concatenation are
+implemented; indexing, calls, and fields require narrowing first.
 
 - [x] **Strict vs. gradual mode** (§3): decided in favor of an explicit `any`
       type annotation (`function foo(x: any): any`), not "no annotation implies
       gradual" - matches faster_lua.md §3's own example syntax exactly, and
-      keeps M1's existing rule ("every function must declare a return type")
+      keeps the existing rule ("every function must declare a return type")
       unchanged rather than adding a second, implicit way to opt in.
-- [x] **Boxed representation** (§4) for `any` - `value.rs`: a plain 16-byte
-      `{ tag: i64, payload: i64 }` heap block (not a full tagged union with
-      `Nil`/pointer-to-heap-object yet - only `i64`/`f64`/`bool` are boxable;
-      `typeck.rs`'s `coerce` is what enforces this, with a clear error for
-      anything else). Allocated through the *same* runtime path as struct
-      literals (`sol_alloc`, self-initializing - see gc.rs's M4 zero-skip
+- [x] **Boxed representation** (§4) for `any` - `value.rs`: a tagged
+      `{ tag: i64, payload: i64 }` block supporting scalar and documented
+      reference families. `typeck.rs`'s `coerce` enforces which values may
+      cross the boundary. Allocated through the *same* runtime path as struct
+      literals (`sol_alloc`, self-initializing - see `gc.rs`'s zero-skip
       work) since both fields are always written immediately - no new
       allocator entry point needed at all.
 - [x] **Runtime type checks** at typed/`any` boundaries - both directions
@@ -37,7 +38,7 @@ checklist item below says exactly what's in scope now.
       into-concrete-type unboxes (`TExprKind::Unbox`, checked at *runtime*
       since the compiler can't know an `any` value's real type) -
       `codegen.rs` compiles the check to the exact same `icmp` + `trapnz`
-      shape M0's array bounds check already uses (a real CPU trap on
+      shape the array bounds check already uses (a real CPU trap on
       mismatch, not a Rust panic across the FFI boundary the box's
       allocation call crosses).
 - [x] **Type-check elision at strict/strict boundaries**: guaranteed
@@ -45,27 +46,20 @@ checklist item below says exactly what's in scope now.
       `Box`/`Unbox` when `Type::Any` is one of the two types involved, so a
       program that never writes `any` anywhere can never produce one. Also
       confirmed via `SOL_DUMP_CLIF`: a strict call chain's IR is
-      byte-for-byte identical whether or not M5's code exists at all (the
-      full existing benchmark suite's numbers were unchanged after this
-      milestone landed - see `benchmarks/RESULTS.md`).
+      byte-for-byte identical whether or not gradual-typing support exists at
+      all (the full existing benchmark suite's numbers were unchanged - see
+      `benchmarks/RESULTS.md`).
 - [x] Benchmark: `benchmarks/any_strict.sol` / `any_dynamic.sol` (identical
       5,000,000-iteration workload, the second with an `any`-typed function
-      boundary in the hot path) - see `benchmarks/RESULTS.md`'s M5 section
+      boundary in the hot path) - see `benchmarks/RESULTS.md`'s gradual-typing section
       for the honest number: the dynamic path is **~7-10× slower**, almost
       entirely the cost of one real heap allocation (the box) per call. This
       is the expected, correct cost of opting into gradual typing - not a
       regression to fix, the whole point of "strict by default, gradual
       where you ask for it."
 
-**Not attempted this milestone** (real future work, not oversights):
-boxing `Array`/`Struct` values into `any` (needs a per-boxed-value shape tag,
-not just a scalar tag - a bigger "object model" investment, §28-adjacent);
-using an `any` value directly as an arithmetic operand without an explicit
-typed-local narrowing step first (would need either a full dynamic-dispatch
-"generic add" - exactly what faster_lua.md §4 warns against building as the
-default - or a type-guard/narrowing construct in the language itself); `Nil`
-as a boxable value (M1-M4 has no nil/optional concept at all yet, so there's
-nothing to box as one).
+**Remaining work**: capturing closure boxes, dynamic indexing/calls/field
+access without prior narrowing, and the complete typed/dynamic module bridge.
 
 **Files**: `types.rs` (`Type::Any`, `TExprKind::Box`/`Unbox`), `typeck.rs`
 (`lower_type`, `coerce`), new `crates/sol/src/value.rs` (tag constants),

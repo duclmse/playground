@@ -1,20 +1,22 @@
-# M4 — GC (done, descoped from the original generational design - see below)
+# Memory management
 
-**Goal**: a real GC, needed once M3 introduces allocations the language can't
-just leak (structs/arrays that genuinely escape and outlive their creating
-function).
+> Status: a conservative mark/sweep collector is implemented. Precise and
+> generational collection remains planned.
 
-**Depends on**: M3 (nothing to collect until real, non-leaked heap allocation
-exists for escaping values).
+**Purpose**: provide a real collector for allocations that cannot be removed by
+escape analysis and scalar replacement instead of leaking structs or arrays
+that genuinely escape and outlive their creating function.
+
+**Prerequisite**: real, non-leaked heap allocation for escaping values.
 
 **Scope call made during implementation**: the original checklist below sketched
 a _generational, moving_ collector with precise stack maps (Cranelift
 safepoints) and write-barrier-backed remembered sets - the `§14`-accurate
-design. That's a substantial, multi-milestone undertaking in its own right (the
+design. That is a substantial, multi-stage undertaking in its own right (the
 Cranelift stack-map/safepoint infrastructure it needs is the same machinery
 wasmtime's own GC support is built on, which took a long time to land there) and
-isn't required to satisfy what M4 actually needs to unblock: reclaiming memory
-M3 would otherwise leak forever. What's implemented instead - a **conservative
+isn't required to satisfy the immediate need: reclaiming memory that escaping
+allocations would otherwise leak forever. What's implemented instead - a **conservative
 (stack-scanning), single-generation mark-sweep collector over a chunked bump
 arena** - is a legitimate, production-precedented simplification (the
 root-scanning approach is the Boehm-Demers-Weiser design; the chunked-arena
@@ -42,7 +44,8 @@ exposed to, not one-off slips):
    collection is cheap enough now (bounded by chunk count and live-set size, not
    garbage volume) to attempt unconditionally whenever the current chunk fills.
 
-Both are documented in `gc.rs` itself and `benchmarks/RESULTS.md`'s M4 section,
+Both are documented in `gc.rs` itself and the collector section of
+`benchmarks/RESULTS.md`,
 and both were caught by tests/benchmarks _before_ being reported as done - not
 found later.
 
@@ -61,7 +64,7 @@ found later.
       **conservative stack scanning**, not stack maps - chosen because precise
       stack maps need Cranelift safepoint support this project doesn't have yet,
       while conservative scanning is a well-understood, safe (if imprecise)
-      standard technique that unblocks this milestone immediately. False
+      standard technique that unblocks collection immediately. False
       retention (a stale stack word that happens to match a live block's
       address, or a chunk kept alive in its entirety by one surviving object -
       see `gc.rs`'s doc comment on chunk-level reclaim granularity) is the
@@ -80,9 +83,9 @@ found later.
       stop-the-world mark-sweep, now cheap enough (O(chunks) sweep, not O(every
       object ever allocated)) that this hasn't mattered yet. Revisit once a real
       program's pause times are actually measured.
-- [x] Retrofit M1's array runtime (`runtime.rs`) and M3's struct allocation onto
+- [x] Retrofit the array runtime (`runtime.rs`) and struct allocation onto
       this allocator, removing the `Box::leak`/`mem::forget` calls called out as
-      a known, documented limitation since M1. Done -
+      a known, documented limitation of the initial runtime. Done -
       `sol_new_array_i64/f64` and `sol_alloc` all route through
       `gc::sol_gc_alloc`/`sol_gc_alloc_atomic` (see below).
 - [x] **Atomic (pointer-free) allocations** - not in the original checklist,
@@ -96,7 +99,7 @@ found later.
       value that happened to numerically match another live block's address
       could previously cause spurious retention; an atomic block can't.
 - [x] Benchmark: `benchmarks/gc_alloc.{lua,fl}` (2,000,000 short-lived 2-field
-      allocations) - see `benchmarks/RESULTS.md`'s M4 section for the full
+      allocations) - see `benchmarks/RESULTS.md`'s collector section for the full
       story, in three parts: sol initially **lost to LuaJIT** on this
       workload (7.9× slower - hashing every allocation and a full heap walk on
       every collection), then **closed the gap to roughly parity** after the
@@ -126,7 +129,7 @@ found later.
       regression fixture. Result, confirmed via a controlled A/B and
       10-round aggregate: sol wins **10/10 rounds** on both median
       wall-clock and user CPU time, a clear, non-overlapping gap - not
-      noise. See `benchmarks/RESULTS.md`'s M4 section for the full
+      noise. See `benchmarks/RESULTS.md`'s collector section for the full
       before/after/before/after story.
 
 **Files**: `crates/sol/src/gc.rs` (single file, not the

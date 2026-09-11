@@ -16,6 +16,16 @@ earlier version of this doc set assumed. See
 [architecture.md](./architecture.md#runtime-choice-rust--piccolo) for why,
 and [risks.md](./risks.md#decision-log) for what that changed.
 
+## Sol documentation
+
+The typed/native Sol compiler is a separate project from the browser runtime
+documented below. Start with [the Sol overview](sol.md), then use:
+
+- [Feature documentation](features/README.md) for implementation design,
+  status, verification, and remaining work.
+- [Language specification](spec/README.md) for normative `.sol` and `.lua`
+  behavior and their explicit compatibility boundary.
+
 ## Reading order
 
 1. [product-brief.md](./product-brief.md) - what we're building, for whom, and what v1 explicitly excludes.

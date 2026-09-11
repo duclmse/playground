@@ -46,6 +46,96 @@ if [ -n "$EXPORT_MARKDOWN" ]; then
   : > "$EXPORT_MARKDOWN"
 fi
 
+SUMMARY_FILE="$(mktemp)"
+cleanup_summary() {
+  rm -f "$SUMMARY_FILE"
+}
+trap cleanup_summary EXIT
+
+record_summary() {
+  local benchmark_name="$1"
+  local csv_file="$2"
+  awk -F, -v benchmark="$benchmark_name" 'NR > 1 {
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n", benchmark, $1, $2, $3, $7, $8
+  }' "$csv_file" >> "$SUMMARY_FILE"
+}
+
+run_group() {
+  local benchmark_name="$1"
+  shift
+  local csv_file
+  csv_file="$(mktemp)"
+  if [ -n "$EXPORT_MARKDOWN" ]; then
+    local markdown_file
+    markdown_file="$(mktemp)"
+    hyperfine "$@" --export-csv "$csv_file" --export-markdown "$markdown_file"
+    { echo "## $benchmark_name"; echo; cat "$markdown_file"; echo; } >> "$EXPORT_MARKDOWN"
+    rm -f "$markdown_file"
+  else
+    hyperfine "$@" --export-csv "$csv_file"
+  fi
+  record_summary "$benchmark_name" "$csv_file"
+  rm -f "$csv_file"
+}
+
+print_summary() {
+  local benchmark_count measurement_count
+  benchmark_count="$(awk -F '\t' '!seen[$1]++ { count++ } END { print count + 0 }' "$SUMMARY_FILE")"
+  measurement_count="$(awk 'END { print NR + 0 }' "$SUMMARY_FILE")"
+  printf '\nBenchmark summary: %s cases, %s measurements (milliseconds; lower is better)\n\n' \
+    "$benchmark_count" "$measurement_count"
+  printf '%-25s %-20s %12s %12s %14s\n' \
+    'Benchmark' 'Runtime' 'Mean' 'Std dev' 'Runtime / Sol'
+  awk -F '\t' '
+    {
+      benchmark[NR] = $1
+      runtime[NR] = $2
+      mean[NR] = $3
+      deviation[NR] = $4
+      if ($2 == "sol") sol_mean[$1] = $3
+    }
+    END {
+      for (i = 1; i <= NR; i++) {
+        relative = "-"
+        if (sol_mean[benchmark[i]] > 0) {
+          relative = sprintf("%.2fx", mean[i] / sol_mean[benchmark[i]])
+        }
+        printf "%-25s %-20s %12.3f %12.3f %14s\n", \
+          benchmark[i], runtime[i], mean[i] * 1000, deviation[i] * 1000, relative
+      }
+    }
+  ' "$SUMMARY_FILE"
+}
+
+append_markdown_summary() {
+  {
+    echo '## Overall summary'
+    echo
+    echo '| Benchmark | Runtime | Mean | Std dev | Runtime / Sol |'
+    echo '|:--|:--|--:|--:|--:|'
+    awk -F '\t' '
+      {
+        benchmark[NR] = $1
+        runtime[NR] = $2
+        mean[NR] = $3
+        deviation[NR] = $4
+        if ($2 == "sol") sol_mean[$1] = $3
+      }
+      END {
+        for (i = 1; i <= NR; i++) {
+          relative = "-"
+          if (sol_mean[benchmark[i]] > 0) {
+            relative = sprintf("%.2fx", mean[i] / sol_mean[benchmark[i]])
+          }
+          printf "| %s | %s | %.3f ms | %.3f ms | %s |\n", \
+            benchmark[i], runtime[i], mean[i] * 1000, deviation[i] * 1000, relative
+        }
+      }
+    ' "$SUMMARY_FILE"
+    echo
+  } >> "$EXPORT_MARKDOWN"
+}
+
 log "Building crates/vm's interpreter example in release mode"
 cargo build --release --example interpreter --manifest-path "$ROOT/crates/vm/Cargo.toml"
 VM_BIN="$ROOT/crates/vm/target/release/examples/interpreter"
@@ -94,16 +184,27 @@ for script in "$ROOT"/benchmarks/*.lua; do
     args+=(-n "sol" "'$SOL_BIN' run '$sol_script'")
   fi
 
-  if [ -n "$EXPORT_MARKDOWN" ]; then
-    tmp="$(mktemp)"
-    hyperfine "${args[@]}" --export-markdown "$tmp"
-    { echo "## $name"; echo; cat "$tmp"; echo; } >> "$EXPORT_MARKDOWN"
-    rm -f "$tmp"
-  else
-    hyperfine "${args[@]}"
-  fi
+  run_group "$name" "${args[@]}"
 done
 
+# Some Sol benchmarks compare two compiler modes or measure a typed-only
+# optimization and deliberately have no meaningful Lua source counterpart.
+# Include those instead of silently dropping them from the suite.
+for sol_script in "$ROOT"/benchmarks/*.sol; do
+  name="$(basename "$sol_script" .sol)"
+  if [ -f "$ROOT/benchmarks/$name.lua" ]; then
+    continue
+  fi
+  if [ -n "$FILTER" ] && [ "$name" != "$FILTER" ]; then
+    continue
+  fi
+  log "Benchmark: $name (Sol-only)"
+  args=(--warmup 3 --min-runs 10 -n "sol" "'$SOL_BIN' run '$sol_script'")
+  run_group "$name" "${args[@]}"
+done
+
+print_summary
 if [ -n "$EXPORT_MARKDOWN" ]; then
+  append_markdown_summary
   log "Results written to $EXPORT_MARKDOWN"
 fi

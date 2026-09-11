@@ -1,5 +1,12 @@
 # Lua Conformance Test Plan
 
+> This document tracks the browser-facing Piccolo runtime in `crates/lua-vm`.
+> Sol's separate byte-oriented `.lua` compatibility runtime is tracked in
+> [the Lua compatibility feature document](features/lua-compatibility.md); its focused tests
+> cover iterator triples, same-block `goto`, mutable upvalues, protected calls,
+> table metatables/metamethods, and instruction/call-depth budgets without
+> changing Piccolo's support claims below.
+
 Piccolo is a from-scratch, pure-Rust Lua-_like_ VM, not a build of the official
 C reference implementation (see
 [architecture.md](./architecture.md#runtime-choice-rust--piccolo)). That means
