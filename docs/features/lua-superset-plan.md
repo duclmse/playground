@@ -360,22 +360,65 @@ rather than one:
   three regression tests above cover the core correctness properties but
   don't yet stress every allocation site.
 
-## Phase 5 — L7: coroutines
+## Phase 5 — L7: coroutines — **done this session**
 
-- Design decision to make explicit before coding (this is the single
-  biggest architectural fork in the whole plan): coroutines need their own
-  suspendable stack. Options: (a) heap-allocated explicit VM frames/registers
-  in the existing tree-walking/bytecode interpreter (keeps everything on one
-  Rust call stack, most compatible with "keep coroutines on bytecode
-  initially" per the doc), or (b) OS threads + channel/condvar handoff per
-  coroutine (simpler to implement, much higher per-coroutine memory/latency
-  cost, harder to bound). The doc's own L7 items assume (a); follow that
-  unless a spike shows it's impractical in the current bytecode design.
-- Implement `coroutine.create/resume/yield/running/status/wrap` and
-  yieldability rules across `pcall`/metamethods/native builtins per the
-  checklist.
-- Defer any dynamic-JIT interaction with coroutines entirely (per the doc:
-  "keep coroutines on bytecode initially").
+- Design decision (the single biggest architectural fork in the whole plan):
+  coroutines need their own suspendable stack. On inspection, the doc's
+  originally-assumed option (a) - heap-allocated explicit VM frames/registers
+  in the existing tree-walking interpreter - turned out to require rewriting
+  `run_proto`/`call`'s recursive structure into an explicit frame-stack
+  machine, not a small addition; this was new information not visible when
+  the plan was written, so it was surfaced to the user as a genuine
+  architectural fork rather than decided silently. The user's steering
+  instruction was "prioritize performance to choose solution." Weighed
+  against that criterion: (a) the interpreter rewrite (large, risky, and not
+  obviously faster than the alternative), (b) OS threads + condvar handoff
+  per coroutine (simplest, but a full OS context switch plus scheduler and
+  mutex overhead per resume/yield), and (c) stackful fibers via a crate
+  (a resume/yield is just a stack-pointer/register swap - no allocation, no
+  OS scheduler involvement, no mutex). (c) was chosen and implemented via
+  `corosensei` (`crates/sol/Cargo.toml`): each `LuaCoroutine`
+  (`crates/sol/src/lua_runtime.rs`) owns a `corosensei::Coroutine` with its
+  own heap-allocated, guard-paged OS stack (1 MiB, lazily committed), and
+  `resume`/`yield` are real stack-pointer/register context switches within
+  the existing single OS thread - this gets "coroutine.yield works from any
+  Lua call depth, including inside `pcall`/metamethods/native builtin
+  callbacks" for free, with **zero changes** to `run_proto`/`call`, unlike
+  option (a).
+- Implementation notes: a small `Rc<CoroLink>` indirection (not
+  `Rc<LuaCoroutine>` directly) is captured by the fiber closure to avoid a
+  permanent self-reference cycle (the fiber lives inside
+  `LuaCoroutine::fiber`, so a closure capturing `Rc<LuaCoroutine>` back would
+  keep every coroutine alive forever). `CoroLink` holds a raw
+  `*mut LuaRuntime` refreshed immediately before each `resume()` (sound
+  because coroutines are strictly cooperative - only one of
+  {resumer, coroutine} ever runs at a time on this thread - and `LuaRuntime`
+  never moves while a `resume()` call is on the Rust stack) and a raw
+  `*const Yielder` that `coroutine.yield` dereferences via
+  `LuaRuntime::coroutine_stack` (the chain of currently-resumed coroutines,
+  pushed/popped by `resume_coroutine` itself, not the fiber body, so nested
+  coroutine-resumes-coroutine cases track "who's actually running" correctly
+  and so `coroutine.status`/`running`/`isyieldable` have an accurate source
+  of truth). `LuaCoroutine.fiber` is `RefCell<Option<_>>`, taken out via
+  `.take()` and put back around the (long, reentrant) `resume()` call rather
+  than held borrowed, so a coroutine inspecting its own status doesn't hit a
+  `RefCell` panic.
+- Implemented `coroutine.create/resume/yield/running/status/wrap/isyieldable`
+  and yieldability across `pcall`/metamethods/native builtins (verified with
+  a `string.gsub` replacement-function callback specifically, since that's
+  the deepest/most native-adjacent call site) per the checklist. Did not
+  implement `coroutine.close`, coroutine cycle-collector tracking, threads as
+  table keys, or a "main coroutine" sentinel value for `coroutine.running()`
+  - documented as known limitations in `docs/features/lua-compatibility.md`'s
+  L7 section.
+- Deferred any dynamic-JIT interaction with coroutines entirely (per the doc:
+  "keep coroutines on bytecode initially") - unchanged, since the `.lua` path
+  has no dynamic JIT yet.
+- Tests: `crates/sol/tests/lua55.rs` covers create/resume/yield round trips,
+  yielding across nested helper calls/`pcall`/`gsub` callbacks, status
+  transitions (including a coroutine inspecting its own status),
+  `coroutine.wrap` error propagation, and rejecting resume of a dead,
+  running, or normal coroutine.
 
 ## Phase 6 — L8: differential testing, benchmarking, and the performance decision
 

@@ -433,21 +433,62 @@ supported GC observable has a reference-backed test.
 **Purpose:** add Lua cooperative concurrency only after stack and GC ownership
 are explicit.
 
-- [ ] Represent each coroutine as heap-owned VM frames, registers, upvalues,
-      status, and resume/yield values. Implement `create`, `resume`, `yield`,
-      `running`, `status`, `wrap`, and error propagation.
-- [ ] Define yieldability across `pcall`, metamethods, native builtins, and
-      module loaders. A non-yieldable boundary must raise the Lua-compatible
-      error rather than corrupting a native stack.
+- [x] Implement `coroutine.create`/`resume`/`yield`/`status`/`wrap`/`running`/
+      `isyieldable` and error propagation. Rather than the originally-planned
+      heap-owned explicit VM frame representation (which, on inspection,
+      would require rewriting the interpreter's recursive `run_proto`/`call`
+      structure into an explicit frame-stack machine), each coroutine is a
+      real stackful fiber: a separate heap-allocated OS stack
+      (`corosensei::Coroutine`, 1 MiB `mmap` + guard page) that a `resume`
+      call context-switches onto and a `yield` call context-switches back
+      from, entirely within one OS thread. This was chosen over both the
+      frame-rewrite and an OS-thread-plus-condvar handoff because a fiber
+      switch is just a stack-pointer/register swap - no allocation, no OS
+      scheduler, no mutex - making it the fastest of the options considered
+      (`crates/sol/src/lua_runtime.rs`: `LuaCoroutine`, `CoroLink`,
+      `LuaRuntime::new_coroutine`/`resume_coroutine`/`call_coroutine_wrapper`;
+      see `docs/features/lua-superset-plan.md` Phase 5). `LuaValue::Thread`
+      holds the coroutine handle `type()` reports as `"thread"`;
+      `LuaValue::CoroutineWrapper` (from `coroutine.wrap`) reports as
+      `"function"` and propagates an internal error as a real Lua error
+      instead of `coroutine.resume`'s `(false, message)` pair, matching Lua.
+- [x] Yieldability works from any Lua call depth for free, as a consequence of
+      the fiber approach: `coroutine.yield` inside a helper function, inside
+      `pcall`, and inside a native builtin's Lua-callback argument (e.g.
+      `string.gsub`'s replacement function) all context-switch correctly with
+      zero special-casing in `run_proto`/`call`/`pcall`/`gsub_replacement` -
+      covered by
+      `dynamic_lua_runtime_coroutine_yields_across_nested_calls_pcall_and_native_callbacks`
+      in `crates/sol/tests/lua55.rs`. Calling `coroutine.yield` outside any
+      coroutine raises the Lua-compatible "attempt to yield from outside a
+      coroutine" error.
 - [ ] Keep coroutines on bytecode initially. A future dynamic JIT call either
       resumes through a compatible trampoline with complete root maps or
-      deoptimizes to the saved interpreter frame before yielding.
-- [ ] Add deterministic scheduling fixtures, repeated resume/yield stress, and
-      GC-during-suspension tests before enabling performance work.
+      deoptimizes to the saved interpreter frame before yielding. (Dynamic
+      JIT does not exist yet for the `.lua` path, so this is unchanged.)
+- [~] `crates/sol/tests/lua55.rs` covers create/resume/yield round trips
+      (multiple yields, values flowing both directions), status transitions
+      (`suspended`/`running`/`normal`/`dead`, including a coroutine observing
+      its own status and `coroutine.running`/`isyieldable` inside vs. outside
+      a coroutine), `coroutine.wrap` error propagation, and rejecting resume
+      of a dead, running, or normal coroutine. Deterministic scheduling
+      fixtures beyond these, dedicated repeated resume/yield stress, and
+      GC-during-suspension tests remain open.
+
+      Known, deliberate limitations: coroutines are not tracked by the
+      Phase 4b cycle collector (`collect_cycles`), so a reference cycle
+      routed through a coroutine leaks, the same conservative class of gap as
+      other untracked types; there is no `coroutine.close`; threads and
+      wrapper functions cannot yet be used as table keys (`LuaValue::key()`
+      unchanged); and there is no "main coroutine" sentinel value -
+      `coroutine.running()` returns `(nil, true)` for the main chunk instead
+      of a real thread value.
 
 **Exit gate:** portable assertions from `coroutine.lua` pass and a suspended
 coroutine remains valid across full collections, protected errors, and module
-calls.
+calls. (`tests/lua55/manifest.toml`'s `coroutine.lua` entry stays `pending`:
+the upstream test also exercises `<close>` to-be-closed variables, which is a
+separate, unimplemented feature.)
 
 ## L8 — Optimization, differential testing, and release gates
 

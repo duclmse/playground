@@ -84,7 +84,7 @@ path = "coroutine.lua"
 category = "coroutines"
 status = "pending"
 requires = []
-note = "blocked-on: `<close>` requires resource finalization, which is not implemented yet (fails at line 176); owned resumable frames and finalization are both scheduled for Phase 4/L7."
+note = "blocked-on: `<close>` (to-be-closed variables) requires resource finalization, which is not implemented yet (fails at line 176); this is unrelated to coroutines themselves - `coroutine.create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable` are implemented (Phase 5/L7, stackful fibers via corosensei) and covered by crates/sol/tests/lua55.rs."
 
 [[case]]
 path = "cstack.lua"
