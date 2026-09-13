@@ -380,7 +380,13 @@ upvalues and final-expression result expansion.
       hand-rolled calendar math (no timezone database), so `os.date(...)` and
       `os.date("!"...)` currently render identically, and its strftime-subset
       only covers `%Y %y %m %d %H %M %S %p %A %a %B %b %j %c %%`. `io.write`
-      does not yet return a file-handle object for chaining. `debug` and
+      now returns a chainable handle (`io.stdout`, a lightweight table with a
+      `write` method backed by `NativeFunction::FileWrite`), so
+      `io.write("a"):write("b")` and `io.stdout:write("a"):write("b")` both
+      work and return the same handle, matching real Lua's default-output-file
+      chaining; this is not a full file-handle implementation (no `close`/
+      `seek`/`lines`/real `io.open`/`io.stderr` — there is still only one
+      process-wide output sink, `LuaRuntime::output`). `debug` and
       `native_modules` still gate nothing observable.
 - [~] Implement `load`/`loadstring`/`dofile` (compile a Lua string/registered
       module into a callable closure at runtime). `load`/`loadstring` compile
