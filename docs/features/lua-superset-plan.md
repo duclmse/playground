@@ -492,12 +492,12 @@ rather than one:
   with basic interpreter-level work (the bytecode/tree-walk tier itself),
   not a JIT - that's a separate initiative from this plan, not started here.
 
-### Addendum: closing two L8 benchmark-coverage gaps
+### Addendum: closing three L8 benchmark-coverage gaps
 
 All 6 phases above are now done (Phase 4's one remaining item, GC stress
 fixtures, shipped in a later session pass; see its section). Reconciling
 `docs/features/lua-compatibility.md`'s L8 checklist against what Phase 6
-actually delivered turned up two concrete, narrowly-scoped gaps, now closed:
+actually delivered turned up three concrete, narrowly-scoped gaps, now closed:
 
 - `benchmarks/metatable_dispatch.lua`: the benchmark suite had no fixture
   exercising metatable dispatch or polymorphic field access at all. Added
@@ -511,12 +511,19 @@ actually delivered turned up two concrete, narrowly-scoped gaps, now closed:
   once unwarmed (`--warmup 0 --runs 1`) and reports it as a separate
   `<name> (cold)` row, so first-launch cost and steady-state cost are both
   visible instead of only the latter.
+- `benchmarks/vararg_calls.lua`: no benchmark isolated vararg/multi-result-call
+  overhead (only a correctness test did). Added one exercising multi-result
+  return + multiple assignment, `...` forwarded through a second vararg
+  function and walked with `select`, and a call used as the sole trailing
+  argument of another call (must expand to all results). Same
+  cross-runtime verification as above; see `benchmarks/RESULTS.md`'s "Phase
+  6 addendum — vararg / multi-result-call overhead" section for numbers.
 
-Still open, not part of this addendum: no benchmark isolates
-vararg/multi-result-call overhead specifically (the L8 checklist's other
-uncovered category), and the differential runner (`test-lua55-differential.sh`)
-still only diffs stdout, not stderr/exit status. See
-`docs/features/lua-compatibility.md`'s L8 section for the full reconciliation.
+Still open, not part of this addendum: the differential runner
+(`test-lua55-differential.sh`) still only diffs stdout, not stderr/exit
+status; there is no fuzzing/property-test infrastructure; and there is no
+release dashboard. See `docs/features/lua-compatibility.md`'s L8 section for
+the full reconciliation.
 
 ## Non-goals for this plan
 

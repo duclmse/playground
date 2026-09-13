@@ -533,7 +533,7 @@ while proving the typed path retains its defining advantage.
 - [ ] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.
-- [~] Benchmark dynamic table array/hash reads, polymorphic field access,
+- [x] Benchmark dynamic table array/hash reads, polymorphic field access,
       closure allocation/calls, vararg/multi-result calls, metatable dispatch,
       GC pressure, and coroutine resume. Report interpreter cold start and
       steady-state cache/JIT results separately against the pinned Lua 5.5
@@ -546,15 +546,20 @@ while proving the typed path retains its defining advantage.
       base, each with its own `__index` metatable, called through a single
       shared call site so every invocation re-resolves `area` through a
       different object's metatable rather than hitting a monomorphic
-      target). `scripts/benchmark.sh` now runs every benchmark twice and
-      reports both numbers as separate rows: `<name>` (the existing
-      `--warmup 3 --min-runs 10` steady-state mean) and `<name> (cold)`
-      (`--warmup 0 --runs 1`, the first unwarmed process launch - a single
-      sample, so its stddev is always 0) — see `benchmarks/RESULTS.md`. Not
-      covered: no benchmark specifically isolates vararg/multi-result-call
-      overhead (the closest existing fixture,
-      `dynamic_lua_runtime_applies_table_iteration_and_multi_result_rules` in
-      `tests/lua55.rs`, is a correctness test, not a benchmark).
+      target) and, as of this update, vararg/multi-result-call overhead
+      specifically (`vararg_calls.lua`: multi-result return consumed by
+      multiple assignment, `...` forwarded through a second vararg function
+      and walked with `select`, and a call used as the sole trailing
+      argument of another call so it must expand to all of its results).
+      `scripts/benchmark.sh` now runs every benchmark twice and reports both
+      numbers as separate rows: `<name>` (the existing `--warmup 3
+      --min-runs 10` steady-state mean) and `<name> (cold)` (`--warmup 0
+      --runs 1`, the first unwarmed process launch - a single sample, so its
+      stddev is always 0) — see `benchmarks/RESULTS.md`. This closes the
+      last concrete benchmark-fixture-coverage gap; still open, and
+      unrelated to fixture coverage: the differential runner only diffs
+      stdout (see the L6 item below), and there is no fuzzing/property-test
+      infrastructure or release dashboard (see the two `[ ]` items below).
 - [ ] Before and after every dynamic optimization, run the existing typed Sol
       numeric, allocation, callback, table/array, JIT, and AOT benchmarks.
       Reject a material typed-path regression (initial budget: 5% outside

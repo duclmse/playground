@@ -621,3 +621,33 @@ This addendum measures only these two benchmarks, not a full re-run of the
 whole suite under the new cold-start methodology; the rest of the table
 above still reflects steady-state-only numbers from the original Phase 6
 run.
+
+## Phase 6 addendum — vararg / multi-result-call overhead
+
+The L8 checklist also called for a benchmark that specifically isolates
+vararg/multi-result-call overhead; the closest thing that existed was a
+correctness test (`dynamic_lua_runtime_applies_table_iteration_and_multi_result_rules`
+in `crates/sol/tests/lua55.rs`), not a benchmark. **`benchmarks/vararg_calls.lua`**
+(new) exercises the multi-value paths that test can't measure: a function
+returning several fixed results consumed by multiple assignment; a vararg
+function forwarding `...` into a second vararg function and walking it with
+`select`; and a call used as the sole, trailing argument of another call,
+which must expand to all of its results rather than being truncated to one.
+No `.sol` counterpart exists (varargs and multi-result calls are a
+`.lua`-only dynamic-path concept; typed `.sol` signatures are fixed-arity).
+
+| Row | lua (ref) | luajit | vm (this project) | sol (dynamic) |
+|:---|---:|---:|---:|---:|
+| vararg_calls | 433.5 ms | 20.3 ms | 1514.9 ms | 5071.9 ms |
+| vararg_calls (cold) | 460.1 ms | 22.4 ms | 1516.1 ms | 5107.5 ms |
+
+Same story as every other dynamic-path benchmark in this file: `sol
+(dynamic)` is roughly 250× slower than LuaJIT and about 3.3× slower than
+this project's own `vm` tree-walker on this workload, and cold vs.
+steady-state again shows no meaningfully different behavior (expected, for
+the same reason noted above - none of these runtimes do warm-up-sensitive
+work inside a single short process invocation). This closes the last
+concrete L8 benchmark-coverage gap identified after Phase 6; the remaining
+open L8 items (differential-runner stderr/exit-status diffing, property
+tests/fuzzing, the release dashboard) are unrelated to benchmark fixture
+coverage.
