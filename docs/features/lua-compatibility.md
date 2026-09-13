@@ -309,18 +309,22 @@ upvalues and final-expression result expansion.
 
 **Purpose:** provide the Lua object protocol and the portable library subset.
 
-- [~] Implement per-value/type metatables and table metatables. Table
+- [x] Implement per-value/type metatables and table metatables. Table
       metatables dispatch
       `__index`, `__newindex`, `__call`, `__tostring`, `__len`, and `__pairs`;
       arithmetic, bitwise, concatenation, comparison, and equality lookup is
-      also implemented. Per-type metatables and remaining edge-order rules are
-      open: strings are indexable only via a special case in `index()` that
-      routes directly to the `string` global table, not a real metatable
-      object, so `getmetatable("")` returns `nil` instead of a shared,
-      mutable `{__index = string}` table — code that mutates the shared
-      string metatable directly (`getmetatable(""):__band = ...`, used by
-      `bwcoercion.lua` to add bitwise metamethods to all strings) does not
-      work yet.
+      also implemented. Strings now share one real, mutable metatable object
+      (`LuaRuntime::string_metatable`, `{ __index = string }`), matching real
+      Lua's `strmt`: `getmetatable("")` returns this table (the same table for
+      every string, `getmetatable("") == getmetatable("x")`), `index()`/
+      `metamethod()` resolve strings through it like any other `__index`/
+      arithmetic/bitwise/etc. metamethod chain rather than a hardcoded
+      special case, and mutating it directly (`getmetatable(""):__band = fn`,
+      the `bwcoercion.lua`-style shim mentioned above) is now visible to every
+      subsequent string operation. `setmetatable` on a string still errors
+      (matches real Lua: `setmetatable`'s first argument must be a table).
+      Remaining open item: other per-type metatables (numbers, booleans,
+      functions) beyond strings.
 - [~] Use metatable/table version counters for dynamic inline caches. Mutation
       counters are maintained now. Each future cache
       guards receiver kind, table shape, metatable identity, and version; any

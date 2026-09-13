@@ -188,7 +188,10 @@ Every one of the 26 `pending` manifest rows now carries a specific
 - **No persistent shared string metatable** (`bwcoercion`): `getmetatable("")`
   returns `nil` (strings are indexable via a special case in `index()`, not
   a real metatable object), so mutating the shared string metatable directly
-  cannot work.
+  cannot work. **Fixed** (see `docs/features/lua-compatibility.md`'s L5
+  section): strings now share one real, mutable `LuaRuntime::string_metatable`
+  table (`{ __index = string }`), and `index()`/`metamethod()` resolve
+  strings through it like any other metamethod chain.
 - **`Xop` string.pack alignment option** (`tpack`): already-documented Phase
   2 scope exclusion, not a new bug.
 - **`any`-value dynamic/native boundary** (`attrib`, `calls`): only
