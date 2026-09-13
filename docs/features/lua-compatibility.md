@@ -1004,6 +1004,72 @@ one. Part of the broader interpreter-level LuaJIT-technique-adoption plan
 names, string-key cloning, dormant inline-cache infrastructure, and
 `LuaValue` representation remain open as that plan's later phases.
 
+### Addendum: constant-pool field names and `Rc`-backed `LuaKey::String` (Phases 7.2+7.3)
+
+`Instr::GetField`/`SetField`'s handlers built a fresh `LuaValue::String(Rc::
+new(name.as_bytes().to_vec()))` on every execution from the instruction's
+inline `Rc<str>` field name, then `LuaValue::key()` cloned that `Vec<u8>` a
+*second* time to build the table's hash key - two heap allocations and two
+full-string copies per field/method access, for a name that never changes
+after compile time.
+
+Fixed in two combined steps (planned as separate phases, landed together
+since they close the same allocation site): `Instr::GetField(Reg, Reg, u32)`/
+`SetField(Reg, u32, Reg)` now carry a constant-pool index into `Proto::consts`
+(reusing the existing `Const::Str(Rc<Vec<u8>>)`, the same pattern
+`Instr::LoadConst` already used) instead of an inline `Rc<str>`, via a new
+`FuncState::push_name_const` helper used at every `GetField`/`SetField`
+emission site; and `LuaKey::String` changed from `Vec<u8>` to
+`Rc<Vec<u8>>`. Together, a field/method access now clones two `Rc`s instead
+of allocating and copying two fresh byte buffers. `PartialEq`/`Hash` for
+`LuaKey::String` are unchanged in behavior - both were already hand-written
+to compare/hash by content, and `Rc<T>`'s own `PartialEq`/`Hash` impls
+delegate to `T`, so wrapping in `Rc` doesn't switch them to pointer-identity
+semantics.
+
+**Scoping decision**: `Instr::GetGlobal`/`SetGlobal` were *not* changed to
+the same constant-pool-index scheme, despite the original plan proposing
+all four. Unlike `GetField`/`SetField`, they were already allocation-free:
+`Globals::get`/`define`/`assign` take `&str` and look up directly into a
+`HashMap<String, Binding>`, so the existing inline `Rc<str>` was already just
+a cheap deref-and-hash at every execution, not a source of allocation. Adding
+a constant-pool index for them would only have saved a few bytes of `Instr`
+size at the cost of introducing a bytes-to-`&str` conversion (and touching
+roughly 30 call sites that currently pass plain string literals into
+`Globals::define`), for no measured win - out of scope for what this pass
+needed to fix.
+
+A useful side effect: shrinking `GetField`/`SetField` from a 16-byte fat
+`Rc<str>` pointer down to a 4-byte index also shrinks `Instr`'s overall size
+(it was the largest-variant driver), which densifies the *entire*
+instruction stream the dispatch loop iterates - not just field-access-heavy
+code. Pinned with a new `instr_size_regression` test in `lua_bytecode.rs`
+asserting `size_of::<Instr>()` stays at or under a fixed bound. Another
+incidental win: `LuaKey::value()` (used by `next`/`pairs` key iteration) also
+lost an allocation, since its `String` arm went from rebuilding a fresh `Vec`
+to cloning the now-`Rc`-backed key directly.
+
+Controlled A/B (`hyperfine --warmup 3 --min-runs 10`, same unbounded-budget
+overrides):
+
+| benchmark | before | after | speedup |
+|---|---:|---:|---:|
+| objects | 4.066 s | 2.869 s | 1.42x |
+| metatable_dispatch | 568.3 ms | 328.9 ms | 1.73x |
+| table_array | 530.7 ms | 524.3 ms | 1.01x (within noise) |
+| fib | 1.643 s | 1.628 s | 1.01x (within noise) |
+
+The largest win in this rewrite series so far. `objects.lua` and
+`metatable_dispatch.lua` are field/method-access-bound and improved
+substantially (42% and 73% faster respectively); `table_array.lua`
+(array-index-bound) and `fib.lua` (register-arithmetic-bound) are correctly
+unaffected, confirming the fix is scoped to the workloads it targets rather
+than a coincidental global speedup. Full regression coverage
+(`cargo test --manifest-path crates/sol/Cargo.toml`: unit + `lua55.rs` +
+`lua55_fuzz.rs` + `programs.rs`, 174 tests total) and
+`scripts/test-lua55-manifest.sh` both pass unchanged - no observable Lua
+semantics changed, only the field-access representation.
+
 ## Delivery order and dependencies
 
 1. Complete L0 before interpreting the headline “34 tests” number; it is the

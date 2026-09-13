@@ -728,3 +728,50 @@ Consistent with the interpreter-level-rewrite plan
 the larger remaining costs (constant-pool field/global names, string-key
 cloning, dormant inline-cache infrastructure, `LuaValue` representation)
 are still open and scoped as later phases of that same plan.
+
+## Interpreter-level rewrite, Phases 2+3 — constant-pool field names and `Rc`-backed `LuaKey::String`
+
+Landed together since they close the same double-allocation site: every
+`GetField`/`SetField` execution built a fresh `LuaValue::String(Rc::new(name
+.as_bytes().to_vec()))` from the instruction's inline field-name string, then
+`LuaValue::key()` cloned that `Vec<u8>` a *second* time to build the hash key
+- two heap allocations and two full-string copies per field/method access,
+for a name that's a compile-time constant. See
+`docs/features/lua-compatibility.md`'s matching addendum for the full
+root-cause writeup and the scoping decision (only `GetField`/`SetField` were
+changed; `GetGlobal`/`SetGlobal` already had no allocation problem, so they
+were left as `Rc<str>` rather than churned for no measured benefit).
+
+Fixed by: (1) `Instr::GetField`/`SetField` now carry a `u32` constant-pool
+index into `Proto::consts` (reusing `Const::Str(Rc<Vec<u8>>)`) instead of an
+inline `Rc<str>`, so the VM clones a pooled `Rc` instead of allocating; (2)
+`LuaKey::String` changed from `Vec<u8>` to `Rc<Vec<u8>>`, so `key()`'s
+`String` arm is also just an `Rc` clone. Content-based `PartialEq`/`Hash`
+semantics are unchanged (`Rc<T>` delegates both to `T`). A bonus: this also
+removed an allocation from `LuaKey::value()` (used by `next`/`pairs` key
+iteration), which previously rebuilt a fresh `Vec` from every string key
+read back out of a table.
+
+As a side effect, shrinking `GetField`/`SetField` from an inline `Rc<str>`
+(a 16-byte fat pointer) down to a 4-byte index also shrinks `Instr`'s overall
+size, which was the largest-variant driver - this densifies the whole
+instruction stream the dispatch loop iterates, not just field-access-heavy
+code. Pinned with a new `instr_size_regression` test in `lua_bytecode.rs`.
+
+Controlled A/B on this machine (same binary before/after, `hyperfine
+--warmup 3 --min-runs 10`, same unbounded-budget overrides used throughout
+this file):
+
+| Benchmark | before | after | speedup |
+|:---|---:|---:|---:|
+| objects | 4066 ms | 2869 ms | 1.42x |
+| metatable_dispatch | 568.3 ms | 328.9 ms | 1.73x |
+| table_array | 530.7 ms | 524.3 ms | 1.01x (within noise) |
+| fib | 1643 ms | 1628 ms | 1.01x (within noise) |
+
+By far the largest win in this rewrite series so far - `objects.lua` and
+`metatable_dispatch.lua` are exactly the field/method-access-bound workloads
+this phase targets, and both improved substantially. `table_array.lua` and
+`fib.lua` are unaffected as expected (array-index and register-arithmetic
+bound, not field-name bound), confirming the fix is scoped correctly rather
+than a coincidental global speedup.

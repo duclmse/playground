@@ -864,6 +864,36 @@ overrides): 1-5% faster across `vararg_calls`, `fib`, `gc_alloc`, `objects`,
 category, not a new one). Full numbers:
 `benchmarks/RESULTS.md`'s matching addendum.
 
+### Phase 7.2+7.3 — constant-pool field names, `Rc`-backed `LuaKey::String` — **done this session**
+
+Landed together since they close the same double-allocation site: every
+`GetField`/`SetField` execution built a fresh `LuaValue::String(Rc::new(name
+.as_bytes().to_vec()))` from the instruction's inline field-name string, then
+`LuaValue::key()` cloned that byte vector a second time to build the hash
+key. `Instr::GetField`/`SetField` now carry a `u32` constant-pool index
+(reusing `Const::Str(Rc<Vec<u8>>)`, the same pattern `LoadConst` uses)
+instead of an inline `Rc<str>`, and `LuaKey::String` changed from `Vec<u8>`
+to `Rc<Vec<u8>>` — together, a field/method access now clones two `Rc`s
+instead of allocating and copying two fresh byte buffers.
+
+`GetGlobal`/`SetGlobal` were deliberately *not* changed to the same scheme:
+unlike field access, they had no allocation problem to begin with (`Globals`
+already looks up by `&str` into a `HashMap<String, _>`, so the existing
+inline `Rc<str>` was already a cheap deref, not an allocation), so migrating
+them would only have shaved a few bytes off `Instr` at the cost of touching
+~30 unrelated call sites for no measured win.
+
+Controlled A/B: `objects` 1.42x faster, `metatable_dispatch` 1.73x faster
+(the two field/method-access-bound benchmarks this phase targets);
+`table_array`/`fib` unaffected as expected (array-index/register-arithmetic
+bound, not field-name bound) — confirms the fix is scoped correctly. Full
+numbers and the `Instr`-size side-benefit (a new `instr_size_regression`
+test pins it): `benchmarks/RESULTS.md`'s and
+`docs/features/lua-compatibility.md`'s matching addenda.
+
+Remaining phases of this plan (table-version inline cache, global-access
+inline cache, NaN-boxed `LuaValue`) are not yet started.
+
 ## Non-goals for this plan
 
 - `sol build`/`sol debug` getting the same per-function partition as `sol
