@@ -21,7 +21,13 @@ The checked manifest currently classifies all 34 top-level Lua 5.5.1 cases:
 26 remain semantic `pending` cases and 8 are explicitly `host-required`.
 Focused fixtures now cover implemented parser/runtime slices, but no complete
 upstream case has been promoted to `pass`; the result remains a baseline, not a
-claim that the suite is a single ready-made Sol acceptance test.
+claim that the suite is a single ready-made Sol acceptance test. Every
+`pending` row now carries a `blocked-on:` note naming the specific missing
+feature or bug class observed against the pinned corpus (Phase 3 triage);
+common blockers are a sandboxed `require` with no `debug` library to register,
+`<close>`/finalization (Phase 4), missing `_ENV`, and no shared string
+metatable — see `docs/features/lua-superset-plan.md`'s Phase 3 section for the
+session-by-session detail.
 
 The upstream suite also exercises a Lua executable, its C API, dynamically
 loaded C modules, a terminal/readline fallback, host files such as `/dev/full`,
@@ -168,12 +174,33 @@ represented by the current scalar-only `any` box.
 - [~] Define Lua truthiness, number equality/comparison/coercion, string
       identity/content rules, number formatting, and key canonicalization with
       differential fixtures. Specify NaN and integer/float table-key behavior.
-- [ ] Add Lua bytecode registers, constants, upvalue descriptors, and source
+      Numeric `for` loops (`Instr::ForPrep`/`ForLoop`) now run a float-mode
+      loop when any control value (start/stop/step) is a float, matching real
+      Lua, instead of unconditionally requiring integer control values (this
+      used to make any `for i = 1, math.huge do ... end` fail before its
+      first iteration). Arithmetic still has no automatic string-to-number
+      coercion at all (`"2" + "3"` errors; real Lua coerces numeral strings
+      in arithmetic contexts) — open.
+- [x] Add Lua bytecode registers, constants, upvalue descriptors, and source
       spans. Interpret dynamic code through this VM; do not force it through
-      typed Cranelift lowering.
+      typed Cranelift lowering. `lua_bytecode.rs` compiles each Lua function
+      to a `Proto` (register-based instructions, constants, upvalue
+      descriptors, per-instruction source lines); `lua_runtime.rs`'s
+      `run_proto` executes it directly, replacing the prior `Env`-chain
+      AST-walking tree-walker entirely.
 - [~] Give every Lua module its own `_ENV` table and resolve reads/writes via
       that environment. Implement `global` declarations through explicit
-      environment slots/metadata, including their const constraints.
+      environment slots/metadata, including their const constraints. Globals
+      currently resolve through a dedicated `Globals` map
+      (`GetGlobal`/`SetGlobal` bytecode ops), not an actual `_ENV` upvalue
+      table — the identifier `_ENV` itself is unbound and reads as `nil`;
+      code that indexes/reassigns `_ENV` directly (`_ENV[k]`, `local _ENV =
+      ...`) does not work (see `closure.lua`'s corpus entry). A bare `global
+      name1, name2` declaration (no `= value`) is fixed to read each name's
+      current value before re-declaring it, instead of unconditionally
+      overwriting it with `nil` — this was clobbering built-ins like `print`
+      on every corpus file using the common `global <const> print, assert,
+      ...` idiom.
 - [~] Add a host-independent error object and stack trace shape. Errors must
       cross dynamic call boundaries without Rust panics or process aborts.
 
@@ -213,7 +240,20 @@ typed top-level function values.
 
 - [~] Compile Lua closures with heap environment cells for captured locals.
       Closing an upvalue at scope exit must preserve a single shared cell across
-      all closures that captured it.
+      all closures that captured it. Fixed two register-allocation bugs in
+      method-call codegen (`lua_bytecode.rs`): method calls with one or more
+      explicit fixed arguments (e.g. `t:greet("x")`) clobbered the `self`
+      register because fixed arguments started at `base` instead of
+      `base + 1`; and a method call used as a trailing multi-value call
+      argument (e.g. `f(s:format(...))`) panicked a `debug_assert_eq!` because
+      `compile_method_base` allocated its base register after evaluating the
+      receiver expression instead of before. Also fixed `function t.f(...)`/
+      `function t:f(...)` declarations (both nested and top-level/hoisted)
+      compiling the dotted/colon name as a literal global variable (e.g. a
+      global literally named `"t.f"`) instead of assigning into `t`'s field;
+      top-level dotted/method declarations are no longer hoisted ahead of the
+      statement that creates their base table, matching real Lua's
+      sequential-sugar semantics.
 - [~] Implement Lua call frames, recursive calls, proper vararg packs, and
       multi-result propagation through call, return, assignment, table
       construction, and parenthesized-expression truncation sites.
@@ -221,7 +261,13 @@ typed top-level function values.
       error values and a bounded, useful stack trace. Add recursion/instruction
       budgets before host-exposed sandbox use. Recursion, instruction/backedge,
       and heap table/closure allocation budgets are enforced; exact byte and
-      environment accounting awaits the dynamic GC allocator.
+      environment accounting awaits the dynamic GC allocator. `assert(v)` with
+      no explicit message now raises the literal `"assertion failed!"` on a
+      falsy `v` (previously it stringified the falsy `v` itself as the error
+      message, e.g. `assert(false)` raised `"false"`). `LuaError` is still
+      string-only (`{ message: String, stack: Vec<String> }`); raising a
+      non-string value (table/number/boolean) loses its original type/identity
+      once caught — a real gap, not yet fixed.
 - [x] Specify tail-call behavior. Calls in tail position currently use ordinary
       bounded frames (no frame elision), preserving protected-call errors and
       stack traces. Proper-tail-call optimization remains a performance/fidelity
@@ -230,6 +276,23 @@ typed top-level function values.
       checked conversion to a typed function signature. Enforce arity/result
       checks at the bridge; do not let `LuaValue` appear in typed IR absent an
       explicit dynamic operation.
+- [x] Split `.lua` compilation per function instead of per file: one dynamic
+      construct anywhere in a file no longer forces every function in that
+      file into the bytecode interpreter. `typeck::check_partitioned`
+      classifies each top-level function (including the synthesized `main`)
+      as native-candidate or dynamic, then demotes any native-candidate that
+      (directly or transitively) calls a dynamic function to a fixed point,
+      via `jit::called_functions` over the native call graph. Dynamic code
+      may call into surviving native functions through a one-directional
+      bridge (`lua_runtime::LuaValue::Native`/`NativeBridge`); native code can
+      never call back into the dynamic runtime. Only scalar (`i64`/`f64`
+      /`bool`) parameters and returns may cross the bridge — non-scalar
+      signatures (strings, tables, structs, arrays, maps, functions) are
+      rejected at compile time with a clear error rather than silently boxed
+      or miscompiled, preserving the "typed hot paths are never implicitly
+      weakened" rule above. `sol run` uses this path (see
+      `main.rs::run_lua_partitioned`); `sol build`/`sol debug` remain
+      all-or-nothing pending follow-up work.
 
 **Exit gate:** `calls`, `closure`, `vararg`, and relevant `errors` assertions
 pass unchanged or as manifest-linked semantic fixtures, including shared
@@ -244,21 +307,77 @@ upvalues and final-expression result expansion.
       `__index`, `__newindex`, `__call`, `__tostring`, `__len`, and `__pairs`;
       arithmetic, bitwise, concatenation, comparison, and equality lookup is
       also implemented. Per-type metatables and remaining edge-order rules are
-      open.
+      open: strings are indexable only via a special case in `index()` that
+      routes directly to the `string` global table, not a real metatable
+      object, so `getmetatable("")` returns `nil` instead of a shared,
+      mutable `{__index = string}` table — code that mutates the shared
+      string metatable directly (`getmetatable(""):__band = ...`, used by
+      `bwcoercion.lua` to add bitwise metamethods to all strings) does not
+      work yet.
 - [~] Use metatable/table version counters for dynamic inline caches. Mutation
       counters are maintained now. Each future cache
       guards receiver kind, table shape, metatable identity, and version; any
       miss or mutation takes the generic bytecode path.
 - [~] Implement deterministic base, table, string, math, and utf8 slices with
       per-function tests. Focused base/string support plus table
-      `concat`/`insert`/`remove`/`pack`/`unpack` and core numeric math functions
-      are present, along with `utf8.len`/`char`/`codepoint`. Sorting and broader
-      string/math/utf8 edge cases remain.
-- [ ] Implement a sandboxed `package`/`require`: deterministic search paths,
-      module cache, cyclic-load behavior, and an explicit host-provided loader
-      interface. Native loaders remain off by default.
-- [ ] Split `io`, `os`, `debug`, native module loading, and locale APIs into
-      declared capability profiles. Test both denial and allowed behavior.
+      `concat`/`insert`/`remove`/`pack`/`unpack`/`sort`/`create` and core numeric
+      math functions (including `sqrt`/`sin`/`cos`/`tan`/`exp`/`log` and the
+      `pi`/`huge`/`maxinteger`/`mininteger` constants) are present, along with
+      `tonumber`, `string.byte`/`char`, and `utf8.len`/`char`/`codepoint`. A
+      real Lua pattern-matching engine (`crates/sol/src/lua_pattern.rs`:
+      character classes, `[...]` sets, `^`/`$` anchors, `()` captures
+      including position captures, `%1`-`%9` back-references, `*`/`+`/`-`/`?`
+      quantifiers, `%b`/`%f`) backs `string.find`/`match`/`gmatch`/`gsub`
+      (string/table/function replacements). `string.format` covers
+      `d`/`i`/`u`/`x`/`X`/`o`/`c`/`f`/`F`/`e`/`E`/`g`/`G`/`s`/`q`/`%` with
+      flags/width/precision (note: `%e`/`%g` use Rust's float formatter under
+      the hood, so extreme-precision rounding may not bit-match C's libm).
+      `collectgarbage` is a deterministic approximation over the existing
+      allocation budget (`"count"` reports bytes used). `"collect"`/`"step"`
+      run a full trial-deletion cycle-collector pass (see L6) on top of the
+      `Rc`-based value graph, reclaiming table/closure reference cycles and
+      running `__gc` finalizers; `"stop"`/`"restart"`/`"isrunning"`/
+      `"incremental"`/`"generational"` are accepted but remain no-ops, since
+      there is no incremental/generational scheduling to toggle.
+      `string.pack`/`unpack`/`packsize` are implemented
+      (`crates/sol/src/lua_pack.rs`: endianness `<`/`>`/`=`, alignment
+      `!`/`!n`, integers `b`/`B`/`h`/`H`/`i`/`I`/`l`/`L`/`j`/`J`/`T`, floats
+      `f`/`d`/`n`, strings `s`/`z`/`c`, padding `x`); the align-without-storing
+      `Xop` option is not implemented and errors clearly if used. Broader
+      math/utf8 edge cases remain.
+- [x] Implement a sandboxed `package`/`require`: an explicit host-provided
+      loader (`LuaRuntime::add_module`) registers exact-name in-memory module
+      sources; `package.loaded` caches each module's result so repeated
+      `require` calls return the same value; a cyclic `require` observes a
+      deterministic partial-initialization sentinel instead of reloading or
+      overflowing the call stack; each loaded module gets its own global
+      environment (`_NAME` set, globals isolated from the requiring module and
+      from other modules). Native/filesystem loaders stay off: `require` is
+      rejected until the `package` capability is explicitly enabled by
+      registering a module. Path-based search and a stable module-interface
+      format remain open.
+- [~] Split `io`, `os`, `debug`, native module loading, and locale APIs into
+      declared capability profiles. `LuaCapabilities` declares `package`, `io`,
+      `os`, `debug`, and `native_modules` as independent flags. `package`
+      denial (no registered module) vs. allowed (an explicit `add_module` call)
+      behavior is tested; `os` (`time`/`clock`/`difftime`/`date`/`getenv`/
+      `exit`) and `io` (`write`/`read`) are now implemented and independently
+      capability-gated too, with denial/allowed tests for each
+      (`LuaRuntime::with_capabilities`; the `sol` CLI enables `os`+`io` by
+      default since it is a trusted native tool, unlike library embedders
+      which keep the sandboxed-by-default profile). `os.date` uses UTC-only
+      hand-rolled calendar math (no timezone database), so `os.date(...)` and
+      `os.date("!"...)` currently render identically, and its strftime-subset
+      only covers `%Y %y %m %d %H %M %S %p %A %a %B %b %j %c %%`. `io.write`
+      does not yet return a file-handle object for chaining. `debug` and
+      `native_modules` still gate nothing observable.
+- [~] Implement `load`/`loadstring`/`dofile` (compile a Lua string/registered
+      module into a callable closure at runtime). `load`/`loadstring` compile
+      arbitrary source and return `(nil, error_string)` on failure, matching
+      Lua's `load` contract; `dofile` is gated behind the same `package`
+      capability and explicit in-memory loader `require`/`add_module` use (no
+      raw filesystem access yet - a deliberate deviation until a real
+      filesystem capability is designed).
 
 **Exit gate:** the object-protocol assertions from `events`, `sort`, and table
 tests pass; portable portions of `strings`, `math`, and `utf8` pass against the
@@ -272,9 +391,33 @@ oracle; every omitted library entry has a documented capability status.
       tables, strings, closures, upvalue cells, iterator state, errors, and
       coroutine frames; compiler/VM root stacks; and write barriers on every
       reference store.
-- [ ] Define reachability, weak table behavior, finalizer registration and
-      scheduling, and `collectgarbage` modes. Lua-visible finalizer timing must
-      be tested as permitted ranges, never as an accidental exact schedule.
+- [~] Weak-table (`__mode`) behavior and table/function-valued table keys are
+      implemented (`lua_runtime.rs`: `LuaKey` gained `Table`/`Closure`/
+      `NativeFunction`/`Native`/`GMatchIterator` variants with identity-based
+      `Hash`/`Eq`; `setmetatable` registers a weak-mode table into
+      `LuaRuntime::weak_tables`; `collectgarbage("collect"/"step")` sweeps
+      that registry via `sweep_weak_tables`/`prune_weak_table`, removing
+      entries whose reference-typed key/value has no strong reference left
+      outside the table itself). This is a registry-based sweep over
+      explicitly weak-registered tables, not a general heap/root scan - see
+      `docs/features/lua-superset-plan.md`'s Phase 4a.
+
+      Cycle collection and `__gc` finalizers are now implemented on top of
+      the `Rc`-based value graph (Phase 4b,
+      `LuaRuntime::collect_cycles`/`track_table`/`track_closure`): every
+      ordinary table/closure allocation is registered as a candidate, and
+      `collectgarbage("collect"/"step")` runs a CPython-style trial-deletion
+      pass that reclaims reference cycles (a self-referential or
+      mutually-referential table/closure pair no longer leaks for the
+      process lifetime) without needing to enumerate program roots. A
+      table's `__gc` metamethod, if its metatable defines one, is called
+      once right before the table is cleared during sweep, with its fields
+      still intact; finalizer errors are discarded so a broken `__gc` can't
+      fail `collectgarbage()` itself. The one deliberate gap versus real
+      Lua: there is no resurrection support — an object referenced from
+      inside its own `__gc` call is not kept alive for one more cycle, it is
+      cleared immediately afterward regardless. Stress fixtures that collect
+      at every allocation point remain open (see the next checklist item).
 - [ ] Add stress modes that collect at allocation points and after every dynamic
       bytecode instruction. Run them under memory checking where available.
 - [ ] Run `gc`, `gengc`, and `tracegc` in their own capability category; map
@@ -334,6 +477,120 @@ while proving the typed path retains its defining advantage.
 **Exit gate:** all release-supported entries pass under the documented profile,
 no unclassified corpus failures remain, and published performance claims state
 the workload, machine, compiler revision, warm-up policy, and comparison.
+
+### Addendum: CLI instruction/allocation budget was blocking any realistic benchmark
+
+Attempting a first honest benchmark of the dynamic `.lua` path (not the typed
+`.sol` native path `scripts/benchmark.sh` measures by default) surfaced that
+`sol run` silently inherited `LuaRuntime::new()`'s sandboxed-embedder defaults
+(1,000,000 instructions / 1,000 call depth / 64MiB allocation - sized for
+untrusted embedded code), unlike `os`/`io` capabilities, which the CLI already
+relaxes as a "trusted native tool." 8 of 10 `benchmarks/*.lua` files
+(`fib`, `function_calls`, `function_calls_closure`, `gc_alloc`, `loop_sum`,
+`matrix`, `nested_loop`, `objects`, `table_array`) failed outright with
+`Lua instruction budget exhausted` or `Lua allocation budget exhausted` before
+producing any output at all.
+
+Fixed by adding `LuaRuntime::with_capabilities_and_budgets` and
+`run_program_with_natives_and_budgets` (`lua_runtime.rs`), and wiring opt-in
+`SOL_LUA_INSTRUCTION_BUDGET` / `SOL_LUA_CALL_DEPTH_BUDGET` /
+`SOL_LUA_ALLOCATION_BUDGET` env vars into both `run_lua_partitioned` call
+sites in `main.rs`, following the existing `SOL_PROMOTE_THRESHOLD`/
+`SOL_OSR_THRESHOLD` env-var-override precedent (`tier.rs`). Defaults are
+unchanged when the vars are unset, so library embedders (including the
+browser/sandboxed use case) are unaffected - only the CLI's opt-in override
+path is new. Regression coverage:
+`dynamic_lua_runtime_capabilities_and_budgets_can_be_overridden_together`
+(`tests/lua55.rs`).
+
+With generous overrides, all 10 benchmarks ran to completion. Single-run,
+one machine, release build, no warm-up (a first look, not a release-grade
+measurement - a real L8 pass still needs hyperfine's warm-up + ≥10-run
+methodology): Sol's dynamic interpreter was consistently slower than
+reference Lua 5.4 (`lua`) by roughly 3x-47x depending on workload (worst on
+function-call-heavy code: `function_calls`/`function_calls_closure` at
+~46x; best on the two already-small/near-noise cases,
+`hashmap_lookup`/`string_concat`), and far behind LuaJIT (up to ~870x on
+`function_calls`). This is a naive tree-walking/bytecode interpreter with no
+tiering, expected for this stage of the plan - Phase 4-6 (precise GC,
+coroutines, then this L8 phase's own optimization work) haven't started yet.
+A second, independent, unrelated-to-this-fix observation from the same run:
+Sol's dynamic float-to-string conversion for large magnitudes prints full
+decimal digit expansion (e.g. `5333329333341399000`) where reference Lua's
+`%.14g`-based formatting uses scientific notation (`5.333329333341399e+18`)
+- a real output-format divergence, not yet triaged into the manifest since it
+wasn't hit by any of the 26 corpus cases audited in Phase 3.
+
+### Addendum: register-slot-reuse closure bug, and selective register unboxing
+
+While investigating the interpreter overhead behind the benchmark numbers
+above, found that `crates/sol/src/lua_bytecode.rs`'s register allocator
+recycled temporary/local register numbers (`FuncState::end_statement`/
+`pop_scope` reset `next_reg` downward) with no awareness of whether a given
+register number had ever been captured as a `ParentLocal` upvalue by an
+escaping closure. Because a captured register's `Rc<RefCell<LuaValue>>` cell
+is shared by reference with the closure for as long as the closure lives
+(potentially past the scope/frame that created it - e.g. a closure stored in
+a table), a later, unrelated write to the same register number (an ordinary
+expression temporary in a sibling or later statement) silently corrupted the
+escaped closure's captured value. Reproduced against the unmodified binary
+with a `do local x = 99; caps[1] = function() return x end end` followed by
+unrelated arithmetic reusing `x`'s register number - `caps[1]()` returned the
+unrelated temporary's value instead of `99`.
+
+Fixed by tracking, per `FuncState`, the set of registers ever captured
+(`captured: HashSet<Reg>`) and a monotonically increasing `retired_floor`
+that every `next_reg`-lowering site (`reset_to`, `pop_scope`,
+`end_statement`) now clamps against, so a captured register's number is
+permanently retired from reuse for the rest of that function's compilation
+once discovered in `resolve()`. This is deliberately conservative (may retire
+a few more registers than strictly necessary) but guarantees no future reuse
+can alias a still-live captured cell. Regression coverage:
+`dynamic_lua_runtime_closures_survive_register_slot_reuse_after_their_scope_ends`
+(`tests/lua55.rs`).
+
+This same "which registers are ever captured" analysis is also the
+prerequisite for closing part of the interpreter-overhead gap measured above.
+Per `lua_bytecode.rs`'s top-of-file design note, every VM register was an
+`Rc<RefCell<LuaValue>>` cell - one heap allocation per register per call,
+plus an `Rc` deref and `RefCell` borrow-check on every single register read
+or write, dominating interpreter overhead. Since the compiler now already
+knows exactly which registers are ever captured
+(`Proto::captured_registers: Vec<bool>`), `lua_runtime.rs`'s `run_proto` was
+changed to a dual representation: an uncaptured register is a plain
+`LuaValue` in a flat `Vec<LuaValue>` (`regs`); only the (typically small)
+subset of registers actually captured by a nested closure get a real
+`Rc<RefCell<LuaValue>>` cell (`cells: Vec<Option<Rc<RefCell<LuaValue>>>>`).
+`NewLocal` and per-iteration loop-variable writes give a captured register a
+*fresh* cell identity (so a closure created in one iteration keeps its own
+cell after a later iteration reuses the same register number); everything
+else reads/writes through the plain slot with no allocation, no `Rc`, and no
+borrow-check.
+
+Same methodology as the benchmark table above (single machine, release
+build, no warm-up - a first look, not a hyperfine-grade measurement), same
+budget overrides:
+
+| benchmark | before (vs `lua`) | after (vs `lua`) |
+|---|---|---|
+| fib | ~32x | ~18x |
+| function_calls | ~46x | ~13x |
+| function_calls_closure | ~47x | ~13x |
+| objects | ~27x | ~13x |
+| gc_alloc | ~11x | ~10x |
+| loop_sum | ~18x | ~10x |
+| table_array | ~14x | ~8x |
+| nested_loop | ~18x | ~12x |
+| matrix | ~11x | ~9x |
+| hashmap_lookup / string_concat | noise-level | noise-level |
+
+A meaningful across-the-board improvement (roughly 1.5x-3.7x faster than
+before this change) without closing the full gap to reference Lua - the
+interpreter is still a naive tree-walker with no tiering for the dynamic
+`.lua` path, and this fix only removed *unnecessary* boxing, not fixed-cost
+interpretation overhead (dispatch, `LuaValue` cloning, dynamic type checks
+per operation). Further gains need the tiering/JIT work already scoped for
+this phase, not another register-representation change.
 
 ## Delivery order and dependencies
 

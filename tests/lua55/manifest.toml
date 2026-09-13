@@ -28,42 +28,42 @@ path = "attrib.lua"
 category = "attributes-and-close"
 status = "pending"
 requires = []
-note = "Needs Lua attributes, to-be-closed locals, tables, functions, and errors."
+note = "blocked-on: dynamic/native boundary only crosses i64/f64/bool; 'f' is called from dynamic Lua code with an any-typed parameter, which cannot cross the runtime boundary."
 
 [[case]]
 path = "big.lua"
 category = "stress"
 status = "pending"
-requires = []
-note = "Large dynamic program and coroutine stress after core runtime support."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require\"debug\"` at line 10; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "bitwise.lua"
 category = "operators"
 status = "pending"
-requires = []
-note = "Needs dynamic values and Lua numeric coercion beyond typed operator fixtures."
+requires = ["package-loader"]
+note = "blocked-on: `require \"bwcoercion\"` / `require 'bit32'` (lines 6, 210) need filesystem-backed cross-file require, which is a stated non-goal; bwcoercion.lua itself is also blocked (see its own entry)."
 
 [[case]]
 path = "bwcoercion.lua"
 category = "numeric-coercion"
 status = "pending"
 requires = []
-note = "Needs Lua integer/float/string coercion and global declarations."
+note = "blocked-on: no persistent shared string metatable; getmetatable(\"\") returns nil (strings are indexable via a special case in index(), not a real metatable object), so `getmetatable(\"\").__band = ...` cannot inject bitwise metamethods onto all strings."
 
 [[case]]
 path = "calls.lua"
 category = "calls"
 status = "pending"
 requires = []
-note = "Needs dynamic functions, tables, multi-results, protected errors, and metatables."
+note = "blocked-on: dynamic/native boundary only crosses i64/f64/bool; 'deep' is called from dynamic Lua code with an any-typed parameter, which cannot cross the runtime boundary."
 
 [[case]]
 path = "closure.lua"
 category = "closures"
 status = "pending"
 requires = []
-note = "Needs heap closures, shared upvalues, GC, and dynamic tables."
+note = "blocked-on: two distinct gaps hit in sequence: (1) `_ENV` is not implemented at all (always reads as nil; Sol does not model globals as sugar for indexing an _ENV upvalue table), fails first at `_ENV[true] = 10` (line 9); (2) once that's worked around, weak tables (__mode) don't actually collect entries, so the file's `while x[1] do ... end` GC-wait loop (line ~42) never terminates and exhausts the instruction budget instead."
 
 [[case]]
 path = "code.lua"
@@ -76,15 +76,15 @@ note = "Exercises Lua binary chunks and internal test hooks."
 path = "constructs.lua"
 category = "control-flow"
 status = "pending"
-requires = []
-note = "Needs Lua expression lists, tables, closures, and generic iteration."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require \"debug\"` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "coroutine.lua"
 category = "coroutines"
 status = "pending"
 requires = []
-note = "Owned resumable frames are scheduled for L7."
+note = "blocked-on: `<close>` requires resource finalization, which is not implemented yet (fails at line 176); owned resumable frames and finalization are both scheduled for Phase 4/L7."
 
 [[case]]
 path = "cstack.lua"
@@ -98,21 +98,21 @@ path = "db.lua"
 category = "debug-library"
 status = "pending"
 requires = ["debug-library"]
-note = "Dynamic debug-library semantics are capability-gated after the core runtime."
+note = "blocked-on: `local debug = require\"debug\"` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "errors.lua"
 category = "errors"
 status = "pending"
-requires = []
-note = "Needs dynamic errors, loading, stack traces, and protected calls."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require\"debug\"` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "events.lua"
 category = "metatables"
 status = "pending"
-requires = []
-note = "Needs the full metatable event protocol."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require'debug'` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "files.lua"
@@ -125,43 +125,43 @@ note = "Validates host file and locale behavior, including /dev/full."
 path = "gc.lua"
 category = "garbage-collection"
 status = "pending"
-requires = []
-note = "Needs precise roots, finalizers, weak tables, and Lua GC APIs."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require\"debug\"` at line 6; also independently needs precise roots, finalizers, and weak-table collection (Phase 4)."
 
 [[case]]
 path = "gengc.lua"
 category = "garbage-collection"
 status = "pending"
-requires = []
-note = "Needs a documented Lua-compatible generational GC surface."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require\"debug\"` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "goto.lua"
 category = "control-flow"
 status = "pending"
 requires = []
-note = "Needs dynamic globals, labels, goto validation, and runtime libraries."
+note = "blocked-on: `<close>` requires resource finalization, which is not implemented yet (fails at line 280); scheduled for Phase 4 alongside GC/weak tables."
 
 [[case]]
 path = "heavy.lua"
 category = "stress"
 status = "pending"
 requires = []
-note = "Long-running dynamic allocation and table stress."
+note = "blocked-on: this test's toomanyidx() loop (`for i = 1, math.huge do a[i] = i end`, expecting an eventual catchable out-of-memory pcall error) used to false-pass in ~8ms because Sol's numeric for loop only supported integer control values and errored on the float `math.huge` limit before the loop body ever ran - fixed this session (ForPrep/ForLoop now run a float-mode loop when any control value is a float). With that fixed, the loop now runs for real and instead hits Sol's non-catchable instruction budget (`Lua instruction budget exhausted`, escapes the inner pcall), since Sol has no real allocation-tracked out-of-memory error a pcall can catch - that remains a Phase 4/GC-adjacent gap."
 
 [[case]]
 path = "literals.lua"
 category = "syntax-and-values"
 status = "pending"
-requires = []
-note = "Needs byte-oriented source, full literals, globals, and runtime string behavior."
+requires = ["debug-library"]
+note = "blocked-on: `local debug = require \"debug\"` at line 8 (also used inline via require\"debug\".getinfo at lines 38/249); require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
 
 [[case]]
 path = "locals.lua"
 category = "scope-and-attributes"
 status = "pending"
 requires = []
-note = "Needs Lua scopes, globals, close attributes, and dynamic closures."
+note = "blocked-on: `<close>` requires resource finalization, which is not implemented yet (fails at line 250); scheduled for Phase 4 alongside GC/weak tables."
 
 [[case]]
 path = "main.lua"
@@ -175,7 +175,7 @@ path = "math.lua"
 category = "math-library"
 status = "pending"
 requires = []
-note = "Needs the Lua math library and dynamic numeric semantics."
+note = "blocked-on: no automatic string-to-number coercion in arithmetic (fails at line 94, `b+\"2\"`/`\"10\"-c`); confirmed even trivial `\"2\"+\"3\"` errors, so coercion is entirely absent, not just an edge case."
 
 [[case]]
 path = "memerr.lua"
@@ -189,35 +189,35 @@ path = "nextvar.lua"
 category = "tables-and-globals"
 status = "pending"
 requires = []
-note = "Needs table identity, next, raw operations, globals, and iteration rules."
+note = "blocked-on: math.random/math.randomseed are entirely missing from the math table (fails at line 335, `math.randomseed()`); not T-gated, a real gap. Much of the rest of the file is gated behind an unavailable ltests `T` global and is otherwise low-value to chase further."
 
 [[case]]
 path = "pm.lua"
 category = "package-library"
 status = "pending"
 requires = ["package-loader"]
-note = "Needs the sandboxed package/require implementation and module cache."
+note = "blocked-on: `utf8.charpattern` is nil (fails at line 63 inside `PU()`, first invoked at line 100); needs the same missing UTF-8 pattern constant as utf8.lua, in addition to the already-tracked package-loader gap."
 
 [[case]]
 path = "sort.lua"
 category = "table-library"
 status = "pending"
 requires = []
-note = "Needs dynamic tables, callbacks, errors, and table.sort semantics."
+note = "blocked-on: table.create's hash-size hint (2nd arg) isn't honored (fails at line 35, `assert(memdiff > 1024 * 12)`; observed memdiff was only 32 bytes) - no hash-part preallocation actually occurs."
 
 [[case]]
 path = "strings.lua"
 category = "string-library"
 status = "pending"
 requires = ["locale"]
-note = "Needs Lua strings, patterns, packing, formatting, and locale-sensitive cases."
+note = "blocked-on: string.rep does not validate/reject huge repeat counts up front (line 114, `checkerror(\"too large\", string.rep, 'aa', math.maxinteger)`), so it hangs indefinitely instead of erroring - confirmed as a genuine infinite loop even inside pcall, not just slow."
 
 [[case]]
 path = "tpack.lua"
 category = "tables-and-multireturn"
 status = "pending"
 requires = []
-note = "Needs table.pack/unpack and expression-list result adjustment."
+note = "blocked-on: string.pack/string.unpack's 'X' alignment option is not supported; matches Phase 2's documented delivered-scope exclusion, not a new bug."
 
 [[case]]
 path = "tracegc.lua"
@@ -231,18 +231,18 @@ path = "utf8.lua"
 category = "utf8-library"
 status = "pending"
 requires = []
-note = "Needs the complete Lua utf8 library over byte strings."
+note = "blocked-on: utf8.charpattern (the UTF-8 pattern constant) is missing from both the global utf8 table and the require'utf8' table, which only exposes char/codepoint/len; fails at line 24, `\"^\" .. utf8.charpattern .. \"$\"`."
 
 [[case]]
 path = "vararg.lua"
 category = "varargs"
 status = "pending"
 requires = []
-note = "Needs dynamic vararg packs, closures, and multi-result propagation."
+note = "blocked-on: Lua 5.5's named-vararg parameter syntax `function f(...t)` (auto-packing extra args into a table `t`) is parsed but not implemented at runtime - `t` never gets bound, so `f()`'s body fails at `assert(x.n == t.n)` (line 27) with `t` nil."
 
 [[case]]
 path = "verybig.lua"
 category = "stress"
 status = "pending"
 requires = []
-note = "Large dynamic program and resource stress after baseline compatibility."
+note = "blocked-on: os.tmpname is missing (fails at line 141, `local file = os.tmpname()`); io.output/io.close/os.remove are also nil but not reached first."

@@ -268,11 +268,15 @@ profiles, and typed-performance gates are defined in
 - [~] Metatables: `__index`, `__newindex`, `__call`, `__tostring`, `__len`,
       `__pairs`, arithmetic, concatenation, equality, and comparison dispatch
       are present; complete per-type metatables and cache lookup rules remain.
-- [~] Standard-library slices: focused base/string, table sequence operations,
-      core numeric math, and initial utf8 functions are present. Complete
-      `table`, `string`, `math`, `utf8`, and a
-      sandboxed `package`/`require`. Keep OS/IO capability-gated and absent
-      from deterministic builds unless explicitly enabled.
+- [~] Standard-library slices: focused base/string, table sequence operations
+      (including `sort`/`create`), core numeric math, and initial utf8
+      functions are present, along with a sandboxed, explicit-loader
+      `package`/`require`, a real Lua pattern-matching engine backing
+      `string.find`/`match`/`gmatch`/`gsub`, `string.format`, and a
+      budget-based `collectgarbage` approximation (see
+      [Lua compatibility](lua-compatibility.md) L5). `string.pack`/`packsize`
+      and broader math/table coverage remain. Keep OS/IO capability-gated and
+      absent from deterministic builds unless explicitly enabled.
 - [ ] Coroutines last: define heap-owned stacks/frames, yielding through the
       bytecode interpreter before attempting JIT resume support. A coroutine
       must either resume through a compatible native trampoline or deopt to a
