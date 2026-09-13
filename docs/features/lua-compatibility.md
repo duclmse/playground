@@ -542,9 +542,32 @@ while proving the typed path retains its defining advantage.
       fuzzing/seed concept (it replays fixed corpus fixtures, not generated
       inputs), so the failure report's "seed" field is always `n/a` - full
       generated-input fuzzing is the next item below.
-- [ ] Add property tests and fuzzing for lexer/parser round trips, table
+- [~] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.
+      `crates/sol/tests/lua55_fuzz.rs` (new) adds a dependency-free, seeded
+      splitmix64 PRNG (`SOL_FUZZ_SEED`/`SOL_FUZZ_CASES` env vars, defaults
+      make a run reproducible) driving five property/fuzz tests: two
+      crash-safety fuzzers for the shared byte-oriented lexer/parser front
+      end (raw random bytes including non-UTF-8, and a token-vocabulary
+      "soup" that exercises real Lua keywords/operators in random order, both
+      via `sol::lexer::lex_bytes`/`sol::parser::parse_with_mode` and both
+      only asserting "does not panic", since malformed input legitimately
+      returns `Err`); one table-operations model check (`LuaTable`'s
+      `get`/`set` are private, so this generates Lua source performing random
+      string-keyed sets and checks it against a plain `HashMap` reference
+      model through the public `sol::lua_runtime::run_source`); and two
+      multi-result-adjustment property tests across randomized return
+      arities (0-4 values) - one for multiple-assignment truncation/nil-fill,
+      one for table-constructor semantics (last position expands to all
+      results, non-last position truncates to exactly one, later positional
+      elements still land at their syntactic index) - the latter's rules
+      were manually verified against reference `lua` before being encoded as
+      assertions. Explicitly out of scope for this pass, still open:
+      metamethod-recursion fuzzing and GC-root-handling fuzzing, and there is
+      no dedicated "fuzz failure becomes a permanent fixture" pipeline yet
+      (a failing case prints its generated source so it can be lifted into
+      `tests/lua55.rs` by hand).
 - [x] Benchmark dynamic table array/hash reads, polymorphic field access,
       closure allocation/calls, vararg/multi-result calls, metatable dispatch,
       GC pressure, and coroutine resume. Report interpreter cold start and

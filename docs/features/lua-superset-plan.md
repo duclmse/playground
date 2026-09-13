@@ -492,12 +492,13 @@ rather than one:
   with basic interpreter-level work (the bytecode/tree-walk tier itself),
   not a JIT - that's a separate initiative from this plan, not started here.
 
-### Addendum: closing six L8 benchmark-coverage and differential-runner gaps
+### Addendum: closing seven L8 benchmark-coverage and differential-runner gaps
 
 All 6 phases above are now done (Phase 4's one remaining item, GC stress
 fixtures, shipped in a later session pass; see its section). Reconciling
 `docs/features/lua-compatibility.md`'s L8 checklist against what Phase 6
-actually delivered turned up six concrete, narrowly-scoped gaps, now closed:
+actually delivered turned up seven concrete, narrowly-scoped gaps, now closed
+(six fully, one partially):
 
 - `benchmarks/metatable_dispatch.lua`: the benchmark suite had no fixture
   exercising metatable dispatch or polymorphic field access at all. Added
@@ -554,13 +555,33 @@ actually delivered turned up six concrete, narrowly-scoped gaps, now closed:
   script explicitly reminds the caller to do, which is why that checklist
   item stays `[~]` rather than `[x]`.
 
+- `crates/sol/tests/lua55_fuzz.rs` (new): no property/fuzz test
+  infrastructure existed at all for the lexer/parser/table/multi-result
+  items. Rather than add `proptest`/`quickcheck` as a new dev-dependency,
+  added a small dependency-free seeded splitmix64 PRNG
+  (`SOL_FUZZ_SEED`/`SOL_FUZZ_CASES` env vars) driving five tests: two
+  crash-safety fuzzers for `sol::lexer::lex_bytes`/`sol::parser::parse_with_mode`
+  (raw random bytes including non-UTF-8, and randomized real-token "soup"),
+  one table set/get model check against a plain `HashMap` (generated as Lua
+  source and run through `sol::lua_runtime::run_source`, since `LuaTable`'s
+  methods are private outside the crate), and two multi-result-adjustment
+  property tests across randomized 0-4-value return arities (multiple
+  assignment, and table-constructor last-position-expands/non-last-truncates
+  semantics — the latter's rules were manually cross-checked against
+  reference `lua` before being encoded as assertions). All five pass
+  (`cargo test --manifest-path crates/sol/Cargo.toml --test lua55_fuzz`).
+  Explicitly deferred, not part of this pass: metamethod-recursion fuzzing,
+  GC-root-handling fuzzing, and a "fuzz failure becomes a permanent fixture"
+  pipeline (a failing case currently just prints its generated source for
+  manual promotion into `tests/lua55.rs`) — this is why the checklist item
+  stays `[~]` rather than `[x]`.
+
 Still open, not part of this addendum: there is no fuzzing/seed concept in
 the differential runner (it replays fixed corpus fixtures, not generated
-inputs, so the failure report's "seed" field is always `n/a`), and there is
-no fuzzing/property-test infrastructure for the lexer/parser/table/GC items -
-this is now the only fully-open L8 item. See
-`docs/features/lua-compatibility.md`'s L8 section for the full
-reconciliation.
+inputs, so the failure report's "seed" field is always `n/a`), and
+metamethod-recursion/GC-root-handling fuzzing remain unaddressed — these are
+now the only open L8 sub-items. See `docs/features/lua-compatibility.md`'s
+L8 section for the full reconciliation.
 
 ## Non-goals for this plan
 
