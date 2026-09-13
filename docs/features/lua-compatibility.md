@@ -520,7 +520,7 @@ separate, unimplemented feature.)
 **Purpose:** improve dynamic execution only after correctness is measurable,
 while proving the typed path retains its defining advantage.
 
-- [~] Add a differential runner that executes each manifest fixture on reference
+- [x] Add a differential runner that executes each manifest fixture on reference
       Lua and Sol, compares normalized stdout/stderr/exit status, and emits a
       minimized failure report with source, seed, and capability profile.
       `scripts/test-lua55-differential.sh` (Phase 6) runs every manifest
