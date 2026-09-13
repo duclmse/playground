@@ -30,12 +30,12 @@ branch.
 
 Lua compatibility is an interpreter-first, byte-oriented dynamic runtime kept
 separate from typed Sol. A useful subset of tables, closures/upvalues,
-varargs/multiple results, iteration, protected calls, metatables, budgets, and
-portable libraries is implemented. Complete libraries, coroutines, precise
-dynamic GC, escaping typed closure environments, richer static algebraic types,
-and the typed/dynamic module bridge remain open. See the [feature
-documentation](features/README.md) for implementation status and the
-[language specification](spec/README.md) for observable behavior.
+varargs/multiple results, iteration, protected calls, metatables, budgets,
+coroutines (stackful fibers), and portable libraries is implemented. Complete
+libraries, precise dynamic GC, escaping typed closure environments, richer
+static algebraic types, and the typed/dynamic module bridge remain open. See
+the [feature documentation](features/README.md) for implementation status and
+the [language specification](spec/README.md) for observable behavior.
 
 ### Feature matrix
 
@@ -75,6 +75,21 @@ both are documented, understood non-findings (a memory-bandwidth-bound loop
 doesn't care about one well-predicted bounds check; neither benchmark calls
 anything inlining could help), not a sign the passes don't work - see
 `benchmarks/RESULTS.md` for the direct A/B evidence.
+
+**This claim is specifically about typed `.sol` programs, not `.lua`
+compatibility mode.** Sol's separate dynamic `.lua` interpreter
+(`lua_runtime.rs`) is, as of Phase 6's first hyperfine-grade measurement of
+it, **26-334× slower than LuaJIT** across call/allocation/control-flow-heavy
+workloads, and 1.3-4.2× slower than even this project's own separate,
+unoptimized `crates/vm` tree-walking interpreter - see
+`benchmarks/RESULTS.md`'s "Phase 6 (L8)" section for the full table. This is
+expected: the dynamic path is a first-cut bytecode/tree-walking interpreter
+with no tiering, and closing that gap (were it ever prioritized) would mean
+building interpreter-level performance work first, not jumping straight to a
+tracing/method JIT on top of an interpreter that isn't yet competitive with
+this repo's own naive one. The "beats LuaJIT" headline is not, and should not
+be read as, a claim about ordinary dynamic Lua code run through `sol run
+foo.lua`.
 
 Scalar replacement has its own, more direct verification: dumping the
 emitted Cranelift IR (`SOL_DUMP_CLIF=1 sol run ...`) for a `Point`

@@ -504,3 +504,67 @@ consequence of the design that keeps the *disabled* path free: instrumenting
 native-to-native calls too would need either two compiled versions of every
 function or a runtime branch inside JIT'd code, both real costs the
 zero-overhead constraint rules out.
+
+## Phase 6 (L8): the dynamic `.lua` interpreter, measured for the first time with real methodology
+
+Every prior benchmark section here is about the **typed** `.sol` path. This
+section is the first hyperfine-grade (warmup 3, ≥10 runs) look at Sol's
+separate **dynamic** `.lua`-compatibility interpreter (`sol run <name>.lua`,
+`crates/sol/src/lua_runtime.rs`) - previously only measured with a single
+uncontrolled run (see the "CLI instruction/allocation budget" addendum in
+`docs/features/lua-compatibility.md`). `scripts/benchmark.sh` now runs every
+`.lua` benchmark through five rows: reference Lua, LuaJIT, `vm (this
+project)` (the separate `crates/vm`/piccolo-fork interpreter), `sol
+(dynamic)` (this section's subject), and `sol` (the typed native path, where
+a `.sol` equivalent exists). `coroutine_resume.lua` is new this run (2M
+resume/yield round trips through a fiber) since coroutines didn't exist
+before Phase 5.
+
+| Benchmark | lua (ref) | luajit | vm (this project) | sol (dynamic) | sol (typed) |
+|:---|---:|---:|---:|---:|---:|
+| coroutine_resume | 228.5 ms | 52.6 ms | 531.6 ms | 1497.6 ms | n/a |
+| fib | 128.5 ms | 16.8 ms | 621.4 ms | 2242.7 ms | 14.8 ms |
+| function_calls | 772.1 ms | 41.6 ms | 3221.0 ms | 9544.7 ms | 18.0 ms |
+| function_calls_closure | 751.7 ms | 40.7 ms | 3236.0 ms | 9643.8 ms | n/a |
+| gc_alloc | 227.6 ms | 14.1 ms | 507.5 ms | 2145.1 ms | 15.9 ms |
+| hashmap_lookup | 3.5 ms | 2.8 ms | 6.2 ms | 8.0 ms | 4.1 ms |
+| loop_sum | 78.8 ms | 22.3 ms | 408.8 ms | 615.8 ms | 29.0 ms |
+| matrix | 37.1 ms | 6.5 ms | 181.4 ms | 248.1 ms | 5.9 ms |
+| nested_loop | 38.1 ms | 5.5 ms | 187.3 ms | 323.7 ms | 12.3 ms |
+| objects | 347.5 ms | 12.6 ms | 1168.9 ms | 4194.6 ms | 18.5 ms |
+| string_concat | 15.0 ms | 16.9 ms | 87.2 ms | 12.9 ms | 20.2 ms |
+| table_array | 71.2 ms | 19.7 ms | 363.7 ms | 514.0 ms | 17.5 ms |
+
+`sol (dynamic)` against LuaJIT ranges from **26-334×** slower across every
+call/allocation/control-flow-heavy benchmark (`fib` 133×, `function_calls`
+230×, `objects` 334×, `coroutine_resume` 28×), with one honest outlier:
+`string_concat`, where `sol (dynamic)` is actually the *fastest* runtime
+measured (0.76× LuaJIT's time) - a small, near-noise workload where process
+startup dominates, not a real signal about string-handling throughput (see
+`benchmarks/README.md`; this case was already flagged as noise-dominated in
+the M7 section above). `hashmap_lookup` is the other near-noise case (all
+five runtimes land within ~5ms of each other).
+
+The more decisive number: `sol (dynamic)` against **`vm (this project)`** -
+this repo's own separate, already-unoptimized tree-of-enums bytecode
+interpreter (itself 5-40× behind LuaJIT per `benchmarks/README.md`'s
+methodology section). `sol (dynamic)` is **1.3-4.2× *slower*** than that
+sibling interpreter on every workload except `string_concat`. Sol's dynamic
+path isn't just far from LuaJIT; it's currently behind the project's own
+other, less-optimized Lua interpreter, and behind plain reference Lua by
+6.5-17.5× on the same call/allocation-heavy workloads. This is a stronger,
+more direct signal than a raw LuaJIT ratio: it says the gap isn't "needs a
+JIT," it's "the interpreter itself has headroom a tracing/method JIT would be
+built on top of, prematurely."
+
+**The Phase 6 decision** (see `docs/features/lua-superset-plan.md`'s Phase 6
+section): given this, investing in a real dynamic JIT/tracing tier for
+`.lua` now would mean building tiering machinery on an interpreter that
+hasn't yet earned a JIT - it's slower than this project's own naive
+tree-walker, which itself has no JIT. The decision is **(b): formally narrow
+the performance claim**. `docs/sol.md`'s "beats LuaJIT" claim was already
+scoped to typed `.sol` programs specifically (never claimed for `.lua`
+compatibility mode), so no retraction was needed there - but the doc now
+states the dynamic-path numbers explicitly rather than leaving them
+unmeasured, so nobody has to infer "Sol" broadly is fast just because typed
+`.sol` is.

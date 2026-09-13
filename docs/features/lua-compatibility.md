@@ -562,6 +562,19 @@ decimal digit expansion (e.g. `5333329333341399000`) where reference Lua's
 - a real output-format divergence, not yet triaged into the manifest since it
 wasn't hit by any of the 26 corpus cases audited in Phase 3.
 
+**Update (Phase 6/L8)**: this single-run, no-warm-up estimate is now
+superseded by a real hyperfine run (warmup 3, ≥10 runs) covering all ten
+original benchmarks plus `coroutine_resume.lua` - see `benchmarks/RESULTS.md`'s
+"Phase 6 (L8)" section for the full table and `docs/features/lua-superset-plan.md`'s
+Phase 6 section for the performance-claim decision it fed into. The
+directional finding held up and sharpened: `sol (dynamic)` isn't just far
+from LuaJIT (26-334×, worse than this addendum's original 3-47x/870x
+estimate on the heaviest workloads once measured properly with warm-up), it
+is also 1.3-4.2× slower than this project's own separate, unoptimized
+`crates/vm` tree-walking interpreter on every workload but one near-noise
+outlier - a stronger signal that the dynamic path needs interpreter-level
+work before a JIT would be the right next investment.
+
 ### Addendum: register-slot-reuse closure bug, and selective register unboxing
 
 While investigating the interpreter overhead behind the benchmark numbers

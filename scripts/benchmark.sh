@@ -174,6 +174,15 @@ for script in "$ROOT"/benchmarks/*.lua; do
     args+=(-n "$label" "'$runtime' '$script'")
   done
   args+=(-n "vm (this project)" "'$VM_BIN' '$script'")
+  # Also run the same .lua source through Sol's own dynamic interpreter
+  # (`sol run`, the `.lua`-compatibility path `lua_runtime.rs` implements -
+  # see docs/features/lua-superset-plan.md Phase 6) - this is the honest
+  # LuaJIT comparison for ordinary dynamic Lua code, as opposed to the typed
+  # `.sol` row below. Budgets are overridden generously: `LuaRuntime::new`'s
+  # defaults are sized for untrusted embedded code and would abort a
+  # benchmark-sized workload partway through (see the `SOL_LUA_*_BUDGET`
+  # addendum in docs/features/lua-compatibility.md).
+  args+=(-n "sol (dynamic)" "SOL_LUA_INSTRUCTION_BUDGET=18446744073709551615 SOL_LUA_CALL_DEPTH_BUDGET=1000000 SOL_LUA_ALLOCATION_BUDGET=18446744073709551615 '$SOL_BIN' run '$script'")
   # If a same-named .sol program exists (Sol's typed compilation path - see
   # docs/sol.md), include it too - the whole reason for writing these Sol
   # programs in the first place is to get an honest, reproducible answer on

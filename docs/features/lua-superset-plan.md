@@ -420,21 +420,49 @@ rather than one:
   `coroutine.wrap` error propagation, and rejecting resume of a dead,
   running, or normal coroutine.
 
-## Phase 6 — L8: differential testing, benchmarking, and the performance decision
+## Phase 6 — L8: differential testing, benchmarking, and the performance decision — **done this session**
 
-- Build the differential runner (run each manifest fixture on both
-  reference Lua 5.5 and Sol, diff normalized output) — this is what makes
-  every future "conformant" claim checkable instead of aspirational.
-- Add the missing benchmark categories against LuaJIT: hashmap/string
-  workloads, closures, small objects, coroutine resume — not just the two
-  numeric-array cases that exist today.
-- Make the explicit call this plan has been deferring: either (a) invest in
-  a real JIT/tracing tier for the dynamic `.lua` path (the only way "beats
-  LuaJIT" becomes true for ordinary Lua code, not just typed `.sol`), or (b)
-  formally narrow the performance claim in `docs/sol.md` to "beats LuaJIT on
-  typed `.sol` code" and stop implying it for dynamic `.lua`. This decision
-  should be revisited once Phases 1–5 are done and there's actual dynamic
-  Lua code (real corpus programs) to benchmark against LuaJIT, not before.
+- **Differential runner**: added `scripts/test-lua55-differential.sh`,
+  which runs a manifest case through both Sol and a pinned reference Lua
+  5.5.1 build and diffs their stdout directly - distinct from the two
+  scripts that already existed (`test-lua55-suite.sh` checks Sol against the
+  manifest's declared expectation; `test-lua55-reference.sh` checks
+  reference Lua against checked-in `tests/lua55/reference/*.stdout`
+  snapshots; neither compares Sol's and reference Lua's output to each
+  other). Follows the same conventions as `test-lua55-reference.sh`
+  (`LUA55_REFERENCE_BIN`, refuses to run without it rather than silently
+  substituting the system `lua` binary as the oracle - verified this
+  refusal path directly). Not yet run end-to-end in this environment: no
+  pinned Lua 5.5.1 source checkout is present locally (only the test
+  corpus), so the script is ready but unexercised until that checkout
+  exists.
+- **Benchmarks**: added a `sol (dynamic)` row to `scripts/benchmark.sh` for
+  every `.lua` benchmark (`sol run <name>.lua` with the sandboxed-embedder
+  instruction/call-depth/allocation budgets overridden to effectively
+  unlimited, since `sol run`'s CLI defaults are sized for untrusted embedded
+  code and would abort a benchmark-sized workload partway through), and
+  added `benchmarks/coroutine_resume.lua` (2M resume/yield round trips) -
+  the one category that didn't exist before Phase 5. Ran the full suite with
+  real hyperfine methodology (warmup 3, ≥10 runs); full results and analysis
+  are in `benchmarks/RESULTS.md`'s "Phase 6 (L8)" section.
+- **The decision**: the plan asked for an explicit choice between (a)
+  investing in a real dynamic JIT/tracing tier for `.lua`, or (b) formally
+  narrowing the "beats LuaJIT" claim to typed `.sol` only. The benchmark data
+  makes this unambiguous: `sol (dynamic)` is 26-334× slower than LuaJIT
+  across call/allocation-heavy workloads, but more decisively, it is also
+  **1.3-4.2× slower than this project's own separate, unoptimized
+  `crates/vm` tree-walking interpreter** (which itself has no JIT and is
+  already 5-40× behind LuaJIT) on every workload but one near-noise outlier.
+  Building a tracing/method JIT on top of an interpreter that isn't yet
+  competitive with this repo's own naive tree-walker would be optimizing the
+  wrong layer first. Decision: **(b)**. `docs/sol.md`'s existing "beats
+  LuaJIT" claim was already scoped to typed `.sol` (it never claimed this for
+  `.lua` compatibility mode), so no retraction was needed, but the doc now
+  states the measured dynamic-path numbers explicitly instead of leaving
+  them unmeasured, so the claim can't be misread as applying more broadly.
+  A future dynamic-path optimization pass, if ever prioritized, should start
+  with basic interpreter-level work (the bytecode/tree-walk tier itself),
+  not a JIT - that's a separate initiative from this plan, not started here.
 
 ## Non-goals for this plan
 

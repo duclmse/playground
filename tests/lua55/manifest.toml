@@ -210,7 +210,7 @@ path = "strings.lua"
 category = "string-library"
 status = "pending"
 requires = ["locale"]
-note = "blocked-on: string.rep does not validate/reject huge repeat counts up front (line 114, `checkerror(\"too large\", string.rep, 'aa', math.maxinteger)`), so it hangs indefinitely instead of erroring - confirmed as a genuine infinite loop even inside pcall, not just slow."
+note = "blocked-on: an unrelated assertion later in the file (`error: assertion failed!`, not yet isolated to a line - `debug.sethook`/`io.stderr` aren't implemented, which rules out the usual line-tracing tricks). The prior blocker here - string.rep hanging indefinitely on huge repeat counts (e.g. `string.rep('aa', math.maxinteger)`) instead of erroring \"resulting string too large\" - is fixed (crates/sol/src/lua_runtime.rs's StringRep now checks against a fixed size ceiling before charging the allocation budget); the string.rep test block (lines 94-124) now passes in isolation."
 
 [[case]]
 path = "tpack.lua"

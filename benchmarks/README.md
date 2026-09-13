@@ -44,12 +44,24 @@ automatically if present, otherwise skipped.
 | `hashmap_lookup.lua` | Integer-keyed map/table lookup throughput                                          |
 | `matrix.lua`        | Dense matrix multiplication over flat numeric arrays                                 |
 | `objects.lua`       | Record/table allocation and field access                                             |
+| `coroutine_resume.lua` | Coroutine resume/yield round-trip (fiber context switch) overhead - see Phase 6 in `docs/features/lua-superset-plan.md` |
 
 Every Lua benchmark has a same-named typed Sol equivalent except
 `function_calls_closure.lua`, whose returned closure requires the heap-backed
-captured environments that Sol deliberately still rejects. `any_strict.sol`,
-`any_dynamic.sol`, and `vector_add.sol` are typed-only measurements and are
-included by the runner in a separate Sol-only pass.
+captured environments that Sol deliberately still rejects, and
+`coroutine_resume.lua`, since coroutines are a `.lua`-compatibility feature
+with no typed `.sol` equivalent. `any_strict.sol`, `any_dynamic.sol`, and
+`vector_add.sol` are typed-only measurements and are included by the runner in
+a separate Sol-only pass.
+
+Every `.lua` benchmark is also run through Sol's own dynamic interpreter
+(`sol run <name>.lua`, the `crates/sol/src/lua_runtime.rs` compatibility
+path) as a `sol (dynamic)` row, alongside `vm (this project)` (the
+`crates/vm`/piccolo-fork interpreter measured below) and, where a same-named
+`.sol` file exists, a `sol` row for the typed native-compiled path. This
+gives an honest three-way comparison for ordinary dynamic Lua code (`vm`
+vs. `sol (dynamic)` vs. reference Lua/LuaJIT) as well as the typed-vs-LuaJIT
+comparison `sol` is actually meant to win.
 
 ## Results (one measured run, Apple Silicon Mac; regenerate for your own hardware)
 
