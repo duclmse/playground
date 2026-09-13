@@ -571,11 +571,23 @@ while proving the typed path retains its defining advantage.
       last concrete benchmark-fixture-coverage gap; still open, and
       unrelated to fixture coverage: there is no fuzzing/property-test
       infrastructure (see the `[ ]` item below).
-- [ ] Before and after every dynamic optimization, run the existing typed Sol
+- [~] Before and after every dynamic optimization, run the existing typed Sol
       numeric, allocation, callback, table/array, JIT, and AOT benchmarks.
       Reject a material typed-path regression (initial budget: 5% outside
       measurement noise) and inspect typed IR/assembly to confirm no `LuaValue`
       boxing or dynamic dispatch was introduced into strict kernels.
+      `scripts/typed-regression-check.sh` (new) automates the wall-clock
+      half: it runs every typed-only benchmark (every `.sol` file under
+      `benchmarks/` with no same-named `.lua` file - numeric, allocation,
+      table/array, and closure/call workloads), compares each against a
+      committed baseline (`benchmarks/typed-baseline.json`, `--record` to
+      refresh it deliberately), and fails if a benchmark's mean regresses by
+      more than 5% *and* that regression exceeds the combined baseline+current
+      standard deviation (so noisy-but-flat results, e.g. `matrix` at +8.8%
+      in one real run here, correctly stay `ok` rather than false-alarming).
+      It does not and cannot automate "inspect typed IR/assembly" - that
+      still requires a human to read generated code by hand, which is why
+      this item stays partial rather than fully checked.
 - [x] Add a release dashboard with corpus counts by manifest status, capability
       profile, benchmark environment, and typed regression status. Only move a
       case from `pending` to `pass` with an oracle-backed test.

@@ -159,12 +159,25 @@ report="$(mktemp)"
   echo
   echo "## Typed-path regression status"
   echo
-  echo "Not yet automated: the L8 checklist's typed-path regression gate"
-  echo "(\"before and after every dynamic optimization, run the existing typed"
-  echo "Sol ... benchmarks [and] reject a material typed-path regression\") has"
-  echo "no CI-enforced check yet, so this dashboard reports its absence rather"
-  echo "than fabricating a pass/fail. See"
-  echo "\`docs/features/lua-compatibility.md\`'s L8 section for that item."
+  baseline_file="$root_dir/benchmarks/typed-baseline.json"
+  if [[ -f "$baseline_file" ]]; then
+    echo "A baseline exists (\`benchmarks/typed-baseline.json\`, last written"
+    echo "$(date -u -r "$baseline_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown time')),"
+    echo "but this dashboard does not re-run the (slow) wall-clock comparison"
+    echo "itself - run \`scripts/typed-regression-check.sh\` for a live"
+    echo "pass/fail against that baseline."
+  else
+    echo "No baseline yet - run \`scripts/typed-regression-check.sh --record\`"
+    echo "to create one, then \`scripts/typed-regression-check.sh\` (no flag)"
+    echo "for a live pass/fail on subsequent runs."
+  fi
+  echo
+  echo "This dashboard does not fabricate a pass/fail here on its own; it"
+  echo "only reports whether the automated check"
+  echo "(\`scripts/typed-regression-check.sh\`) has a baseline to compare"
+  echo "against. That script still only automates the wall-clock half of the"
+  echo "L8 gate - \"inspect typed IR/assembly to confirm no \`LuaValue\`"
+  echo "boxing or dynamic dispatch was introduced\" remains a manual step."
 } >"$report"
 
 if [[ -n "$output" ]]; then
