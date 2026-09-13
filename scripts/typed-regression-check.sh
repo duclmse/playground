@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 # Automates the wall-clock half of the L8 checklist's typed-path regression
-# gate: "before and after every dynamic optimization, run the existing typed
-# Sol numeric, allocation, callback, table/array, JIT, and AOT benchmarks...
+# gate, plus the mechanically-checkable part of its IR-inspection half:
+# "before and after every dynamic optimization, run the existing typed Sol
+# numeric, allocation, callback, table/array, JIT, and AOT benchmarks...
 # reject a material typed-path regression (initial budget: 5% outside
-# measurement noise)". Runs every typed-only benchmark (a `.sol` file under
+# measurement noise) and inspect typed IR/assembly to confirm no LuaValue
+# boxing or dynamic dispatch was introduced into strict kernels".
+#
+# Wall-clock half: runs every typed-only benchmark (a `.sol` file under
 # benchmarks/ with no `.lua` counterpart - the same set scripts/benchmark.sh's
 # "Sol-only" loop measures) through hyperfine and compares the result against
 # a committed baseline (benchmarks/typed-baseline.json).
 #
-# This does NOT automate the other half of the gate - "inspect typed IR/
-# assembly to confirm no LuaValue boxing or dynamic dispatch was introduced
-# into strict kernels" - that requires reading generated code by hand. This
-# script prints a reminder of that step at the end; it never claims to have
-# performed it.
+# IR half: runs each typed-only benchmark once more through
+# `sol run --dump-ir`, which dumps every compiled function's Cranelift CLIF
+# IR to stderr, and greps the dump for the two ways dynamic dispatch shows up
+# in typed CLIF: an indirect call (`call_indirect`, vs. a statically-resolved
+# `call`) or a call to one of the runtime helpers that exist specifically to
+# service `any`-typed/dynamic values (`sol_dynamic_binary`, `sol_dynamic_compare`,
+# `sol_dynamic_neg`, `sol_truth` - see crates/sol/src/codegen.rs's
+# declare_runtime). A typed-only benchmark has no `any`/dynamic values by
+# construction, so any of these appearing in its own dump is a strong signal
+# that a strict kernel started boxing/dispatching dynamically. This does NOT
+# detect boxing itself (Box/Unbox compile to inline bit-packing, not a call -
+# see crates/sol/src/codegen.rs), nor does it replace reading generated
+# assembly by hand for subtler regressions; it automates the specific,
+# mechanically-checkable "did a dynamic-dispatch call creep in" question.
 #
 # Usage:
 #   scripts/typed-regression-check.sh --record   # (re)write the baseline
@@ -81,6 +94,28 @@ for name in "${typed_benchmarks[@]}"; do
     '.[$name] = {mean: $mean, stddev: $stddev}' <<<"$current_results")"
 done
 
+log "Checking for dynamic dispatch in typed IR (dump-ir + grep)"
+DISPATCH_PATTERN='call_indirect|sol_dynamic_binary|sol_dynamic_compare|sol_dynamic_neg|sol_truth'
+dispatch_found=0
+for name in "${typed_benchmarks[@]}"; do
+  sol_script="$ROOT/benchmarks/$name.sol"
+  # Force immediate promotion so every function actually gets JIT-compiled
+  # and dumped, regardless of how many times this benchmark happens to call
+  # it at runtime - otherwise a kernel below the default promote/OSR
+  # thresholds would produce an empty dump and silently pass unchecked.
+  ir="$(SOL_PROMOTE_THRESHOLD=1 SOL_OSR_THRESHOLD=1 "$SOL_BIN" run --dump-ir "$sol_script" 2>&1 >/dev/null)"
+  if hits="$(grep -Ein "$DISPATCH_PATTERN" <<<"$ir")"; then
+    echo "DYNAMIC DISPATCH DETECTED in $name:"
+    echo "$hits"
+    dispatch_found=$((dispatch_found + 1))
+  fi
+done
+if [[ $dispatch_found -gt 0 ]]; then
+  echo
+  die "$dispatch_found typed benchmark(s) show dynamic dispatch (call_indirect or sol_dynamic_*/sol_truth) in their compiled IR"
+fi
+log "No dynamic dispatch detected in any typed benchmark's IR"
+
 if [[ "$MODE" == "record" ]]; then
   echo "$current_results" | jq . >"$BASELINE_FILE"
   log "Baseline written to $BASELINE_FILE"
@@ -130,10 +165,10 @@ for name in "${typed_benchmarks[@]}"; do
 done
 
 echo
-echo "Wall-clock check only - manually inspect typed IR/assembly for touched"
-echo "kernels to confirm no LuaValue boxing or dynamic dispatch was"
-echo "introduced (the L8 checklist's other regression-gate requirement; not"
-echo "automated by this script)."
+echo "IR dispatch check passed above (no call_indirect/sol_dynamic_*/sol_truth"
+echo "in any typed benchmark). This does not detect boxing itself (Box/Unbox"
+echo "compile to inline bit-packing, not a call) - for subtler regressions,"
+echo "still inspect generated assembly for touched kernels by hand."
 
 if [[ $regressed -gt 0 ]]; then
   echo

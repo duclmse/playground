@@ -675,18 +675,51 @@ while proving the typed path retains its defining advantage.
       Reject a material typed-path regression (initial budget: 5% outside
       measurement noise) and inspect typed IR/assembly to confirm no `LuaValue`
       boxing or dynamic dispatch was introduced into strict kernels.
-      `scripts/typed-regression-check.sh` (new) automates the wall-clock
-      half: it runs every typed-only benchmark (every `.sol` file under
-      `benchmarks/` with no same-named `.lua` file - numeric, allocation,
-      table/array, and closure/call workloads), compares each against a
-      committed baseline (`benchmarks/typed-baseline.json`, `--record` to
-      refresh it deliberately), and fails if a benchmark's mean regresses by
-      more than 5% *and* that regression exceeds the combined baseline+current
+      `scripts/typed-regression-check.sh` automates the wall-clock half: it
+      runs every typed-only benchmark (every `.sol` file under `benchmarks/`
+      with no same-named `.lua` file - numeric, allocation, table/array, and
+      closure/call workloads), compares each against a committed baseline
+      (`benchmarks/typed-baseline.json`, `--record` to refresh it
+      deliberately), and fails if a benchmark's mean regresses by more than
+      5% *and* that regression exceeds the combined baseline+current
       standard deviation (so noisy-but-flat results, e.g. `matrix` at +8.8%
       in one real run here, correctly stay `ok` rather than false-alarming).
-      It does not and cannot automate "inspect typed IR/assembly" - that
-      still requires a human to read generated code by hand, which is why
-      this item stays partial rather than fully checked.
+
+      It also now automates the mechanically-checkable half of "inspect
+      typed IR/assembly": for each typed-only benchmark it runs
+      `sol run --dump-ir` (forcing immediate promotion via
+      `SOL_PROMOTE_THRESHOLD=1`/`SOL_OSR_THRESHOLD=1` so every kernel
+      actually JIT-compiles and dumps, regardless of how many times the
+      benchmark happens to call it) and greps the dump for `call_indirect` or
+      a call to one of the runtime helpers that exist specifically to
+      service `any`-typed/dynamic values (`sol_dynamic_binary`,
+      `sol_dynamic_compare`, `sol_dynamic_neg`, `sol_truth`). A typed-only
+      benchmark has no `any`/dynamic values by construction, so any of these
+      appearing is a strong signal that a strict kernel started dispatching
+      dynamically.
+
+      Getting this right required a real fix, not just a script: Cranelift's
+      `Function` `Display` only ever prints a callee as an opaque `u0:N`
+      module-function-id reference, never its linkage name - so a naive
+      `grep` for `sol_dynamic_binary` (or, as some existing `tests/programs.rs`
+      IR-inspection tests already did, a `stderr.contains("sol_alloc")`-style
+      assertion) can *never* match, regardless of whether that call is
+      actually present. `jit.rs`'s `dump_clif_with_legend` fixes this: after
+      dumping a function's CLIF, it walks that function's external-function
+      table and resolves each `u0:N` callee back to its real declared name
+      via `JITModule::declarations()`, printing a `"; fnN = <real name>"`
+      legend line. `dumped_ir_legend_resolves_runtime_calls_to_their_real_names`
+      (`tests/programs.rs`) is a regression test for this specifically -
+      it forces a genuine, non-inlined, non-narrowed `any + any` and asserts
+      the dump names `sol_dynamic_binary`, guarding against the check
+      silently regressing back into a no-op.
+
+      This still does not detect boxing itself: `Box`/`Unbox` (the
+      typed/dynamic boundary coercions) compile to inline bit-packing/tag
+      operations in `codegen.rs`, not a runtime call, so there is no callee
+      name to grep for. Reviewing generated assembly for subtler boxing
+      regressions in touched kernels by hand remains the honest remaining
+      manual step, which is why the script still prints a reminder of it.
 - [x] Add a release dashboard with corpus counts by manifest status, capability
       profile, benchmark environment, and typed regression status. Only move a
       case from `pending` to `pass` with an oracle-backed test.

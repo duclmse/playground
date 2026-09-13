@@ -662,6 +662,68 @@ section has no remaining open sub-items; see
 `docs/features/lua-compatibility.md`'s L8 section for the authoritative
 checklist state.
 
+### Addendum 3: automating the L8 IR-inspection gate, plus a vacuous-check bug it found
+
+The L8 regression gate's other still-manual half — "inspect typed IR/
+assembly to confirm no `LuaValue` boxing or dynamic dispatch was introduced
+into strict kernels" — is now partly automated:
+`scripts/typed-regression-check.sh` runs every typed-only benchmark through
+`sol run --dump-ir` (forcing immediate promotion via
+`SOL_PROMOTE_THRESHOLD=1`/`SOL_OSR_THRESHOLD=1` so every kernel actually
+JIT-compiles regardless of how many times the benchmark happens to call it)
+and greps the dump for `call_indirect` or a call to one of the four runtime
+helpers that exist specifically to service `any`-typed/dynamic values
+(`sol_dynamic_binary`, `sol_dynamic_compare`, `sol_dynamic_neg`,
+`sol_truth`). A typed-only benchmark has no `any`/dynamic values by
+construction, so any of these appearing is a strong, low-false-positive
+signal of unwanted dynamic dispatch.
+
+**Bug found and fixed while validating this**: the first version of this
+check (developed and manually spot-checked before being wired into the
+script) reported zero dispatch hits across all 13 typed benchmarks — but a
+follow-up adversarial check (writing a small fixture that deliberately does
+`a + b` on two non-narrowed `any` values, which must compile to a
+`sol_dynamic_binary` call per `codegen.rs`) also showed zero hits, which
+should have been impossible. The root cause: Cranelift's `Function` `Display`
+only ever prints a callee as an opaque `u0:N` module-function-id reference —
+it never prints the callee's linkage name. Grepping the dumped text for
+`sol_dynamic_binary` (or any other runtime helper's name) can therefore
+*never* match, regardless of whether that call is present, making the check
+vacuous — it would report "clean" unconditionally. The same defect turned
+out to already be present in two existing `tests/programs.rs` assertions
+(`!stderr.contains("sol_alloc")` and `!stderr.contains("sol_dynamic")`),
+which had been passing for the same non-reason.
+
+Fixed properly in `crates/sol/src/jit.rs`: `dump_clif_with_legend` replaces
+the bare `eprintln!` at all three `--dump-ir` call sites (real function
+bodies, `__spec{tag}` speculative specializations, `__osr{from_stmt}`
+variants). After dumping a function's CLIF text, it walks that function's
+external-function table (`ctx.func.dfg.ext_funcs`), resolves each `u0:N`
+callee back to its real declared name via
+`JITModule::declarations().get_function_decl(id).linkage_name(id)`, and
+prints a `"; fnN = <real name>"` legend line per callee. This makes every
+runtime call in a dump identifiable by name, not just by an opaque,
+build-specific numeric index.
+`dumped_ir_legend_resolves_runtime_calls_to_their_real_names`
+(`tests/programs.rs`, using the new `tests/fixtures/dynamic_dispatch_probe.sol`
+fixture) is a permanent regression test against this specific failure mode —
+it forces a genuine, non-inlined, non-narrowed `any + any` and asserts the
+dump names `sol_dynamic_binary`, so this can't silently regress back into a
+no-op check again. With the legend fix in place, re-running the check
+against all 13 typed benchmarks still reports zero dispatch hits — now a
+meaningful result rather than a foregone conclusion.
+
+**Still open, out of scope for this pass**: detecting boxing itself.
+`Box`/`Unbox` (the typed/dynamic boundary coercions) compile to inline
+bit-packing/tag operations in `codegen.rs`, not a runtime call, so there is
+no callee name to grep for — this would need a different detection strategy
+(e.g. a CLIF-level structural check for the specific instruction sequence
+`Box`/`Unbox` lower to) if it's ever automated. Reviewing generated assembly
+by hand for subtler regressions in touched kernels also remains manual; the
+L8 checklist item stays `[~]` (partial) for this reason, and
+`scripts/typed-regression-check.sh` still prints a reminder of both at the
+end of a run.
+
 ## Non-goals for this plan
 
 - `sol build`/`sol debug` getting the same per-function partition as `sol
