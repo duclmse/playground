@@ -257,17 +257,24 @@ typed top-level function values.
 - [~] Implement Lua call frames, recursive calls, proper vararg packs, and
       multi-result propagation through call, return, assignment, table
       construction, and parenthesized-expression truncation sites.
-- [~] Implement `pcall`, `xpcall`, `error`, `assert`, and `select`, preserving
+- [x] Implement `pcall`, `xpcall`, `error`, `assert`, and `select`, preserving
       error values and a bounded, useful stack trace. Add recursion/instruction
       budgets before host-exposed sandbox use. Recursion, instruction/backedge,
       and heap table/closure allocation budgets are enforced; exact byte and
       environment accounting awaits the dynamic GC allocator. `assert(v)` with
       no explicit message now raises the literal `"assertion failed!"` on a
       falsy `v` (previously it stringified the falsy `v` itself as the error
-      message, e.g. `assert(false)` raised `"false"`). `LuaError` is still
-      string-only (`{ message: String, stack: Vec<String> }`); raising a
-      non-string value (table/number/boolean) loses its original type/identity
-      once caught — a real gap, not yet fixed.
+      message, e.g. `assert(false)` raised `"false"`). `LuaError` now carries
+      an optional `value: Option<LuaValue>` alongside `message`/`stack`:
+      `error(v)` and `assert(false, v)` stash the original `v` unchanged (same
+      type, same reference identity for tables/closures), and `pcall`,
+      `xpcall`, and `coroutine.resume` hand that exact value back via
+      `LuaError::into_lua_value` instead of the `display_bytes()` string that
+      was previously the only option. String values still round-trip as
+      plain strings with no added position prefix. `error()`'s own fallback
+      display text still uses non-metamethod-aware `display_bytes()`, matching
+      real Lua's `error()`/`assert()`, which don't invoke `__tostring` (only
+      `lua.c`'s top-level `msghandler` does).
 - [x] Specify tail-call behavior. Calls in tail position currently use ordinary
       bounded frames (no frame elision), preserving protected-call errors and
       stack traces. Proper-tail-call optimization remains a performance/fidelity
