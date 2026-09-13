@@ -569,17 +569,29 @@ while proving the typed path retains its defining advantage.
       --runs 1`, the first unwarmed process launch - a single sample, so its
       stddev is always 0) — see `benchmarks/RESULTS.md`. This closes the
       last concrete benchmark-fixture-coverage gap; still open, and
-      unrelated to fixture coverage: the differential runner only diffs
-      stdout (see the L6 item below), and there is no fuzzing/property-test
-      infrastructure or release dashboard (see the two `[ ]` items below).
+      unrelated to fixture coverage: there is no fuzzing/property-test
+      infrastructure (see the `[ ]` item below).
 - [ ] Before and after every dynamic optimization, run the existing typed Sol
       numeric, allocation, callback, table/array, JIT, and AOT benchmarks.
       Reject a material typed-path regression (initial budget: 5% outside
       measurement noise) and inspect typed IR/assembly to confirm no `LuaValue`
       boxing or dynamic dispatch was introduced into strict kernels.
-- [ ] Add a release dashboard with corpus counts by manifest status, capability
+- [x] Add a release dashboard with corpus counts by manifest status, capability
       profile, benchmark environment, and typed regression status. Only move a
       case from `pending` to `pass` with an oracle-backed test.
+      `scripts/lua55-dashboard.sh` (new) generates a markdown report with all
+      four: manifest status counts (currently 26 `pending`, 8
+      `host-required`, 0 `pass`/`adapted`/`diverges` - an honest snapshot,
+      not yet a compatibility win), a capability-profile histogram (which
+      `requires` tag blocks the most cases - `debug-library` currently blocks
+      the most, at 8), the local benchmark environment (rustc/cargo/OS/`lua`/
+      `luajit` versions, so a published number can be traced to the
+      machine/compiler revision that produced it), and typed-regression
+      status - reported honestly as "not yet automated" rather than
+      fabricated, since the item directly above this one is still `[ ]`. It
+      is a read-only report; it does not itself move any case from `pending`
+      to `pass` (that still requires an oracle-backed test per this item's
+      own rule).
 
 **Exit gate:** all release-supported entries pass under the documented profile,
 no unclassified corpus failures remain, and published performance claims state
