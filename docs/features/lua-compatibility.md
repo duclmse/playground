@@ -416,17 +416,42 @@ oracle; every omitted library entry has a documented capability status.
       fail `collectgarbage()` itself. The one deliberate gap versus real
       Lua: there is no resurrection support — an object referenced from
       inside its own `__gc` call is not kept alive for one more cycle, it is
-      cleared immediately afterward regardless. Stress fixtures that collect
-      at every allocation point remain open (see the next checklist item).
-- [ ] Add stress modes that collect at allocation points and after every dynamic
-      bytecode instruction. Run them under memory checking where available.
+      cleared immediately afterward regardless.
+- [x] Add stress modes that collect at allocation points and after every dynamic
+      bytecode instruction (Phase 4b addendum, `lua_runtime.rs`:
+      `LuaRuntime::set_gc_stress`/`gc_stress` field). When enabled, both
+      `tick()` (the once-per-dispatched-instruction chokepoint) and
+      `charge_allocation()` (the per-allocation-site chokepoint) run a full
+      weak-table sweep + trial-deletion cycle collection, rather than only on
+      an explicit `collectgarbage()` call. This is sound at arbitrary
+      mid-execution points because trial deletion's residual count
+      (`strong_count - 1 - inter_candidate_edges`) never depends on
+      enumerating roots — any live register/local holding a strong reference
+      to a candidate surfaces as a positive residual automatically. Exposed
+      to the `sol` CLI via `SOL_LUA_GC_STRESS=1`
+      (`main.rs::lua_gc_stress_enabled`, mirroring the existing
+      `SOL_LUA_*_BUDGET` env vars). Four fixtures in
+      `crates/sol/tests/lua55.rs` re-run the self-cycle, table+closure-cycle,
+      and finalizer scenarios with stress mode collecting on its own instead
+      of an explicit `collectgarbage()` call, plus a fixture proving a
+      still-reachable local survives 200 stress-collected allocations of
+      unrelated cyclic garbage around it. Not yet done: collector
+      statistics (e.g. pass counts/bytes reclaimed) are not yet surfaced to
+      the benchmark harness (see the exit gate below) — memory-checker
+      integration (ASan/valgrind) is also not wired into these fixtures, only
+      Sol's own budget accounting.
 - [ ] Run `gc`, `gengc`, and `tracegc` in their own capability category; map
       their implementation-dependent expectations to semantic invariants and
       retain exact upstream assertions where Sol claims identical behavior.
 
 **Exit gate:** dynamic stress fixtures have no dangling references or missed
-roots, collector statistics are exposed to the benchmark harness, and every
-supported GC observable has a reference-backed test.
+roots (done — see the stress-mode checklist item above), collector
+statistics are exposed to the benchmark harness (**not done**), and every
+supported GC observable has a reference-backed test (done for weak tables,
+cycle collection, and finalizers, both under normal and stress-mode
+collection; `gc`/`gengc`/`tracegc` themselves remain blocked on the
+unrelated debug-library/native-module gaps tracked in
+`tests/lua55/manifest.toml`).
 
 ## L7 — Coroutines and resumable execution
 

@@ -230,7 +230,7 @@ binary and running the actual differential-oracle scripts
 failures by reading Sol's own error output, not by diffing against reference
 Lua's actual behavior line-for-line. No corpus file was promoted to `pass`.
 
-## Phase 4 — L6: precise GC semantics, weak tables, finalizers
+## Phase 4 — L6: precise GC semantics, weak tables, finalizers — **stress fixtures done this session**
 
 This is the prerequisite the compatibility doc itself names before
 coroutines (suspended coroutine frames are more reference-dense than
@@ -356,9 +356,37 @@ rather than one:
     resurrection semantics. Both remain open follow-ups, not required by
     this sub-phase's exit bar.
 - Add GC stress-test fixtures (collect at every allocation point / every
-  dynamic bytecode instruction) per the L6 exit gate — **not done**; the
-  three regression tests above cover the core correctness properties but
-  don't yet stress every allocation site.
+  dynamic bytecode instruction) per the L6 exit gate — **done this session**.
+  - `LuaRuntime` gained a `gc_stress: bool` field and a `set_gc_stress`
+    setter (default off — this mode is far too slow for normal use). When
+    enabled, `tick()` (the single chokepoint called once per dispatched
+    dynamic bytecode instruction) and `charge_allocation()` (called at every
+    allocation site) both run a full weak-table sweep + trial-deletion
+    cycle-collection pass, instead of only running that work on an explicit
+    `collectgarbage()` call.
+  - This is safe by construction, not just by luck: the trial-deletion
+    collector's residual computation
+    (`Rc::strong_count(candidate) - 1 - inter_candidate_edges`) never relies
+    on enumerating program roots. Any strong reference to a candidate held
+    outside the tracked set — e.g. a live VM register or local holding an
+    `Rc` clone — shows up automatically as a positive residual, since it was
+    never subtracted as an inter-candidate edge. Running the collector at an
+    arbitrary mid-execution point therefore can't reclaim something a live
+    register still points to.
+  - Exposed to the `sol` CLI via `SOL_LUA_GC_STRESS=1` (mirroring the
+    existing `SOL_LUA_*_BUDGET` convention in `main.rs`'s
+    `lua_dynamic_budgets`/new `lua_gc_stress_enabled`), threaded through
+    `run_program_with_natives_and_budgets`'s new `gc_stress` parameter.
+  - Tests (`crates/sol/tests/lua55.rs`): four new stress-mode fixtures cover
+    the same table-cycle, table+closure-cycle, and finalizer scenarios as
+    the non-stress GC tests but with `collectgarbage()` removed from the
+    script entirely (stress mode collects on its own), plus a dedicated test
+    that a still-reachable local survives 200 stress-collected garbage
+    allocations around it.
+  - Still open, tracked separately, not part of this bullet: running
+    `gc.lua`/`gengc.lua`/`tracegc.lua` themselves (blocked on the unrelated,
+    pre-existing `debug`-library/native-module gaps recorded in
+    `tests/lua55/manifest.toml`).
 
 ## Phase 5 — L7: coroutines — **done this session**
 
