@@ -538,16 +538,40 @@ while proving the typed path retains its defining advantage.
       gets a minimized entry (source fixture, manifest capability profile -
       `category`/`requires` - which axis diverged, first lines of any stdout
       diff) appended to a single `failure-report.md` under
-      `SOL_LUA55_DIFF_RESULTS_DIR`. Still unimplemented: there is no
-      fuzzing/seed concept (it replays fixed corpus fixtures, not generated
-      inputs), so the failure report's "seed" field is always `n/a` - full
-      generated-input fuzzing is the next item below.
-- [~] Add property tests and fuzzing for lexer/parser round trips, table
+      `SOL_LUA55_DIFF_RESULTS_DIR`. **Update**: the script now also has an
+      opt-in generated-input fuzz mode (`SOL_LUA55_DIFF_FUZZ_CASES` - default
+      0, so existing invocations are unaffected -/`SOL_LUA55_DIFF_FUZZ_SEED`),
+      driven by a dependency-free, deterministic LCG that assembles 1-4
+      randomly-chosen blocks from six templates (arithmetic, concatenation,
+      table indexing, multi-return, conditionals, `while` loops) into a
+      self-contained, always-terminating program, runs it through both Sol
+      and the reference build directly (no manifest entry needed), and diffs
+      the same three axes as the corpus loop. Sol's CLI unconditionally
+      echoes its synthesized `main`'s return value after a run's stdout (see
+      `docs/spec/functions-and-modules.md` and
+      `dynamic_lua_code_can_call_a_natively_typed_helper_function` in
+      `crates/sol/tests/lua55.rs` - this is deliberate and tested, not a bug,
+      and must not be "fixed"), which real Lua's CLI never does; every
+      generated case ends with `return "SOL_LUA55_FUZZ_DONE"` so that one
+      known, marker-tagged line can be stripped from Sol's stdout before
+      diffing, rather than working around it by weakening the comparison. A
+      diverging case's source is copied to `tests/lua55/fuzz-fixtures/` as a
+      permanent fixture and given a real `seed:` value in `failure-report.md`
+      (previously always `n/a`). Verified with the real reference Lua 5.5.1
+      build (`/opt/homebrew/bin/lua5.5`, used only as an explicit
+      `LUA55_REFERENCE_BIN` override for this one-off check, never as the
+      script's default): 200/200 generated cases matched; the
+      divergence/fixture-promotion path was separately verified with a
+      stubbed reference binary forced to disagree. The fixed-corpus loop
+      above is intentionally left as-is (not generalized to share code with
+      the new fuzz loop), to avoid touching its already-delicate comparison
+      logic.
+- [x] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.
-      `crates/sol/tests/lua55_fuzz.rs` (new) adds a dependency-free, seeded
+      `crates/sol/tests/lua55_fuzz.rs` adds a dependency-free, seeded
       splitmix64 PRNG (`SOL_FUZZ_SEED`/`SOL_FUZZ_CASES` env vars, defaults
-      make a run reproducible) driving five property/fuzz tests: two
+      make a run reproducible) driving ten property/fuzz tests: two
       crash-safety fuzzers for the shared byte-oriented lexer/parser front
       end (raw random bytes including non-UTF-8, and a token-vocabulary
       "soup" that exercises real Lua keywords/operators in random order, both
@@ -556,18 +580,70 @@ while proving the typed path retains its defining advantage.
       returns `Err`); one table-operations model check (`LuaTable`'s
       `get`/`set` are private, so this generates Lua source performing random
       string-keyed sets and checks it against a plain `HashMap` reference
-      model through the public `sol::lua_runtime::run_source`); and two
+      model through the public `sol::lua_runtime::run_source`); two
       multi-result-adjustment property tests across randomized return
       arities (0-4 values) - one for multiple-assignment truncation/nil-fill,
       one for table-constructor semantics (last position expands to all
       results, non-last position truncates to exactly one, later positional
       elements still land at their syntactic index) - the latter's rules
       were manually verified against reference `lua` before being encoded as
-      assertions. Explicitly out of scope for this pass, still open:
-      metamethod-recursion fuzzing and GC-root-handling fuzzing, and there is
-      no dedicated "fuzz failure becomes a permanent fixture" pipeline yet
-      (a failing case prints its generated source so it can be lifted into
-      `tests/lua55.rs` by hand).
+      assertions; three metamethod-recursion tests - random-depth (1-80)
+      linear `__index` fallback chains resolve correctly, a random-length
+      (2-50) *cyclic* `__index` ring (no table ever holds the key) errors
+      gracefully with `"chain too long"` instead of hanging or crashing (a
+      direct regression test for the `MAX_METATABLE_CHAIN` fix below), and a
+      random-depth (1-300) `__call` forwarding chain dispatches arguments and
+      results correctly all the way through; and two GC-root-handling tests -
+      randomly-shaped (2-6-table) cyclic garbage rings are reclaimed under an
+      allocation budget too tight to hold more than a couple of iterations at
+      once, and a table kept reachable through a randomized-depth (1-15)
+      chain of field hops survives unrelated cyclic garbage collection
+      happening all around it every iteration. Designing the cyclic-chain and
+      call-chain tests surfaced a real, separate bug, fixed alongside these
+      tests (see the two entries below): a native stack overflow (hard
+      process abort) on ordinary deep Lua recursion, and unbounded native
+      recursion in `__index`/`__newindex` fallback dispatch. A failing
+      fuzz-generated case still prints its source on panic (no dedicated
+      auto-promotion pipeline for *this* file's in-process fuzz tests, unlike
+      the differential runner's generated-input mode above, which does
+      auto-promote to `tests/lua55/fuzz-fixtures/`).
+- [x] **Bug found via the above fuzzing work, fixed**: `LuaRuntime::index`/
+      `set_index` (`crates/sol/src/lua_runtime.rs`) used to recurse through
+      table-to-table `__index`/`__newindex` fallback chains as plain native
+      Rust call frames with no bound, so a cyclic metatable chain (`a`'s
+      `__index` is `b`, `b`'s is `a`) recursed forever and overflowed the
+      native stack - a hard process abort, not a graceful Lua error - unlike
+      function-valued `__index`/`__call` chains, which were already bounded
+      by `call_depth`/`max_call_depth`. Fixed with a `MAX_METATABLE_CHAIN =
+      2000` bound matching real Lua's `MAXTAGLOOP` (`lvm.c`), and - after an
+      initial recursive-with-a-depth-counter version was itself found (via
+      this same fuzz test, on a plain 8MiB stack) to still overflow before
+      reaching that bound - rewritten as an explicit loop, so the bound costs
+      O(1) native stack regardless of chain length instead of one recursive
+      call frame per fallback. Verified to produce error wording
+      byte-identical to real Lua 5.5.1's own message for the same cyclic
+      case.
+- [x] **Second bug found via the above fuzzing work, fixed**: Sol's dynamic
+      interpreter dispatches every nested Lua call as a native Rust call
+      (`LuaRuntime::call`), so before this fix, an ordinary non-tail-
+      recursive Lua function - nothing pathological, no metatables involved -
+      could overflow the native stack and abort the whole process at roughly
+      400-500 levels deep, far below the interpreter's own documented
+      `max_call_depth` safety-net budget (1000), which never got a chance to
+      fire. Fixed at the `sol` CLI layer (`crates/sol/src/main.rs`): `sol
+      run`/`build`/`debug` now dispatch onto a worker thread with an explicit
+      256MiB stack instead of running on the ~8MiB default thread, so the
+      existing `max_call_depth` check is now what actually fires for runaway
+      recursion. This does not raise how deep Lua recursion Sol can express -
+      still capped at `max_call_depth` - only makes that cap reachable
+      without crashing first. **Still open, not attempted here**: real Lua
+      keeps its own heap-allocated call stack rather than recursing natively
+      per call, so it handles non-tail recursion hundreds of thousands of
+      levels deep (verified empirically against
+      `/opt/homebrew/bin/lua5.5`); closing that gap for Sol would mean
+      changing dynamic-call dispatch to not consume native stack per level
+      (e.g. a trampoline), which is a materially larger change than this
+      pass's scope.
 - [x] Benchmark dynamic table array/hash reads, polymorphic field access,
       closure allocation/calls, vararg/multi-result calls, metatable dispatch,
       GC pressure, and coroutine resume. Report interpreter cold start and

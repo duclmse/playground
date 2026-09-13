@@ -27,9 +27,128 @@
 # `failure-report.md` under the results directory collects a minimized entry
 # per diverging case: its source fixture, manifest capability profile
 # (category/requires), which axis diverged, and the first lines of any
-# stdout diff - there is no seed, since this runner replays fixed corpus
-# fixtures rather than generated/fuzzed input.
+# stdout diff.
+#
+# Generated-input fuzzing (SOL_LUA55_DIFF_FUZZ_CASES): in addition to the
+# fixed corpus above, this can also generate SOL_LUA55_DIFF_FUZZ_CASES
+# self-contained Lua programs from a small template library (arithmetic,
+# string concat, table iteration, multi-return assignment, a conditional,
+# and a bounded while loop), assembled by a deterministic, seeded (no
+# external dependency) linear-congruential generator - see
+# `fuzz_lcg_next`/`fuzz_generate_case` below - so a run is reproducible from
+# SOL_LUA55_DIFF_FUZZ_SEED alone. A diverging generated case gets its source
+# saved as a permanent fixture under tests/lua55/fuzz-fixtures/ (the L8
+# checklist's "differential fuzz failures become permanent fixtures" rule)
+# and its seed recorded in failure-report.md (a real number, not the fixed
+# corpus's `n/a`). Every generated program ends with a fixed marker return
+# statement (`return "SOL_LUA55_FUZZ_DONE"`) so this script can strip Sol
+# CLI's one intentional, documented divergence from real Lua's CLI - it
+# echoes its script's return value (mirroring `.sol`'s typed `main` contract,
+# see docs/spec/functions-and-modules.md and
+# crates/sol/tests/lua55.rs's `dynamic_lua_code_can_call_a_natively_typed_helper_function`
+# - a deliberate, tested design choice, not a bug) - before diffing; without
+# this every generated case would show a false stdout divergence on that one
+# trailing line. The fixed corpus loop above does not get this treatment: it
+# runs corpus files as-is and this quirk is a pre-existing, separate gap in
+# that comparison outside this task's scope.
 set -u
+
+FUZZ_MARKER="SOL_LUA55_FUZZ_DONE"
+fuzz_cases=${SOL_LUA55_DIFF_FUZZ_CASES:-0}
+fuzz_seed=${SOL_LUA55_DIFF_FUZZ_SEED:-1}
+
+# Deterministic linear-congruential generator (glibc's constants) - no
+# external dependency, no reliance on bash's own $RANDOM (whose algorithm
+# isn't guaranteed stable across bash versions/platforms, which would make
+# "seeded" reproducibility a lie). Callers must invoke fuzz_lcg_next/
+# fuzz_lcg_range directly (never via `$(...)`), since a command substitution
+# runs in a subshell and any state it sets is lost when the subshell exits.
+fuzz_lcg_state=0
+fuzz_lcg_last=0
+fuzz_lcg_seed() { fuzz_lcg_state=$(( $1 % 2147483648 )); }
+fuzz_lcg_next() { fuzz_lcg_state=$(( (1103515245 * fuzz_lcg_state + 12345) % 2147483648 )); fuzz_lcg_last=$fuzz_lcg_state; }
+fuzz_lcg_range() { fuzz_lcg_next; fuzz_lcg_last=$(( fuzz_lcg_last % $1 )); }
+
+case_source=""
+
+fuzz_block_arith() {
+  fuzz_lcg_range 100; local a=$fuzz_lcg_last
+  fuzz_lcg_range 19; local b=$(( fuzz_lcg_last + 1 ))
+  case_source+="do local a, b = $a, $b
+  print(\"arith\", a + b, a - b, a * b, a // b, a % b)
+end
+"
+}
+
+fuzz_block_concat() {
+  fuzz_lcg_range 4; local i1=$(( fuzz_lcg_last + 1 ))
+  fuzz_lcg_range 4; local i2=$(( fuzz_lcg_last + 1 ))
+  fuzz_lcg_range 1000; local n=$fuzz_lcg_last
+  case_source+="do local words = {\"alpha\", \"beta\", \"gamma\", \"delta\"}
+  print(\"concat\", words[$i1] .. \"-\" .. words[$i2] .. \"-\" .. tostring($n))
+end
+"
+}
+
+fuzz_block_table() {
+  fuzz_lcg_range 40; local n=$(( fuzz_lcg_last + 1 ))
+  fuzz_lcg_range 9; local k=$(( fuzz_lcg_last + 1 ))
+  case_source+="do local t = {}
+  for i = 1, $n do t[i] = i * $k end
+  local sum = 0
+  for _, v in ipairs(t) do sum = sum + v end
+  print(\"table\", sum, #t)
+end
+"
+}
+
+fuzz_block_multiret() {
+  fuzz_lcg_range 100; local r1=$fuzz_lcg_last
+  fuzz_lcg_range 100; local r2=$fuzz_lcg_last
+  fuzz_lcg_range 100; local r3=$fuzz_lcg_last
+  case_source+="do local function f() return $r1, $r2, $r3 end
+  local a, b, c, d = f()
+  print(\"multiret\", a, b, c, d)
+end
+"
+}
+
+fuzz_block_cond() {
+  fuzz_lcg_range 200; local x=$(( fuzz_lcg_last - 100 ))
+  fuzz_lcg_range 200; local threshold=$(( fuzz_lcg_last - 100 ))
+  case_source+="do local x = $x
+  if x > $threshold then print(\"cond\", \"gt\")
+  elseif x == $threshold then print(\"cond\", \"eq\")
+  else print(\"cond\", \"lt\") end
+end
+"
+}
+
+fuzz_block_while() {
+  fuzz_lcg_range 30; local n=$(( fuzz_lcg_last + 1 ))
+  case_source+="do local i, total = 0, 0
+  while i < $n do total = total + i; i = i + 1 end
+  print(\"while\", total, i)
+end
+"
+}
+
+fuzz_blocks=(fuzz_block_arith fuzz_block_concat fuzz_block_table fuzz_block_multiret fuzz_block_cond fuzz_block_while)
+
+# Fills the global `case_source` with one self-contained generated program
+# deterministically derived from $1.
+fuzz_generate_case() {
+  fuzz_lcg_seed "$1"
+  case_source=""
+  fuzz_lcg_range 4
+  local block_count=$(( fuzz_lcg_last + 1 ))
+  for ((i = 0; i < block_count; i++)); do
+    fuzz_lcg_range ${#fuzz_blocks[@]}
+    "${fuzz_blocks[$fuzz_lcg_last]}"
+  done
+  case_source+="return \"$FUZZ_MARKER\"
+"
+}
 
 root_dir=$(cd "$(dirname "$0")/.." && pwd)
 suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
@@ -62,6 +181,13 @@ Environment:
   SOL_LUA55_DIFF_RUN_PENDING=0  Only diff pass/adapted/diverges cases
   SOL_LUA55_DIFF_RESULTS_DIR  Preserve per-case stdout/diff logs and the
                               minimized failure-report.md here
+  SOL_LUA55_DIFF_FUZZ_CASES  Also generate and diff this many seeded,
+                              synthetic Lua programs (default: 0, disabled)
+  SOL_LUA55_DIFF_FUZZ_SEED   Base seed for generated cases (default: 1);
+                              case N uses seed SOL_LUA55_DIFF_FUZZ_SEED + N,
+                              so a run is fully reproducible from the seed
+                              alone. A diverging generated case is saved to
+                              tests/lua55/fuzz-fixtures/case-<seed>.lua.
 
 This requires a real pinned-source build of reference Lua 5.5.1
 (scripts/test-lua55-reference.sh's LUA55_BUILD=1 builds one); it exits
@@ -146,10 +272,8 @@ failure_report="$results_dir/failure-report.md"
   echo "# Lua 5.5 differential failure report"
   echo
   echo "Each entry is a minimized summary of a diverging case: its source"
-  echo "fixture, capability profile (manifest category/requires), and"
-  echo "which comparison axis diverged. There is no seed here - this runner"
-  echo "replays fixed corpus fixtures, not generated/fuzzed inputs (see the"
-  echo "L8 checklist's still-open fuzzing item in docs/features/lua-compatibility.md)."
+  echo "fixture, capability profile (manifest category/requires, or a seed for"
+  echo "a generated fuzz case), and which comparison axis diverged."
   echo
 } >"$failure_report"
 
@@ -220,9 +344,87 @@ while IFS=$'\034' read -r path status fixture category requires; do
 done <"$entries_file"
 
 printf '\nLua 5.5 differential: %d match, %d diverge, %d skipped\n' "$matched" "$diverged" "$skipped"
+
+fuzz_matched=0
+fuzz_diverged=0
+if [[ $fuzz_cases -gt 0 ]]; then
+  fuzz_fixtures_dir="$root_dir/tests/lua55/fuzz-fixtures"
+  for ((case_index = 0; case_index < fuzz_cases; case_index++)); do
+    case_seed=$(( fuzz_seed + case_index ))
+    fuzz_generate_case "$case_seed"
+    label="fuzz-case-$case_seed"
+    fuzz_file="$results_dir/$label.lua"
+    printf '%s' "$case_source" >"$fuzz_file"
+
+    sol_out="$results_dir/$label.sol.stdout"
+    sol_err="$results_dir/$label.sol.stderr"
+    ref_out="$results_dir/$label.reference.stdout"
+    ref_err="$results_dir/$label.reference.stderr"
+
+    "$sol_bin" run "$fuzz_file" >"$sol_out" 2>"$sol_err"
+    sol_status=$?
+    "$reference_bin" "$fuzz_file" >"$ref_out" 2>"$ref_err"
+    ref_status=$?
+
+    # Strip Sol CLI's one deliberate, documented divergence from real Lua's
+    # CLI before diffing - see the header comment above `FUZZ_MARKER`. Only
+    # strips the marker if it is genuinely the trailing line (a case that
+    # errored out before the implicit `return` runs keeps its real output
+    # untouched, so a real divergence there is still caught).
+    sol_out_compare="$results_dir/$label.sol.stdout.compare"
+    awk -v marker="$FUZZ_MARKER" '
+      { lines[NR] = $0 }
+      END {
+        n = NR
+        if (n > 0 && lines[n] == marker) n--
+        for (i = 1; i <= n; i++) print lines[i]
+      }
+    ' "$sol_out" >"$sol_out_compare"
+
+    reasons=()
+    diff -u "$ref_out" "$sol_out_compare" >"$results_dir/$label.stdout.diff" || reasons+=("stdout")
+
+    sol_failed=1; [[ $sol_status -eq 0 ]] && sol_failed=0
+    ref_failed=1; [[ $ref_status -eq 0 ]] && ref_failed=0
+    [[ $sol_failed -eq $ref_failed ]] || reasons+=("exit-status(sol=$sol_status ref=$ref_status)")
+
+    sol_err_present=1; [[ -s "$sol_err" ]] || sol_err_present=0
+    ref_err_present=1; [[ -s "$ref_err" ]] || ref_err_present=0
+    [[ $sol_err_present -eq $ref_err_present ]] || reasons+=("stderr-presence(sol=$sol_err_present ref=$ref_err_present)")
+
+    if [[ ${#reasons[@]} -eq 0 ]]; then
+      printf 'MATCH %-18s (seed %s)\n' "$label" "$case_seed"
+      fuzz_matched=$((fuzz_matched + 1))
+    else
+      printf 'DIVG  %-18s %s (seed %s, logs: %s)\n' "$label" "${reasons[*]}" "$case_seed" "$results_dir/$label.*"
+      fuzz_diverged=$((fuzz_diverged + 1))
+      mkdir -p "$fuzz_fixtures_dir"
+      fixture_path="$fuzz_fixtures_dir/case-$case_seed.lua"
+      cp "$fuzz_file" "$fixture_path"
+      {
+        echo "## $label"
+        echo
+        echo "- source: $fixture_path (generated; promoted to a permanent fixture)"
+        echo "- seed: $case_seed"
+        echo "- diverged on: ${reasons[*]}"
+        echo "- logs: $sol_out $sol_err $ref_out $ref_err $results_dir/$label.stdout.diff"
+        if [[ -s "$results_dir/$label.stdout.diff" ]]; then
+          echo
+          echo '```diff'
+          head -n 20 "$results_dir/$label.stdout.diff"
+          echo '```'
+        fi
+        echo
+      } >>"$failure_report"
+    fi
+  done
+  printf '\nLua 5.5 differential fuzz (seed=%d, %d cases): %d match, %d diverge\n' \
+    "$fuzz_seed" "$fuzz_cases" "$fuzz_matched" "$fuzz_diverged"
+fi
+
 if [[ -n "$keep_results" ]]; then
   printf 'Logs: %s\n' "$results_dir"
-  if [[ $diverged -gt 0 ]]; then
+  if [[ $((diverged + fuzz_diverged)) -gt 0 ]]; then
     printf 'Failure report: %s\n' "$failure_report"
   fi
 else
