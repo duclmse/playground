@@ -651,3 +651,45 @@ concrete L8 benchmark-coverage gap identified after Phase 6; the remaining
 open L8 items (differential-runner stderr/exit-status diffing, property
 tests/fuzzing, the release dashboard) are unrelated to benchmark fixture
 coverage.
+
+## Phase 6 addendum — pooled call frames narrow the `sol (dynamic)` vs `vm` gap
+
+`LuaRuntime::run_proto` allocated two fresh heap-backed `Vec`s (`regs`,
+`cells`) on every single Lua function call; see
+`docs/features/lua-compatibility.md`'s "pooled call frames" addendum for the
+full root-cause/fix writeup (including a wrong turn - an early version wrapped
+the interpreter loop in a closure to simplify multi-exit-path cleanup, which
+measurably regressed loop-heavy/call-light benchmarks by 3-8% and was
+reverted in favor of recycling only at the one normal-return site). Fixed by
+adding `regs_pool`/`cells_pool` free lists to `LuaRuntime` so steady-state
+calls reuse a previous frame's buffer instead of allocating one.
+
+Controlled A/B on this machine (same binary before/after, `hyperfine
+--warmup 2 --min-runs 8`, same unbounded-budget overrides used throughout
+this file):
+
+| Benchmark | sol (dynamic) before | sol (dynamic) after | speedup | vm (this project) | ratio before | ratio after |
+|:---|---:|---:|---:|---:|---:|---:|
+| vararg_calls | 5138.0 ms | 3988.0 ms | 1.29x | 1514.9 ms | 3.39x | 2.63x |
+| fib | 2217.0 ms | 1771.0 ms | 1.25x | 621.4 ms | 3.57x | 2.85x |
+| gc_alloc | 2308.0 ms | 2092.0 ms | 1.10x | 507.5 ms | 4.55x | 4.12x |
+| function_calls_closure | 9853.0 ms | 9219.0 ms | 1.07x | 3236.0 ms | 3.04x | 2.85x |
+| function_calls | 9658.0 ms | 9043.0 ms | 1.07x | 3221.0 ms | 3.00x | 2.81x |
+| metatable_dispatch | 635.1 ms | 596.2 ms | 1.07x | 182.2 ms | 3.49x | 3.27x |
+| objects | 4297.0 ms | 4147.0 ms | 1.04x | 1168.9 ms | 3.68x | 3.55x |
+| coroutine_resume | 1527.0 ms | 1533.0 ms | 1.00x | 531.6 ms | 2.87x | 2.88x |
+| loop_sum / matrix / nested_loop / table_array | ~unchanged | ~unchanged | within noise | - | - | - |
+
+This is a real, meaningful improvement on every call-heavy benchmark (7-29%
+faster), but it does not close the gap against `crates/vm`'s tree-walker -
+`sol (dynamic)` remains 2.6-4.1x slower than `vm` on these same workloads
+after the fix, down from 3.0-4.6x before. Per-call `Vec` allocation was one
+concrete, fixable cost among several contributing to the gap this file's
+Phase 6 sections documented; register-cell-indirection overhead, `LuaValue`
+cloning on every register access, and the interpreter's general dispatch
+cost remain unaddressed and are still consistent with the Phase 6 decision
+above (narrow the performance claim, since the dynamic path still needs
+interpreter-level work before a JIT/tracing tier would be the right next
+investment). `coroutine_resume` is unaffected, as expected - it resumes an
+existing fiber's frame rather than entering `run_proto` fresh on its
+measured hot path.

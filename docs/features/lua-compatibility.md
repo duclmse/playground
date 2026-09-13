@@ -868,6 +868,76 @@ interpretation overhead (dispatch, `LuaValue` cloning, dynamic type checks
 per operation). Further gains need the tiering/JIT work already scoped for
 this phase, not another register-representation change.
 
+### Addendum: pooled call frames close part of the remaining per-call allocation gap
+
+The register-unboxing addendum above removed *unnecessary* per-register
+boxing but left one allocation-shaped cost untouched: `run_proto` allocated
+two fresh heap-backed `Vec`s on **every single Lua function call** -
+`regs: Vec<LuaValue> = vec![LuaValue::Nil; proto.num_registers]` and
+`cells: Vec<Option<Rc<RefCell<LuaValue>>>>` (the latter built even when zero
+registers in that function are ever captured, the common case). For
+call-heavy benchmarks this dominates: `vararg_calls.lua` alone is 8,000,000
+calls; `fib.lua`'s recursion and `function_calls.lua`'s 10,000,000 calls pay
+the same tax.
+
+Fixed by adding two free-list pools to `LuaRuntime` - `regs_pool: Vec<Vec<LuaValue>>`
+and `cells_pool: Vec<Vec<Option<Rc<RefCell<LuaValue>>>>>` - and two helpers,
+`take_regs_buffer`/`take_cells_buffer`, that pop a previously-used buffer off
+the pool (falling back to a fresh allocation only when the pool is empty),
+clear it, and refill it to the new callee's exact shape before use -
+functionally identical to a fresh allocation, just without the `malloc`.
+`recycle_frame_buffers` pushes both buffers back onto their pools. Because
+Rust's own call stack for `run_proto`'s recursive `self.call()` is itself
+LIFO, a buffer taken by an inner call is always returned before its caller
+resumes, so this is correctness-safe for arbitrary recursion with no extra
+bookkeeping.
+
+**A wrong turn worth recording**: the first version of this fix wrapped
+`run_proto`'s entire `'exec: loop { ... }` in an immediately-invoked closure,
+so every one of its many internal `return`/`?` exit points could funnel
+through one place that recycled the buffers before returning - avoiding the
+need to touch each of the ~30 instruction-handling match arms individually.
+It worked and was correct, but benchmarking it against an unmodified binary
+(same machine, same binary swapped in place, not just before/after numbers
+from a different run) showed a real, repeatable 3-8% *regression* on
+benchmarks with no meaningful call traffic at all (`loop_sum`, `matrix`,
+`nested_loop`, `table_array` - each effectively one `run_proto` call for the
+whole program). The closure adds a layer of indirection between the hot
+loop and `self`/`regs`/`cells`/`pc`/`top` (captured by reference rather than
+being plain locals of the enclosing function), and that indirection cost
+more on loop-heavy, call-light workloads than the pooling saved on call-heavy
+ones. Recycling was moved to the one actual normal-return site instead
+(`Instr::Return`, right before its `return Ok(values)`); error exits simply
+drop their frame instead of recycling it, since errors are the rare path and
+this avoids the closure restructuring entirely. Re-measured after this
+change: the loop-heavy benchmarks returned to within noise of the
+unmodified binary, and the call-heavy gains were unaffected.
+
+Controlled A/B on one machine, same binaries, `hyperfine --warmup 2
+--min-runs 8`, same unbounded-budget overrides as `scripts/benchmark.sh`:
+
+| benchmark | before | after | speedup |
+|---|---:|---:|---:|
+| vararg_calls | 5.138 s | 3.988 s | 1.29x |
+| fib | 2.217 s | 1.771 s | 1.25x |
+| gc_alloc | 2.308 s | 2.092 s | 1.10x |
+| function_calls_closure | 9.853 s | 9.219 s | 1.07x |
+| function_calls | 9.658 s | 9.043 s | 1.07x |
+| metatable_dispatch | 635.1 ms | 596.2 ms | 1.07x |
+| objects | 4.297 s | 4.147 s | 1.04x |
+| loop_sum / matrix / nested_loop / table_array / coroutine_resume | - | - | within noise (no meaningful call traffic to amortize, as expected) |
+
+This closes part, not all, of the gap against `crates/vm`'s tree-walker
+noted in the Phase 6 sections of `benchmarks/RESULTS.md`: recomputing that
+ratio with these numbers, `sol (dynamic)` goes from ~3.3-3.6x slower than
+`vm` on the call-heaviest benchmarks (`vararg_calls`, `fib`) to ~2.6-2.9x
+slower - real, but still behind, since per-call `Vec` allocation was one
+cost among several (register-cell indirection on every access, `LuaValue`
+cloning, dynamic-dispatch-shaped instruction handling) that remain
+unaddressed. `coroutine_resume` shows no change, consistent with it
+resuming an existing fiber's frame rather than entering `run_proto` fresh
+on the hot path being measured.
+
 ## Delivery order and dependencies
 
 1. Complete L0 before interpreting the headline “34 tests” number; it is the

@@ -724,6 +724,82 @@ L8 checklist item stays `[~]` (partial) for this reason, and
 `scripts/typed-regression-check.sh` still prints a reminder of both at the
 end of a run.
 
+### Addendum 4: pooling call frames to shrink the dynamic-`.lua` per-call cost
+
+The other half of the task this pass picked up — "fix the documented
+dynamic-path slowdown" (`benchmarks/RESULTS.md`'s Phase 6 finding that `sol
+(dynamic)` is 3.3-3.4x slower than this project's own `crates/vm`
+tree-walker on `metatable_dispatch.lua`/`vararg_calls.lua`, and up to ~250x
+slower than LuaJIT) — is root-caused and partly fixed.
+
+Root cause: `LuaRuntime::run_proto` (`crates/sol/src/lua_runtime.rs`)
+allocated two fresh heap-backed `Vec`s on *every single Lua function call* —
+a `regs: Vec<LuaValue>` sized to the callee's register count, and a
+`cells: Vec<Option<Rc<RefCell<LuaValue>>>>` built unconditionally even when
+the callee captures zero registers as upvalues (the common case). For
+call-heavy benchmarks (`vararg_calls.lua`: 8,000,000 calls;
+`function_calls.lua`: 10,000,000 calls), this is two `malloc`/`free` pairs
+per call, layered on top of the register-cell-indirection overhead the
+lua-compatibility.md register-unboxing addendum already addressed.
+
+Fixed by adding a pair of free-list pools to `LuaRuntime` —
+`regs_pool: Vec<Vec<LuaValue>>` and
+`cells_pool: Vec<Vec<Option<Rc<RefCell<LuaValue>>>>>` — with
+`take_regs_buffer`/`take_cells_buffer` helpers that pop a previously-used
+buffer (falling back to a fresh allocation only when the pool is empty),
+clear it, and refill it to the new callee's exact shape before use.
+`recycle_frame_buffers` pushes both buffers back to their pools. Rust's own
+call stack for `run_proto`'s recursive `self.call()` is itself LIFO, so a
+buffer taken by an inner call is always returned before its caller resumes —
+correctness-safe for arbitrary recursion, no extra bookkeeping needed.
+
+**A wrong turn worth recording, matching the spirit of Addendum 3's**: the
+first version of this fix wrapped the entire `'exec: loop { ... }` instruction
+dispatch loop in an immediately-invoked closure, so every one of its many
+internal `return`/`?` exit points would funnel through a single point that
+recycled the buffers before returning — avoiding a one-by-one edit of the
+~30 instruction-handling match arms. It built, passed all 117 tests, and
+clippy stayed clean — but before committing, a controlled A/B (same
+machine, same binary swapped in place via `git stash`, not just comparing
+against numbers from a different run) on benchmarks with little or no call
+traffic (`loop_sum`, `matrix`, `nested_loop`, `table_array` — each
+effectively one `run_proto` invocation for the whole program) showed a real,
+repeatable 3-8% *regression*, not noise. The closure captures `self`/
+`regs`/`cells`/`pc`/`top` by reference rather than leaving them as plain
+locals of the enclosing function, and that extra indirection cost more on
+loop-heavy, call-light workloads than the pooling saved on call-heavy ones.
+Reverted to a simpler design: recycle only at the one actual normal-return
+site (`Instr::Return`, immediately before its `return Ok(values)`); an error
+exit just drops its frame without recycling it, since errors are the rare
+path and this sidesteps the closure restructuring entirely. Re-measured:
+the loop-heavy benchmarks returned to within noise of the unmodified binary,
+and the call-heavy gains held.
+
+Final controlled-A/B results (one machine, same binaries, `hyperfine
+--warmup 2 --min-runs 8`): `vararg_calls` 1.29x faster, `fib` 1.25x faster,
+`gc_alloc` 1.10x faster, `function_calls`/`function_calls_closure`/
+`metatable_dispatch` ~1.07x faster, `objects` 1.04x faster;
+`loop_sum`/`matrix`/`nested_loop`/`table_array`/`coroutine_resume` unchanged
+within noise (as expected — they have no meaningful call traffic to
+amortize, or in `coroutine_resume`'s case resume an existing fiber's frame
+rather than entering `run_proto` fresh on the measured hot path). Recomputed
+against `crates/vm`: `sol (dynamic)` goes from ~3.3-3.6x slower than `vm` on
+the call-heaviest benchmarks to ~2.6-2.9x slower — real, but not full
+parity. Full numbers and methodology: `benchmarks/RESULTS.md`'s "pooled call
+frames" addendum and `docs/features/lua-compatibility.md`'s matching
+addendum.
+
+**Still open, out of scope for this pass**: per-call `Vec` allocation was
+one concrete, fixable cost among several. Register-cell-indirection overhead
+on every `reg_get`/`reg_set` (an `Rc` clone plus a match branch to check
+whether that register is captured), `LuaValue` cloning, and the
+interpreter's general dispatch cost are all untouched. The Phase 6 decision
+to formally narrow the "beats LuaJIT" claim to typed `.sol` code stands —
+this fix narrows the gap against `crates/vm`, it doesn't close it, and
+closing it fully would need the interpreter-level or tiering work Phase 6
+already scoped as the honest next investment, not another allocation-shaped
+fix.
+
 ## Non-goals for this plan
 
 - `sol build`/`sol debug` getting the same per-function partition as `sol
