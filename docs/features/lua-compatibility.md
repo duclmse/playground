@@ -524,12 +524,21 @@ while proving the typed path retains its defining advantage.
       Lua and Sol, compares normalized stdout/stderr/exit status, and emits a
       minimized failure report with source, seed, and capability profile.
       `scripts/test-lua55-differential.sh` (Phase 6) runs every manifest
-      case through both Sol and a pinned reference Lua 5.5.1 build and diffs
-      stdout, preserving per-case logs in `SOL_LUA55_DIFF_RESULTS_DIR` - but
-      it only compares stdout, not stderr/exit status, and there is no
-      fuzzing/seed concept (it replays fixed corpus fixtures, not generated
-      inputs), so "minimized failure report with source, seed, and
-      capability profile" remains unimplemented.
+      case through both Sol and a pinned reference Lua 5.5.1 build, preserving
+      per-case logs in `SOL_LUA55_DIFF_RESULTS_DIR`. It now compares all three
+      axes named in this item: stdout byte-for-byte, exit status as "did this
+      side fail at all" (Sol's CLI and PUC Lua's `lua` don't share a nonzero
+      exit-code convention, so requiring the literal codes to match would
+      test an undocumented implementation detail), and stderr the same way
+      ("did this side produce anything on stderr at all", not literal text -
+      Sol's error-message wording is not a byte-for-byte clone of PUC Lua's C
+      error/traceback formatting). A divergence report names which axis
+      failed (e.g. `stdout`, `exit-status(sol=1 ref=0)`,
+      `stderr-presence(sol=0 ref=1)`) per case. Still unimplemented: there is
+      no fuzzing/seed concept (it replays fixed corpus fixtures, not
+      generated inputs) and no separate "minimized failure report" artifact
+      beyond the per-case logs already written, so that half of this item
+      remains open.
 - [ ] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.

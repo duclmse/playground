@@ -492,12 +492,12 @@ rather than one:
   with basic interpreter-level work (the bytecode/tree-walk tier itself),
   not a JIT - that's a separate initiative from this plan, not started here.
 
-### Addendum: closing three L8 benchmark-coverage gaps
+### Addendum: closing four L8 benchmark-coverage and differential-runner gaps
 
 All 6 phases above are now done (Phase 4's one remaining item, GC stress
 fixtures, shipped in a later session pass; see its section). Reconciling
 `docs/features/lua-compatibility.md`'s L8 checklist against what Phase 6
-actually delivered turned up three concrete, narrowly-scoped gaps, now closed:
+actually delivered turned up four concrete, narrowly-scoped gaps, now closed:
 
 - `benchmarks/metatable_dispatch.lua`: the benchmark suite had no fixture
   exercising metatable dispatch or polymorphic field access at all. Added
@@ -518,12 +518,23 @@ actually delivered turned up three concrete, narrowly-scoped gaps, now closed:
   argument of another call (must expand to all results). Same
   cross-runtime verification as above; see `benchmarks/RESULTS.md`'s "Phase
   6 addendum — vararg / multi-result-call overhead" section for numbers.
+- `scripts/test-lua55-differential.sh` only ever diffed stdout. It now also
+  compares exit status and stderr, both as "did this side fail / produce
+  output at all" rather than requiring literal codes/text to match (Sol's
+  CLI exit codes and error-message wording are not, and are not meant to be,
+  byte-for-byte clones of PUC Lua's - see the script's header comment). A
+  divergent case now names which axis failed. Verified against synthetic
+  fake `sol`/reference binaries covering match, stdout-only-divergence, and
+  fully-divergent cases (a real pinned Lua 5.5.1 reference build isn't
+  available in this environment - see `tests/lua55/README.md`).
 
-Still open, not part of this addendum: the differential runner
-(`test-lua55-differential.sh`) still only diffs stdout, not stderr/exit
-status; there is no fuzzing/property-test infrastructure; and there is no
-release dashboard. See `docs/features/lua-compatibility.md`'s L8 section for
-the full reconciliation.
+Still open, not part of this addendum: there is no fuzzing/seed concept in
+the differential runner (it replays fixed corpus fixtures, not generated
+inputs) and no separate "minimized failure report" artifact; there is no
+fuzzing/property-test infrastructure for the lexer/parser/table/GC items;
+and there is no release dashboard. See
+`docs/features/lua-compatibility.md`'s L8 section for the full
+reconciliation.
 
 ## Non-goals for this plan
 
