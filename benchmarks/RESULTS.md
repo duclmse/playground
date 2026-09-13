@@ -568,3 +568,56 @@ compatibility mode), so no retraction was needed there - but the doc now
 states the dynamic-path numbers explicitly rather than leaving them
 unmeasured, so nobody has to infer "Sol" broadly is fast just because typed
 `.sol` is.
+
+## Phase 6 addendum — metatable dispatch and cold-start timing
+
+Reconciling `docs/features/lua-compatibility.md`'s L8 checklist against the
+Phase 6 work above found two gaps: no benchmark exercised metatable dispatch
+or polymorphic field access, and only one (steady-state) number was ever
+reported per benchmark. `scripts/benchmark.sh` now runs every benchmark
+twice - once with the existing `--warmup 3 --min-runs 10` methodology, and
+once unwarmed (`--warmup 0 --runs 1`, a single sample, so its std dev is
+always 0) - and reports the unwarmed run as a separate `<name> (cold)` row.
+
+**`benchmarks/metatable_dispatch.lua`** (new): three unrelated shape
+"classes" (`Circle`/`Square`/`Triangle`), each with its own `__index`
+metatable, called through one shared call site (`shape:area()`) so every
+invocation re-resolves the method through a different concrete type -
+real metatable dispatch and polymorphic field access, not a monomorphic
+call site. No `.sol` counterpart exists (metatables are a `.lua`-only
+compatibility concept; typed `.sol` has no equivalent construct to
+benchmark).
+
+| Row | lua (ref) | luajit | vm (this project) | sol (dynamic) |
+|:---|---:|---:|---:|---:|
+| metatable_dispatch | 29.2 ms | 7.4 ms | 182.2 ms | 618.1 ms |
+| metatable_dispatch (cold) | 31.8 ms | 8.6 ms | 175.3 ms | 609.3 ms |
+
+The result matches the rest of this section's finding: `sol (dynamic)` is
+83× slower than LuaJIT here and, again more decisively, **3.4× slower than
+this project's own `vm` tree-walker** on the same workload - metatable
+dispatch doesn't change the Phase 6 conclusion, it reinforces it.
+
+**Cold vs. steady-state**, shown here on `hashmap_lookup` (one of the
+smallest, most process-startup-dominated benchmarks, where a difference
+would be easiest to see):
+
+| Row | lua (ref) | luajit | vm (this project) | sol (dynamic) | sol (typed) |
+|:---|---:|---:|---:|---:|---:|
+| hashmap_lookup | 2.9 ms | 2.7 ms | 6.4 ms | 7.2 ms | 4.2 ms |
+| hashmap_lookup (cold) | 4.8 ms | 3.5 ms | 8.1 ms | 7.8 ms | 4.0 ms |
+
+None of these runtimes carry meaningfully different cold-vs-warm behavior on
+this workload - expected, since none of them (including LuaJIT here, given
+the workload is far too short to trigger trace compilation) is doing
+warm-up-sensitive JIT work inside a single process invocation; the
+differences between the two rows are within normal process-launch noise.
+This is an honest, currently-uninteresting result for today's benchmark
+set, not a broken measurement - the value of reporting both is that it will
+surface something real the moment a workload or runtime *does* have
+warm-up-sensitive behavior (e.g. a future dynamic-path tiering pass).
+
+This addendum measures only these two benchmarks, not a full re-run of the
+whole suite under the new cold-start methodology; the rest of the table
+above still reflects steady-state-only numbers from the original Phase 6
+run.

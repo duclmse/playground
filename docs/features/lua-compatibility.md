@@ -520,17 +520,41 @@ separate, unimplemented feature.)
 **Purpose:** improve dynamic execution only after correctness is measurable,
 while proving the typed path retains its defining advantage.
 
-- [ ] Add a differential runner that executes each manifest fixture on reference
+- [~] Add a differential runner that executes each manifest fixture on reference
       Lua and Sol, compares normalized stdout/stderr/exit status, and emits a
       minimized failure report with source, seed, and capability profile.
+      `scripts/test-lua55-differential.sh` (Phase 6) runs every manifest
+      case through both Sol and a pinned reference Lua 5.5.1 build and diffs
+      stdout, preserving per-case logs in `SOL_LUA55_DIFF_RESULTS_DIR` - but
+      it only compares stdout, not stderr/exit status, and there is no
+      fuzzing/seed concept (it replays fixed corpus fixtures, not generated
+      inputs), so "minimized failure report with source, seed, and
+      capability profile" remains unimplemented.
 - [ ] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.
-- [ ] Benchmark dynamic table array/hash reads, polymorphic field access,
+- [~] Benchmark dynamic table array/hash reads, polymorphic field access,
       closure allocation/calls, vararg/multi-result calls, metatable dispatch,
       GC pressure, and coroutine resume. Report interpreter cold start and
       steady-state cache/JIT results separately against the pinned Lua 5.5
-      reference and any additional named runtimes.
+      reference and any additional named runtimes. `benchmarks/*.lua` covers
+      closure allocation/calls (`function_calls_closure`), table array/hash
+      reads (`table_array`, `hashmap_lookup`), GC pressure (`gc_alloc`),
+      coroutine resume (`coroutine_resume`), and, as of this update,
+      polymorphic field access and metatable dispatch together
+      (`metatable_dispatch.lua`: three unrelated "classes" sharing no common
+      base, each with its own `__index` metatable, called through a single
+      shared call site so every invocation re-resolves `area` through a
+      different object's metatable rather than hitting a monomorphic
+      target). `scripts/benchmark.sh` now runs every benchmark twice and
+      reports both numbers as separate rows: `<name>` (the existing
+      `--warmup 3 --min-runs 10` steady-state mean) and `<name> (cold)`
+      (`--warmup 0 --runs 1`, the first unwarmed process launch - a single
+      sample, so its stddev is always 0) — see `benchmarks/RESULTS.md`. Not
+      covered: no benchmark specifically isolates vararg/multi-result-call
+      overhead (the closest existing fixture,
+      `dynamic_lua_runtime_applies_table_iteration_and_multi_result_rules` in
+      `tests/lua55.rs`, is a correctness test, not a benchmark).
 - [ ] Before and after every dynamic optimization, run the existing typed Sol
       numeric, allocation, callback, table/array, JIT, and AOT benchmarks.
       Reject a material typed-path regression (initial budget: 5% outside

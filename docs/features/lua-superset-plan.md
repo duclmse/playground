@@ -492,6 +492,32 @@ rather than one:
   with basic interpreter-level work (the bytecode/tree-walk tier itself),
   not a JIT - that's a separate initiative from this plan, not started here.
 
+### Addendum: closing two L8 benchmark-coverage gaps
+
+All 6 phases above are now done (Phase 4's one remaining item, GC stress
+fixtures, shipped in a later session pass; see its section). Reconciling
+`docs/features/lua-compatibility.md`'s L8 checklist against what Phase 6
+actually delivered turned up two concrete, narrowly-scoped gaps, now closed:
+
+- `benchmarks/metatable_dispatch.lua`: the benchmark suite had no fixture
+  exercising metatable dispatch or polymorphic field access at all. Added
+  one modeled on real OOP-in-Lua code (three shape "classes", each with its
+  own `__index` metatable, iterated through a shared call site so every
+  `shape:area()` call resolves through a different concrete type). Verified
+  against `lua`, `luajit`, `crates/vm`'s interpreter, and `sol run` directly
+  before wiring it in — all four agree on the numeric result.
+- `scripts/benchmark.sh` only ever reported one steady-state number
+  (`--warmup 3 --min-runs 10`) per benchmark. It now also runs each command
+  once unwarmed (`--warmup 0 --runs 1`) and reports it as a separate
+  `<name> (cold)` row, so first-launch cost and steady-state cost are both
+  visible instead of only the latter.
+
+Still open, not part of this addendum: no benchmark isolates
+vararg/multi-result-call overhead specifically (the L8 checklist's other
+uncovered category), and the differential runner (`test-lua55-differential.sh`)
+still only diffs stdout, not stderr/exit status. See
+`docs/features/lua-compatibility.md`'s L8 section for the full reconciliation.
+
 ## Non-goals for this plan
 
 - `sol build`/`sol debug` getting the same per-function partition as `sol

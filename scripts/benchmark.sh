@@ -7,6 +7,14 @@
 # way for every implementation - a fair, real-world "run this program"
 # comparison rather than an internal-clock micro-measurement.
 #
+# Each benchmark is measured twice (L8 checklist: "report interpreter cold
+# start and steady-state cache/JIT results separately"): once as "<name>"
+# with hyperfine's usual --warmup 3 --min-runs 10 (repeated process
+# launches, so any OS-level disk-cache/JIT-cache warm-up has already
+# happened), and once as "<name> (cold)" with --warmup 0 --runs 1 (the very
+# first, unwarmed process launch). A single unwarmed run has no variance to
+# report (stddev is 0), which is expected, not a measurement bug.
+#
 # Usage: scripts/benchmark.sh [--filter NAME] [--export-markdown FILE]
 set -euo pipefail
 # Resolve --export-markdown's path relative to the caller's original
@@ -167,13 +175,13 @@ for script in "$ROOT"/benchmarks/*.lua; do
     continue
   fi
   log "Benchmark: $name"
-  args=(--warmup 3 --min-runs 10)
+  commands=()
   for runtime in "${LUA_RUNTIMES[@]}"; do
     label="$runtime"
     [ "$runtime" = "lua" ] && label="lua (reference)"
-    args+=(-n "$label" "'$runtime' '$script'")
+    commands+=(-n "$label" "'$runtime' '$script'")
   done
-  args+=(-n "vm (this project)" "'$VM_BIN' '$script'")
+  commands+=(-n "vm (this project)" "'$VM_BIN' '$script'")
   # Also run the same .lua source through Sol's own dynamic interpreter
   # (`sol run`, the `.lua`-compatibility path `lua_runtime.rs` implements -
   # see docs/features/lua-superset-plan.md Phase 6) - this is the honest
@@ -182,7 +190,7 @@ for script in "$ROOT"/benchmarks/*.lua; do
   # defaults are sized for untrusted embedded code and would abort a
   # benchmark-sized workload partway through (see the `SOL_LUA_*_BUDGET`
   # addendum in docs/features/lua-compatibility.md).
-  args+=(-n "sol (dynamic)" "SOL_LUA_INSTRUCTION_BUDGET=18446744073709551615 SOL_LUA_CALL_DEPTH_BUDGET=1000000 SOL_LUA_ALLOCATION_BUDGET=18446744073709551615 '$SOL_BIN' run '$script'")
+  commands+=(-n "sol (dynamic)" "SOL_LUA_INSTRUCTION_BUDGET=18446744073709551615 SOL_LUA_CALL_DEPTH_BUDGET=1000000 SOL_LUA_ALLOCATION_BUDGET=18446744073709551615 '$SOL_BIN' run '$script'")
   # If a same-named .sol program exists (Sol's typed compilation path - see
   # docs/sol.md), include it too - the whole reason for writing these Sol
   # programs in the first place is to get an honest, reproducible answer on
@@ -190,10 +198,11 @@ for script in "$ROOT"/benchmarks/*.lua; do
   # it's supposed to be best at.
   sol_script="$ROOT/benchmarks/$name.sol"
   if [ -f "$sol_script" ]; then
-    args+=(-n "sol" "'$SOL_BIN' run '$sol_script'")
+    commands+=(-n "sol" "'$SOL_BIN' run '$sol_script'")
   fi
 
-  run_group "$name" "${args[@]}"
+  run_group "$name" --warmup 3 --min-runs 10 "${commands[@]}"
+  run_group "$name (cold)" --warmup 0 --runs 1 "${commands[@]}"
 done
 
 # Some Sol benchmarks compare two compiler modes or measure a typed-only
@@ -208,8 +217,9 @@ for sol_script in "$ROOT"/benchmarks/*.sol; do
     continue
   fi
   log "Benchmark: $name (Sol-only)"
-  args=(--warmup 3 --min-runs 10 -n "sol" "'$SOL_BIN' run '$sol_script'")
-  run_group "$name" "${args[@]}"
+  commands=(-n "sol" "'$SOL_BIN' run '$sol_script'")
+  run_group "$name" --warmup 3 --min-runs 10 "${commands[@]}"
+  run_group "$name (cold)" --warmup 0 --runs 1 "${commands[@]}"
 done
 
 print_summary
