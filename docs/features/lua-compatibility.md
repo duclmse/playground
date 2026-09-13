@@ -955,6 +955,55 @@ unaddressed. `coroutine_resume` shows no change, consistent with it
 resuming an existing fiber's frame rather than entering `run_proto` fresh
 on the hot path being measured.
 
+### Addendum: pooling the remaining per-call argument/return buffers (Phase 7.1)
+
+The pooled-call-frames addendum above left two per-call `Vec<LuaValue>`
+allocations untouched: `Instr::Call`'s argument buffer and a closure call's
+return-value buffer. Fixed by adding a `values_pool: Vec<Vec<LuaValue>>`
+free list (same shape as `regs_pool`/`cells_pool`) with
+`take_values_buffer`/`recycle_values_buffer` helpers, wired into
+`Instr::Call` (both the argument build and the results readout) and
+`run_proto`'s `Instr::Return`/vararg handling (which now reuses `args`'s own
+allocation as `varargs` via `drain` instead of collecting into a fresh
+`Vec`). Also precomputes `Proto::captured_cell_count` at compile time
+instead of rescanning `captured_registers` with `.filter().count()` on
+every call.
+
+**A correctness bug this surfaced**: the first version pushed a buffer back
+to its pool without clearing it, deferring the clear to the next
+`take_values_buffer` call - matching `recycle_frame_buffers`'s pre-existing
+(latent, previously untested) behavior. That leaves any `LuaValue` still
+sitting in the buffer holding its `Rc` alive for as long as the buffer sits
+unused in the pool, which the trial-deletion cycle collector
+(`collect_cycles`) has no way to see (it only walks `gc_tables`/
+`gc_closures`, never these pools).
+`dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_cycles`
+caught this immediately: a self-referential table passed as a
+`setmetatable` argument lingered live in a recycled-but-not-yet-reused
+`call_args` buffer, so only 2 of the expected 4 cycles were collected. Fixed
+by clearing eagerly in `recycle_values_buffer` - and, since it's the exact
+same latent defect, in `recycle_frame_buffers` too (untested until this
+pass's new pooling made a case that exercises it).
+
+Controlled A/B (`hyperfine --warmup 3 --min-runs 10`, same unbounded-budget
+overrides):
+
+| benchmark | before | after | speedup |
+|---|---:|---:|---:|
+| vararg_calls | 3.920 s | 3.745 s | 1.05x |
+| fib | 1.651 s | 1.609 s | 1.03x |
+| gc_alloc | 2.060 s | 1.999 s | 1.03x |
+| objects | 4.160 s | 4.072 s | 1.02x |
+| function_calls_closure | 9.286 s | 9.074 s | 1.02x |
+| function_calls | 9.066 s | 8.962 s | 1.01x |
+
+Smaller than the first pooling pass (1-5% vs. 7-29%), as expected - this
+closes the last of an already-mostly-pooled cost category rather than a new
+one. Part of the broader interpreter-level LuaJIT-technique-adoption plan
+(`docs/features/lua-superset-plan.md`'s Phase 7); constant-pool field/global
+names, string-key cloning, dormant inline-cache infrastructure, and
+`LuaValue` representation remain open as that plan's later phases.
+
 ## Delivery order and dependencies
 
 1. Complete L0 before interpreting the headline “34 tests” number; it is the

@@ -693,3 +693,38 @@ interpreter-level work before a JIT/tracing tier would be the right next
 investment). `coroutine_resume` is unaffected, as expected - it resumes an
 existing fiber's frame rather than entering `run_proto` fresh on its
 measured hot path.
+
+## Interpreter-level rewrite, Phase 1 — call-path allocation, round 2
+
+Follow-on to the pooled-call-frames fix above, closing the two remaining
+per-call `Vec<LuaValue>` allocations it didn't cover: `Instr::Call`'s
+argument buffer and a closure call's return-value buffer (see
+`docs/features/lua-compatibility.md`'s matching addendum for the full
+writeup, including a correctness fix this phase required: the pooled
+buffers must be cleared *when recycled*, not only when next taken, or a
+value left sitting in an idle pooled buffer keeps its `Rc` alive invisibly
+to the trial-deletion cycle collector). Also precomputes
+`Proto::captured_cell_count` once at compile time instead of rescanning
+`captured_registers` on every call.
+
+Controlled A/B on this machine (same binary before/after, `hyperfine
+--warmup 3 --min-runs 10`, same unbounded-budget overrides used throughout
+this file):
+
+| Benchmark | before | after | speedup |
+|:---|---:|---:|---:|
+| vararg_calls | 3920 ms | 3745 ms | 1.05x |
+| fib | 1651 ms | 1609 ms | 1.03x |
+| gc_alloc | 2060 ms | 1999 ms | 1.03x |
+| objects | 4160 ms | 4072 ms | 1.02x |
+| function_calls_closure | 9286 ms | 9074 ms | 1.02x |
+| function_calls | 9066 ms | 8962 ms | 1.01x |
+
+A smaller, more incremental win than the first pooling pass (1-5% vs.
+7-29%) - expected, since this phase targets the two remaining allocations
+on top of an already-mostly-pooled call path, not a new class of cost.
+Consistent with the interpreter-level-rewrite plan
+(`docs/features/lua-superset-plan.md`'s LuaJIT-technique-adoption section):
+the larger remaining costs (constant-pool field/global names, string-key
+cloning, dormant inline-cache infrastructure, `LuaValue` representation)
+are still open and scoped as later phases of that same plan.

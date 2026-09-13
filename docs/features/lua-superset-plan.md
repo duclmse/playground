@@ -803,6 +803,67 @@ closing it fully would need the interpreter-level or tiering work Phase 6
 already scoped as the honest next investment, not another allocation-shaped
 fix.
 
+## Phase 7 — Interpreter-level LuaJIT-technique adoption for the dynamic path
+
+Follow-on to Phase 6's decision (above) and Addendum 4's pooled-call-frames
+fix. The dynamic `.lua` interpreter is still 2.6-4.1x slower than this
+project's own `crates/vm` tree-walker and 26-334x slower than LuaJIT on
+call/allocation/control-flow-heavy benchmarks. Rather than building a JIT on
+an interpreter that hasn't earned one (Phase 6's own conclusion), this phase
+adopts LuaJIT-style *implementation techniques* — representation, dispatch,
+call-path, and GC choices, not a JIT — into `lua_runtime.rs`/
+`lua_bytecode.rs`, in six independently-committable increments:
+
+1. Call-path allocation elimination, round 2 (pool the remaining per-call
+   argument/return `Vec`s; precompute `Proto::captured_cell_count`).
+2. Constant-pool field/global names (stop rebuilding/reallocating a field or
+   global name's bytes from scratch on every access; carry a constant-pool
+   index instead, like `LoadConst` already does).
+3. `LuaKey::String` as `Rc<Vec<u8>>` instead of an owned clone, removing the
+   remaining per-access byte-string copy identified by (2).
+4. Activate `LuaTable::version` (already correctly maintained, never read) as
+   a real per-call-site inline cache for field/index access.
+5. The same idea for `Globals` (a separate subsystem, its own generation
+   counter).
+6. A NaN-boxed/packed `LuaValue` representation, prototyped in isolation
+   before a full rollout given its blast radius.
+
+A stackless/trampolined call model (matching `crates/vm`'s `Frame`-vec
+design, and the natural place to add tail-call optimization, which the
+dynamic interpreter has none of today), a real tracing garbage collector,
+and a tracing/method JIT are all explicitly flagged as separate, later
+initiatives — not part of this phase, per the same Phase 6 reasoning.
+
+### Phase 7.1 — call-path allocation, round 2 — **done this session**
+
+Closed the two remaining per-call `Vec<LuaValue>` allocations Addendum 4's
+pooling pass didn't cover: `Instr::Call`'s argument buffer, and a closure
+call's return-value buffer (both now drawn from a new `values_pool` free
+list, mirroring `regs_pool`/`cells_pool`). `Proto::captured_cell_count` is
+now precomputed once at compile time instead of rescanned on every call.
+
+This surfaced a real correctness bug worth recording: the first version
+pushed buffers back to their pools without clearing them first, matching
+`recycle_frame_buffers`'s existing (undocumented-as-a-bug) behavior of
+leaving that to the next `take_*_buffer` call. That leaves a `LuaValue`
+sitting in an idle, unused pooled buffer holding its `Rc` alive for however
+long the buffer goes unreused — invisible to the trial-deletion cycle
+collector (`collect_cycles`, which only walks `gc_tables`/`gc_closures`, not
+these pools). `dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_cycles`
+caught it immediately (expected 4 finalizer calls, got 2 — a self-referential
+table passed as a `setmetatable` argument lingered live in a recycled-but-
+unreused `call_args` buffer). Fixed by clearing eagerly at recycle time for
+both the new `values_pool` and the pre-existing `regs_pool`/`cells_pool`
+(the latter had the identical latent risk, just not exercised by any
+existing test until this pass's new pooling made it observable).
+
+Controlled A/B (`hyperfine --warmup 3 --min-runs 10`, same unbounded-budget
+overrides): 1-5% faster across `vararg_calls`, `fib`, `gc_alloc`, `objects`,
+`function_calls_closure`, `function_calls` — smaller than Addendum 4's
+7-29% (expected: this closes the last of one already-mostly-addressed cost
+category, not a new one). Full numbers:
+`benchmarks/RESULTS.md`'s matching addendum.
+
 ## Non-goals for this plan
 
 - `sol build`/`sol debug` getting the same per-function partition as `sol
