@@ -534,11 +534,14 @@ while proving the typed path retains its defining advantage.
       Sol's error-message wording is not a byte-for-byte clone of PUC Lua's C
       error/traceback formatting). A divergence report names which axis
       failed (e.g. `stdout`, `exit-status(sol=1 ref=0)`,
-      `stderr-presence(sol=0 ref=1)`) per case. Still unimplemented: there is
-      no fuzzing/seed concept (it replays fixed corpus fixtures, not
-      generated inputs) and no separate "minimized failure report" artifact
-      beyond the per-case logs already written, so that half of this item
-      remains open.
+      `stderr-presence(sol=0 ref=1)`) per case, and every diverging case also
+      gets a minimized entry (source fixture, manifest capability profile -
+      `category`/`requires` - which axis diverged, first lines of any stdout
+      diff) appended to a single `failure-report.md` under
+      `SOL_LUA55_DIFF_RESULTS_DIR`. Still unimplemented: there is no
+      fuzzing/seed concept (it replays fixed corpus fixtures, not generated
+      inputs), so the failure report's "seed" field is always `n/a` - full
+      generated-input fuzzing is the next item below.
 - [ ] Add property tests and fuzzing for lexer/parser round trips, table
       operations, multi-result adjustment, metamethod recursion, and GC root
       handling. Differential fuzz failures become permanent fixtures.

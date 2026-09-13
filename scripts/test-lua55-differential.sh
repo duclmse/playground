@@ -23,7 +23,12 @@
 # docs/features/lua-compatibility.md), so a literal stderr diff would mostly
 # report cosmetic wording differences, not compatibility bugs. Per-case log
 # files under the results directory still capture the raw stdout/stderr of
-# both sides for manual inspection when a case diverges on any axis.
+# both sides for manual inspection when a case diverges on any axis. A single
+# `failure-report.md` under the results directory collects a minimized entry
+# per diverging case: its source fixture, manifest capability profile
+# (category/requires), which axis diverged, and the first lines of any
+# stdout diff - there is no seed, since this runner replays fixed corpus
+# fixtures rather than generated/fuzzed input.
 set -u
 
 root_dir=$(cd "$(dirname "$0")/.." && pwd)
@@ -55,7 +60,8 @@ Environment:
                               source in tests/lua55/README.md; this script
                               will not substitute the system `lua` binary
   SOL_LUA55_DIFF_RUN_PENDING=0  Only diff pass/adapted/diverges cases
-  SOL_LUA55_DIFF_RESULTS_DIR  Preserve per-case stdout/diff logs here
+  SOL_LUA55_DIFF_RESULTS_DIR  Preserve per-case stdout/diff logs and the
+                              minimized failure-report.md here
 
 This requires a real pinned-source build of reference Lua 5.5.1
 (scripts/test-lua55-reference.sh's LUA55_BUILD=1 builds one); it exits
@@ -103,11 +109,23 @@ function string_value(value) {
   value = trim(value)
   return substr(value, 2, length(value) - 2)
 }
+function array_value(value,    n, i, parts, out) {
+  value = trim(value)
+  value = substr(value, 2, length(value) - 2)
+  n = split(value, parts, ",")
+  out = ""
+  for (i = 1; i <= n; i++) {
+    piece = string_value(trim(parts[i]))
+    if (piece == "") continue
+    out = (out == "" ? piece : out "," piece)
+  }
+  return out
+}
 BEGIN { in_case = 0 }
 /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
 /^[[:space:]]*\[\[case\]\][[:space:]]*$/ {
-  if (in_case && path != "") print path "\034" status "\034" fixture
-  in_case = 1; path = status = fixture = ""
+  if (in_case && path != "") print path "\034" status "\034" fixture "\034" category "\034" requires
+  in_case = 1; path = status = fixture = category = requires = ""
   next
 }
 {
@@ -117,14 +135,28 @@ BEGIN { in_case = 0 }
   if (key == "path") path = string_value(value)
   else if (key == "status") status = string_value(value)
   else if (key == "fixture") fixture = string_value(value)
+  else if (key == "category") category = string_value(value)
+  else if (key == "requires") requires = array_value(value)
 }
-END { if (in_case && path != "") print path "\034" status "\034" fixture }
+END { if (in_case && path != "") print path "\034" status "\034" fixture "\034" category "\034" requires }
 ' "$manifest" >"$entries_file"
+
+failure_report="$results_dir/failure-report.md"
+{
+  echo "# Lua 5.5 differential failure report"
+  echo
+  echo "Each entry is a minimized summary of a diverging case: its source"
+  echo "fixture, capability profile (manifest category/requires), and"
+  echo "which comparison axis diverged. There is no seed here - this runner"
+  echo "replays fixed corpus fixtures, not generated/fuzzed inputs (see the"
+  echo "L8 checklist's still-open fuzzing item in docs/features/lua-compatibility.md)."
+  echo
+} >"$failure_report"
 
 matched=0
 diverged=0
 skipped=0
-while IFS=$'\034' read -r path status fixture; do
+while IFS=$'\034' read -r path status fixture category requires; do
   case "$status" in
     host-required) skipped=$((skipped + 1)); continue ;;
     pending) [[ $run_pending == 1 ]] || { skipped=$((skipped + 1)); continue; } ;;
@@ -166,12 +198,33 @@ while IFS=$'\034' read -r path status fixture; do
   else
     printf 'DIVG  %-18s %s (logs: %s)\n' "$path" "${reasons[*]}" "$results_dir/$path.{stdout,sol,reference}.*"
     diverged=$((diverged + 1))
+    {
+      echo "## $path"
+      echo
+      echo "- source: $target"
+      echo "- status: $status"
+      echo "- category: ${category:-<none>}"
+      echo "- requires (capability profile): ${requires:-<none>}"
+      echo "- seed: n/a (fixed corpus fixture, not a generated/fuzzed input)"
+      echo "- diverged on: ${reasons[*]}"
+      echo "- logs: $sol_out $sol_err $ref_out $ref_err $results_dir/$path.stdout.diff"
+      if [[ -s "$results_dir/$path.stdout.diff" ]]; then
+        echo
+        echo '```diff'
+        head -n 20 "$results_dir/$path.stdout.diff"
+        echo '```'
+      fi
+      echo
+    } >>"$failure_report"
   fi
 done <"$entries_file"
 
 printf '\nLua 5.5 differential: %d match, %d diverge, %d skipped\n' "$matched" "$diverged" "$skipped"
 if [[ -n "$keep_results" ]]; then
   printf 'Logs: %s\n' "$results_dir"
+  if [[ $diverged -gt 0 ]]; then
+    printf 'Failure report: %s\n' "$failure_report"
+  fi
 else
   rm -rf "$results_dir"
 fi

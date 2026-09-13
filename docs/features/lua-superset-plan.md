@@ -523,14 +523,18 @@ actually delivered turned up four concrete, narrowly-scoped gaps, now closed:
   output at all" rather than requiring literal codes/text to match (Sol's
   CLI exit codes and error-message wording are not, and are not meant to be,
   byte-for-byte clones of PUC Lua's - see the script's header comment). A
-  divergent case now names which axis failed. Verified against synthetic
-  fake `sol`/reference binaries covering match, stdout-only-divergence, and
-  fully-divergent cases (a real pinned Lua 5.5.1 reference build isn't
-  available in this environment - see `tests/lua55/README.md`).
+  divergent case now names which axis failed, and also gets a minimized
+  entry (source fixture, manifest `category`/`requires` as a capability
+  profile, which axis diverged, first lines of any stdout diff) appended to
+  a single `failure-report.md` alongside the existing per-case logs.
+  Verified against synthetic fake `sol`/reference binaries covering match,
+  stdout-only-divergence, and fully-divergent cases (a real pinned Lua 5.5.1
+  reference build isn't available in this environment - see
+  `tests/lua55/README.md`).
 
 Still open, not part of this addendum: there is no fuzzing/seed concept in
 the differential runner (it replays fixed corpus fixtures, not generated
-inputs) and no separate "minimized failure report" artifact; there is no
+inputs, so the failure report's "seed" field is always `n/a`); there is no
 fuzzing/property-test infrastructure for the lexer/parser/table/GC items;
 and there is no release dashboard. See
 `docs/features/lua-compatibility.md`'s L8 section for the full
