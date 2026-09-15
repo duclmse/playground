@@ -7,7 +7,7 @@ by how much they'd cost to discover late.
 
 - **Runtime engine changed from Wasmoon (official C Lua via WASM) to Rust +
   piccolo (pure-Rust Lua-like VM via WASM).** Rationale in
-  [architecture.md](./architecture.md#runtime-choice-rust--piccolo). This
+  [architecture.md](./architecture.md#historicalcurrent-browser-runtime-rust--piccolo). This
   resolved what were risks §1 and §2 against the Wasmoon design (the
   debug-binding gap and the `SharedArrayBuffer`/cross-origin-isolation
   requirement - both marked resolved below) and introduced a new central risk in

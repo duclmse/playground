@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the Sol conformance suite: a hand-written typed `.sol` counterpart for
+# Run the typed Sol capability regression suite: a hand-written typed `.sol` counterpart for
 # every top-level file in the pinned Lua 5.5.1 test checkout
 # (lua-5.5.1-tests/*.lua), reinterpreted for Sol's typed surface where one
 # exists, or an honest "not applicable" stub where none does.
@@ -45,7 +45,7 @@ if [[ ${1:-} == --help ]]; then
 fi
 
 if [[ ! -f "$manifest" ]]; then
-  echo "Sol conformance manifest not found: $manifest" >&2
+  echo "Typed capability manifest not found: $manifest" >&2
   exit 2
 fi
 
@@ -149,7 +149,7 @@ else
 fi
 
 if [[ $validate_only == 1 ]]; then
-  printf 'Sol conformance manifest: %d entries, %d fixtures present\n' "$manifest_count" "$manifest_count"
+  printf 'Typed capability manifest: %d entries, %d fixtures present (not Lua compatibility evidence)\n' "$manifest_count" "$manifest_count"
   exit 0
 fi
 
@@ -181,7 +181,7 @@ while IFS=$'\034' read -r path sol status category expected note; do
   rm -f "$stderr_file"
 done <"$entries_file"
 
-printf '\nSol conformance suite: %d ported, %d not-applicable, %d failed (of %d total)\n' \
+printf '\nTyped capability regressions: %d ported, %d not-applicable, %d failed (of %d total; not Lua compatibility evidence)\n' \
   "$ported" "$not_applicable" "$failed" "$manifest_count"
 
 if ((failed != 0)); then

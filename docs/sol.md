@@ -1,15 +1,18 @@
 # Sol
 
-`crates/sol` is a typed, Lua-compatible language compiled straight to native code
-via [Cranelift](https://cranelift.dev/). It's a from-scratch answer to
-`faster_lua.md` (repo root): can a Lua-like language beat LuaJIT on typed
-numeric/data-oriented workloads by leaning on static types and native
-compilation instead of trying to out-optimize a dynamic interpreter?
+`crates/sol` is the native implementation of Sol's final goal: a Lua
+5.5-compatible superset with optional types, type inference, and native
+optimization tiers that ultimately outperform a pinned LuaJIT baseline on
+unchanged Lua applications. The accepted architecture and U0-U14 milestones
+are defined in the
+[unified runtime plan](features/unified-sol-runtime-plan.md).
 
-This is a **separate initiative** from `crates/vm`/`crates/lua-vm` (the browser
-debugger's Lua-_compatible_ VM - see `docs/architecture.md`). Nothing there
-changes; Sol accepts both `.lua` and `.sol` source files. Lua's fully dynamic
-runtime features remain an incremental compatibility target.
+The implementation has not reached that architecture yet. Typed `.sol` and
+dynamic `.lua` currently take separate compiler/runtime paths, and the browser
+still uses `crates/vm`/`crates/lua-vm`. These are migration baselines and test
+oracles, not permanent product boundaries. Current behavior remains documented
+here and in [the specification](spec/README.md) until each convergence milestone
+lands.
 
 ## Status
 
@@ -28,8 +31,8 @@ profiling, and call-boundary debugging. Uninstrumented execution uses a
 different generic monomorphization and contains no debug/profile runtime
 branch.
 
-Lua compatibility is an interpreter-first, byte-oriented dynamic runtime kept
-separate from typed Sol. A useful subset of tables, closures/upvalues,
+Lua compatibility is currently an interpreter-first, byte-oriented dynamic
+runtime implemented separately from typed Sol. A useful subset of tables, closures/upvalues,
 varargs/multiple results, iteration, protected calls, metatables, budgets,
 coroutines (stackful fibers), and portable libraries is implemented. Complete
 libraries, precise dynamic GC, escaping typed closure environments, richer
@@ -37,7 +40,7 @@ static algebraic types, and the typed/dynamic module bridge remain open. See
 the [feature documentation](features/README.md) for implementation status and
 the [language specification](spec/README.md) for observable behavior.
 
-### Feature matrix
+### Current implementation matrix
 
 This matrix records implemented execution paths; “separate” means the `.lua`
 runtime provides Lua semantics without routing values through typed Sol's
@@ -63,18 +66,13 @@ the value type's zero value. Maps support unboxed `i64`, `f64`, and `bool`
 values. Keys remain `i64`, and pointer-bearing keys/values remain rejected until
 precise GC entry layouts and write barriers make them safe.
 
-### Early results
+### Performance baseline
 
-From `benchmarks/RESULTS.md` (hyperfine, whole-process wall time - see that file
-for full methodology, the initial-to-optimized comparison, and caveats): on the two workloads
-sol currently has equivalent programs for, it beats not just reference Lua
-(3.8-8.5×) and this repo's own dynamic VM (19-40×), but **LuaJIT** (1.15-1.30×).
-Encouraging, not conclusive: two workloads, one machine. Notably, the optimizer
-work didn't move either benchmark's wall-clock time (within measurement noise) -
-both are documented, understood non-findings (a memory-bandwidth-bound loop
-doesn't care about one well-predicted bounds check; neither benchmark calls
-anything inlining could help), not a sign the passes don't work - see
-`benchmarks/RESULTS.md` for the direct A/B evidence.
+From `benchmarks/RESULTS.md` (hyperfine, whole-process wall time; see that file
+for methodology and caveats), typed `.sol` beats LuaJIT on several selected
+numeric/call/array workloads and loses on others such as object allocation.
+Those results validate the typed compiler but do not satisfy the final product
+goal, which is measured on unchanged, untyped Lua applications.
 
 **This claim is specifically about typed `.sol` programs, not `.lua`
 compatibility mode.** Sol's separate dynamic `.lua` interpreter
@@ -83,13 +81,12 @@ it, **26-334× slower than LuaJIT** across call/allocation/control-flow-heavy
 workloads, and 1.3-4.2× slower than even this project's own separate,
 unoptimized `crates/vm` tree-walking interpreter - see
 `benchmarks/RESULTS.md`'s "Phase 6 (L8)" section for the full table. This is
-expected: the dynamic path is a first-cut bytecode/tree-walking interpreter
-with no tiering, and closing that gap (were it ever prioritized) would mean
-building interpreter-level performance work first, not jumping straight to a
-tracing/method JIT on top of an interpreter that isn't yet competitive with
-this repo's own naive one. The "beats LuaJIT" headline is not, and should not
-be read as, a claim about ordinary dynamic Lua code run through `sol run
-foo.lua`.
+This is the U0 baseline: the dynamic path is an early interpreter with no
+native tier. Closing that gap is now an explicit product requirement, first
+through interpreter representation/dispatch work and then through inline
+caches, baseline JIT, optimizing SSA specialization, OSR, and deoptimization.
+Until the final gate passes, Sol must not use an unqualified “faster than
+LuaJIT” claim.
 
 Scalar replacement has its own, more direct verification: dumping the
 emitted Cranelift IR (`SOL_DUMP_CLIF=1 sol run ...`) for a `Point`
@@ -438,6 +435,16 @@ and `tests/lua55/README.md`.
 
 ## Architecture
 
+The target architecture is a shared byte-oriented frontend, semantic runtime,
+heap/GC, module graph, call ABI, and bytecode feeding portable interpreter,
+baseline JIT, optimizing JIT/OSR, and AOT tiers. Typed facts allow unboxed
+representations inside optimized frames; they do not select another runtime.
+See [the unified runtime plan](features/unified-sol-runtime-plan.md#3-target-architecture)
+and [the U0 decisions](decisions/README.md).
+
+The pipeline below describes the current typed implementation that will be
+retained and adapted as the optimizing tier:
+
 ```
 source (.sol)
    │
@@ -520,6 +527,7 @@ defines observable behavior without tying it to a delivery sequence.
 | Dynamic boundaries and execution | [Gradual typing](features/gradual-typing.md), [tiered execution](features/tiered-execution.md) |
 | Native tooling | [Native toolchain](features/native-toolchain.md), [debugging and profiling](features/debugging-and-profiling.md) |
 | Language/runtime expansion | [Feature delivery plan](features/delivery-plan.md), [Lua compatibility](features/lua-compatibility.md) |
+| Final architecture and gates | [Unified runtime plan](features/unified-sol-runtime-plan.md), [architecture decisions](decisions/README.md) |
 
 ## Trying it
 
@@ -527,6 +535,8 @@ defines observable behavior without tying it to a delivery sequence.
 cargo run --manifest-path crates/sol/Cargo.toml -- run crates/sol/tests/fixtures/extension_probe.sol
 cargo test --manifest-path crates/sol/Cargo.toml
 scripts/benchmark.sh --export-markdown benchmarks/RESULTS.md   # Sol is included wherever a matching .sol or legacy .sol exists
+scripts/project-status.sh --check                              # honest compatibility/capability summary
+scripts/project-status.sh --json                              # machine-readable U0 status
 
 sol run --dump-ir/--dump-asm/--jit-log/--target-info <file.lua|file.sol>   # compiler introspection
 cargo build --manifest-path crates/sol/Cargo.toml && ./crates/sol/target/debug/sol build <file.lua|file.sol> -o <out>   # AOT: needs the sibling libsol.a `cargo build` produces

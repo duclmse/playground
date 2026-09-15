@@ -1,10 +1,10 @@
-# Sol conformance suite inventory: one [[case]] row per top-level file in
+# Typed Sol capability regression inventory: one [[case]] row per top-level file in
 # the pinned Lua 5.5.1 test checkout (lua-5.5.1-tests/*.lua), each mapped to
 # a hand-written typed `.sol` counterpart under
 # crates/sol/tests/fixtures/sol-conformance/<same-stem>.sol.
 #
 # This is intentionally a small TOML subset read by
-# scripts/test-sol-conformance.sh - see that script and
+# scripts/test-sol-conformance-suite.sh - see that script and
 # tests/sol-conformance/README.md before changing the schema.
 #
 # `status = "ported"` means the `.sol` file is a genuine typed
@@ -17,8 +17,10 @@
 #
 # Unlike tests/lua55/manifest.toml, this suite is NOT compared against a
 # real Lua 5.5.1 oracle - `expected` values are self-authored from Sol's own
-# typed semantics, because the whole point of this suite is that typed Sol
-# and Lua are different languages with only partially-overlapping intent.
+# current typed semantics, because these fixtures are reinterpretations rather
+# than the unchanged source needed to establish Lua compatibility.
+# Neither status is Lua compatibility evidence. Only oracle-backed unchanged
+# source in tests/lua55/ contributes to the compatibility pass count.
 
 version = 1
 upstream = "Lua 5.5.1"

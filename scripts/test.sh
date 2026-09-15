@@ -16,10 +16,17 @@ cargo test --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
 log "cargo clippy (crates/sol, warnings denied)"
 cargo clippy --offline --manifest-path "$ROOT/crates/sol/Cargo.toml" --all-targets -- -D warnings
 
+log "cargo test + clippy (crates/sol-lsp)"
+cargo test --offline --manifest-path "$ROOT/crates/sol-lsp/Cargo.toml"
+cargo clippy --offline --manifest-path "$ROOT/crates/sol-lsp/Cargo.toml" --all-targets -- -D warnings
+
 log "Lua 5.5 corpus-manifest regression checks"
 "$ROOT/scripts/test-lua55-manifest.sh"
 
-log "Sol supported Lua conformance profile"
+log "Unified product status gate (classification is not compatibility)"
+"$ROOT/scripts/test-project-status.sh"
+
+log "Focused supported-Lua fixture regressions"
 "$ROOT/scripts/test-sol-conformance.sh"
 
 log "Sol M10 typed-map benchmark smoke test"

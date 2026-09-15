@@ -1,5 +1,11 @@
 # Feature delivery plan
 
+> Historical/current-implementation plan. Its checked items remain useful
+> status evidence, but future architecture and ordering are superseded by the
+> [unified Sol runtime plan](unified-sol-runtime-plan.md). In particular,
+> `.lua` compatibility is no longer intended to remain a permanently separate
+> product runtime or be exempt from the LuaJIT performance goal.
+
 > Status: compiler foundations, typed data, nonescaping closures/modules,
 > explicit dynamic narrowing, and an interpreter-first Lua subset are
 > implemented. The unchecked items below remain planned.

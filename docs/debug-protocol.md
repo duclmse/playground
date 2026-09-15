@@ -237,7 +237,7 @@ interface LuaValue {
 
 These values are marshaled across the `wasm-bindgen` boundary from piccolo's own
 Rust value representation - see
-[architecture.md](./architecture.md#runtime-choice-rust--piccolo) for where that
+[architecture.md](./architecture.md#historicalcurrent-browser-runtime-rust--piccolo) for where that
 boundary sits.
 
 ### Reference identity (`ObjectRegistry`)

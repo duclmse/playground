@@ -1,8 +1,14 @@
-# Lua Playground - Docs
+# Sol project documentation
 
-A browser-based Lua playground with a real debugger and object inspector,
-built on a real Lua VM compiled to WebAssembly rather than a hand-rolled
-TypeScript interpreter.
+Sol is converging on one Lua 5.5-compatible language/runtime with optional
+types, native optimization tiers, a WebAssembly playground/debugger, an LSP,
+and a first-party VS Code client. Start with the
+[product brief](product-brief.md) and the
+[unified runtime roadmap](features/unified-sol-runtime-plan.md).
+
+The browser playground and typed/native compiler were built as independent
+efforts. Their documents remain useful descriptions of current behavior, but
+U0 makes their convergence—not permanent separation—the accepted direction.
 
 This directory was restructured from a single design narrative
 (`browser-based Lua playground.md`) into a standard doc set. That original
@@ -10,31 +16,32 @@ file is kept as-is - it's the source rationale and contains useful
 diagrams/examples - but the documents below are the ones to build from; they
 correct a few assumptions the original made and fill in gaps it left open.
 
-**Runtime decision:** the engine is **Rust + piccolo, compiled to
-WebAssembly** - not Wasmoon/official C Lua, which the original doc and an
-earlier version of this doc set assumed. See
-[architecture.md](./architecture.md#runtime-choice-rust--piccolo) for why,
-and [risks.md](./risks.md#decision-log) for what that changed.
+**Current browser runtime:** Rust + Piccolo compiled to WebAssembly. It remains
+the shipping engine and migration oracle until the canonical `sol-wasm`
+runtime reaches debugger and semantic parity. See
+[architecture.md](./architecture.md#historicalcurrent-browser-runtime-rust--piccolo)
+for its historical rationale.
 
 ## Sol documentation
 
-The typed/native Sol compiler is a separate project from the browser runtime
-documented below. Start with [the Sol overview](sol.md), then use:
+Start with [the Sol overview](sol.md), then use:
 
 - [Feature documentation](features/README.md) for implementation design,
   status, verification, and remaining work.
-- [Language specification](spec/README.md) for normative `.sol` and `.lua`
-  behavior and their explicit compatibility boundary.
+- [Language specification](spec/README.md) for current observable `.sol` and
+  `.lua` behavior during migration.
+- [Architecture decisions](decisions/README.md) for the accepted U0 choices.
 
 ## Reading order
 
-1. [product-brief.md](./product-brief.md) - what we're building, for whom, and what v1 explicitly excludes.
-2. [architecture.md](./architecture.md) - layers, project/package structure, runtime choice, worker model.
-3. [debug-protocol.md](./debug-protocol.md) - the DebugSession API, state machine, stepping algorithms, value/inspector model.
-4. [roadmap.md](./roadmap.md) - phased delivery plan and the MVP-1 feature cut line.
-5. [risks.md](./risks.md) - open questions and technical risks that need resolving before or during the phases above, including the one that should be spiked first.
-6. [conformance.md](./conformance.md) - the Lua conformance test plan, needed because the runtime is no longer the official reference implementation.
-7. [phase-4-8-implementation.md](./phase-4-8-implementation.md) - what's actually built vs. designed-but-deferred for the debugger engine and its Phase 8 advanced features, and three places the implementation diverged from this doc set's original design once it was actually built.
+1. [product-brief.md](./product-brief.md) - the unified product contract.
+2. [features/unified-sol-runtime-plan.md](./features/unified-sol-runtime-plan.md) - U0-U14 milestones and gates.
+3. [architecture.md](./architecture.md) - target layers plus the current Piccolo implementation.
+4. [debug-protocol.md](./debug-protocol.md) - the current debugger protocol and inspector model.
+5. [roadmap.md](./roadmap.md) - historical browser delivery phases.
+6. [risks.md](./risks.md) - browser implementation risks and decision history.
+7. [conformance.md](./conformance.md) - current Piccolo conformance fixtures/deviations.
+8. [phase-4-8-implementation.md](./phase-4-8-implementation.md) - implemented debugger features and findings.
 
 ## Status
 

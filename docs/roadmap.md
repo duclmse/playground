@@ -1,5 +1,11 @@
 # Roadmap
 
+> Historical browser-delivery roadmap. These phases describe how the existing
+> Piccolo-backed playground/debugger was built. Future product work follows the
+> [unified Sol runtime U0-U14 roadmap](features/unified-sol-runtime-plan.md),
+> which migrates this UI onto Sol's canonical runtime and adds LSP/VS Code
+> delivery. Do not use the phase list below as the current product roadmap.
+
 Eight phases, plus an up-front conformance harness. Phases 1–2 produce a
 usable (non-debugging) playground; Phase 5 is the first point where a *real
 debugger* exists; Phases 6–8 build out the inspector, evaluation, and

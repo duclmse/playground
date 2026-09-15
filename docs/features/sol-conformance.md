@@ -1,7 +1,9 @@
-# Sol conformance suite
+# Typed Sol capability regression suite
 
-> Status: implemented. 22 of the 34 top-level `lua-5.5.1-tests` files have a
-> genuine typed-Sol port; 12 are honest "not applicable" stubs. See
+> Status: implemented under the legacy `sol-conformance` path. Twenty-two of
+> the 34 top-level `lua-5.5.1-tests` files have a genuine typed-Sol
+> reinterpretation; 12 are honest "not applicable" stubs. This is not Lua
+> compatibility or conformance evidence. See
 > [tests/sol-conformance/README.md](../../tests/sol-conformance/README.md)
 > for how to run it.
 
@@ -9,7 +11,7 @@
 "does Sol's `.lua`-compatibility mode run real upstream Lua source
 correctly?" This suite answers a different question: for each thing the
 upstream Lua 5.5.1 test suite checks, is there a meaningful reinterpretation
-of that same intent in Sol's *typed* `.sol` surface - a different, statically
+of that same intent in Sol's current *typed* `.sol` surface - a different, statically
 typed language with no coroutines, no C API, no metatables, no `io`/`os`, no
 pattern matching, and no dynamic table/global model?
 
@@ -33,7 +35,7 @@ against a real Lua 5.5.1 interpreter's output.** There is no meaningful
 "matches Lua" question to ask about a typed reinterpretation of a dynamic
 test file - `expected` values are self-authored from Sol's own typed
 semantics. What the suite actually guards against is a silent regression in
-Sol's typed semantics landing on exactly the corner cases each upstream
+Sol's typed capabilities landing on exactly the corner cases each upstream
 file's *intent* maps to.
 
 ## Ported vs. not applicable

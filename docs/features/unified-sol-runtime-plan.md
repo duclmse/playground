@@ -1,7 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
-> Status: proposed convergence roadmap. This document defines the intended end
-> state and the order for future work. It does not change the current language
+> Status: accepted convergence roadmap; U0 completed 2026-09-15. This document
+> defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
 >
@@ -504,7 +504,7 @@ Each milestone is independently reviewable. Its implementation, tests,
 benchmarks, documentation, and migration notes land together. A later milestone
 may prototype early, but may not declare an earlier exit gate complete.
 
-### U0 — Charter, baselines, and decision records
+### U0 — Charter, baselines, and decision records — **complete**
 
 **Purpose:** stop architectural drift before more implementation work.
 
@@ -525,6 +525,27 @@ Deliverables:
 Exit gate: all top-level documents describe one product and link to the same
 compatibility/performance definitions; baseline commands reproduce on a clean
 checkout.
+
+Delivered in U0:
+
+- unified the product brief, architecture overview, repository guides, spec
+  introduction, CLI overview, and historical-roadmap pointers;
+- accepted ADRs 0001-0006 under `docs/decisions/`;
+- captured `baselines/u0-2026-09-15.json`, explicitly distinguishing the last
+  complete dynamic benchmark suite from later targeted remeasurements;
+- added `scripts/project-status.sh` with text/JSON output, classification
+  validation, and a strict full-compatibility gate;
+- added `scripts/test-project-status.sh` to prevent typed capability ports from
+  being counted as oracle-backed Lua compatibility;
+- reclassified the legacy `sol-conformance` suite as typed capability
+  regressions in documentation, test names, and script output;
+- wired LSP checks and the unified status gate into `scripts/test.sh`.
+
+Verification at completion: `scripts/test.sh` passed the native Sol suite,
+browser runtime/conformance suite, strict Sol/LSP Clippy, manifest/status
+checks, focused Lua fixtures, typed benchmark smoke, and web production build.
+The honest baseline remains 0/34 oracle-backed upstream passes, 26 pending, and
+8 host-required; U0 records that gap rather than changing runtime behavior.
 
 ### U1 — Superset frontend and semantic AST
 

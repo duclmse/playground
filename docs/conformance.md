@@ -9,7 +9,7 @@
 
 Piccolo is a from-scratch, pure-Rust Lua-_like_ VM, not a build of the official
 C reference implementation (see
-[architecture.md](./architecture.md#runtime-choice-rust--piccolo)). That means
+[architecture.md](./architecture.md#historicalcurrent-browser-runtime-rust--piccolo)). That means
 this project no longer inherits language conformance for free - it has to
 validate it, on an ongoing basis, itself. This document is that plan.
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run Sol's currently supported Lua conformance profile with exact output.
+# Run focused, currently supported Lua fixtures with exact output. Passing
+# these fixtures does not promote a complete upstream corpus file.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -27,4 +28,4 @@ for fixture in "${fixtures[@]}"; do
   passed=$((passed + 1))
 done
 
-printf 'Sol Lua conformance: %d supported fixtures passed\n' "$passed"
+printf 'Supported Lua fixture regressions: %d passed (0 complete upstream cases implied)\n' "$passed"

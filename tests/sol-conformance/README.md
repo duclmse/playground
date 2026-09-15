@@ -1,4 +1,8 @@
-# Sol conformance suite
+# Typed Sol capability regression suite
+
+The directory name is retained for compatibility with existing scripts and
+test paths. This suite is not Lua conformance evidence and must never be added
+to the upstream compatibility pass count.
 
 [manifest.toml](manifest.toml) maps every top-level file in the pinned Lua
 5.5.1 test checkout (`lua-5.5.1-tests/*.lua`, see
@@ -33,7 +37,7 @@ stdout. **These values are self-authored from Sol's own typed semantics, not
 copied from a Lua oracle** - unlike `tests/lua55/`, there is no meaningful
 "does Sol's output match real Lua's output" question to ask here, since the
 two programs aren't doing the same computation in the first place. What this
-suite actually guards against is silent regressions in Sol's typed semantics
+suite actually guards against is silent regressions in Sol's typed capabilities
 across the specific corner cases each upstream file's intent maps to (integer
 wraparound, generational-GC write barriers, `Map`/`Array` iteration order,
 `any`/`is`/`as` narrowing, and so on).

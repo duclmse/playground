@@ -1,16 +1,37 @@
 # Architecture
 
-See [product-brief.md](./product-brief.md) for goals/non-goals and
-[risks.md](./risks.md) for the open technical question this architecture
-depends on (§1, piccolo's debug-introspection surface).
+See [product-brief.md](./product-brief.md) for the product contract and the
+[unified runtime plan](./features/unified-sol-runtime-plan.md) for milestone
+ordering and release gates.
 
-> **Decision (superseded Wasmoon):** the runtime is **Rust + piccolo,
-> compiled to WebAssembly**, not Wasmoon/official-C-Lua. See
-> [Runtime choice](#runtime-choice-rust--piccolo) below for why, and
-> [risks.md](./risks.md) for the tradeoff this creates (Lua-like semantics,
-> not certified-conformant - mitigated by [conformance.md](./conformance.md)).
+> **Accepted direction (U0):** `crates/sol` becomes the canonical Lua
+> 5.5-compatible semantic runtime for native execution, WebAssembly, debugging,
+> and tooling. The existing Piccolo runtime remains the current browser engine
+> and a migration oracle until U12 reaches parity; it is not the final product
+> architecture. The historical Piccolo decisions below explain the currently
+> shipped playground and must not be read as overriding the unified direction.
 
-## Layers
+## Target layers
+
+```mermaid
+flowchart TB
+    Source[.lua and .sol source] --> Core[sol-core frontend and semantic runtime]
+    Core --> Interpreter[Portable bytecode interpreter]
+    Core --> Native[Baseline and optimizing native tiers]
+    Core --> Analysis[Binder and gradual type inference]
+    Interpreter --> Wasm[sol-wasm]
+    Wasm --> Web[Web worker and debugger UI]
+    Analysis --> LSP[sol-lsp]
+    LSP --> VSCode[First-party VS Code client]
+    Native --> CLI[sol CLI / AOT / embedding]
+```
+
+All paths share Lua semantics, runtime object identity, modules, and GC. Typed
+and dynamic values may use different physical representations inside optimized
+frames; checked adapters and one semantic ABI connect them. The detailed crate
+boundaries are recorded in [ADR 0004](decisions/0004-runtime-boundary-and-abi.md).
+
+## Current browser layers
 
 ```mermaid
 flowchart TB
@@ -71,31 +92,26 @@ doesn't require touching the UI:
 5. **UI** - React. **React must not know anything about Lua internals** - it
    only talks to `DebugSession`.
 
-## Lua dialect
+## Target language and transitional browser dialect
 
-Target **piccolo's Lua-like language**, which tracks Lua 5.4 syntax and core
-semantics closely but is a from-scratch pure-Rust implementation, not a
-build of the official C source - it is **not** guaranteed conformant, and
-its standard-library coverage is smaller. This is a deliberate tradeoff (see
-[Runtime choice](#runtime-choice-rust--piccolo) below), not an oversight,
-and it's tracked on an ongoing basis rather than assumed away - see
-[conformance.md](./conformance.md) for the test plan and the running
-known-deviations ledger.
+The target language is the pinned Lua 5.5 revision plus contextual Sol type and
+extension syntax. `.lua` and annotation-free `.sol` must have identical
+semantics and use the same runtime. PUC Lua is the compatibility oracle;
+LuaJIT is a performance comparator.
 
-Keep the runtime adapter-based so other engines are additive, not a
-rewrite - this matters more now, not less, since it's what lets a gap found
-in piccolo's semantics be patched by falling back to an alternate engine for
-specific cases without a UI-level rewrite:
+The current browser still executes Piccolo's Lua-like language, which tracks
+Lua 5.4 syntax and core semantics but is not certified conformant. Its known
+deviations remain tracked in [conformance.md](./conformance.md) while U12
+migrates the existing debugger UI to the portable Sol runtime:
 
 ```text
 Lua Debugger
      │
-     ├── piccolo adapter (Rust/WASM)     (v1)
-     ├── official-Lua adapter            future, if conformance gaps prove blocking
-     └── LuaJIT adapter                  future
+     ├── piccolo adapter (current production, migration oracle)
+     └── sol-wasm adapter (target production runtime)
 ```
 
-## Runtime choice: Rust + piccolo
+## Historical/current browser runtime: Rust + Piccolo
 
 **piccolo** (`kyren/piccolo`) is a Lua-like VM implemented in pure Rust,
 using the `gc-arena` crate for an arena-based, generational GC designed so

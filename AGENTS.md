@@ -1,18 +1,27 @@
 # Repository guide
 
-This repository contains two related but independent Lua efforts:
+This repository is converging on one Sol product: a Lua 5.5-compatible
+superset with optional types, a shared semantic runtime, native tiers, a web
+playground, and editor tooling. The authoritative future roadmap is
+`docs/features/unified-sol-runtime-plan.md`.
 
-- `crates/lua-vm` is the browser runtime, built on the vendored `crates/vm`
-  (a patched Piccolo fork) and compiled to WebAssembly for `apps/web`.
-- `crates/sol` is a separate typed, native-oriented Sol compiler/JIT. Its
-  implementation status is in `docs/features/` and its language contract is
-  in `docs/spec/`.
+The current implementation still contains two runtime efforts during that
+migration:
+
+- `crates/lua-vm` is the current browser runtime, built on the vendored
+  `crates/vm` (a patched Piccolo fork) and compiled to WebAssembly for
+  `apps/web`. It is a migration oracle/fallback, not the final production
+  engine.
+- `crates/sol` contains the native compiler/JIT and the in-progress Lua 5.5
+  runtime that will become canonical. Its implementation status is in
+  `docs/features/` and its current language contract is in `docs/spec/`.
 - `crates/decompiler` is an independent recovery-oriented decompiler for
   raw Sol instruction words and version-matched Lua binary chunks.
 
-Do not assume a change to one runtime applies to the other. Keep their
-semantics, tests, and documentation separate unless a task explicitly spans
-both.
+Do not assume a change to one runtime already applies to the other. During the
+migration, keep differential tests and current-status documentation explicit,
+but do not introduce new permanent product semantics that depend on choosing a
+runtime by file extension.
 
 ## Layout
 
@@ -49,6 +58,7 @@ Use the project wrappers for cross-component checks:
 
 ```sh
 scripts/test.sh                 # lua-vm tests, corpus-manifest check, web build if deps exist
+scripts/project-status.sh --check # honest compatibility/capability/architecture summary
 npm run build --workspace=apps/web
 scripts/build-wasm.sh           # regenerates packages/lua-runtime/pkg after lua-vm changes
 ```
@@ -75,8 +85,10 @@ system Lua executable as its oracle.
   for Sol.
 - Keep the browser runtime sandboxed: host filesystem, OS, and native loading
   capabilities must stay explicit.
-- Keep Sol's typed and dynamic representations separate. `.lua` compatibility
-  features must not implicitly box or weaken typed `.sol` hot paths.
+- Keep Sol's typed and dynamic *representations* distinct where performance
+  requires it, while converging them on one object model, heap, GC, module
+  graph, and call ABI. `.lua` compatibility must not implicitly box proven
+  typed hot paths.
 - Add focused regression coverage with behavior changes. For Lua compatibility,
   update the corpus manifest/fixture and status documentation together.
 - Preserve byte-oriented Lua source handling in Sol; do not require source or
