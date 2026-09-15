@@ -11,7 +11,8 @@ mod value;
 pub use capabilities::Capabilities;
 pub use heap::{
     ClosureObject, Collection, CollectionKind, ErrorObject, FinalizerState, GcGeneration, Heap,
-    HeapError, HeapObject, ObjectHeader, ObjectKind, RootId, StackMap, StackMapError, TableKey,
-    TableObject, ThreadObject, ThreadStatus, UpvalueObject, UserdataObject, WeakHandle,
+    HeapError, HeapObject, NativeCallableObject, ObjectHeader, ObjectKind, RootId, StackMap,
+    StackMapError, TableKey, TableObject, ThreadObject, ThreadStatus, UpvalueObject,
+    UserdataObject, WeakHandle,
 };
 pub use value::{ObjectId, Value, ValueTag};

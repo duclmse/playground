@@ -45,15 +45,20 @@ contracts.
 ## Transitional adapter
 
 `sol::lua_runtime::CanonicalAdapter` can import legacy nil, boolean, integer,
-float, byte-string, and table graphs. One adapter instance memoizes every
-legacy table pointer, preserving repeated references and cycles. It also maps
-the existing typed scalar ABI to canonical values without allocating a wrapper.
+float, byte-string, table, Lua-closure, shared-upvalue, standard-library
+native-callable, and raised-error graphs. One adapter instance memoizes object
+pointers, preserving repeated references, shared cells, and cycles. Legacy globals become
+an explicit shared `_ENV` upvalue. Standard-library callables use portable
+`(provider, function)` registry identifiers rather than Rust function pointers.
+The adapter also maps the existing typed scalar ABI to canonical values without
+allocating a wrapper.
 
 The adapter is intentionally one-way and snapshot-based. It rejects legacy
-closures, native callables, iterators, userdata, and coroutine frames rather
-than inventing unsafe cross-collector ownership. A migrated object graph must
-have one authoritative owner; code must not mutate a legacy graph and its
-canonical snapshot as though they were the same live object.
+native bridge callables that have no provider registration, stateful iterators,
+userdata, and coroutine frames rather than inventing unsafe cross-collector
+ownership. A migrated object graph must have one authoritative owner; code must
+not mutate a legacy graph and its canonical snapshot as though they were the
+same live object.
 
 ## Verified invariants
 
@@ -62,12 +67,16 @@ Forced-collection tests cover:
 - identity, slot reuse, and stale handles;
 - string interning and Lua numeric table-key canonicalization;
 - `_ENV` and captured-upvalue reachability;
+- native-callable capture tracing and portable provider/function IDs;
+- raised-error payload identity and reachability;
 - weak values and ephemeron reachability;
 - one-shot finalizer queueing and callback-window survival;
 - suspended coroutine roots;
 - old-to-young write barriers;
 - stack maps that expose only declared frame slots;
-- cyclic/repeated legacy-table import and typed scalar round trips.
+- cyclic/repeated legacy-table import, production-created recursive closure
+  import with its real library `_ENV`, standard-library callable identity, and
+  typed scalar round trips.
 
 These checks run in `scripts/test.sh` with warnings denied.
 

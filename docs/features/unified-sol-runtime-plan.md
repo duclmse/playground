@@ -609,8 +609,11 @@ kinds, explicit host capabilities, `_ENV` closure upvalues, precise registered
 roots/stack maps, generational metadata and barriers, weak tables, ephemerons,
 finalizer queues, and coroutine tracing. Focused forced-collection tests cover
 these invariants. A transitional adapter preserves legacy scalar, string,
-table, cycle, and repeated-reference identity when importing old `LuaValue`
-graphs, and preserves unboxed typed scalars at the typed boundary.
+table, closure, shared-upvalue, `_ENV`, standard-library native-callable,
+raised-error, cycle, and repeated-reference identity when importing old
+`LuaValue` graphs, and preserves unboxed typed scalars at the typed boundary. Canonical native
+callables carry portable provider/function registry IDs and traced captures,
+never raw host pointers.
 
 The production Lua runtime now uses `sol_core::Capabilities` directly instead
 of maintaining a second coarse `os`/`io` authority type. Clock, environment,

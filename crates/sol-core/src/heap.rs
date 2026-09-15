@@ -8,6 +8,7 @@ pub enum ObjectKind {
     String,
     Table,
     Closure,
+    NativeCallable,
     Upvalue,
     Thread,
     Userdata,
@@ -62,6 +63,18 @@ pub struct ClosureObject {
     pub environment: usize,
 }
 
+/// A runtime/provider callback and the managed values it closes over.
+///
+/// `(provider, function)` is a portable registry key, never a process pointer.
+/// Native and WASM hosts resolve it through their own provider registry while
+/// the portable heap owns identity and captured-value tracing.
+#[derive(Debug, Clone)]
+pub struct NativeCallableObject {
+    pub provider: u32,
+    pub function: u32,
+    pub captures: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UpvalueObject {
     pub value: Value,
@@ -101,6 +114,7 @@ pub enum HeapObject {
     String(Vec<u8>),
     Table(TableObject),
     Closure(ClosureObject),
+    NativeCallable(NativeCallableObject),
     Upvalue(UpvalueObject),
     Thread(ThreadObject),
     Userdata(UserdataObject),
@@ -113,6 +127,7 @@ impl HeapObject {
             Self::String(_) => ObjectKind::String,
             Self::Table(_) => ObjectKind::Table,
             Self::Closure(_) => ObjectKind::Closure,
+            Self::NativeCallable(_) => ObjectKind::NativeCallable,
             Self::Upvalue(_) => ObjectKind::Upvalue,
             Self::Thread(_) => ObjectKind::Thread,
             Self::Userdata(_) => ObjectKind::Userdata,
@@ -369,6 +384,19 @@ impl Heap {
             upvalues,
             environment,
         })))
+    }
+
+    pub fn alloc_native_callable(
+        &mut self,
+        provider: u32,
+        function: u32,
+        captures: Vec<Value>,
+    ) -> ObjectId {
+        self.alloc(HeapObject::NativeCallable(NativeCallableObject {
+            provider,
+            function,
+            captures,
+        }))
     }
 
     pub fn alloc_thread(&mut self, stack: Vec<Value>) -> ObjectId {
@@ -739,6 +767,11 @@ impl Heap {
                         mark_id(*upvalue, self, marked, queue);
                     }
                 }
+                HeapObject::NativeCallable(callable) => {
+                    for value in &callable.captures {
+                        mark_value(*value, self, marked, queue);
+                    }
+                }
                 HeapObject::Upvalue(upvalue) => mark_value(upvalue.value, self, marked, queue),
                 HeapObject::Thread(thread) => {
                     for value in thread.stack.iter().chain(&thread.yielded) {
@@ -939,6 +972,24 @@ mod tests {
         assert!(heap.contains(environment_cell));
         heap.remove_root(root);
         assert_eq!(heap.collect_major().reclaimed, 3);
+    }
+
+    #[test]
+    fn native_callable_registry_ids_and_captures_are_portable_roots() {
+        let mut heap = Heap::default();
+        let captured = heap.alloc_table();
+        let callable = heap.alloc_native_callable(7, 11, vec![Value::object(captured)]);
+        let HeapObject::NativeCallable(object) = heap.object(callable).unwrap() else {
+            panic!("allocated native callable has the wrong object kind")
+        };
+        assert_eq!((object.provider, object.function), (7, 11));
+
+        let root = heap.add_root(Value::object(callable));
+        heap.collect_major();
+        assert!(heap.contains(callable));
+        assert!(heap.contains(captured));
+        heap.remove_root(root);
+        assert_eq!(heap.collect_major().reclaimed, 2);
     }
 
     #[test]
