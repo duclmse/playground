@@ -179,7 +179,10 @@ represented by the current scalar-only `any` box.
       loop when any control value (start/stop/step) is a float, matching real
       Lua, instead of unconditionally requiring integer control values (this
       used to make any `for i = 1, math.huge do ... end` fail before its
-      first iteration). Arithmetic still has no automatic string-to-number
+      first iteration). Integer loops now terminate at `i64` overflow instead
+      of wrapping forever. Integer floor division/modulo follow the divisor's
+      sign and shifts handle `i64::MIN` without recursive negation, matching
+      the corresponding typed helpers. Arithmetic still has no automatic string-to-number
       coercion at all (`"2" + "3"` errors; real Lua coerces numeral strings
       in arithmetic contexts) — open.
 - [x] Add Lua bytecode registers, constants, upvalue descriptors, and source
@@ -276,10 +279,11 @@ typed top-level function values.
       display text still uses non-metamethod-aware `display_bytes()`, matching
       real Lua's `error()`/`assert()`, which don't invoke `__tostring` (only
       `lua.c`'s top-level `msghandler` does).
-- [x] Specify tail-call behavior. Calls in tail position currently use ordinary
-      bounded frames (no frame elision), preserving protected-call errors and
-      stack traces. Proper-tail-call optimization remains a performance/fidelity
-      follow-up and must retain those observables when added.
+- [x] Specify and implement tail-call behavior. The generic compiler emits an
+      explicit semantic tail call for a sole returned call expression. Lua
+      closure calls replace the active trampoline frame without increasing the
+      call-depth charge; native and protected continuations retain the caller
+      frame only when their observable error/yield behavior requires it.
 - [ ] Implement the `.sol` bridge for calling dynamic functions as `any` and
       checked conversion to a typed function signature. Enforce arity/result
       checks at the bridge; do not let `LuaValue` appear in typed IR absent an

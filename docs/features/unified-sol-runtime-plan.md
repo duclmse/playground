@@ -666,9 +666,14 @@ publishes the same frame-state transitions to its existing zero-cost hooks.
 Both compilers emit explicit semantic tail calls: generic Lua closure frames are
 replaced in the trampoline, and specialized bytecode redispatches in a loop, so
 deep proper tail recursion does not consume native or heap frame depth. U3
-remains in progress until every result/error/yield transition uses this ABI,
-the dispatcher can execute both opcode families, and the legacy
-extension-selected partition path is removed.
+now also routes annotation-free `.lua` and `.sol` through the same generic
+runtime based on AST type surface rather than filename; an explicit annotation
+selects the specialized/partitioned path. This exposed and fixed dynamic
+integer-loop overflow, negative-divisor floor arithmetic, and minimum-integer
+shift discrepancies. U3 remains in progress until every result/error/yield
+transition uses this ABI, the dispatcher can execute both opcode families, and
+the remaining typed/dynamic partition bridge is represented by canonical
+callables rather than a separate raw-pointer path.
 
 ### U4 — Gradual type system and sound static inference
 
