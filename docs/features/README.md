@@ -19,6 +19,7 @@ specification](../spec/README.md).
 | Tiered execution | Implemented with one native promotion tier | [Tiered execution](tiered-execution.md) |
 | Native toolchain | Implemented, platform scope documented | [Native toolchain](native-toolchain.md) |
 | Debugging and profiling | Implemented at call boundaries | [Debugging and profiling](debugging-and-profiling.md) |
+| Unified final-goal roadmap | Proposed convergence plan | [One Lua-compatible Sol runtime](unified-sol-runtime-plan.md) |
 | Language/runtime expansion | Partially implemented | [Feature delivery plan](delivery-plan.md) |
 | Lua compatibility | Interpreter-first subset implemented | [Lua compatibility](lua-compatibility.md) |
 | Sol conformance suite | 22/34 upstream Lua 5.5.1 tests ported to typed `.sol`, 12 not applicable | [Sol conformance suite](sol-conformance.md) |

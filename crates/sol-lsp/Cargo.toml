@@ -1,0 +1,17 @@
+[package]
+name = "sol-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "Language Server Protocol implementation for Sol: typed .sol and Lua-compatible .lua source, sharing crates/sol's lexer/parser/typeck front end. See docs/sol-lsp.md."
+
+[[bin]]
+name = "sol-lsp"
+path = "src/main.rs"
+
+[dependencies]
+sol = { path = "../sol" }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "macros"] }
+dashmap = "5"
+
+[dev-dependencies]

@@ -1,5 +1,10 @@
 # Execution plan: Sol as a Lua 5.5 superset, faster than LuaJIT
 
+> Future architecture and milestone ordering are superseded by
+> [the unified Sol runtime final-goal plan](unified-sol-runtime-plan.md).
+> Completed phases and measurements in this document remain implementation
+> history and establish the baseline from which that convergence plan starts.
+
 This is the concrete, sequenced execution plan for closing the gaps found in
 the 2026-09 review of `crates/sol`. It complements
 [`lua-compatibility.md`](lua-compatibility.md)'s L0–L8 checklist (which

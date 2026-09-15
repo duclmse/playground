@@ -27,6 +27,8 @@ both.
   and Lua-compatibility fixtures.
 - `crates/decompiler` — standalone library/CLI that emits annotated
   Sol-style register code from Sol bytecode or `luac` listings/chunks.
+- `crates/sol-lsp` — standalone LSP server for both `.sol` and `.lua`, built
+  on `crates/sol`. See `docs/sol-lsp.md`.
 - `docs` — architecture, protocol, conformance, feature, and specification documents.
 - `tests/lua55` — Lua 5.5 corpus manifest and reference-oracle metadata.
 
@@ -40,6 +42,7 @@ cargo test --manifest-path crates/lua-vm/Cargo.toml
 cargo test --manifest-path crates/sol/Cargo.toml
 cargo test --manifest-path crates/decompiler/Cargo.toml
 cargo test --manifest-path crates/dap-server/Cargo.toml
+cargo build --manifest-path crates/sol-lsp/Cargo.toml
 ```
 
 Use the project wrappers for cross-component checks:
