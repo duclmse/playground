@@ -14,13 +14,14 @@ specification](../spec/README.md).
 | Typed compiler pipeline | Implemented | [Compiler pipeline](compiler-pipeline.md) |
 | Optimization | Implemented, with scoped follow-ups | [Optimization](optimization.md) |
 | Records and escape analysis | Implemented, with scoped follow-ups | [Records and escape analysis](records-and-escape-analysis.md) |
-| Memory management | Conservative collector implemented; precise/generational work open | [Memory management](memory-management.md) |
+| Memory management | Conservative, non-moving generational collector implemented; precise/incremental work open | [Memory management](memory-management.md) |
 | Gradual typing | Implemented for the documented value families | [Gradual typing](gradual-typing.md) |
 | Tiered execution | Implemented with one native promotion tier | [Tiered execution](tiered-execution.md) |
 | Native toolchain | Implemented, platform scope documented | [Native toolchain](native-toolchain.md) |
 | Debugging and profiling | Implemented at call boundaries | [Debugging and profiling](debugging-and-profiling.md) |
 | Language/runtime expansion | Partially implemented | [Feature delivery plan](delivery-plan.md) |
 | Lua compatibility | Interpreter-first subset implemented | [Lua compatibility](lua-compatibility.md) |
+| Sol conformance suite | 22/34 upstream Lua 5.5.1 tests ported to typed `.sol`, 12 not applicable | [Sol conformance suite](sol-conformance.md) |
 
 ## Documentation rules
 

@@ -10,6 +10,9 @@ packages/lua-runtime/pkg/
 # App build output
 dist/
 
+# scripts/build-sol-demo.sh's AOT output
+examples/sol-demo/build/
+
 # Screenshots from apps/web/e2e/verify-debugger-features.mjs
 apps/web/e2e/screenshots/
 

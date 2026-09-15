@@ -1,0 +1,296 @@
+# Sol conformance suite inventory: one [[case]] row per top-level file in
+# the pinned Lua 5.5.1 test checkout (lua-5.5.1-tests/*.lua), each mapped to
+# a hand-written typed `.sol` counterpart under
+# crates/sol/tests/fixtures/sol-conformance/<same-stem>.sol.
+#
+# This is intentionally a small TOML subset read by
+# scripts/test-sol-conformance.sh - see that script and
+# tests/sol-conformance/README.md before changing the schema.
+#
+# `status = "ported"` means the `.sol` file is a genuine typed
+# reinterpretation of the upstream file's intent, and `expected` is its
+# exact `sol run` stdout. `status = "not-applicable"` means the upstream
+# file exercises a subsystem typed Sol does not have (the C API, a
+# standalone executable's CLI, coroutines, io/os, a debug library, pattern
+# matching, native modules, ...); its `.sol` file is an intentional stub
+# that always returns 0, documented with why no analogue exists.
+#
+# Unlike tests/lua55/manifest.toml, this suite is NOT compared against a
+# real Lua 5.5.1 oracle - `expected` values are self-authored from Sol's own
+# typed semantics, because the whole point of this suite is that typed Sol
+# and Lua are different languages with only partially-overlapping intent.
+
+version = 1
+upstream = "Lua 5.5.1"
+
+[[case]]
+path = "all.lua"
+sol = "all.sol"
+category = "distribution-driver"
+status = "not-applicable"
+expected = "0"
+note = "Drives the whole distribution's test suite through the standalone executable; no typed-Sol analogue of a suite driver."
+
+[[case]]
+path = "api.lua"
+sol = "api.sol"
+category = "c-api"
+status = "not-applicable"
+expected = "0"
+note = "Exercises Lua's embeddable C API directly; Sol's only native boundary is scalar extern function calls."
+
+[[case]]
+path = "attrib.lua"
+sol = "attrib.sol"
+category = "attributes-and-close"
+status = "ported"
+expected = "5050"
+note = "<close> and any-typed native calls are unsupported; <const> locals are, so this exercises a <const> local instead."
+
+[[case]]
+path = "big.lua"
+sol = "big.sol"
+category = "stress"
+status = "ported"
+expected = "599950010"
+note = "require\"debug\" is unavailable; reinterpreted as a typed Array<i64>/struct stress test."
+
+[[case]]
+path = "bitwise.lua"
+sol = "bitwise.sol"
+category = "operators"
+status = "ported"
+expected = "533"
+note = "Cross-file require is a stated non-goal; reinterpreted as a direct exercise of Sol's native i64 bitwise operators."
+
+[[case]]
+path = "bwcoercion.lua"
+sol = "bwcoercion.sol"
+category = "numeric-coercion"
+status = "ported"
+expected = "1"
+note = "No persistent string metatable to inject metamethods onto; reinterpreted as i64->f64 implicit widening."
+
+[[case]]
+path = "calls.lua"
+sol = "calls.sol"
+category = "calls"
+status = "ported"
+expected = "125250"
+note = "any-typed native calls are unsupported; reinterpreted as typed recursive function calls."
+
+[[case]]
+path = "closure.lua"
+sol = "closure.sol"
+category = "closures"
+status = "ported"
+expected = "44"
+note = "_ENV and weak-table collection are unimplemented; reinterpreted using Sol's real capture-by-value closure model."
+
+[[case]]
+path = "code.lua"
+sol = "code.sol"
+category = "loading-and-dumping"
+status = "not-applicable"
+expected = "0"
+note = "Exercises Lua binary chunk dump/undump; Sol exposes no public bytecode serialization format."
+
+[[case]]
+path = "constructs.lua"
+sol = "constructs.sol"
+category = "control-flow"
+status = "ported"
+expected = "188"
+note = "require\"debug\" is unavailable; reinterpreted as a pure if/while/numeric-for/break exercise."
+
+[[case]]
+path = "coroutine.lua"
+sol = "coroutine.sol"
+category = "coroutines"
+status = "not-applicable"
+expected = "0"
+note = "Coroutines exist only in Sol's dynamic .lua mode; typed Sol has no suspend/resume primitive."
+
+[[case]]
+path = "cstack.lua"
+sol = "cstack.sol"
+category = "c-api"
+status = "not-applicable"
+expected = "0"
+note = "Measures Lua's C call-stack behavior through the internal test library; no analogue for Sol."
+
+[[case]]
+path = "db.lua"
+sol = "db.sol"
+category = "debug-library"
+status = "not-applicable"
+expected = "0"
+note = "Exercises Lua's debug.* library; Sol's debugger is an external CLI (sol debug), not an in-language library."
+
+[[case]]
+path = "errors.lua"
+sol = "errors.sol"
+category = "errors"
+status = "ported"
+expected = "54"
+note = "Typed Sol traps are fatal, not catchable via pcall; reinterpreted as the valid, non-trapping side of the same boundaries."
+
+[[case]]
+path = "events.lua"
+sol = "events.sol"
+category = "metatables"
+status = "ported"
+expected = "26"
+note = "No metatables/metamethods in typed Sol; reinterpreted as function-value dispatch plus any/is narrowing."
+
+[[case]]
+path = "files.lua"
+sol = "files.sol"
+category = "filesystem"
+status = "not-applicable"
+expected = "0"
+note = "Exercises io/os/locale/filesystem behavior; typed Sol has no io/os library surface."
+
+[[case]]
+path = "gc.lua"
+sol = "gc.sol"
+category = "garbage-collection"
+status = "ported"
+expected = "7"
+note = "require\"debug\" plus finalizers/weak tables are unavailable; reinterpreted as a live-reference-survives-collection exercise."
+
+[[case]]
+path = "gengc.lua"
+sol = "gengc.sol"
+category = "garbage-collection"
+status = "ported"
+expected = "100"
+note = "Reinterpreted as a direct regression for Sol's generational collector's promotion + write-barrier behavior."
+
+[[case]]
+path = "goto.lua"
+sol = "goto.sol"
+category = "control-flow"
+status = "ported"
+expected = "10"
+note = "goto/labels are Lua-mode only and <close> is unimplemented; reinterpreted using nested while/return."
+
+[[case]]
+path = "heavy.lua"
+sol = "heavy.sol"
+category = "stress"
+status = "ported"
+expected = "899997"
+note = "Typed Sol has no catchable out-of-memory error; reinterpreted as a large bounded allocation stress loop."
+
+[[case]]
+path = "literals.lua"
+sol = "literals.sol"
+category = "syntax-and-values"
+status = "ported"
+expected = "3"
+note = "Hex/hex-float literals are Lua-mode only; reinterpreted as decimal-literal i64 wraparound plus a string escape."
+
+[[case]]
+path = "locals.lua"
+sol = "locals.sol"
+category = "scope-and-attributes"
+status = "ported"
+expected = "9"
+note = "<close> is unimplemented; reinterpreted as a pure nested-block lexical-scoping exercise."
+
+[[case]]
+path = "main.lua"
+sol = "main.sol"
+category = "standalone-cli"
+status = "not-applicable"
+expected = "0"
+note = "Tests the lua executable's own CLI/stdin/shell behavior; not a language-level feature."
+
+[[case]]
+path = "math.lua"
+sol = "math.sol"
+category = "math-library"
+status = "ported"
+expected = "81"
+note = "No math.* library exists; reinterpreted using extern function bindings to real libm symbols plus // and %."
+
+[[case]]
+path = "memerr.lua"
+sol = "memerr.sol"
+category = "c-api"
+status = "not-applicable"
+expected = "0"
+note = "Injects allocator failures through the internal C test API; no fault-injection hook exists for Sol's allocator."
+
+[[case]]
+path = "nextvar.lua"
+sol = "nextvar.sol"
+category = "tables-and-globals"
+status = "ported"
+expected = "332834600"
+note = "No globals or next(); reinterpreted as a Map<i64, i64> insert/lookup/iteration exercise."
+
+[[case]]
+path = "pm.lua"
+sol = "pm.sol"
+category = "package-library"
+status = "not-applicable"
+expected = "0"
+note = "Exercises Lua pattern matching and require; typed Sol's string has no pattern operations at all."
+
+[[case]]
+path = "sort.lua"
+sol = "sort.sol"
+category = "table-library"
+status = "ported"
+expected = "119"
+note = "No sort intrinsic on Array<T>; reinterpreted as a hand-written insertion sort."
+
+[[case]]
+path = "strings.lua"
+sol = "strings.sol"
+category = "string-library"
+status = "ported"
+expected = "8"
+note = "No string library beyond the language's own operators; reinterpreted as .., #, ==, < on string."
+
+[[case]]
+path = "tpack.lua"
+sol = "tpack.sol"
+category = "tables-and-multireturn"
+status = "not-applicable"
+expected = "0"
+note = "Exercises string.pack/unpack binary serialization; no such library exists for typed Sol."
+
+[[case]]
+path = "tracegc.lua"
+sol = "tracegc.sol"
+category = "garbage-collection"
+status = "not-applicable"
+expected = "0"
+note = "Loads a native tracegc C module; Sol has no native-module loading facility."
+
+[[case]]
+path = "utf8.lua"
+sol = "utf8.sol"
+category = "utf8-library"
+status = "ported"
+expected = "3"
+note = "No utf8.* library; reinterpreted as a demonstration that # is a byte length, not a codepoint count."
+
+[[case]]
+path = "vararg.lua"
+sol = "vararg.sol"
+category = "varargs"
+status = "ported"
+expected = "104"
+note = "No variadic typed functions; reinterpreted using an explicit Array<i64> in place of a packed vararg table."
+
+[[case]]
+path = "verybig.lua"
+sol = "verybig.sol"
+category = "stress"
+status = "ported"
+expected = "999899867"
+note = "os.tmpname/io are unavailable; reinterpreted as an in-memory large-Array<i64> stress test."

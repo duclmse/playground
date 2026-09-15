@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use bytecode_to_sol::{lua, sol, Error};
+use decompiler::{lua, sol, Error};
 
-const USAGE: &str = "usage:\n  bytecode-to-sol sol <instructions.bin> [-o output.sol] [--name function]\n  bytecode-to-sol lua <chunk.luac> [-o output.sol] [--luac /path/to/luac]\n  bytecode-to-sol lua-listing <listing.txt> [-o output.sol]";
+const USAGE: &str = "usage:\n  decompiler sol <instructions.bin> [-o output.sol] [--name function]\n  decompiler lua <chunk.luac> [-o output.sol] [--luac /path/to/luac]\n  decompiler lua-listing <listing.txt> [-o output.sol]";
 
 fn main() {
     if let Err(error) = run(std::env::args().skip(1).collect()) {

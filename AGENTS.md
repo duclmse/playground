@@ -7,7 +7,7 @@ This repository contains two related but independent Lua efforts:
 - `crates/sol` is a separate typed, native-oriented Sol compiler/JIT. Its
   implementation status is in `docs/features/` and its language contract is
   in `docs/spec/`.
-- `crates/bytecode-to-sol` is an independent recovery-oriented decompiler for
+- `crates/decompiler` is an independent recovery-oriented decompiler for
   raw Sol instruction words and version-matched Lua binary chunks.
 
 Do not assume a change to one runtime applies to the other. Keep their
@@ -25,7 +25,7 @@ both.
 - `crates/dap-server` — native Debug Adapter Protocol server using `lua-vm`.
 - `crates/sol` — standalone Cargo crate with compiler, interpreter, JIT, AOT,
   and Lua-compatibility fixtures.
-- `crates/bytecode-to-sol` — standalone library/CLI that emits annotated
+- `crates/decompiler` — standalone library/CLI that emits annotated
   Sol-style register code from Sol bytecode or `luac` listings/chunks.
 - `docs` — architecture, protocol, conformance, feature, and specification documents.
 - `tests/lua55` — Lua 5.5 corpus manifest and reference-oracle metadata.
@@ -38,7 +38,7 @@ manifest:
 ```sh
 cargo test --manifest-path crates/lua-vm/Cargo.toml
 cargo test --manifest-path crates/sol/Cargo.toml
-cargo test --manifest-path crates/bytecode-to-sol/Cargo.toml
+cargo test --manifest-path crates/decompiler/Cargo.toml
 cargo test --manifest-path crates/dap-server/Cargo.toml
 ```
 

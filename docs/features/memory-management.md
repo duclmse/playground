@@ -1,7 +1,9 @@
 # Memory management
 
-> Status: a conservative mark/sweep collector is implemented. Precise and
-> generational collection remains planned.
+> Status: a conservative mark/sweep collector is implemented, now with a real
+> generational split (chunk-granularity promotion, write barriers, remembered
+> sets - see below). Precise (Cranelift-stack-map-backed) collection and
+> incremental/interruptible major GC remain planned.
 
 **Purpose**: provide a real collector for allocations that cannot be removed by
 escape analysis and scalar replacement instead of leaking structs or arrays
@@ -23,8 +25,29 @@ root-scanning approach is the Boehm-Demers-Weiser design; the chunked-arena
 allocator is closer in spirit to a region-based collector than a true
 generational one), not a shortcut: see `crates/sol/src/gc.rs`'s module doc
 comment for the full reasoning. True generations, promotion, and write barriers
-are real, understood, deferred follow-ups - each checklist item below is marked
-with what actually happened.
+were deferred follow-ups at the time this was first written; they have since
+been implemented (chunk-granularity promotion, `sol_gc_write_barrier`,
+remembered-set-scanned minor collections - see the checklist below for what
+actually landed and `gc.rs`'s module doc comment for the design). Precise
+(Cranelift-safepoint-backed) collection and incremental/interruptible major GC
+remain deferred follow-ups - each checklist item below is marked with what
+actually happened.
+
+**A pre-existing array-atomicity bug, found and fixed alongside the
+generational work**: `Array<T>`'s data buffer was always allocated via
+`sol_gc_alloc_atomic` (never traced), which is correct when `T` is a scalar
+(`i64`/`f64`) but silently wrong when `T` is itself pointer-bearing (a struct,
+string, another array, a map, or `any`) - the collector would never scan into
+such an array's elements, and they could be reclaimed while still reachable
+only through it. The only surface syntax that can construct a pointer-element
+array is an `Array<T>` table literal (`typeck.rs`'s `ArrayLiteral`; the
+`new_array_i64`/`new_array_f64` builtins are hardcoded to scalar element
+types, so they were never affected). Fixed by adding a parallel
+`sol_new_array_ptr`/`Op::NewArrayPtr` path (traced `sol_gc_alloc`, manually
+zeroed to preserve the language's zero-read guarantee for unwritten elements)
+selected via `Type::is_gc_pointer()` at the `ArrayLiteral` codegen/bytecode
+sites in `codegen.rs`/`bccompile.rs`. Regression coverage:
+`tests/fixtures/gc_array_of_structs.sol`.
 
 **Two real bugs were caught and fixed during implementation** (both worth
 recording since they're the kind of subtle mistake this design is inherently
@@ -69,20 +92,70 @@ found later.
       address, or a chunk kept alive in its entirety by one surviving object -
       see `gc.rs`'s doc comment on chunk-level reclaim granularity) is the
       accepted tradeoff.
-- [ ] **Promotion + old generation**: not applicable - one collection treats
-      every chunk the same way regardless of age. A chunk with even one
-      long-lived survivor keeps _all_ of its dead space until the whole chunk
-      happens to die together (a documented fragmentation trade-off - see
-      `gc.rs`). Real future work if profiling ever shows a genuine young/old
-      split would help.
-- [ ] **Remembered sets + write barriers**: not needed without a generational
-      split (they exist specifically to let a _generational_ collector skip
-      rescanning the old generation on a minor collection). Future work if/when
-      generations are added.
-- [ ] **Incremental major GC**: not implemented - every collection is a full
-      stop-the-world mark-sweep, now cheap enough (O(chunks) sweep, not O(every
-      object ever allocated)) that this hasn't mattered yet. Revisit once a real
-      program's pause times are actually measured.
+- [x] **Promotion + old generation**: implemented, at chunk granularity - each
+      `Chunk` carries a `Generation::{Young, Old}` tag (`gc.rs`). New
+      allocations only ever land in a `Young` chunk. A `Young` chunk found
+      reachable at the end of *either* a minor or major collection is
+      promoted to `Old` **in place** (relabeled, never copied/compacted -
+      conservative root-finding can't safely move an object it might not have
+      found every reference to). The fragmentation trade-off this checklist
+      item originally flagged is unchanged and, if anything, sharper at chunk
+      granularity: a single long-lived survivor still keeps its *whole*
+      chunk's dead space alive - now for the chunk's entire remaining
+      lifetime as `Old`, not just until the next collection.
+- [x] **Remembered sets + write barriers**: implemented. `sol_gc_write_barrier`
+      (called from `codegen.rs`'s `AssignField`/non-map `AssignIndex` and
+      `interp.rs`'s `Op::SetField`/`Op::SetIndex`) sets an `Old` chunk's
+      `dirty` bit whenever a store might create a new `Old -> Young` pointer
+      edge - a safe over-approximation, never cleared by the barrier itself.
+      A minor collection (`collect_minor`) rescans only `Young` chunks plus
+      every `dirty` `Old` chunk's live blocks (the remembered set), never the
+      full heap. Only a full major collection (`collect_heap`) may ever
+      *clear* a `dirty` bit, by re-deriving the true `Old -> Young` edge set
+      from its own complete trace - a minor collection doesn't re-verify an
+      `Old` chunk's own reachability each cycle, so it can't safely tell
+      whether a previously-recorded edge is now stale; clearing early there
+      could make a live `Young` object invisible to the next minor
+      collection (a real use-after-free). See `gc.rs`'s module doc comment
+      and `sol_gc_write_barrier`'s own comment for the full reasoning.
+      Regression coverage: `tests/fixtures/gc_struct_field_write_barrier.sol`
+      (a struct field reassigned to a fresh `Young` array only after the
+      struct itself was promoted to `Old` - the write barrier is the only
+      thing keeping that array visible to a later minor collection),
+      `tests/fixtures/gc_array_of_structs.sol` (a related array-atomicity fix
+      this work required - see below), and
+      `tests/fixtures/gc_generational_stress.sol` (a combined stress run,
+      asserted via `SOL_GC_DEBUG` to actually exercise both a minor *and* at
+      least one major collection, not just one or the other).
+- [ ] **Incremental major GC**: still not implemented - every major collection
+      (`collect_heap`) remains a full stop-the-world mark-sweep. Explicitly
+      out of scope for this pass: incremental/interruptible collection is a
+      separate, substantial undertaking (safely pausing mid-trace needs a
+      tricolor invariant maintained across barrier-protected mutation, not
+      just the generational split done here) and deserves its own dedicated
+      design and test pass rather than being folded in as an afterthought.
+      Revisit once a real program's pause times are actually measured and
+      shown to matter.
+
+**Honest benchmark note on the generational rewrite**: `benchmarks/gc_alloc.sol`
+and `benchmarks/objects.sol` - the two workloads this rewrite was most likely
+to move - were re-measured before/after (`hyperfine`, 40+ runs, release build).
+Neither showed a decisive change: `gc_alloc.sol` stayed within noise of its
+pre-generational number (~13ms vs. LuaJIT's ~12ms, statistically a wash both
+before and after), and `objects.sol` stayed a consistent, honest LuaJIT win at
+roughly the same margin as before (~16ms vs. LuaJIT's ~10ms, versus the
+previously-documented 19.0ms/13.0ms - the same ~0.6-0.7x ratio, not a closed
+gap). This tracks with the design: these benchmarks are short single-shot
+processes with a modest live-object count, so a full stop-the-world trace was
+already cheap enough that skipping the old generation's rescan doesn't move
+the needle. The generational split is a real, tested correctness feature (an
+`Old` struct's field can now safely point at a `Young` object without forcing
+a full trace to notice), not a benchmark-driven one - a workload with a much
+larger long-lived heap relative to its garbage-generation rate would be needed
+to see the throughput case for it. Reported honestly rather than claimed as a
+speed win it isn't, per this document's own established practice (see the
+`objects.sol`/`gc_alloc.sol` "honest non-win" precedent in
+`benchmarks/RESULTS.md`).
 - [x] Retrofit the array runtime (`runtime.rs`) and struct allocation onto
       this allocator, removing the `Box::leak`/`mem::forget` calls called out as
       a known, documented limitation of the initial runtime. Done -

@@ -1,14 +1,14 @@
-# bytecode-to-sol
+# decompiler
 
 Best-effort decompilation of Sol tier-0 instructions and Lua binary chunks into
 annotated, Sol-style register code.
 
 ```sh
-cargo run --manifest-path crates/bytecode-to-sol/Cargo.toml -- \
+cargo run --manifest-path crates/decompiler/Cargo.toml -- \
   sol instructions.bin --name recovered
 
 luac -o program.luac program.lua
-cargo run --manifest-path crates/bytecode-to-sol/Cargo.toml -- \
+cargo run --manifest-path crates/decompiler/Cargo.toml -- \
   lua program.luac -o recovered.sol
 ```
 

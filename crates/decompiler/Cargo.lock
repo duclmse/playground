@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "bytecode-to-sol"
+name = "decompiler"
 version = "0.1.0"
