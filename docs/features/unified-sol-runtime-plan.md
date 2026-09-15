@@ -612,6 +612,12 @@ these invariants. A transitional adapter preserves legacy scalar, string,
 table, cycle, and repeated-reference identity when importing old `LuaValue`
 graphs, and preserves unboxed typed scalars at the typed boundary.
 
+The production Lua runtime now uses `sol_core::Capabilities` directly instead
+of maintaining a second coarse `os`/`io` authority type. Clock, environment,
+process, stdin, and stdout effects are independently gated, the native CLI opts
+into the declared `NATIVE_CLI` profile, and library embedding remains
+sandboxed by default.
+
 U2 remains in progress because the production Lua interpreter and typed runtime
 still own objects in their existing `Rc` and arena collectors. The adapter is a
 migration seam, not a second production owner: imported canonical graphs are

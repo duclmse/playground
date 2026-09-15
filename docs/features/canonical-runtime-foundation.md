@@ -23,7 +23,18 @@ dependency. It currently owns:
 - young/old generations, remembered old-to-young writes, major/minor collection
   entry points, weak keys/values, ephemeron fixed-point marking, finalizer
   queues, coroutine stacks, and traceback/cause tracing;
-- explicit sandbox and native-host capability profiles.
+- explicit sandbox and native-host capability profiles, including independent
+  package, filesystem, process, environment, clock, locale, stdin, stdout,
+  native-module, and debug authority.
+
+The production Lua runtime now consumes this exact `sol_core::Capabilities`
+type. Its previous coarse `os` and `io` switches have been removed; native
+operations check the narrow authority they actually use. `os.difftime` and
+`os.date` with an explicit timestamp remain available without host authority,
+while clock reads, environment reads, process exit, stdin, and stdout are
+independently denied by the sandbox profile. `LuaCapabilities` remains only as
+a naming-compatibility type alias, not a second model; embedders using its old
+coarse fields must migrate to the granular fields.
 
 The current collector deliberately prioritizes semantic correctness over
 throughput. Minor collection uses the complete precise root graph while the
@@ -69,8 +80,10 @@ collector and typed arena must then cease owning production-visible objects.
 The exit audit must demonstrate one identity and reachability domain under
 forced collection across mixed dynamic/typed calls.
 
-As the first production-facing semantic step, the legacy bytecode runtime now
-stores each global environment in a `LuaTable`, exposes `_G`, and resolves
-global names through a lexically rebound/captured `_ENV`. This removes the old
-map-only behavior but does not count as canonical ownership: those tables and
-upvalue cells remain `Rc` objects until the next migration slice.
+The first production-facing semantic steps are now in place: the legacy
+bytecode runtime stores each global environment in a `LuaTable`, exposes `_G`,
+resolves global names through a lexically rebound/captured `_ENV`, and uses the
+canonical capability profile directly. These remove the old map-only global
+behavior and duplicate authority model, but do not count as canonical object
+ownership: tables and upvalue cells remain `Rc` objects until the next
+migration slice.

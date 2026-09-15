@@ -369,15 +369,19 @@ upvalues and final-expression result expansion.
       registering a module. Path-based search and a stable module-interface
       format remain open.
 - [~] Split `io`, `os`, `debug`, native module loading, and locale APIs into
-      declared capability profiles. `LuaCapabilities` declares `package`, `io`,
-      `os`, `debug`, and `native_modules` as independent flags. `package`
-      denial (no registered module) vs. allowed (an explicit `add_module` call)
-      behavior is tested; `os` (`time`/`clock`/`difftime`/`date`/`getenv`/
-      `exit`) and `io` (`write`/`read`) are now implemented and independently
-      capability-gated too, with denial/allowed tests for each
-      (`LuaRuntime::with_capabilities`; the `sol` CLI enables `os`+`io` by
-      default since it is a trusted native tool, unlike library embedders
-      which keep the sandboxed-by-default profile). `os.date` uses UTC-only
+      declared capability profiles. The shared `sol_core::Capabilities` model
+      independently declares package, filesystem, process, environment, clock,
+      locale, stdin, stdout, native-module, and debug authority; the legacy
+      `LuaCapabilities` name is only a naming alias. `package` denial
+      (no registered module) vs. allowed (an explicit `add_module` call)
+      behavior is tested. Implemented `os` effects are gated narrowly:
+      `time`/`clock` require clock, `getenv` requires environment, and `exit`
+      requires process authority, while pure `difftime` and explicit-timestamp
+      `date` calls remain portable. `io.read` requires stdin and `io.write`
+      requires stdout, with denial/allowed and cross-authority isolation tests
+      (`LuaRuntime::with_capabilities`; the trusted `sol` CLI selects
+      `Capabilities::NATIVE_CLI`, unlike library embedders which keep the
+      sandboxed-by-default profile). `os.date` uses UTC-only
       hand-rolled calendar math (no timezone database), so `os.date(...)` and
       `os.date("!"...)` currently render identically, and its strftime-subset
       only covers `%Y %y %m %d %H %M %S %p %A %a %B %b %j %c %%`. `io.write`
@@ -387,8 +391,9 @@ upvalues and final-expression result expansion.
       work and return the same handle, matching real Lua's default-output-file
       chaining; this is not a full file-handle implementation (no `close`/
       `seek`/`lines`/real `io.open`/`io.stderr` — there is still only one
-      process-wide output sink, `LuaRuntime::output`). `debug` and
-      `native_modules` still gate nothing observable.
+      process-wide output sink, `LuaRuntime::output`). Filesystem, locale,
+      `debug`, and native-module authorities still gate no implemented host
+      provider, so the profile split remains partial.
 - [~] Implement `load`/`loadstring`/`dofile` (compile a Lua string/registered
       module into a callable closure at runtime). `load`/`loadstring` compile
       arbitrary source and return `(nil, error_string)` on failure, matching

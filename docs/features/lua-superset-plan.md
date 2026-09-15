@@ -33,10 +33,12 @@ this repo's standing discipline of keeping behavior and status docs in sync.
 
 ## Phase 1 — `os`/`io`/`load` (L5 completion) — **done this session**
 
-Scope: the mechanical, capability-gated stdlib surface that's currently just
-declared (`LuaCapabilities::os`/`io`) but gates nothing observable.
+Scope: the mechanical, capability-gated stdlib surface that, at the start of
+this historical phase, had only coarse declarations and gated nothing
+observable. U2 later replaced those switches with the canonical granular
+`sol_core::Capabilities` model.
 
-- Add `LuaRuntime::with_capabilities(LuaCapabilities) -> Self` (new
+- Add `LuaRuntime::with_capabilities(Capabilities) -> Self` (new
   constructor; `new()` keeps its sandboxed-by-default capabilities).
 - Add an `os` global table: `time`, `clock`, `difftime`, `date` (`*t`/`!*t`
   table form plus a `strftime`-subset string form: `%Y %m %d %H %M %S %y %p
@@ -47,10 +49,10 @@ declared (`LuaCapabilities::os`/`io`) but gates nothing observable.
   `io.read(fmt)` reading from real process stdin (`"l"`/`"n"`/`"a"`
   variants). This is the CLI (`sol run`), not the browser sandbox, so real
   stdin/stdout is appropriate.
-- Every function checks `self.capabilities.{os,io}` and raises the same
+- Every host effect checks its declared capability and raises the same
   "capability is disabled" error shape `require` already uses when off.
 - `main.rs`'s CLI entry points (both the plain `compile`+tier path fallback
-  and `run_lua_partitioned`) enable `os`+`io` by default, matching a real
+  and `run_lua_partitioned`) select the native CLI profile, matching a real
   `lua` binary's behavior; library embedders keep default-deny.
 - Add `load`/`loadstring` (compile a Lua string into a callable closure at
   runtime, reusing `lexer::lex_bytes`/`parser::parse_lua`) and `dofile`
