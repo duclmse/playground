@@ -634,7 +634,7 @@ production global environment still need to move onto canonical handles before
 the exit gate can be claimed. See
 [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
-### U3 — Unified bytecode, frames, and semantic call ABI
+### U3 — Unified bytecode, frames, and semantic call ABI — **in progress**
 
 **Purpose:** execute typed and untyped functions in one resumable engine.
 
@@ -654,6 +654,21 @@ Deliverables:
 Exit gate: annotation-free `.lua` and `.sol` run through the same runtime path;
 mixed modules call, error, tail-call, yield, and collect correctly in every
 direction; the legacy partition/fallback path is no longer the default.
+
+Started 2026-09-16. `sol-core` now defines the tier-independent function IDs,
+prototype metadata, arity, value-count, call-site, call-kind, frame-state, and
+call-outcome contracts. Generic Lua and specialized Sol bytecode both expose
+that metadata and project their call instructions onto the same semantic ABI.
+The generic compiler no longer stores Lua's open argument/result convention as
+an untyped `-1` sentinel, and its resumable frames now carry stable function
+IDs and canonical ready/running/suspended/returned state. The typed interpreter
+publishes the same frame-state transitions to its existing zero-cost hooks.
+Both compilers emit explicit semantic tail calls: generic Lua closure frames are
+replaced in the trampoline, and specialized bytecode redispatches in a loop, so
+deep proper tail recursion does not consume native or heap frame depth. U3
+remains in progress until every result/error/yield transition uses this ABI,
+the dispatcher can execute both opcode families, and the legacy
+extension-selected partition path is removed.
 
 ### U4 — Gradual type system and sound static inference
 

@@ -4,10 +4,15 @@
 //! dependencies. U2 introduces the canonical value, object, root, and tracing
 //! model here; later milestones move the existing interpreters onto it.
 
+mod abi;
 mod capabilities;
 mod heap;
 mod value;
 
+pub use abi::{
+    CallKind, CallOutcome, CallSite, FrameHeader, FrameState, FunctionArity, FunctionId,
+    PrototypeMetadata, ValueCount, ValueCountError,
+};
 pub use capabilities::Capabilities;
 pub use heap::{
     ClosureObject, Collection, CollectionKind, ErrorObject, FinalizerState, GcGeneration, Heap,
