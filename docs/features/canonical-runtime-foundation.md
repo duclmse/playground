@@ -46,19 +46,23 @@ contracts.
 
 `sol::lua_runtime::CanonicalAdapter` can import legacy nil, boolean, integer,
 float, byte-string, table, Lua-closure, shared-upvalue, standard-library
-native-callable, and raised-error graphs. One adapter instance memoizes object
-pointers, preserving repeated references, shared cells, and cycles. Legacy globals become
-an explicit shared `_ENV` upvalue. Standard-library callables use portable
-`(provider, function)` registry identifiers rather than Rust function pointers.
-The adapter also maps the existing typed scalar ABI to canonical values without
-allocating a wrapper.
+native-callable, stateful iterator, userdata, coroutine, coroutine-wrapper, and
+raised-error graphs. One adapter instance memoizes object pointers, preserving
+repeated references, shared cells, and cycles. Legacy globals become an explicit
+shared `_ENV` upvalue. Standard-library callables use portable `(provider,
+function)` registry identifiers rather than Rust function pointers. The adapter
+also maps the existing typed scalar ABI to canonical values without allocating
+a wrapper.
 
 The adapter is intentionally one-way and snapshot-based. It rejects legacy
-native bridge callables that have no provider registration, stateful iterators,
-userdata, and coroutine frames rather than inventing unsafe cross-collector
-ownership. A migrated object graph must have one authoritative owner; code must
-not mutate a legacy graph and its canonical snapshot as though they were the
-same live object.
+native bridge callables that have no provider registration rather than
+smuggling executable pointers into the portable heap. Coroutine snapshots
+flatten every live register, vararg, captured cell, `_ENV`, and native
+continuation value into the canonical thread's traced stack. This proves
+reachability but does not make a snapshot resumable; executable frame shape,
+program counters, and continuations move in U3. A migrated object graph must
+have one authoritative owner, so code must not mutate a legacy graph and its
+canonical snapshot as though they were the same live object.
 
 ## Verified invariants
 
@@ -72,6 +76,8 @@ Forced-collection tests cover:
 - weak values and ephemeron reachability;
 - one-shot finalizer queueing and callback-window survival;
 - suspended coroutine roots;
+- suspended production-coroutine frame values, coroutine-wrapper cycles,
+  iterator state, and userdata snapshot identity;
 - old-to-young write barriers;
 - stack maps that expose only declared frame slots;
 - cyclic/repeated legacy-table import, production-created recursive closure

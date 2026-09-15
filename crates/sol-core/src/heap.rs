@@ -399,12 +399,53 @@ impl Heap {
         }))
     }
 
+    pub fn set_native_callable_captures(
+        &mut self,
+        callable: ObjectId,
+        captures: Vec<Value>,
+    ) -> Result<(), HeapError> {
+        self.expect_kind(callable, ObjectKind::NativeCallable)?;
+        let roots = captures.clone();
+        let HeapObject::NativeCallable(object) = &mut self.entry_mut(callable)?.object else {
+            unreachable!()
+        };
+        object.captures = captures;
+        for value in roots {
+            self.write_barrier(callable, value);
+        }
+        Ok(())
+    }
+
     pub fn alloc_thread(&mut self, stack: Vec<Value>) -> ObjectId {
         self.alloc(HeapObject::Thread(ThreadObject {
             status: ThreadStatus::Suspended,
             stack,
             yielded: Vec::new(),
         }))
+    }
+
+    /// Replaces a thread snapshot after its handle has been allocated.
+    /// Placeholder-first initialization is required for graphs where a live
+    /// frame reaches a table or closure that points back to the thread.
+    pub fn set_thread_state(
+        &mut self,
+        thread: ObjectId,
+        status: ThreadStatus,
+        stack: Vec<Value>,
+        yielded: Vec<Value>,
+    ) -> Result<(), HeapError> {
+        self.expect_kind(thread, ObjectKind::Thread)?;
+        let roots = stack.iter().chain(&yielded).copied().collect::<Vec<_>>();
+        let HeapObject::Thread(object) = &mut self.entry_mut(thread)?.object else {
+            unreachable!()
+        };
+        object.status = status;
+        object.stack = stack;
+        object.yielded = yielded;
+        for value in roots {
+            self.write_barrier(thread, value);
+        }
+        Ok(())
     }
 
     pub fn alloc_userdata(&mut self, host_handle: u64) -> ObjectId {
