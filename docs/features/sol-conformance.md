@@ -64,29 +64,42 @@ all: `all.lua`/`api.lua`/`cstack.lua`/`memerr.lua` (C API), `code.lua`
 own CLI), `pm.lua` (pattern matching), `tpack.lua` (`string.pack`), and
 `tracegc.lua` (native modules).
 
-## A bug this suite found
+## A bug this suite found (fixed)
 
 While porting `calls.lua`, an early draft called two mutually-recursive
 top-level functions (`is_even`/`is_odd`) directly from `main` in the same
-program. That reproducibly panics the Cranelift JIT backend:
+program. That reproducibly panicked the Cranelift JIT backend:
 
 ```
 thread '<unnamed>' panicked at cranelift-jit-0.134.4/src/backend.rs:252:21:
 can't resolve symbol is_odd
 ```
 
-Isolated repro (confirmed independent of the rest of `calls.lua`, including
-`sum_to`): a program with `is_even` and `is_odd` calling each other, where
-`main` calls *both* names directly, fails to link; calling only one of the
-two names from `main` works fine, and the two functions calling each other
-without both being called from `main` also works fine. This looks like a
-JIT symbol-registration ordering bug specific to multiple direct call sites
-into a mutually-recursive pair, not a fundamental limitation - typed Sol's
-spec places no restriction on mutual recursion between top-level functions.
-`calls.sol` was rewritten to a single self-recursive `is_even` to avoid it,
-and this document records the repro so it isn't rediscovered from scratch.
-This is a real, open bug - fixing it was out of scope for building this
-suite and is tracked here rather than silently worked around.
+Root cause (`crates/sol/src/jit.rs`'s `promote`): `compute_inlinable`
+(`codegen.rs`) marks a function inlinable unless it's *directly*
+self-recursive (`is_directly_recursive` only detects a function calling
+itself, not a mutual cycle). `promote`'s transitive dependency walk then
+skipped compiling a real body for any callee in that `inlinable` set,
+reasoning that inlined call sites never need one. But `inline_call`'s
+`MAX_INLINE_DEPTH` safety net (codegen.rs) falls back to a genuine
+out-of-line `call` once compile-time inline-unrolling of a recursive chain
+gets 8 levels deep - which mutual recursion between two "not directly
+recursive" functions hits just as easily as any other recursion. That
+fallback call referenced a `FuncId` that was declared (in `Jit::new`) but
+never `define_function`'d, since `promote` had skipped it - hence
+`finalize_definitions` failing to resolve the symbol. This reproduced
+regardless of whether `main` called one or both of the pair directly, as
+long as the compile-time-unrolled chain reached the depth cap; the original
+"calling only one name works" note above was an artifact of the specific
+repro's recursion depth, not a distinct case.
+
+Fixed by removing the `inlinable` short-circuit from `promote`'s dependency
+walk: every real callee always gets a compiled body now, whether or not any
+particular call site to it ends up inlined. `calls.sol` was restored to
+genuine mutual recursion (`is_even`/`is_odd`, both called directly from
+`main`), and `crates/sol/tests/fixtures/mutual_recursion.sol` (exercised via
+`crates/sol/tests/programs.rs`) is a dedicated regression covering the
+bytecode, native, OSR, and AOT tiers.
 
 ## Non-goals
 
