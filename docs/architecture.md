@@ -31,6 +31,13 @@ and dynamic values may use different physical representations inside optimized
 frames; checked adapters and one semantic ABI connect them. The detailed crate
 boundaries are recorded in [ADR 0004](decisions/0004-runtime-boundary-and-abi.md).
 
+U2 has established this model in the portable `crates/sol-core` foundation,
+including canonical handles, precise roots, stack maps, and tracing-GC rules.
+Production execution has not migrated yet: `crates/sol` still uses its legacy
+dynamic and typed ownership models, connected only by a deliberately limited
+snapshot adapter. Consequently the repository does not yet satisfy the
+one-identity-domain exit gate.
+
 ## Current browser layers
 
 ```mermaid

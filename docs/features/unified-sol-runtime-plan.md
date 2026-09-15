@@ -1,6 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
-> Status: accepted convergence roadmap; U0 completed 2026-09-15. This document
+> Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U2 is
+> in progress. This document
 > defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
@@ -581,7 +582,7 @@ The former Sol-only `{ ... }` statement block was removed because it is
 syntactically indistinguishable from Lua's newline-insensitive `callee { ... }`
 call sugar. Scoped statement blocks use Lua's equivalent `do ... end` form.
 
-### U2 — Canonical runtime object model and GC foundation
+### U2 — Canonical runtime object model and GC foundation — **in progress**
 
 **Purpose:** establish one identity/reachability domain before merging execution
 tiers.
@@ -601,6 +602,24 @@ Deliverables:
 Exit gate: identity, weak reference, finalization, coroutine, and mixed-adapter
 stress tests pass under forced collection; no production object is owned by two
 independent collectors.
+
+Started 2026-09-15. The portable `sol-core` crate now defines the canonical
+tagged value, generation-checked object handles, all planned managed object
+kinds, explicit host capabilities, `_ENV` closure upvalues, precise registered
+roots/stack maps, generational metadata and barriers, weak tables, ephemerons,
+finalizer queues, and coroutine tracing. Focused forced-collection tests cover
+these invariants. A transitional adapter preserves legacy scalar, string,
+table, cycle, and repeated-reference identity when importing old `LuaValue`
+graphs, and preserves unboxed typed scalars at the typed boundary.
+
+U2 remains in progress because the production Lua interpreter and typed runtime
+still own objects in their existing `Rc` and arena collectors. The adapter is a
+migration seam, not a second production owner: imported canonical graphs are
+snapshots and must not be mutated concurrently with legacy graphs. Dynamic
+libraries, native callables, closures, userdata, coroutine frames, and the
+production global environment still need to move onto canonical handles before
+the exit gate can be claimed. See
+[canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
 ### U3 — Unified bytecode, frames, and semantic call ABI
 

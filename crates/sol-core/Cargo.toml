@@ -1,0 +1,11 @@
+[package]
+name = "sol-core"
+version = "0.1.0"
+edition = "2021"
+description = "Portable semantic runtime foundation for Lua-compatible Sol"
+
+[lib]
+name = "sol_core"
+path = "src/lib.rs"
+
+[dependencies]

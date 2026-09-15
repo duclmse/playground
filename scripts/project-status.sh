@@ -68,6 +68,7 @@ if [[ -d "$root_dir/editors/vscode-sol" ]]; then vscode_client=true; else vscode
 # the explicit migration seam until U3 replaces it with one semantic ABI.
 if grep -q 'run_lua_partitioned' "$root_dir/crates/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
 if [[ -f "$root_dir/crates/sol-lsp/Cargo.toml" ]]; then lsp_present=true; else lsp_present=false; fi
+if [[ -f "$root_dir/crates/sol-core/src/heap.rs" ]]; then canonical_heap_foundation=true; else canonical_heap_foundation=false; fi
 commit=$(git -C "$root_dir" rev-parse --short HEAD 2>/dev/null || printf unknown)
 
 if ((check)); then
@@ -81,6 +82,7 @@ if ((check)); then
   ((lua_total == upstream_count)) || { echo "status: Lua manifest has $lua_total cases for $upstream_count inventory files" >&2; exit 1; }
   [[ -f "$root_dir/docs/features/unified-sol-runtime-plan.md" ]] || { echo "status: unified roadmap missing" >&2; exit 1; }
   [[ -f "$root_dir/docs/decisions/README.md" ]] || { echo "status: U0 decision index missing" >&2; exit 1; }
+  [[ "$canonical_heap_foundation" == true ]] || { echo "status: U2 canonical heap foundation missing" >&2; exit 1; }
 fi
 
 if [[ "$format" == json ]]; then
@@ -91,8 +93,8 @@ if [[ "$format" == json ]]; then
     "$lua_total" "$lua_oracle" "$lua_pass" "$lua_adapted" "$lua_pending" "$lua_host" "$lua_diverges" "$compatibility_complete"
   printf '  "typed_capability_regressions": {"total": %d, "ported": %d, "not_applicable": %d, "lua_compatibility_evidence": false},\n' \
     "$typed_total" "$typed_ported" "$typed_na"
-  printf '  "architecture": {"runtime_unified": %s, "web_runtime": "%s", "lsp_present": %s, "vscode_client": %s}\n' \
-    "$runtime_unified" "$web_runtime" "$lsp_present" "$vscode_client"
+  printf '  "architecture": {"runtime_unified": %s, "canonical_heap_foundation": %s, "web_runtime": "%s", "lsp_present": %s, "vscode_client": %s}\n' \
+    "$runtime_unified" "$canonical_heap_foundation" "$web_runtime" "$lsp_present" "$vscode_client"
   printf '}\n'
 else
   printf 'Sol unified-product status (%s)\n' "$commit"
@@ -100,8 +102,8 @@ else
     "$lua_oracle" "$lua_total" "$lua_pending" "$lua_host" "$lua_diverges"
   printf 'Typed capability regressions (not Lua compatibility): %d ported; %d not-applicable; %d total\n' \
     "$typed_ported" "$typed_na" "$typed_total"
-  printf 'Architecture: runtime_unified=%s web_runtime=%s lsp=%s vscode_client=%s\n' \
-    "$runtime_unified" "$web_runtime" "$lsp_present" "$vscode_client"
+  printf 'Architecture: runtime_unified=%s canonical_heap_foundation=%s web_runtime=%s lsp=%s vscode_client=%s\n' \
+    "$runtime_unified" "$canonical_heap_foundation" "$web_runtime" "$lsp_present" "$vscode_client"
 fi
 
 if ((require_full)) && [[ "$compatibility_complete" != true ]]; then

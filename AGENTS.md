@@ -15,6 +15,9 @@ migration:
 - `crates/sol` contains the native compiler/JIT and the in-progress Lua 5.5
   runtime that will become canonical. Its implementation status is in
   `docs/features/` and its current language contract is in `docs/spec/`.
+- `crates/sol-core` is the portable, host-independent foundation for the
+  canonical value/object model, precise roots, and tracing collector. U2 is
+  migrating production objects onto it incrementally.
 - `crates/decompiler` is an independent recovery-oriented decompiler for
   raw Sol instruction words and version-matched Lua binary chunks.
 
@@ -29,11 +32,14 @@ runtime by file extension.
 - `packages/lua-runtime` — wasm-bindgen package consumed by the web app;
   generated `pkg/` contents come from `scripts/build-wasm.sh`.
 - `crates/lua-vm` — WASM-facing runtime, debugger session, conformance tests.
-- `crates/vm` — vendored Piccolo fork. Preserve fork-marker comments and read
-  `crates/vm/README.md` before changing its debugger-facing internals.
+- `crates/vm` — vendored Piccolo fork and path dependency, intentionally
+  excluded from the root Cargo workspace. Preserve fork-marker comments and
+  read `crates/vm/README.md` before changing its debugger-facing internals.
 - `crates/dap-server` — native Debug Adapter Protocol server using `lua-vm`.
 - `crates/sol` — standalone Cargo crate with compiler, interpreter, JIT, AOT,
   and Lua-compatibility fixtures.
+- `crates/sol-core` — portable canonical runtime value/heap/GC foundation; no
+  native code generator or ambient host-OS dependency.
 - `crates/decompiler` — standalone library/CLI that emits annotated
   Sol-style register code from Sol bytecode or `luac` listings/chunks.
 - `crates/sol-lsp` — standalone LSP server for both `.sol` and `.lua`, built
@@ -43,11 +49,14 @@ runtime by file extension.
 
 ## Commands
 
-There is no root Cargo workspace. Run Rust commands against the relevant
-manifest:
+The root Cargo workspace covers first-party crates and excludes the vendored
+`crates/vm` fork. Use it for cross-crate validation, or run commands against a
+specific manifest for focused work:
 
 ```sh
+cargo test --workspace
 cargo test --manifest-path crates/lua-vm/Cargo.toml
+cargo test --manifest-path crates/sol-core/Cargo.toml
 cargo test --manifest-path crates/sol/Cargo.toml
 cargo test --manifest-path crates/decompiler/Cargo.toml
 cargo test --manifest-path crates/dap-server/Cargo.toml

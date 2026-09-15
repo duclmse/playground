@@ -22,6 +22,10 @@ grep -q '"runtime_unified": false' "$work_dir/current.json" || {
   echo "project status regression: frontend convergence was presented as runtime convergence" >&2
   exit 1
 }
+grep -q '"canonical_heap_foundation": true' "$work_dir/current.json" || {
+  echo "project status regression: U2 canonical heap foundation was not reported" >&2
+  exit 1
+}
 
 if ((expected_oracle < expected_total)); then
   if "$root_dir/scripts/project-status.sh" --require-full-compat >/dev/null 2>&1; then

@@ -10,6 +10,10 @@ require_cmd cargo "Install Rust: https://rustup.rs"
 log "cargo test (crates/lua-vm: unit tests + conformance suite against conformance/fixtures + conformance/expected)"
 cargo test --manifest-path "$ROOT/crates/lua-vm/Cargo.toml"
 
+log "cargo test + clippy (crates/sol-core: canonical values, heap, roots, and GC)"
+cargo test --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml"
+cargo clippy --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml" --all-targets -- -D warnings
+
 log "cargo test (crates/sol: compiler, bytecode/JIT/AOT, and Lua compatibility)"
 cargo test --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
 
