@@ -25,8 +25,9 @@ claim that the suite is a single ready-made Sol acceptance test. Every
 `pending` row now carries a `blocked-on:` note naming the specific missing
 feature or bug class observed against the pinned corpus (Phase 3 triage);
 common blockers are a sandboxed `require` with no `debug` library to register,
-`<close>`/finalization (Phase 4), missing `_ENV`, and no shared string
-metatable — see `docs/features/lua-superset-plan.md`'s Phase 3 section for the
+`<close>`/finalization (Phase 4), remaining binary-chunk support, and incomplete
+weak-table collection in the legacy runtime — see
+`docs/features/lua-superset-plan.md`'s Phase 3 section for the
 session-by-session detail.
 
 The upstream suite also exercises a Lua executable, its C API, dynamically
@@ -190,17 +191,17 @@ represented by the current scalar-only `any` box.
       AST-walking tree-walker entirely.
 - [~] Give every Lua module its own `_ENV` table and resolve reads/writes via
       that environment. Implement `global` declarations through explicit
-      environment slots/metadata, including their const constraints. Globals
-      currently resolve through a dedicated `Globals` map
-      (`GetGlobal`/`SetGlobal` bytecode ops), not an actual `_ENV` upvalue
-      table — the identifier `_ENV` itself is unbound and reads as `nil`;
-      code that indexes/reassigns `_ENV` directly (`_ENV[k]`, `local _ENV =
-      ...`) does not work (see `closure.lua`'s corpus entry). A bare `global
-      name1, name2` declaration (no `= value`) is fixed to read each name's
-      current value before re-declaring it, instead of unconditionally
-      overwriting it with `nil` — this was clobbering built-ins like `print`
-      on every corpus file using the common `global <const> print, assert,
-      ...` idiom.
+      environment slots/metadata, including their const constraints. The
+      legacy dynamic runtime now backs each `Globals` scope with a real
+      `LuaTable`, exposes the root table as `_G`, returns it for the implicit
+      `_ENV`, and compiles global reads/writes through a lexically rebound
+      local or captured `_ENV` when present. Closures therefore share mutations
+      to an explicitly supplied environment. The remaining U2 work is to move
+      these tables/cells onto canonical `sol-core` handles, make default global
+      accesses use the complete table metamethod path, and define how Sol's
+      `global <const>` metadata behaves when `_ENV` is an arbitrary user table.
+      A bare `global name1, name2` declaration (no `= value`) retains each
+      name's current value instead of clobbering built-ins with `nil`.
 - [~] Add a host-independent error object and stack trace shape. Errors must
       cross dynamic call boundaries without Rust panics or process aborts.
 

@@ -63,7 +63,7 @@ path = "closure.lua"
 category = "closures"
 status = "pending"
 requires = []
-note = "blocked-on: two distinct gaps hit in sequence: (1) `_ENV` is not implemented at all (always reads as nil; Sol does not model globals as sugar for indexing an _ENV upvalue table), fails first at `_ENV[true] = 10` (line 9); (2) once that's worked around, weak tables (__mode) don't actually collect entries, so the file's `while x[1] do ... end` GC-wait loop (line ~42) never terminates and exhausts the instruction budget instead."
+note = "blocked-on: lexical `_ENV` tables now execute in the legacy dynamic runtime, but this upstream case next stalls in its GC/weak-table stress section: weak-key/ephemeron behavior is not complete in the legacy collector, so the `while x[1] do ... end` loop (line ~42) exhausts the instruction budget. Canonical weak/ephemeron semantics exist in sol-core but production objects have not migrated."
 
 [[case]]
 path = "code.lua"

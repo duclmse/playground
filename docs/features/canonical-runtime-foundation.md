@@ -68,3 +68,9 @@ coroutine frames, and the root `_ENV` table. The existing `Rc` trial-deletion
 collector and typed arena must then cease owning production-visible objects.
 The exit audit must demonstrate one identity and reachability domain under
 forced collection across mixed dynamic/typed calls.
+
+As the first production-facing semantic step, the legacy bytecode runtime now
+stores each global environment in a `LuaTable`, exposes `_G`, and resolves
+global names through a lexically rebound/captured `_ENV`. This removes the old
+map-only behavior but does not count as canonical ownership: those tables and
+upvalue cells remain `Rc` objects until the next migration slice.
