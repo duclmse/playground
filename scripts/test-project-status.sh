@@ -18,6 +18,10 @@ grep -q '"lua_compatibility_evidence": false' "$work_dir/current.json" || {
   echo "project status regression: typed ports were presented as Lua compatibility" >&2
   exit 1
 }
+grep -q '"runtime_unified": false' "$work_dir/current.json" || {
+  echo "project status regression: frontend convergence was presented as runtime convergence" >&2
+  exit 1
+}
 
 if ((expected_oracle < expected_total)); then
   if "$root_dir/scripts/project-status.sh" --require-full-compat >/dev/null 2>&1; then

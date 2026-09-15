@@ -7,7 +7,10 @@
 //! interpreter for. Only genuine lex/parse errors and non-dynamic typeck
 //! errors become diagnostics.
 
-use sol::{ast, parser::SourceMode};
+use sol::{
+    binder::BindingIndex,
+    parser::{LanguageConfig, ParsedProgram, SourceMode},
+};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::text::line_range;
@@ -15,7 +18,8 @@ use crate::text::line_range;
 /// The parsed AST (when parsing succeeded, regardless of typeck outcome) and
 /// any diagnostics to publish.
 pub struct Analysis {
-    pub program: Option<ast::Program>,
+    pub syntax: Option<ParsedProgram>,
+    pub bindings: Option<BindingIndex>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -47,32 +51,43 @@ pub fn analyze(text: &str, mode: SourceMode) -> Analysis {
         Ok(tokens) => tokens,
         Err(error) => {
             return Analysis {
-                program: None,
+                syntax: None,
+                bindings: None,
                 diagnostics: vec![diagnostic_from_error(text, &error)],
             }
         }
     };
 
-    let program = match sol::parser::parse_with_mode(tokens, mode) {
-        Ok(program) => program,
+    let syntax = match sol::parser::parse_document_with_config(tokens, LanguageConfig::from(mode)) {
+        Ok(syntax) => syntax,
         Err(error) => {
             return Analysis {
-                program: None,
+                syntax: None,
+                bindings: None,
                 diagnostics: vec![diagnostic_from_error(text, &error)],
             }
         }
     };
 
-    let diagnostics = match sol::compile_program_with_mode(program.clone(), mode) {
-        Ok(_) => Vec::new(),
+    let bindings = sol::binder::bind(&syntax.ast);
+    let mut diagnostics: Vec<_> = bindings
+        .errors
+        .iter()
+        .map(|error| diagnostic_from_error(text, &format!("line {}: {}", error.line, error.message)))
+        .collect();
+
+    match sol::compile_program_with_config(syntax.ast.clone(), syntax.config) {
+        Ok(_) => {}
         Err(error) if mode == SourceMode::Lua && sol::typeck::requires_dynamic_runtime(&error) => {
-            Vec::new()
+            // The shared parser and binder still provide useful analysis for
+            // code that will execute in the dynamic tier.
         }
-        Err(error) => vec![diagnostic_from_error(text, &error)],
-    };
+        Err(error) => diagnostics.push(diagnostic_from_error(text, &error)),
+    }
 
     Analysis {
-        program: Some(program),
+        syntax: Some(syntax),
+        bindings: Some(bindings),
         diagnostics,
     }
 }

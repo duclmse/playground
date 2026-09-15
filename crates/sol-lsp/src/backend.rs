@@ -218,7 +218,7 @@ impl LanguageServer for Backend {
             let enclosing = doc.index.enclosing_function_at(&doc.text, pos.line + 1);
             CompletionResponse::Array(features::completions(
                 &doc.index,
-                doc.mode,
+                doc.language,
                 &enclosing,
                 pos.line + 1,
             ))

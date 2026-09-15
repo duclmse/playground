@@ -547,7 +547,7 @@ checks, focused Lua fixtures, typed benchmark smoke, and web production build.
 The honest baseline remains 0/34 oracle-backed upstream passes, 26 pending, and
 8 host-required; U0 records that gap rather than changing runtime behavior.
 
-### U1 — Superset frontend and semantic AST
+### U1 — Superset frontend and semantic AST — **complete**
 
 **Purpose:** make all Lua source valid input to the Sol frontend without yet
 changing runtime implementation.
@@ -567,6 +567,19 @@ Deliverables:
 Exit gate: every parser fixture and unchanged upstream source accepted in `.lua`
 is also accepted when treated as `.sol`; AST differential tests show no semantic
 mode fork; invalid Sol annotations produce located diagnostics.
+
+Completed 2026-09-15. `LanguageConfig` now separates the Lua 5.5 dialect, Sol
+extension recognition, and type policy; compatibility `SourceMode` adapters no
+longer select parser productions. The lossless parse result retains token
+lexemes and byte spans, the shared binder models lexical scopes, upvalues,
+labels, and `_ENV`, and `sol-lsp` consumes both APIs. The frontend differential
+gate covers every parseable checked-in Lua fixture, benchmark, sibling-VM
+script, and pinned Lua 5.5 upstream source in both profiles, as well as
+contextual identifiers and located annotation errors.
+
+The former Sol-only `{ ... }` statement block was removed because it is
+syntactically indistinguishable from Lua's newline-insensitive `callee { ... }`
+call sugar. Scoped statement blocks use Lua's equivalent `do ... end` form.
 
 ### U2 — Canonical runtime object model and GC foundation
 

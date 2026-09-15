@@ -4,7 +4,7 @@
 
 Typed Sol accepts top-level function, extern function, struct, type-alias,
 import, and exported declarations. Local declarations have the form
-`local name [: Type] = expression`. `do ... end` and `{ ... }` statement blocks
+`local name [: Type] = expression`. `do ... end` statement blocks
 create lexical scopes.
 
 Assignment is permitted only when the target and value types are compatible,
@@ -42,7 +42,7 @@ indexing, calling, or field access through `any` requires a supported dynamic
 operation or prior narrowing; it must never be treated as unchecked typed
 memory access.
 
-Lua mode has expression-list adjustment, multiple results, table constructors,
-method-call syntax, labels/goto, and Lua truthiness. Those rules apply only to
-the supported compatibility surface described in
+Both source profiles have Lua expression-list adjustment, multiple results,
+table constructors, method-call syntax, labels/goto, and Lua truthiness. The
+currently implemented runtime subset is described in
 [Lua compatibility](lua-compatibility.md).

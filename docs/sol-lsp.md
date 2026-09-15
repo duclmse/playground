@@ -4,11 +4,10 @@
 > references, document symbols, workspace symbols, document highlight,
 > rename, completion, and signature help all work end to end over stdio.
 
-`crates/sol-lsp` is a Language Server Protocol server for both of `crates/sol`'s
-source languages - typed `.sol` and Lua-compatible `.lua` - built on top of
-`crates/sol` as a library (path dependency), reusing its shared lexer/parser/
-typeck front end (`parser::SourceMode::Sol` vs. `SourceMode::Lua`) rather than
-reimplementing any part of it. It was written after reviewing `LuaHelper`
+`crates/sol-lsp` is a Language Server Protocol server for Lua-compatible `.lua`
+and superset `.sol` source. It uses `crates/sol`'s lossless parser,
+`LanguageConfig`, lexical binder, and type checker rather than reimplementing
+frontend semantics. It was written after reviewing `LuaHelper`
 (a Go-based Lua LSP available in a local external checkout during development,
 not a repository dependency) for the shape of its LSP surface - `initialize`,
 `textDocument/{didOpen,didChange,didSave,didClose,definition,hover,
@@ -25,10 +24,9 @@ direct Rust equivalent to port.
   makes `tower-lsp`'s request routing and `lsp-types` structs worth the extra
   `tokio` dependency this crate alone carries.
 - **Document store** (`document.rs`): one `Document` per open URI
-  (`DashMap<Url, Document>`), holding the raw text, its `SourceMode` (by file
-  extension - `.lua` is `SourceMode::Lua`, everything else including `.sol`/
-  `.fl`/untitled is `SourceMode::Sol`, matching `main.rs::source_mode`), and a
-  `SymbolIndex`. Sync is whole-document (`TextDocumentSyncKind::FULL`): every
+  (`DashMap<Url, Document>`), holding the raw text, independent language
+  configuration, lexical bindings, and a presentation-oriented `SymbolIndex`.
+  Sync is whole-document (`TextDocumentSyncKind::FULL`): every
   `didChange` carries the full new text and triggers a full re-analysis, no
   incremental patching.
 - **Diagnostics** (`diagnostics.rs`): runs the exact lex -> parse -> typeck
@@ -38,14 +36,15 @@ direct Rust equivalent to port.
   `pairs`, dynamic function values, ...), exactly like `sol run`'s own
   fallback to the dynamic interpreter. Only genuine lex/parse errors and
   non-dynamic typeck errors get published.
+- **Lexical binder** (`crates/sol/src/binder.rs`): models nested block scopes,
+  shadowing, locals, parameters, loop variables, upvalues, labels/gotos, and
+  global access through `_ENV`. Go-to-definition consults these bindings before
+  falling back to the presentation index.
 - **Symbol index** (`index.rs`): built by walking the *untyped* `ast::Program`
   (not the typed `TProgram`), so it exists even when typeck fails with
   "requires dynamic runtime" - which is the common case for `.lua` files.
-  This is deliberately not a real binder: locals are recorded as a flat,
-  line-ordered list per top-level function, and a reference resolves to the
-  nearest preceding same-named declaration in the same top-level function.
-  That misses real nested-scope shadowing, but needed no changes to
-  `crates/sol` itself to build.
+  It remains a lightweight store for hover, completion, and document symbols;
+  it is not the authority for lexical name resolution.
 - **Position resolution** (`text.rs`): `crates/sol`'s AST carries 1-based
   *line* numbers almost everywhere (not columns), except
   `ast::Function::source_span`, which has full byte ranges. Rather than
@@ -56,11 +55,10 @@ direct Rust equivalent to port.
 
 ## Known limitations (v1)
 
-- **References/rename/highlight are textual, not semantic**: they match
+- **References/rename/highlight are still textual**: they match
   every word-boundary occurrence of the identifier's *text* in the document,
   so a same-named local in an unrelated function or an unrelated global will
-  be included. Real scope resolution would need a proper binder shared with
-  `typeck.rs`.
+  be included. U13 will route these operations through the shared binder.
 - **Single-file only**: no cross-file `.sol` project resolution
   (`modules.rs::compile_project`) and no cross-file rename/references/
   workspace symbol beyond documents currently open in the editor.
@@ -82,10 +80,8 @@ cargo build --manifest-path crates/sol-lsp/Cargo.toml
 cargo clippy --manifest-path crates/sol-lsp/Cargo.toml --all-targets
 ```
 
-No automated test suite yet (v1 was verified with a manual JSON-RPC-over-stdio
-smoke test exercising every request type against real `.sol`/`.lua` source);
-see `docs/sol-lsp.md`'s limitations above for what a first regression suite
-should target.
+The crate includes focused frontend/binding tests; U13 adds protocol-level VS
+Code integration and semantic rename/reference coverage.
 
 Point an editor's generic LSP client at the built binary
 (`crates/sol-lsp/target/debug/sol-lsp` after the build above) for `.sol` and

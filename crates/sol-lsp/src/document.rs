@@ -1,5 +1,8 @@
 use dashmap::DashMap;
-use sol::parser::SourceMode;
+use sol::{
+    binder::BindingIndex,
+    parser::{LanguageConfig, SourceMode},
+};
 use tower_lsp::lsp_types::Url;
 
 use crate::index::{self, SymbolIndex};
@@ -7,7 +10,8 @@ use crate::diagnostics;
 
 pub struct Document {
     pub text: String,
-    pub mode: SourceMode,
+    pub language: LanguageConfig,
+    pub bindings: Option<BindingIndex>,
     pub index: SymbolIndex,
 }
 
@@ -28,12 +32,17 @@ impl Document {
     pub fn new(text: String, mode: SourceMode) -> (Self, Vec<tower_lsp::lsp_types::Diagnostic>) {
         let analysis = diagnostics::analyze(&text, mode);
         let index = analysis
-            .program
+            .syntax
             .as_ref()
-            .map(index::build)
+            .map(|syntax| index::build(&syntax.ast))
             .unwrap_or_default();
         (
-            Document { text, mode, index },
+            Document {
+                text,
+                language: mode.into(),
+                bindings: analysis.bindings,
+                index,
+            },
             analysis.diagnostics,
         )
     }

@@ -63,7 +63,10 @@ typed_accounted=$((typed_ported + typed_na))
 if ((lua_oracle == lua_total)); then compatibility_complete=true; else compatibility_complete=false; fi
 if grep -q '@lua-playground/runtime' "$root_dir/apps/web/src/lua-worker.ts"; then web_runtime=piccolo; else web_runtime=sol; fi
 if [[ -d "$root_dir/editors/vscode-sol" ]]; then vscode_client=true; else vscode_client=false; fi
-if grep -q 'SourceMode::Lua' "$root_dir/crates/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
+# Frontend configuration no longer selects grammar productions after U1, but
+# that does not make the execution engine unified. The partition bridge remains
+# the explicit migration seam until U3 replaces it with one semantic ABI.
+if grep -q 'run_lua_partitioned' "$root_dir/crates/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
 if [[ -f "$root_dir/crates/sol-lsp/Cargo.toml" ]]; then lsp_present=true; else lsp_present=false; fi
 commit=$(git -C "$root_dir" rev-parse --short HEAD 2>/dev/null || printf unknown)
 

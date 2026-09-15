@@ -4,11 +4,9 @@
 //! is the *normal* case for real Lua source, not an error condition (see
 //! `sol::typeck::requires_dynamic_runtime`).
 //!
-//! This is intentionally not a real binder: locals are tracked per
-//! top-level function as a flat, line-ordered list, and a reference resolves
-//! to the nearest preceding declaration with the same name in the same
-//! top-level function. That misses nested-scope shadowing precision but
-//! needs no changes to `crates/sol` itself. See `docs/sol-lsp.md`.
+//! This remains a presentation-oriented index for hover/completion/symbols.
+//! Lexical resolution comes from `sol::binder::BindingIndex`, retained by the
+//! document store. See `docs/sol-lsp.md`.
 
 use sol::ast::{self, Expr, ExprKind, Stmt, TypeName};
 

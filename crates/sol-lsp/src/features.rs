@@ -2,7 +2,7 @@
 //! whatever LSP request data it needs. `backend.rs` is just the
 //! `LanguageServer` trait wiring onto these.
 
-use sol::parser::SourceMode;
+use sol::parser::LanguageConfig;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, DocumentSymbol, Location, ParameterInformation,
     ParameterLabel, Position, Range, SignatureHelp, SignatureInformation, SymbolKind, Url,
@@ -29,8 +29,8 @@ fn identifier_range_on_line(text: &str, line: u32, name: &str) -> Range {
         .unwrap_or_else(|| crate::text::line_range(text, line))
 }
 
-fn hover_markdown(mode: SourceMode, code: String) -> String {
-    let lang = if mode == SourceMode::Lua { "lua" } else { "sol" };
+fn hover_markdown(language: LanguageConfig, code: String) -> String {
+    let lang = if language.sol_extensions { "sol" } else { "lua" };
     format!("```{lang}\n{code}\n```")
 }
 
@@ -51,7 +51,7 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
             .unwrap_or_default();
         let kw = if f.is_extern { "extern function" } else { "function" };
         return Some(hover_markdown(
-            doc.mode,
+            doc.language,
             format!("{kw} {}({params}){ret}", f.name),
         ));
     }
@@ -64,7 +64,7 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
             .collect::<Vec<_>>()
             .join(",\n");
         return Some(hover_markdown(
-            doc.mode,
+            doc.language,
             format!("struct {} {{\n{fields}\n}}", s.name),
         ));
     }
@@ -72,7 +72,7 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
     let enclosing = doc.index.enclosing_function_at(&doc.text, pos.line + 1);
     if let Some(local) = doc.index.find_local(&word, &enclosing, pos.line + 1) {
         let ty = local.ty.clone().unwrap_or_else(|| "any".to_string());
-        return Some(hover_markdown(doc.mode, format!("local {}: {ty}", local.name)));
+        return Some(hover_markdown(doc.language, format!("local {}: {ty}", local.name)));
     }
 
     None
@@ -80,6 +80,20 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
 
 pub fn definition(doc: &Document, uri: &Url, pos: Position) -> Option<Location> {
     let (word, _range) = word_at_position(&doc.text, pos)?;
+
+    if let Some(bindings) = &doc.bindings {
+        let line = pos.line + 1;
+        if let Some(declaration) = bindings
+            .references
+            .iter()
+            .find(|reference| reference.name == word && reference.line == line)
+            .and_then(|reference| reference.binding)
+            .and_then(|binding| bindings.bindings.get(binding))
+        {
+            let range = identifier_range_on_line(&doc.text, declaration.line, &declaration.name);
+            return Some(Location::new(uri.clone(), range));
+        }
+    }
 
     if let Some(f) = doc.index.find_function(&word) {
         let range = identifier_range_on_line(&doc.text, f.line, &f.name);
@@ -152,7 +166,7 @@ pub fn document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
     out
 }
 
-pub fn completions(index: &SymbolIndex, mode: SourceMode, enclosing: &str, line: u32) -> Vec<CompletionItem> {
+pub fn completions(index: &SymbolIndex, language: LanguageConfig, enclosing: &str, line: u32) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     for f in &index.functions {
         let params = f
@@ -185,12 +199,10 @@ pub fn completions(index: &SymbolIndex, mode: SourceMode, enclosing: &str, line:
             });
         }
     }
-    let keywords: &[&str] = if mode == SourceMode::Lua {
-        LUA_KEYWORDS
-    } else {
-        SOL_KEYWORDS
-    };
-    for kw in keywords {
+    for kw in LUA_KEYWORDS
+        .iter()
+        .chain(language.sol_extensions.then_some(SOL_KEYWORDS).into_iter().flatten())
+    {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
@@ -283,4 +295,23 @@ pub fn signature_help(doc: &Document, pos: Position) -> Option<SignatureHelp> {
         active_signature: Some(0),
         active_parameter: Some(active_param as u32),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn definition_uses_lexical_bindings_for_shadowed_locals() {
+        let text = "local value = 1\ndo\n  local value = 2\n  return value\nend\nreturn value\n".to_string();
+        let (document, diagnostics) = Document::new(text, sol::parser::SourceMode::Lua);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let uri = Url::parse("file:///shadowing.lua").unwrap();
+
+        let inner = definition(&document, &uri, Position::new(3, 10)).unwrap();
+        assert_eq!(inner.range.start.line, 2);
+
+        let outer = definition(&document, &uri, Position::new(5, 8)).unwrap();
+        assert_eq!(outer.range.start.line, 0);
+    }
 }
