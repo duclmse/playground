@@ -150,6 +150,7 @@ pub enum HeapError {
         index: usize,
         upvalues: usize,
     },
+    NativeProviderIdsExhausted,
 }
 
 impl fmt::Display for HeapError {
@@ -170,6 +171,9 @@ impl fmt::Display for HeapError {
                 f,
                 "closure environment index {index} is outside {upvalues} upvalues"
             ),
+            Self::NativeProviderIdsExhausted => {
+                f.write_str("canonical native-provider ID space is exhausted")
+            }
         }
     }
 }
@@ -269,6 +273,7 @@ pub struct Heap {
     next_root: u64,
     interned_strings: HashMap<Vec<u8>, ObjectId>,
     remembered: HashSet<ObjectId>,
+    next_native_provider: u32,
     pub capabilities: Capabilities,
 }
 
@@ -287,6 +292,9 @@ impl Heap {
             next_root: 1,
             interned_strings: HashMap::new(),
             remembered: HashSet::new(),
+            // Provider zero is reserved for sol-core's portable standard
+            // library callback namespace.
+            next_native_provider: 1,
             capabilities,
         }
     }
@@ -397,6 +405,18 @@ impl Heap {
             function,
             captures,
         }))
+    }
+
+    /// Reserves a heap-local provider namespace for host/native callables.
+    /// Keeping allocation here prevents two independent adapters or hosts
+    /// from assigning the same provider ID inside one identity domain.
+    pub fn reserve_native_provider(&mut self) -> Result<u32, HeapError> {
+        let provider = self.next_native_provider;
+        self.next_native_provider = self
+            .next_native_provider
+            .checked_add(1)
+            .ok_or(HeapError::NativeProviderIdsExhausted)?;
+        Ok(provider)
     }
 
     pub fn set_native_callable_captures(
@@ -1018,6 +1038,8 @@ mod tests {
     #[test]
     fn native_callable_registry_ids_and_captures_are_portable_roots() {
         let mut heap = Heap::default();
+        assert_eq!(heap.reserve_native_provider().unwrap(), 1);
+        assert_eq!(heap.reserve_native_provider().unwrap(), 2);
         let captured = heap.alloc_table();
         let callable = heap.alloc_native_callable(7, 11, vec![Value::object(captured)]);
         let HeapObject::NativeCallable(object) = heap.object(callable).unwrap() else {
