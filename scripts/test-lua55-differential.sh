@@ -12,7 +12,9 @@
 # refuses to run if that executable is missing rather than silently falling
 # back to whatever `lua` happens to be on PATH.
 #
-# stdout is diffed byte-for-byte. Exit status is compared only as "did this
+# stdout is diffed byte-for-byte after removing Sol's documented top-level
+# return echo (`nil` for ordinary corpus chunks and the explicit marker for
+# generated cases). Exit status is compared only as "did this
 # program fail at all" (both zero, or both nonzero) - Sol's CLI and PUC Lua's
 # `lua` do not share a nonzero-exit-code convention (e.g. panics vs. runtime
 # errors vs. usage errors), so requiring the literal codes to match would be
@@ -150,11 +152,12 @@ fuzz_generate_case() {
 "
 }
 
-root_dir=$(cd "$(dirname "$0")/.." && pwd)
-suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
-manifest=${SOL_LUA55_MANIFEST:-"$root_dir/tests/lua55/manifest.toml"}
-sol_bin=${SOL_BIN:-"$root_dir/crates/sol/target/debug/sol"}
-source_dir=${LUA55_SOURCE_DIR:-"$root_dir/lua-5.5.1"}
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/lib.sh"
+
+suite_dir=${1:-"$ROOT/lua-5.5.1-tests"}
+manifest=${SOL_LUA55_MANIFEST:-"$ROOT/tests/lua55/manifest.toml"}
+source_dir=${LUA55_SOURCE_DIR:-"$ROOT/lua-5.5.1"}
 reference_bin=${LUA55_REFERENCE_BIN:-"$source_dir/src/lua"}
 run_pending=${SOL_LUA55_DIFF_RUN_PENDING:-1}
 results_dir=${SOL_LUA55_DIFF_RESULTS_DIR:-"$(mktemp -d "${TMPDIR:-/tmp}/sol-lua55-diff.XXXXXX")"}
@@ -222,50 +225,20 @@ or point LUA55_REFERENCE_BIN at an existing pinned-source build.
 EOF
   exit 2
 fi
-if [[ ! -x "$sol_bin" ]]; then
-  cargo build --offline --manifest-path "$root_dir/crates/sol/Cargo.toml" >&2 || exit $?
-fi
+ensure_sol_bin debug || exit $?
+sol_bin=$SOL_BIN
 
 mkdir -p "$results_dir"
 entries_file="$results_dir/manifest.tsv"
 
-awk '
-function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function string_value(value) {
-  value = trim(value)
-  return substr(value, 2, length(value) - 2)
-}
-function array_value(value,    n, i, parts, out) {
-  value = trim(value)
-  value = substr(value, 2, length(value) - 2)
-  n = split(value, parts, ",")
-  out = ""
-  for (i = 1; i <= n; i++) {
-    piece = string_value(trim(parts[i]))
-    if (piece == "") continue
-    out = (out == "" ? piece : out "," piece)
-  }
-  return out
-}
-BEGIN { in_case = 0 }
-/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-/^[[:space:]]*\[\[case\]\][[:space:]]*$/ {
-  if (in_case && path != "") print path "\034" status "\034" fixture "\034" category "\034" requires
-  in_case = 1; path = status = fixture = category = requires = ""
-  next
-}
-{
-  pos = index($0, "=")
-  if (!in_case || pos == 0) next
-  key = trim(substr($0, 1, pos - 1)); value = trim(substr($0, pos + 1))
-  if (key == "path") path = string_value(value)
-  else if (key == "status") status = string_value(value)
-  else if (key == "fixture") fixture = string_value(value)
-  else if (key == "category") category = string_value(value)
-  else if (key == "requires") requires = array_value(value)
-}
-END { if (in_case && path != "") print path "\034" status "\034" fixture "\034" category "\034" requires }
-' "$manifest" >"$entries_file"
+if ! parse_lua55_manifest "$manifest" "$entries_file"; then
+  [[ -n "$keep_results" ]] || rm -rf "$results_dir"
+  exit 2
+fi
+if ! validate_lua55_corpus_coverage "$entries_file" "$suite_dir"; then
+  [[ -n "$keep_results" ]] || rm -rf "$results_dir"
+  exit 2
+fi
 
 failure_report="$results_dir/failure-report.md"
 {
@@ -280,7 +253,7 @@ failure_report="$results_dir/failure-report.md"
 matched=0
 diverged=0
 skipped=0
-while IFS=$'\034' read -r path status fixture category requires; do
+while IFS=$'\034' read -r path status category requires fixture note; do
   case "$status" in
     host-required) skipped=$((skipped + 1)); continue ;;
     pending) [[ $run_pending == 1 ]] || { skipped=$((skipped + 1)); continue; } ;;
@@ -288,7 +261,7 @@ while IFS=$'\034' read -r path status fixture category requires; do
   source="$suite_dir/$path"
   target=$source
   if [[ -n "$fixture" ]]; then
-    target="$root_dir/$fixture"
+    target="$ROOT/$fixture"
   fi
   if [[ ! -f "$target" ]]; then
     printf 'SKIP  %-18s fixture not found: %s\n' "$path" "$target"
@@ -296,6 +269,7 @@ while IFS=$'\034' read -r path status fixture category requires; do
     continue
   fi
   sol_out="$results_dir/$path.sol.stdout"
+  sol_out_compare="$results_dir/$path.sol.stdout.compare"
   sol_err="$results_dir/$path.sol.stderr"
   ref_out="$results_dir/$path.reference.stdout"
   ref_err="$results_dir/$path.reference.stderr"
@@ -305,8 +279,9 @@ while IFS=$'\034' read -r path status fixture category requires; do
   ( cd "$suite_dir" && "$reference_bin" "$path" >"$ref_out" 2>"$ref_err" )
   ref_status=$?
 
+  strip_sol_cli_return_line "$sol_out" "$sol_out_compare" nil
   reasons=()
-  diff -u "$ref_out" "$sol_out" >"$results_dir/$path.stdout.diff" || reasons+=("stdout")
+  diff -u "$ref_out" "$sol_out_compare" >"$results_dir/$path.stdout.diff" || reasons+=("stdout")
 
   sol_failed=1; [[ $sol_status -eq 0 ]] && sol_failed=0
   ref_failed=1; [[ $ref_status -eq 0 ]] && ref_failed=0
@@ -348,7 +323,7 @@ printf '\nLua 5.5 differential: %d match, %d diverge, %d skipped\n' "$matched" "
 fuzz_matched=0
 fuzz_diverged=0
 if [[ $fuzz_cases -gt 0 ]]; then
-  fuzz_fixtures_dir="$root_dir/tests/lua55/fuzz-fixtures"
+  fuzz_fixtures_dir="$ROOT/tests/lua55/fuzz-fixtures"
   for ((case_index = 0; case_index < fuzz_cases; case_index++)); do
     case_seed=$(( fuzz_seed + case_index ))
     fuzz_generate_case "$case_seed"
@@ -367,19 +342,9 @@ if [[ $fuzz_cases -gt 0 ]]; then
     ref_status=$?
 
     # Strip Sol CLI's one deliberate, documented divergence from real Lua's
-    # CLI before diffing - see the header comment above `FUZZ_MARKER`. Only
-    # strips the marker if it is genuinely the trailing line (a case that
-    # errored out before the implicit `return` runs keeps its real output
-    # untouched, so a real divergence there is still caught).
+    # CLI before diffing - see the header comment above `FUZZ_MARKER`.
     sol_out_compare="$results_dir/$label.sol.stdout.compare"
-    awk -v marker="$FUZZ_MARKER" '
-      { lines[NR] = $0 }
-      END {
-        n = NR
-        if (n > 0 && lines[n] == marker) n--
-        for (i = 1; i <= n; i++) print lines[i]
-      }
-    ' "$sol_out" >"$sol_out_compare"
+    strip_sol_cli_return_line "$sol_out" "$sol_out_compare" "$FUZZ_MARKER"
 
     reasons=()
     diff -u "$ref_out" "$sol_out_compare" >"$results_dir/$label.stdout.diff" || reasons+=("stdout")

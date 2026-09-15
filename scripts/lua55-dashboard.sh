@@ -13,8 +13,10 @@
 # backed by scripts/test-lua55-suite.sh / scripts/test-lua55-differential.sh.
 set -u
 
-root_dir=$(cd "$(dirname "$0")/.." && pwd)
-manifest=${SOL_LUA55_MANIFEST:-"$root_dir/tests/lua55/manifest.toml"}
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/lib.sh"
+
+manifest=${SOL_LUA55_MANIFEST:-"$ROOT/tests/lua55/manifest.toml"}
 output=""
 
 usage() {
@@ -51,46 +53,7 @@ fi
 entries_file="$(mktemp)"
 trap 'rm -f "$entries_file"' EXIT
 
-# Reuses the same narrow scalar/string-array TOML subset the manifest is
-# written in (see scripts/test-lua55-suite.sh); this reader does not
-# re-validate manifest well-formedness - run scripts/test-lua55-manifest.sh
-# for that - it assumes a manifest that already passes that check.
-awk '
-function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function string_value(value) {
-  value = trim(value)
-  return substr(value, 2, length(value) - 2)
-}
-function array_value(value,    n, i, parts, piece, out) {
-  value = trim(value)
-  value = substr(value, 2, length(value) - 2)
-  n = split(value, parts, ",")
-  out = ""
-  for (i = 1; i <= n; i++) {
-    piece = string_value(trim(parts[i]))
-    if (piece == "") continue
-    out = (out == "" ? piece : out "," piece)
-  }
-  return out
-}
-BEGIN { in_case = 0 }
-/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-/^[[:space:]]*\[\[case\]\][[:space:]]*$/ {
-  if (in_case && path != "") print path "\034" status "\034" category "\034" requires
-  in_case = 1; path = status = category = requires = ""
-  next
-}
-{
-  pos = index($0, "=")
-  if (!in_case || pos == 0) next
-  key = trim(substr($0, 1, pos - 1)); value = trim(substr($0, pos + 1))
-  if (key == "path") path = string_value(value)
-  else if (key == "status") status = string_value(value)
-  else if (key == "category") category = string_value(value)
-  else if (key == "requires") requires = array_value(value)
-}
-END { if (in_case && path != "") print path "\034" status "\034" category "\034" requires }
-' "$manifest" >"$entries_file"
+parse_lua55_manifest "$manifest" "$entries_file" || exit 2
 
 report="$(mktemp)"
 
@@ -98,8 +61,8 @@ report="$(mktemp)"
   echo "# Lua 5.5 corpus release dashboard"
   echo
   echo "Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) from \`$(basename "$manifest")\`."
-  if git -C "$root_dir" rev-parse --short HEAD >/dev/null 2>&1; then
-    echo "Commit: \`$(git -C "$root_dir" rev-parse --short HEAD)\`"
+  if git -C "$ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+    echo "Commit: \`$(git -C "$ROOT" rev-parse --short HEAD)\`"
   fi
   echo
   echo "## Corpus counts by manifest status"
@@ -111,7 +74,7 @@ report="$(mktemp)"
   }' "$entries_file" | sort -t $'\034' -k2,2 -rn | while IFS=$'\034' read -r status count; do
     printf '| %s | %s |\n' "$status" "$count"
   done
-  total="$(wc -l <"$entries_file" | tr -d ' ')"
+  total="$(awk 'END { print NR + 0 }' "$entries_file")"
   echo "| **total** | **$total** |"
   echo
   echo "Only \`pass\`/\`adapted\` counts as an oracle-backed, file-level pass;"
@@ -159,7 +122,7 @@ report="$(mktemp)"
   echo
   echo "## Typed-path regression status"
   echo
-  baseline_file="$root_dir/benchmarks/typed-baseline.json"
+  baseline_file="$ROOT/benchmarks/typed-baseline.json"
   if [[ -f "$baseline_file" ]]; then
     echo "A baseline exists (\`benchmarks/typed-baseline.json\`, last written"
     echo "$(date -u -r "$baseline_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown time')),"

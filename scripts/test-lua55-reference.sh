@@ -4,11 +4,13 @@
 
 set -u
 
-root_dir=$(cd "$(dirname "$0")/.." && pwd)
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/lib.sh"
+root_dir=$ROOT
 suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
 source_dir=${LUA55_SOURCE_DIR:-"$root_dir/lua-5.5.1"}
 archive=${LUA55_SOURCE_ARCHIVE:-"$root_dir/lua-5.5.1.tar.gz"}
-expected_sha256=1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce
+expected_sha256=$LUA55_SOURCE_SHA256
 lua_bin=${LUA55_REFERENCE_BIN:-"$source_dir/src/lua"}
 results_dir=${LUA55_REFERENCE_RESULTS_DIR:-"$(mktemp -d "${TMPDIR:-/tmp}/lua55-reference.XXXXXX")"}
 keep_results=${LUA55_REFERENCE_RESULTS_DIR:+1}
@@ -47,7 +49,7 @@ if [[ ! -d "$suite_dir" ]]; then
   exit 2
 fi
 if [[ -f "$archive" ]]; then
-  actual_sha256=$(sha256sum "$archive" | awk '{print $1}')
+  actual_sha256=$(sha256_file "$archive")
   if [[ $actual_sha256 != "$expected_sha256" ]]; then
     echo "Lua source checksum mismatch for $archive: $actual_sha256" >&2
     exit 2

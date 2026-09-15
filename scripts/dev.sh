@@ -16,7 +16,10 @@ if [ -f "$PKG_WASM" ]; then
       NEEDS_BUILD=1
       break
     fi
-  done < <(find "$ROOT/crates/lua-vm/src" "$ROOT/crates/lua-vm/Cargo.toml" -type f -print0)
+  done < <(find \
+    "$ROOT/crates/lua-vm/src" "$ROOT/crates/lua-vm/Cargo.toml" \
+    "$ROOT/crates/vm/src" "$ROOT/crates/vm/Cargo.toml" \
+    -type f -print0)
 fi
 
 if [ "$NEEDS_BUILD" = "1" ]; then

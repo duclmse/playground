@@ -22,10 +22,10 @@
 set -u
 
 root_dir=$(cd "$(dirname "$0")/.." && pwd)
+source "$root_dir/scripts/lib.sh"
 suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
 manifest=${SOL_CONFORMANCE_MANIFEST:-"$root_dir/tests/sol-conformance/manifest.toml"}
 fixtures_dir="$root_dir/crates/sol/tests/fixtures/sol-conformance"
-sol_bin=${SOL_BIN:-"$root_dir/crates/sol/target/debug/sol"}
 validate_only=${SOL_CONFORMANCE_VALIDATE_ONLY:-0}
 
 usage() {
@@ -153,9 +153,8 @@ if [[ $validate_only == 1 ]]; then
   exit 0
 fi
 
-if [[ ! -x "$sol_bin" ]]; then
-  cargo build --offline --manifest-path "$root_dir/crates/sol/Cargo.toml" >&2 || exit $?
-fi
+ensure_sol_bin debug || exit $?
+sol_bin=$SOL_BIN
 
 ported=0
 not_applicable=0

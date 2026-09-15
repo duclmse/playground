@@ -149,8 +149,9 @@ cargo build --release --example interpreter --manifest-path "$ROOT/crates/vm/Car
 VM_BIN="$ROOT/crates/vm/target/release/examples/interpreter"
 
 log "Building crates/sol in release mode"
-cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
-SOL_BIN="$ROOT/crates/sol/target/release/sol"
+target_root=$(cargo_target_root)
+CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
+SOL_BIN="$target_root/release/sol"
 
 LUA_RUNTIMES=(lua)
 LUA_RUNTIME_VERSIONS=("$(lua -v 2>&1 | head -n 1)")

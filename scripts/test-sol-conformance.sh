@@ -8,10 +8,8 @@ source ./lib.sh
 
 require_cmd cargo "Install Rust: https://rustup.rs"
 
-sol_bin=${SOL_BIN:-"$ROOT/crates/sol/target/debug/sol"}
-if [[ ! -x "$sol_bin" ]]; then
-  cargo build --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
-fi
+ensure_sol_bin debug
+sol_bin=$SOL_BIN
 
 fixtures=(
   "$ROOT/crates/sol/tests/fixtures/lua55/dynamic_core.lua"

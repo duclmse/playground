@@ -10,11 +10,8 @@ source ./lib.sh
 
 require_cmd cargo "Install Rust: https://rustup.rs"
 
-sol_bin=${SOL_BIN:-"$ROOT/crates/sol/target/release/sol"}
-if [[ ! -x "$sol_bin" ]]; then
-  log "Building sol (release)..."
-  cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
-fi
+ensure_sol_bin release
+sol_bin=$SOL_BIN
 
 out_dir="$ROOT/examples/sol-demo/build"
 mkdir -p "$out_dir"

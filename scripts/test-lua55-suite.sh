@@ -5,10 +5,11 @@
 
 set -u
 
-root_dir=$(cd "$(dirname "$0")/.." && pwd)
-suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
-manifest=${SOL_LUA55_MANIFEST:-"$root_dir/tests/lua55/manifest.toml"}
-sol_bin=${SOL_BIN:-"$root_dir/crates/sol/target/debug/sol"}
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/lib.sh"
+
+suite_dir=${1:-"$ROOT/lua-5.5.1-tests"}
+manifest=${SOL_LUA55_MANIFEST:-"$ROOT/tests/lua55/manifest.toml"}
 results_dir=${SOL_LUA55_RESULTS_DIR:-"$(mktemp -d "${TMPDIR:-/tmp}/sol-lua55.XXXXXX")"}
 keep_results=${SOL_LUA55_RESULTS_DIR:+1}
 run_pending=${SOL_LUA55_RUN_PENDING:-1}
@@ -47,121 +48,16 @@ fi
 mkdir -p "$results_dir"
 entries_file="$results_dir/manifest.tsv"
 
-# The manifest deliberately uses only scalar strings and string arrays. Keep
-# this reader narrow so a malformed inventory fails loudly instead of silently
-# changing a corpus result.
-if ! awk '
-function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function die(message) { print "manifest: " message > "/dev/stderr"; bad = 1 }
-function string_value(value, key) {
-  value = trim(value)
-  if (substr(value, 1, 1) != "\"" || substr(value, length(value), 1) != "\"") {
-    die("expected quoted string for " key " at line " NR)
-    return ""
-  }
-  return substr(value, 2, length(value) - 2)
-}
-function array_value(value, key) {
-  value = trim(value)
-  if (substr(value, 1, 1) != "[" || substr(value, length(value), 1) != "]") {
-    die("expected string array for " key " at line " NR)
-    return ""
-  }
-  value = substr(value, 2, length(value) - 2)
-  gsub(/[[:space:]]/, "", value)
-  if (value == "") return ""
-  if (value !~ /^"[^"]+"(,"[^"]+")*$/) {
-    die("expected string array for " key " at line " NR)
-    return ""
-  }
-  gsub(/"/, "", value)
-  return value
-}
-function emit() {
-  if (!in_case) return
-  if (path == "" || category == "" || status == "" || note == "") {
-    die("case starting at line " case_line " must contain path, category, status, and note")
-  }
-  if (status != "pass" && status != "adapted" && status != "host-required" && status != "pending" && status != "diverges") {
-    die("unknown status '\''" status "'\'' for " path)
-  }
-  if (seen[path]++) die("duplicate path " path)
-  print path "\034" status "\034" category "\034" requires "\034" fixture "\034" note
-}
-BEGIN { in_case = 0; bad = 0 }
-/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-/^[[:space:]]*\[\[case\]\][[:space:]]*$/ {
-  emit(); in_case = 1; case_line = NR
-  path = category = status = requires = fixture = note = ""
-  next
-}
-{
-  pos = index($0, "=")
-  if (!in_case) {
-    if (pos == 0) die("expected top-level key or [[case]] at line " NR)
-    next
-  }
-  if (pos == 0) { die("expected key/value pair at line " NR); next }
-  key = trim(substr($0, 1, pos - 1)); value = trim(substr($0, pos + 1))
-  if (key == "path" || key == "category" || key == "status" || key == "fixture" || key == "note") {
-    value = string_value(value, key)
-  } else if (key == "requires") {
-    value = array_value(value, key)
-  } else {
-    die("unknown case key " key " at line " NR); next
-  }
-  if (key == "path") path = value
-  else if (key == "category") category = value
-  else if (key == "status") status = value
-  else if (key == "requires") requires = value
-  else if (key == "fixture") fixture = value
-  else if (key == "note") note = value
-}
-END { emit(); exit bad }
-' "$manifest" >"$entries_file"; then
+if ! parse_lua55_manifest "$manifest" "$entries_file"; then
   rm -rf "$results_dir"
   exit 2
 fi
-
-manifest_paths='|'
-manifest_count=0
-while IFS=$'\034' read -r path status category requires fixture note; do
-  if [[ $path == /* || $path == */* || $path == *".."* || ! -f "$suite_dir/$path" ]]; then
-    echo "manifest: source path is not a top-level corpus file: $path" >&2
-    rm -rf "$results_dir"
-    exit 2
-  fi
-  case "$manifest_paths" in
-    *"|$path|"*)
-      echo "manifest: duplicate source path: $path" >&2
-      rm -rf "$results_dir"
-      exit 2
-      ;;
-  esac
-  manifest_paths="${manifest_paths}${path}|"
-  manifest_count=$((manifest_count + 1))
-done <"$entries_file"
-
-corpus_count=0
-for case_file in "$suite_dir"/*.lua; do
-  [[ -f "$case_file" ]] || continue
-  case_name=$(basename "$case_file")
-  corpus_count=$((corpus_count + 1))
-  case "$manifest_paths" in
-    *"|$case_name|"*) ;;
-    *)
-      echo "manifest: missing corpus entry for $case_name" >&2
-      rm -rf "$results_dir"
-      exit 2
-      ;;
-  esac
-done
-
-if [[ $manifest_count -ne $corpus_count ]]; then
-  echo "manifest: has $manifest_count entries for $corpus_count top-level corpus files" >&2
+if ! validate_lua55_corpus_coverage "$entries_file" "$suite_dir"; then
   rm -rf "$results_dir"
   exit 2
 fi
+manifest_count=$LUA55_MANIFEST_COUNT
+corpus_count=$LUA55_CORPUS_COUNT
 
 if [[ $validate_only == 1 ]]; then
   printf 'Lua 5.5 manifest: %d entries cover %d top-level files\n' "$manifest_count" "$corpus_count"
@@ -169,9 +65,8 @@ if [[ $validate_only == 1 ]]; then
   exit 0
 fi
 
-if [[ ! -x "$sol_bin" ]]; then
-  cargo build --offline --manifest-path "$root_dir/crates/sol/Cargo.toml" >&2 || exit $?
-fi
+ensure_sol_bin debug || exit $?
+sol_bin=$SOL_BIN
 
 passed=0
 pending=0
@@ -185,7 +80,7 @@ run_case() {
   local source="$suite_dir/$path"
   local target=$source
   if [[ -n "$fixture" ]]; then
-    target="$root_dir/$fixture"
+    target="$ROOT/$fixture"
   fi
   if [[ ! -f "$target" ]]; then
     printf 'FAIL  %-18s manifest fixture not found: %s\n' "$path" "$target"

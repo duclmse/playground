@@ -11,9 +11,11 @@ require_wasm_target
 require_wasm_bindgen_cli
 
 log "Building crates/lua-vm for wasm32-unknown-unknown (release)"
-cargo build --release --manifest-path "$ROOT/crates/lua-vm/Cargo.toml" --target wasm32-unknown-unknown
+target_root=$(cargo_target_root)
+CARGO_TARGET_DIR="$target_root" cargo build --release \
+  --manifest-path "$ROOT/crates/lua-vm/Cargo.toml" --target wasm32-unknown-unknown
 
-WASM_OUT="$ROOT/crates/lua-vm/target/wasm32-unknown-unknown/release/lua_vm.wasm"
+WASM_OUT="$target_root/wasm32-unknown-unknown/release/lua_vm.wasm"
 [ -f "$WASM_OUT" ] || die "expected build output not found at $WASM_OUT"
 
 log "Generating wasm-bindgen JS glue into packages/lua-runtime/pkg"

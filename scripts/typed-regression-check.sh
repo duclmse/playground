@@ -68,8 +68,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 log "Building crates/sol in release mode"
-cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
-SOL_BIN="$ROOT/crates/sol/target/release/sol"
+target_root=$(cargo_target_root)
+CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
+SOL_BIN="$target_root/release/sol"
 
 # The same "typed-only" set scripts/benchmark.sh's second loop measures: a
 # .sol file with no same-named .lua file, i.e. a workload with no meaningful

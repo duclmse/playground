@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Check that every benchmark is covered by the Sol runner and that paired Lua
-# and Sol workloads produce numerically equivalent results before they are
-# timed. Escaping closures are the sole documented language-level exception.
+# Check that every benchmark is covered by the Sol runner before timing. Every
+# Lua workload is compared with Sol's dynamic runtime; same-named typed Sol
+# workloads are additionally required to produce the same numeric result.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -11,10 +11,8 @@ require_cmd cargo "Install Rust: https://rustup.rs"
 require_cmd lua "Install a reference Lua interpreter, e.g.: brew install lua"
 require_cmd awk "Install a POSIX awk implementation"
 
-sol_bin=${SOL_BIN:-"$ROOT/crates/sol/target/debug/sol"}
-if [[ ! -x "$sol_bin" ]]; then
-  cargo build --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
-fi
+ensure_sol_bin debug
+sol_bin=$SOL_BIN
 
 equivalent_number() {
   awk -v lua_value="$1" -v sol_value="$2" 'BEGIN {
@@ -33,26 +31,37 @@ equivalent_number() {
 }
 
 paired=0
+dynamic_only=0
 sol_only=0
-skipped=0
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/sol-benchmark-conformance.XXXXXX")
+trap 'rm -rf "$work_dir"' EXIT
 for lua_script in "$ROOT"/benchmarks/*.lua; do
   name=$(basename "$lua_script" .lua)
   sol_script="$ROOT/benchmarks/$name.sol"
-  if [[ ! -f "$sol_script" ]]; then
-    if [[ "$name" == function_calls_closure ]]; then
-      printf 'SKIP  %-24s escaping Sol closures are not implemented\n' "$name"
-      skipped=$((skipped + 1))
-      continue
-    fi
-    die "$name.lua has no matching Sol benchmark"
-  fi
-
   lua_output=$(lua "$lua_script")
-  sol_output=$("$sol_bin" run "$sol_script")
-  equivalent_number "$lua_output" "$sol_output" \
-    || die "$name differs: Lua='$lua_output', Sol='$sol_output'"
-  printf 'PASS  %-24s Lua=%s Sol=%s\n' "$name" "$lua_output" "$sol_output"
-  paired=$((paired + 1))
+  dynamic_raw=$(SOL_LUA_INSTRUCTION_BUDGET=18446744073709551615 \
+    SOL_LUA_CALL_DEPTH_BUDGET=1000000 \
+    SOL_LUA_ALLOCATION_BUDGET=18446744073709551615 \
+    "$sol_bin" run "$lua_script")
+  dynamic_file="$work_dir/$name.raw"
+  normalized_file="$work_dir/$name.normalized"
+  printf '%s\n' "$dynamic_raw" >"$dynamic_file"
+  strip_sol_cli_return_line "$dynamic_file" "$normalized_file" nil
+  dynamic_output=$(<"$normalized_file")
+  equivalent_number "$lua_output" "$dynamic_output" \
+    || die "$name dynamic result differs: Lua='$lua_output', Sol dynamic='$dynamic_output'"
+  if [[ -f "$sol_script" ]]; then
+    typed_output=$("$sol_bin" run "$sol_script")
+    equivalent_number "$lua_output" "$typed_output" \
+      || die "$name typed result differs: Lua='$lua_output', Sol typed='$typed_output'"
+    printf 'PASS  %-24s Lua=%s dynamic=%s typed=%s\n' \
+      "$name" "$lua_output" "$dynamic_output" "$typed_output"
+    paired=$((paired + 1))
+  else
+    printf 'PASS  %-24s Lua=%s dynamic=%s (no typed equivalent)\n' \
+      "$name" "$lua_output" "$dynamic_output"
+    dynamic_only=$((dynamic_only + 1))
+  fi
 done
 
 for sol_script in "$ROOT"/benchmarks/*.sol; do
@@ -63,5 +72,5 @@ for sol_script in "$ROOT"/benchmarks/*.sol; do
   sol_only=$((sol_only + 1))
 done
 
-printf 'Sol benchmark conformance: %d paired, %d Sol-only, %d documented skip\n' \
-  "$paired" "$sol_only" "$skipped"
+printf 'Sol benchmark conformance: %d Lua/typed pairs, %d dynamic-only Lua, %d typed-only Sol\n' \
+  "$paired" "$dynamic_only" "$sol_only"
