@@ -21,3 +21,6 @@ apps/web/e2e/screenshots/
 *.log
 lua-5.5.1-tests/
 lua-5.5.1-tests.tar.gz
+
+# Temporary/diagnostic files not meant to be committed (see AGENTS.md)
+**/scratch/

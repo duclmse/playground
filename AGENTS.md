@@ -100,6 +100,11 @@ system Lua executable as its oracle.
   typed hot paths.
 - Add focused regression coverage with behavior changes. For Lua compatibility,
   update the corpus manifest/fixture and status documentation together.
+- Put one-off diagnostic or exploratory test files (e.g. a bytecode dump used
+  to root-cause a bug) in that crate's `scratch/` directory (e.g.
+  `crates/sol/scratch/`) instead of `tests/`. `scratch/` is gitignored, so
+  files there are never committed and are not auto-discovered by `cargo test`;
+  copy a file into `tests/` temporarily if you need it to actually run.
 - Preserve byte-oriented Lua source handling in Sol; do not require source or
   string-literal bytes to be valid UTF-8.
 - Avoid modifying generated output, lockfiles, vendored `crates/vm`, or broad

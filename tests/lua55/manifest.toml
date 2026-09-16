@@ -189,7 +189,7 @@ path = "nextvar.lua"
 category = "tables-and-globals"
 status = "pending"
 requires = []
-note = "blocked-on: math.random/math.randomseed now implement Lua 5.5's xoshiro256** behavior and the case advances beyond its former line-335 blocker; the unchanged case now exhausts Sol's instruction budget in a later table-iteration stress section and still needs isolation. Much of the file is gated behind the unavailable ltests `T` global."
+note = "blocked-on: math.random/math.randomseed's xoshiro256** behavior, the former line-335 blocker, the table-iteration stress section, native argument-count validation's \"bad argument\" wording (checkerror(\"bad argument\", pairs) at line 398), and `next`/`pairs` traversal after tombstoning a deleted key mid-iteration are all now fixed (the last was `LuaTable::hash`'s `std::HashMap` silently reordering its iteration order on a same-key overwrite when an internal capacity-growth rehash happened to trigger; fixed by switching to `indexmap::IndexMap`, which never repositions an existing key). Under unlimited resource budgets the case now advances past the entire \"testing next x GC of deleted keys\" section and fails later, at line 581, inside a `table.insert`/`table.remove` boundary-condition helper (`local function test(a)`, lines 547-566) exercised against tables built with negative/zero integer keys (e.g. `{[-7] = \"ban\"}`, `{[-1] = \"ban\"}`, `{[0] = \"ban\"}`) mixed with the `#` length operator - not yet root-caused. The upstream file's `T`-gated (ltests) sections are already skipped gracefully by upstream code when `T` is absent, so that is not an independent blocker on its own."
 
 [[case]]
 path = "pm.lua"

@@ -998,6 +998,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "indexmap",
  "sol-core",
 ]
 

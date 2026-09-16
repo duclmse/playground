@@ -511,16 +511,16 @@ may prototype early, but may not declare an earlier exit gate complete.
 
 Deliverables:
 
-- adopt this document as the authoritative future roadmap;
-- update the product brief, architecture, specification introduction,
+- [x] adopt this document as the authoritative future roadmap;
+- [x] update the product brief, architecture, specification introduction,
   `AGENTS.md`, and CLI documentation to the unified goal;
-- record decisions for target Lua revision, C API scope, contextual extension
+- [x] record decisions for target Lua revision, C API scope, contextual extension
   syntax, common call ABI, runtime crate boundary, JIT strategy, and benchmark
   gates;
-- rename/reclassify typed “conformance” reporting as typed capability tests;
-- capture current compatibility, interpreter, JIT, web, and LSP baselines in
+- [x] rename/reclassify typed “conformance” reporting as typed capability tests;
+- [x] capture current compatibility, interpreter, JIT, web, and LSP baselines in
   machine-readable reports;
-- add a cross-component CI summary that cannot present classified/pending tests
+- [x] add a cross-component CI summary that cannot present classified/pending tests
   as passing compatibility.
 
 Exit gate: all top-level documents describe one product and link to the same
@@ -555,15 +555,15 @@ changing runtime implementation.
 
 Deliverables:
 
-- replace extension-driven parser forks with a common Lua grammar plus
+- [x] replace extension-driven parser forks with a common Lua grammar plus
   contextual Sol extensions;
-- separate `Dialect`/extension flags, type-check policy, host capabilities, and
+- [x] separate `Dialect`/extension flags, type-check policy, host capabilities, and
   execution tier instead of overloading `SourceMode`;
-- preserve byte spans and original spelling through AST and diagnostics;
-- implement a real lexical binder for locals, upvalues, labels, `_ENV`, and
+- [x] preserve byte spans and original spelling through AST and diagnostics;
+- [x] implement a real lexical binder for locals, upvalues, labels, `_ENV`, and
   nested scopes;
-- make `.lua` and annotation-free `.sol` produce semantically equivalent ASTs;
-- expose parser/binder APIs to `sol-lsp`.
+- [x] make `.lua` and annotation-free `.sol` produce semantically equivalent ASTs;
+- [x] expose parser/binder APIs to `sol-lsp`.
 
 Exit gate: every parser fixture and unchanged upstream source accepted in `.lua`
 is also accepted when treated as `.sol`; AST differential tests show no semantic
@@ -589,14 +589,14 @@ tiers.
 
 Deliverables:
 
-- introduce the canonical runtime `Value`, object headers/handles, strings,
+- [x] introduce the canonical runtime `Value`, object headers/handles, strings,
   tables, closures, upvalues, threads, userdata, errors, and capabilities;
-- replace dedicated globals with `_ENV` table/upvalue semantics;
-- define root registration and stack-map interfaces before optimizing layouts;
-- migrate dynamic libraries and metatables onto the canonical objects;
-- add precise tracing, barriers, weak/ephemeron rules, finalizer queues, and
+- [x] replace dedicated globals with `_ENV` table/upvalue semantics;
+- [x] define root registration and stack-map interfaces before optimizing layouts;
+- [ ] migrate dynamic libraries and metatables onto the canonical objects;
+- [x] add precise tracing, barriers, weak/ephemeron rules, finalizer queues, and
   coroutine roots;
-- provide temporary adapters for existing `LuaValue` and typed heap objects so
+- [x] provide temporary adapters for existing `LuaValue` and typed heap objects so
   migration can proceed without a flag day.
 
 Exit gate: identity, weak reference, finalization, coroutine, and mixed-adapter
@@ -640,16 +640,16 @@ the exit gate can be claimed. See
 
 Deliverables:
 
-- converge `lua_bytecode` and typed bytecode into one function/prototype model
+- [x] converge `lua_bytecode` and typed bytecode into one function/prototype model
   with generic and specialized opcodes;
-- standardize varargs, multiple results, tail calls, errors, protected calls,
+- [x] standardize varargs, multiple results, tail calls, errors, protected calls,
   yield/resume, and source maps;
-- use heap-resident/trampolined frames that can suspend for coroutine, debugger,
+- [x] use heap-resident/trampolined frames that can suspend for coroutine, debugger,
   or deoptimization;
-- implement all dynamic↔typed call combinations and identity-preserving
+- [x] implement all dynamic↔typed call combinations and identity-preserving
   boxing/unboxing adapters;
-- route `sol run` through this engine for both extensions;
-- retain an old/new differential switch until the unified path is stable.
+- [x] route `sol run` through this engine for both extensions;
+- [x] retain an old/new differential switch until the unified path is stable.
 
 Exit gate: annotation-free `.lua` and `.sol` run through the same runtime path;
 mixed modules call, error, tail-call, yield, and collect correctly in every
@@ -702,13 +702,13 @@ dynamic programs.
 
 Deliverables:
 
-- implement the type lattice, small unions, widening rules, flow narrowing, nil
+- [x] implement the type lattice, small unions, widening rules, flow narrowing, nil
   elimination, return inference, and local call signatures;
-- add CFG/SSA-based escape, alias, mutation, and effect analysis;
-- infer local table shapes and nonescaping closure signatures;
-- make annotations optional contracts and add `off`/`infer`/`strict` policies;
-- emit optimization explanations for proven and remaining dynamic operations;
-- replace heap-allocating `any` transitions with the canonical tagged value
+- [x] add CFG/SSA-based escape, alias, mutation, and effect analysis;
+- [x] infer local table shapes and nonescaping closure signatures;
+- [x] make annotations optional contracts and add `off`/`infer`/`strict` policies;
+- [x] emit optimization explanations for proven and remaining dynamic operations;
+- [ ] replace heap-allocating `any` transitions with the canonical tagged value
   wherever possible.
 
 Exit gate: inference fixtures show that literals, dominated type tests, loop
@@ -742,15 +742,15 @@ inside the unified runtime.
 
 Deliverables:
 
-- lower proven scalars, arrays, records, maps, and closure environments to
+- [x] lower proven scalars, arrays, records, maps, and closure environments to
   specialized layouts;
-- preserve identity when a specialized object becomes dynamically visible;
-- scalar-replace nonescaping table/record literals where Lua observation cannot
+- [x] preserve identity when a specialized object becomes dynamically visible;
+- [x] scalar-replace nonescaping table/record literals where Lua observation cannot
   detect the allocation;
-- generate semantic ABI adapters and direct typed ABIs;
-- make imports/`require` share one module cache and support typed contracts over
+- [x] generate semantic ABI adapters and direct typed ABIs;
+- [x] make imports/`require` share one module cache and support typed contracts over
   dynamic exports;
-- generate precise GC layouts and barriers for specialized objects.
+- [x] generate precise GC layouts and barriers for specialized objects.
 
 Exit gate: existing typed benchmark IR retains unboxed hot paths; mixed-module
 fixtures pass without duplicate modules or collectors; adding unused dynamic
@@ -783,13 +783,13 @@ semantic ABI and module identity.
 
 Deliverables:
 
-- close remaining grammar, coercion, `_ENV`, goto/scope, `<close>`, metamethod,
+- [ ] close remaining grammar, coercion, `_ENV`, goto/scope, `<close>`, metamethod,
   iteration, coroutine, error, and GC-observable gaps;
-- complete portable standard libraries and debug behavior;
-- implement native filesystem/package/`io`/`os`/locale profiles;
-- implement Lua 5.5 binary chunk load/dump compatibility where required;
-- execute the embedding/C API decision from U0, including native module tests;
-- promote manifest rows only through unchanged reference comparisons.
+- [ ] complete portable standard libraries and debug behavior;
+- [ ] implement native filesystem/package/`io`/`os`/locale profiles;
+- [ ] implement Lua 5.5 binary chunk load/dump compatibility where required;
+- [ ] execute the embedding/C API decision from U0, including native module tests;
+- [ ] promote manifest rows only through unchanged reference comparisons.
 
 Exit gate: the compatibility gates in section 6.2 pass for the declared full
 runtime profile. If the embedding profile remains incomplete, public wording
@@ -822,21 +822,69 @@ match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
 close but still blocked on hex-float parsing for very long numerals; the
 remaining U6 rows stay pending at their next observed blocker.
 
+The CLI also had a general output-loss bug affecting every erroring corpus
+case with prior output, not just a display nuance: `print`/`io.write` only
+ever appended to an in-memory buffer that was flushed to real stdout on the
+success path (`write_lua_run`), so any script that printed output before an
+uncaught error lost that output entirely instead of matching real Lua's
+write-immediately semantics. `LuaError` now carries whatever output had been
+buffered at the point it was raised, and the CLI flushes it before reporting
+the error. This was found while isolating `nextvar.lua`'s remaining blocker
+(prior output was needed to tell where execution had reached) and is
+independent of the CLI's one intentional divergence (auto-printing the
+top-level chunk's return value). With it fixed, `nextvar.lua` advanced past
+its former instruction-budget exhaustion to fail
+`checkerror("bad argument", pairs)`: Sol's native argument-count validation
+(the shared `required` closure in `lua_runtime/natives.rs` and repeated
+`LuaError::new("missing argument")` sites in `lua_runtime/dispatch.rs`) used a
+generic "missing argument" message instead of real Lua's
+`"bad argument #N to 'name' (...)"` wording, so `checkerror`'s substring match
+failed. That wording gap is now fixed across `call_native`'s argument checks
+(a systemic fix, not specific to `pairs`/`ipairs`), which unblocked several
+other pending rows' `checkerror`-style assertions.
+
+`nextvar.lua` then failed its "testing next x GC of deleted keys" section:
+`next(t, k)` on a table where `k` had just been set to nil mid-traversal
+(real Lua explicitly permits this) raised "invalid key to 'next'" instead of
+resuming, because `LuaTable::set` removed a hash-part key outright on
+`t[k] = nil` instead of tombstoning it. Fixed by tombstoning (keeping the key
+with a `Nil` value so `next` can still locate its position to resume from,
+while `entries()`/iteration/length continue to skip tombstones as absent).
+That surfaced a second, harder-to-reproduce bug behind the same section,
+nondeterministic across process runs: `LuaTable::hash`'s `std::HashMap` can
+silently reorder its whole iteration order on a same-key overwrite — exactly
+what the tombstone write does — because `HashMap::insert`'s internal
+capacity-growth check runs before it knows whether the key already exists, so
+a table that happens to be at its growth threshold rehashes (and reorders)
+even though no key was added or removed. Since `next` resumes by re-locating
+the last-returned key in a freshly fetched snapshot and continuing right
+after it, such a reorder could strand not-yet-visited entries before that
+position and silently truncate the traversal. `LuaTable::hash` is now an
+`indexmap::IndexMap`, which never repositions an existing key on overwrite,
+making the resume-by-position algorithm robust regardless of internal
+rehashing.
+
+With both fixed, `nextvar.lua` advances past the entire "testing next x GC of
+deleted keys" section and now fails at line 581, inside a `table.insert`/
+`table.remove` boundary-condition helper exercised against tables built with
+negative/zero integer keys mixed with the `#` length operator — not yet
+root-caused.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
 
 Deliverables, each benchmarked independently:
 
-- packed/tagged `Value` representation prototype and measured selection;
-- dense frame/register layout with no routine `Rc` clone or heap allocation per
+- [ ] packed/tagged `Value` representation prototype and measured selection;
+- [ ] dense frame/register layout with no routine `Rc` clone or heap allocation per
   register operation/call;
-- allocation-free common call, return, vararg, and iterator paths;
-- optimized table array/hash layout, string interning/hashing, and shape IDs;
-- direct-threaded/computed dispatch only if a maintainable Rust implementation
+- [ ] allocation-free common call, return, vararg, and iterator paths;
+- [ ] optimized table array/hash layout, string interning/hashing, and shape IDs;
+- [ ] direct-threaded/computed dispatch only if a maintainable Rust implementation
   measures better than dense `match` dispatch;
-- generational allocation fast paths and measured barriers;
-- fast metamethod-negative paths and tail-call frame reuse.
+- [ ] generational allocation fast paths and measured barriers;
+- [ ] fast metamethod-negative paths and tail-call frame reuse.
 
 Exit gate: interpreter-readiness performance gate passes with compatibility, GC
 stress, debugger, and WASM tests enabled.
@@ -847,13 +895,13 @@ stress, debugger, and WASM tests enabled.
 
 Deliverables:
 
-- table field/index, global, arithmetic/metamethod, iterator, and call-target
+- [ ] table field/index, global, arithmetic/metamethod, iterator, and call-target
   inline caches;
-- shape, metatable, global, and module version counters with invalidation;
-- bounded mono/poly/megamorphic transitions;
-- type/shape/call/allocation profiles serialized for benchmark inspection and
+- [ ] shape, metatable, global, and module version counters with invalidation;
+- [ ] bounded mono/poly/megamorphic transitions;
+- [ ] type/shape/call/allocation profiles serialized for benchmark inspection and
   optional profile-guided runs;
-- cache correctness tests that mutate aliases, metatables, `_ENV`, modules, and
+- [ ] cache correctness tests that mutate aliases, metatables, `_ENV`, modules, and
   debug-visible state.
 
 Exit gate: cache-heavy benchmarks improve without semantic mismatch; forced
@@ -865,12 +913,12 @@ invalidation and megamorphic workloads remain bounded and correct.
 
 Deliverables:
 
-- fast bytecode-to-Cranelift lowering for generic and cached operations;
-- semantic/runtime stubs for slow paths;
-- safepoints, stack maps, exception/error transitions, and coroutine fallback;
-- hot-function counters and background or bounded compilation policy;
-- direct entry adapters for stable call targets;
-- code cache lifecycle, invalidation, and executable-memory safety.
+- [ ] fast bytecode-to-Cranelift lowering for generic and cached operations;
+- [ ] semantic/runtime stubs for slow paths;
+- [ ] safepoints, stack maps, exception/error transitions, and coroutine fallback;
+- [ ] hot-function counters and background or bounded compilation policy;
+- [ ] direct entry adapters for stable call targets;
+- [ ] code cache lifecycle, invalidation, and executable-memory safety.
 
 Exit gate: baseline-JIT readiness gate passes; compile latency and code memory
 stay within published budgets; interpreter/JIT differential and GC tests pass.
@@ -882,13 +930,13 @@ profiles.
 
 Deliverables:
 
-- lift bytecode to shared SSA with proof provenance;
-- insert/hoist/fuse guards and record full deoptimization snapshots;
-- specialize arithmetic, tables, calls, loops, allocation, and iteration;
-- inline across stable dynamic and typed calls;
-- enter optimized loops through OSR and leave through precise side exits;
-- reconstruct inlined frames for errors, coroutines, profiler, and debugger;
-- prevent recompilation storms with failure counters and widening.
+- [ ] lift bytecode to shared SSA with proof provenance;
+- [ ] insert/hoist/fuse guards and record full deoptimization snapshots;
+- [ ] specialize arithmetic, tables, calls, loops, allocation, and iteration;
+- [ ] inline across stable dynamic and typed calls;
+- [ ] enter optimized loops through OSR and leave through precise side exits;
+- [ ] reconstruct inlined frames for errors, coroutines, profiler, and debugger;
+- [ ] prevent recompilation storms with failure counters and widening.
 
 Exit gate: dynamic parity gate passes first; final-performance work continues
 until the final performance claim gate passes or the release explicitly states
@@ -900,12 +948,12 @@ that it has not yet achieved the goal.
 
 Deliverables:
 
-- feed checked annotations and static inference directly into shared SSA;
-- remove guards and generic runtime calls proven unnecessary;
-- specialize generics, records, arrays, maps, and callbacks across modules;
-- retain dynamic adapters for exported/reflective entry points;
-- support profile-guided AOT with safe fallback when profiles change;
-- compare each gradually typed program against its unchanged Lua version.
+- [ ] feed checked annotations and static inference directly into shared SSA;
+- [ ] remove guards and generic runtime calls proven unnecessary;
+- [ ] specialize generics, records, arrays, maps, and callbacks across modules;
+- [ ] retain dynamic adapters for exported/reflective entry points;
+- [ ] support profile-guided AOT with safe fallback when profiles change;
+- [ ] compare each gradually typed program against its unchanged Lua version.
 
 Exit gate: typed advantage gate passes, annotation coverage yields monotonic or
 explained results, and mixed dynamic behavior remains compatible.
@@ -916,14 +964,14 @@ explained results, and mixed dynamic behavior remains compatible.
 
 Deliverables:
 
-- create `sol-wasm` and `packages/sol-runtime` from the Tier-0 runtime;
-- reproduce execution budgets, virtual modules, output capture, breakpoints,
+- [ ] create `sol-wasm` and `packages/sol-runtime` from the Tier-0 runtime;
+- [ ] reproduce execution budgets, virtual modules, output capture, breakpoints,
   stepping, stack frames, locals/upvalues, evaluation, profiling, and timeline;
-- accept `.lua` and `.sol` projects and use the shared parser/type diagnostics;
-- keep execution in a worker and capabilities default-deny;
-- switch the web adapter behind a feature flag, run old/new browser
+- [ ] accept `.lua` and `.sol` projects and use the shared parser/type diagnostics;
+- [ ] keep execution in a worker and capabilities default-deny;
+- [ ] switch the web adapter behind a feature flag, run old/new browser
   differentials, then remove the Piccolo production dependency;
-- address bundle size, initialization latency, and long-running responsiveness.
+- [ ] address bundle size, initialization latency, and long-running responsiveness.
 
 Exit gate: existing web end-to-end debugger scenarios pass on the canonical
 runtime; native/WASM portable-profile fixtures agree; the production worker no
@@ -935,17 +983,17 @@ longer imports `@lua-playground/runtime`.
 
 Deliverables:
 
-- commit and test `sol-lsp` as part of the supported repository;
-- replace textual indexing with the U1 binder and U4 type facts;
-- implement incremental documents, multi-file module graphs, complete diagnostic
+- [ ] commit and test `sol-lsp` as part of the supported repository;
+- [ ] replace textual indexing with the U1 binder and U4 type facts;
+- [ ] implement incremental documents, multi-file module graphs, complete diagnostic
   lists, semantic rename/references, completion, signature help, hover, symbols,
   semantic tokens, formatting policy, and cancellation;
-- share the same analysis with Monaco directly or through a worker-safe LSP
+- [ ] share the same analysis with Monaco directly or through a worker-safe LSP
   transport;
-- create `editors/vscode-sol` with language configuration, syntax/semantic
+- [ ] create `editors/vscode-sol` with language configuration, syntax/semantic
   highlighting, server launch/download/path configuration, logs, restart,
   workspace discovery, and `.lua`/`.sol` activation;
-- add protocol, golden fixture, headless VS Code integration, packaging, and
+- [ ] add protocol, golden fixture, headless VS Code integration, packaging, and
   clean-install tests.
 
 Exit gate: a packaged extension installed into a clean VS Code profile starts
@@ -959,15 +1007,15 @@ analysis.
 
 Deliverables:
 
-- run compatibility, fuzz, tier differential, GC stress, sanitizer, native,
+- [ ] run compatibility, fuzz, tier differential, GC stress, sanitizer, native,
   WASM, LSP, VS Code, and web E2E matrices from a clean checkout;
-- publish raw benchmark data and summaries for both architectures;
-- audit capabilities, native loading, executable memory, FFI, and browser
+- [ ] publish raw benchmark data and summaries for both architectures;
+- [ ] audit capabilities, native loading, executable memory, FFI, and browser
   isolation;
-- remove obsolete fallback/partition paths and production Piccolo dependencies
+- [ ] remove obsolete fallback/partition paths and production Piccolo dependencies
   only after rollback tags and differential evidence exist;
-- align all feature/spec/product documents and publish known limitations;
-- package CLI/runtime libraries, web assets, LSP, and VS Code extension from one
+- [ ] align all feature/spec/product documents and publish known limitations;
+- [ ] package CLI/runtime libraries, web assets, LSP, and VS Code extension from one
   versioned release process.
 
 Exit gate: every item in the definition of done below is satisfied. Otherwise
@@ -1025,38 +1073,38 @@ The final goal is complete only when all of the following are true.
 
 ### Language and runtime
 
-- Valid target-version Lua executes unchanged as Sol.
-- `.lua` and annotation-free `.sol` have identical observable semantics.
-- Types are optional, sound contracts and do not create a second runtime.
-- Typed/untyped modules, calls, errors, coroutines, tables, and GC objects
+- [ ] Valid target-version Lua executes unchanged as Sol.
+- [ ] `.lua` and annotation-free `.sol` have identical observable semantics.
+- [ ] Types are optional, sound contracts and do not create a second runtime.
+- [ ] Typed/untyped modules, calls, errors, coroutines, tables, and GC objects
   interoperate with shared identity.
-- The declared native compatibility profile, including the decided embedding
+- [ ] The declared native compatibility profile, including the decided embedding
   boundary, passes its upstream and differential suites.
 
 ### Performance
 
-- The final performance claim gate in section 7.3 passes on published,
+- [ ] The final performance claim gate in section 7.3 passes on published,
   reproducible untyped application workloads.
-- Typed/annotated workloads retain a separately measured advantage.
-- Startup, compilation, memory, and GC behavior are published and not hidden by
+- [ ] Typed/annotated workloads retain a separately measured advantage.
+- [ ] Startup, compilation, memory, and GC behavior are published and not hidden by
   throughput-only reporting.
-- No compatibility mode or fallback runtime is excluded from the headline.
+- [ ] No compatibility mode or fallback runtime is excluded from the headline.
 
 ### Products
 
-- Native CLI, AOT/JIT, and embedding interfaces use the canonical runtime.
-- The web playground runs the canonical interpreter in WebAssembly and supports
+- [ ] Native CLI, AOT/JIT, and embedding interfaces use the canonical runtime.
+- [ ] The web playground runs the canonical interpreter in WebAssembly and supports
   `.lua` and `.sol` editing/debugging.
-- `sol-lsp` provides semantic multi-file analysis from the shared frontend.
-- A packaged first-party VS Code extension launches and supports `sol-lsp`.
-- Monaco, VS Code, and the CLI agree on parsing, binding, and diagnostics.
+- [ ] `sol-lsp` provides semantic multi-file analysis from the shared frontend.
+- [ ] A packaged first-party VS Code extension launches and supports `sol-lsp`.
+- [ ] Monaco, VS Code, and the CLI agree on parsing, binding, and diagnostics.
 
 ### Engineering quality
 
-- Compatibility, fuzz, tier differential, GC stress, sanitizer, native/WASM, web
+- [ ] Compatibility, fuzz, tier differential, GC stress, sanitizer, native/WASM, web
   E2E, LSP, and extension tests run in CI at appropriate frequencies.
-- Benchmarks retain raw results and environment metadata.
-- Unsafe runtime/JIT boundaries have explicit invariants and targeted tests.
+- [ ] Benchmarks retain raw results and environment metadata.
+- [ ] Unsafe runtime/JIT boundaries have explicit invariants and targeted tests.
 - Product, feature, specification, and status documents agree with executable
   behavior.
 
