@@ -18,6 +18,22 @@ impl FunctionId {
     }
 }
 
+/// Portable identity of a host-provided callable. The provider namespace is
+/// allocated by the owning runtime; `function` is meaningful only within
+/// that provider. Host pointers and Rust object addresses are deliberately
+/// absent from this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NativeCallableId {
+    pub provider: u32,
+    pub function: u32,
+}
+
+impl NativeCallableId {
+    pub const fn new(provider: u32, function: u32) -> Self {
+        Self { provider, function }
+    }
+}
+
 /// Number of values consumed or produced at a semantic call boundary.
 /// `Open` is Lua's open argument/result sequence and replaces the legacy
 /// `-1` sentinel used by the dynamic bytecode.
@@ -93,6 +109,57 @@ pub struct PrototypeMetadata {
     pub registers: u32,
 }
 
+/// The byte-oriented source position associated with one executable
+/// instruction. Columns are byte offsets, matching the shared frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceLocation {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl SourceLocation {
+    pub const fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
+}
+
+/// Tier-independent instruction-to-source mapping. Generic and specialized
+/// bytecode can have different instruction formats while debugger, error, and
+/// deoptimization consumers use the same program-counter lookup contract.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceMap {
+    locations: Vec<SourceLocation>,
+}
+
+impl SourceMap {
+    pub fn new(locations: Vec<SourceLocation>) -> Self {
+        Self { locations }
+    }
+
+    pub fn single_line(instruction_count: usize, line: u32) -> Self {
+        Self::new(vec![SourceLocation::new(line, 0); instruction_count])
+    }
+
+    pub fn location(&self, pc: u32) -> Option<SourceLocation> {
+        self.locations.get(pc as usize).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.locations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.locations.is_empty()
+    }
+}
+
+/// Common introspection contract implemented by every executable prototype.
+pub trait ExecutablePrototype {
+    fn metadata(&self) -> &PrototypeMetadata;
+    fn source_map(&self) -> &SourceMap;
+    fn instruction_count(&self) -> usize;
+}
+
 impl PrototypeMetadata {
     pub fn new(
         name: impl Into<String>,
@@ -114,6 +181,33 @@ pub enum CallKind {
     Normal,
     Tail,
     Protected,
+}
+
+/// A tier-independent request to invoke a callable. Arguments use the
+/// caller's current representation; boxing adapters translate the generic
+/// parameter when a request crosses between specialized and dynamic tiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRequest<V> {
+    pub function: FunctionId,
+    pub arguments: Vec<V>,
+    pub results: ValueCount,
+    pub kind: CallKind,
+}
+
+impl<V> CallRequest<V> {
+    pub fn new(
+        function: FunctionId,
+        arguments: Vec<V>,
+        results: ValueCount,
+        kind: CallKind,
+    ) -> Self {
+        Self {
+            function,
+            arguments,
+            results,
+            kind,
+        }
+    }
 }
 
 /// Register-window description shared by generic and specialized bytecode.
@@ -183,6 +277,7 @@ impl FrameHeader {
 pub enum CallOutcome<V, E> {
     Returned(Vec<V>),
     Yielded(Vec<V>),
+    TailCall(CallRequest<V>),
     Raised(E),
 }
 
@@ -215,5 +310,31 @@ mod tests {
         assert_eq!(metadata.name, "main");
         assert_eq!(metadata.arity, FunctionArity::new(300, true));
         assert_eq!(metadata.registers, 70_000);
+    }
+
+    #[test]
+    fn source_maps_have_one_lookup_contract_for_every_tier() {
+        let map = SourceMap::new(vec![
+            SourceLocation::new(4, 2),
+            SourceLocation::new(4, 9),
+            SourceLocation::new(5, 0),
+        ]);
+        assert_eq!(map.location(1), Some(SourceLocation::new(4, 9)));
+        assert_eq!(map.location(3), None);
+    }
+
+    #[test]
+    fn tail_calls_are_semantic_abi_outcomes() {
+        let outcome = CallOutcome::<u64, ()>::TailCall(CallRequest::new(
+            FunctionId::new(12),
+            vec![7, 8],
+            ValueCount::ONE,
+            CallKind::Tail,
+        ));
+        let CallOutcome::TailCall(request) = outcome else {
+            panic!("expected a tail-call request")
+        };
+        assert_eq!(request.function, FunctionId::new(12));
+        assert_eq!(request.arguments, vec![7, 8]);
     }
 }
