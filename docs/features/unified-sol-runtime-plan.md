@@ -870,6 +870,57 @@ deleted keys" section and now fails at line 581, inside a `table.insert`/
 negative/zero integer keys mixed with the `#` length operator — not yet
 root-caused.
 
+That line-581 failure was `table.insert`/`table.remove` splicing
+`LuaTable`'s internal array-part `Vec` directly instead of going through
+generic `t[i]` get/set the way real Lua's `lua_geti`/`lua_seti`-based
+implementation does, so a live integer key held in the table's hash part —
+`0`, a negative number, or anything past the array part's contiguous prefix —
+was invisible to both natives. Fixed by rewriting both in terms of the
+table's generic `get`/`set`/`len()`, matching real Lua's exact bounds-check
+semantics, including the subtle rule that `table.remove`'s default position
+(`#list`) is used unchecked even at size `0` (letting `table.remove(a)`
+observe `a[0]` on a table whose only entry is `a[0]`).
+
+With that fixed, `nextvar.lua` advanced to line 613, in the "testing table
+library with metamethods" section: `table.insert`/`concat`/`unpack`/`remove`/
+`sort` must all respect a table argument's `__index`/`__newindex`/`__len`
+metamethods — i.e. work correctly against a "proxy" table whose actual
+storage lives behind those metamethods on a *different* table — instead of
+only ever touching the proxy's own (possibly empty) raw storage directly.
+`table.sort` was the hardest case: its coroutine-yield-safe stepped
+implementation (`SortState`/`LuaRuntime::sort_step`, needed so a comparator
+can itself `yield` across a coroutine boundary) read the table's raw
+`array` field directly to gather values and wrote back into it directly on
+completion, both bypassing metamethods entirely — so `table.sort(proxy)`
+silently did nothing whenever the proxy's own array was empty. Fixed by
+adding blocking, metamethod-aware `LuaRuntime::index_get`/`index_set`/
+`length_of` helpers (thin wrappers around the existing non-blocking
+`index_resolve`/`set_index_resolve`/`len_resolve` primitives already used by
+the bytecode dispatch loop, invoking the resolved metamethod call
+synchronously via the existing `self.call` recursion) and rewiring
+`table.insert`/`remove`/`concat`/`unpack`, plus `SortState`'s table field
+(now the original `LuaValue` argument rather than a raw
+`Rc<RefCell<LuaTable>>`) and both ends of `sort_step`, to go through them.
+
+Fixing `table.insert`'s bounds arithmetic for the metamethod case also
+surfaced the corpus's very next block, "testing overflow in table.insert
+(must wrap-around)": when a `__len` metamethod reports `math.maxinteger`,
+`table.insert(t, v)`'s implicit end position (`size + 1`) must wrap around to
+`math.mininteger`, matching real Lua's C integer arithmetic, rather than
+panicking on Rust's default debug-build overflow check. Fixed by computing
+that position (and its companion bounds check) with explicit
+`wrapping_add`/unsigned-wraparound comparison instead of a plain `+`, and by
+only running `table.insert`'s element-shifting loop for the explicit-position
+three-argument call (matching real Lua's `tinsert`, which has no shifting
+loop at all in the two-argument case) so the wrapped end position can never
+itself drive a bogus shift.
+
+With all three fixed, `nextvar.lua` advances past the entire "testing table
+library with metamethods" and "testing overflow in table.insert" sections and
+now fails at line 742, in the "testing floats in numeric for" section (mixed
+integer/float control-value semantics for the numeric `for` loop) — not yet
+root-caused.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
