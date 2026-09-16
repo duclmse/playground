@@ -1,11 +1,11 @@
 # Gradual typing
 
-> Status: explicit `any` values and the documented narrowing/value families are
-> implemented; remaining dynamic operations are listed below.
+> Status: explicit contracts and non-rejecting annotation-free inference are
+> implemented; remaining layout specialization belongs to U5.
 
-**Purpose**: provide `any`-typed values and a boxed fallback path for genuinely dynamic
-code (§3, §4), without forcing every program to pay for it - most code stays
-fully typed/unboxed exactly as today.
+**Purpose**: provide checked `any` contracts plus a sound inference path for
+ordinary Lua, without making uncertainty a source error or forcing proven code
+to pay for dynamic dispatch.
 
 **Prerequisite**: a dynamic `Value` needs a real GC because it is a boxed,
 heap-referencing type.
@@ -17,11 +17,19 @@ closures and Lua dynamic tables retain their separate runtime representations.
 Direct dynamic arithmetic, comparison, truth, negation, and concatenation are
 implemented; indexing, calls, and fields require narrowing first.
 
-- [x] **Strict vs. gradual mode** (§3): decided in favor of an explicit `any`
-      type annotation (`function foo(x: any): any`), not "no annotation implies
-      gradual" - matches faster_lua.md §3's own example syntax exactly, and
-      keeps the existing rule ("every function must declare a return type")
-      unchanged rather than adding a second, implicit way to opt in.
+- [x] **Type policies**: `off`, `infer`, and `strict` are available through
+      `sol --type-policy`. They affect proofs and diagnostics, never parsing or
+      runtime semantics. Explicit annotations—including explicit `any`—remain
+      contracts; omitted annotations remain valid and may be inferred.
+- [x] **Flow inference**: a bounded union lattice widens after four members and
+      supports truthy nil elimination, dominated type tests, branch joins,
+      loop headers, return fixed points, and nonescaping local-call signatures.
+- [x] **Object/effect inference**: local table shapes carry escape, alias, and
+      mutation facts. Function summaries track global/table access,
+      allocation, calls, raises, yields, and unknown effects.
+- [x] **Optimization explanations**: `sol run --type-policy infer
+      --explain-types file.lua` reports each proven check removal and each
+      operation that must remain dynamic.
 - [x] **Boxed representation** (§4) for `any` - `value.rs`: a tagged
       `{ tag: i64, payload: i64 }` block supporting scalar and documented
       reference families. `typeck.rs`'s `coerce` enforces which values may
@@ -58,10 +66,19 @@ implemented; indexing, calls, and fields require narrowing first.
       regression to fix, the whole point of "strict by default, gradual
       where you ask for it."
 
-**Remaining work**: capturing closure boxes, dynamic indexing/calls/field
-access without prior narrowing, and the complete typed/dynamic module bridge.
+At the unified semantic ABI, dynamic values use `sol_core::Value`; proven scalar
+arguments/results use `BoundaryValue::Unboxed` and therefore allocate no
+two-word `any` block. The legacy typed-only `Type::Any` representation still
+uses a two-word allocation when a value must live in that IR. U5 will converge
+that storage with typed object layouts while preserving identity.
 
-**Files**: `types.rs` (`Type::Any`, `TExprKind::Box`/`Unbox`), `typeck.rs`
+**Remaining work (U5+)**: specialized layouts for capturing closures and
+escaping tables, identity-preserving typed/dynamic object exposure, dynamic
+module contracts, and direct lowering of analysis facts into optimized
+bytecode/native code.
+
+**Files**: `typeck/inference.rs` (flow lattice and reports), `types.rs`
+(`Type::Any`, `TExprKind::Box`/`Unbox`), `typeck.rs`
 (`lower_type`, `coerce`), new `crates/sol/src/value.rs` (tag constants),
 `codegen.rs` (`clif_type`, `translate_expr`'s box/unbox codegen, reusing the
 existing struct-literal allocation path), `ast.rs`/`parser.rs` (`any` in type

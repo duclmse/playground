@@ -352,7 +352,7 @@ updatable handle or a pinned allocation.
       hook-free.
 - [ ] Feed profile data into inlining, monomorphization, map specialization,
       closure escape decisions, and dynamic-call polymorphism limits.
-- [ ] Add optimization reports that explain why a value was boxed, why a map
+- [x] Add optimization reports that explain why a value was boxed, why a map
       did not specialize, or why an allocation did not scalar-replace.
 
 ## Benchmark and release gates

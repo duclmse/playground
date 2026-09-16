@@ -1,7 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
 > Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U3
-> completed 2026-09-16; U2's production-object migration remains in progress. This document
+> and U4 completed 2026-09-16; U2's production-object migration remains in progress. This document
 > defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
@@ -695,7 +695,7 @@ yield/resume through a specialized slot, canonical callable collection tests,
 and the legacy/unified differential test. The old raw-pointer value bridge is
 no longer the installed production representation.
 
-### U4 — Gradual type system and sound static inference
+### U4 — Gradual type system and sound static inference — **completed 2026-09-16**
 
 **Purpose:** remove checks from ordinary Lua using proof, without rejecting
 dynamic programs.
@@ -714,6 +714,26 @@ Deliverables:
 Exit gate: inference fixtures show that literals, dominated type tests, loop
 indices, local functions, and nonescaping table literals remove redundant
 checks; all annotation-free compatibility fixtures still execute unchanged.
+
+Completed 2026-09-16. `typeck::inference` supplies a bounded union lattice,
+truthy/type-test narrowing, nil elimination, loop widening, fixed-point return
+and nonescaping-local-call inference, table shapes, and structured CFG join/phi
+summaries. Escape, alias, mutation, and effect facts are conservative: an
+unknown call invalidates a table shape instead of making program validity depend
+on an optimization. The AST retains whether each parameter annotation was
+written, so an omitted Lua parameter may specialize while explicit `any`
+remains a dynamic contract. The CLI exposes `--type-policy off|infer|strict`
+and `--explain-types`; policies never change Lua semantics.
+
+The U3 semantic boundary already represents dynamic values with
+`sol_core::Value` and passes proven scalars through `BoundaryValue::Unboxed`, so
+mixed-tier scalar transitions allocate no `any` box. The older typed-only IR
+continues to use its two-word `any` allocation internally; replacing that
+isolated representation requires U5's typed-layout/identity work and is not on
+the annotation-free unified path. Executable fixtures in
+`crates/sol/tests/fixtures/inference` cover every exit-gate proof, compare
+`off`/`infer` results, and the complete compatibility suite remains the
+semantic regression gate.
 
 ### U5 — Typed layouts and mixed-module specialization
 

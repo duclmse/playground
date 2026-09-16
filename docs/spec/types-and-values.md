@@ -18,12 +18,21 @@ hashing, and GC layout rules are specified.
 User-declared generic functions, arbitrary union types, `Option<T>`, tagged
 enums, and exhaustive `match` are currently unsupported.
 
+The optimizer may use internal unions of up to four runtime type atoms while
+analyzing annotation-free code. These unions are flow facts, not source-level
+types: they widen to `dynamic` when precision would exceed the bound and never
+cause an otherwise-valid Lua program to be rejected.
+
 ## Inference and conversion
 
 The initializer in `local name = expression` determines the local's static
 type. An explicit annotation in `local name: T = expression` constrains it.
 `i64` widens implicitly to `f64` where `f64` is required. No other numeric or
 unrelated-type conversion is implicit.
+
+An omitted function-parameter annotation is distinguishable from an explicit
+`: any` contract. A nonescaping local function may infer the former from all
+of its local call sites. Explicit `any` remains dynamic under every policy.
 
 ## Arrays, records, and structs
 
