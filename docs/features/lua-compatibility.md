@@ -345,8 +345,14 @@ upvalues and final-expression result expansion.
       per-function tests. Focused base/string support plus table
       `concat`/`insert`/`remove`/`pack`/`unpack`/`sort`/`create` and core numeric
       math functions (including `sqrt`/`sin`/`cos`/`tan`/`exp`/`log` and the
+      inverse-angle/conversion/remainder/decomposition functions, Lua 5.5's
+      xoshiro256** `random`/`randomseed`, and the
       `pi`/`huge`/`maxinteger`/`mininteger` constants) are present, along with
-      `tonumber`, `string.byte`/`char`, and `utf8.len`/`char`/`codepoint`. A
+      `tonumber`, string-to-number arithmetic/bitwise coercion,
+      `string.byte`/`char`, and the complete portable UTF-8 library
+      (`len`/`char`/`codepoint`/`offset`/`codes`/`charpattern`, including lax
+      extended UTF-8). The unchanged upstream `bwcoercion.lua` and `utf8.lua`
+      cases now match the pinned Lua 5.5.1 reference. A
       real Lua pattern-matching engine (`crates/sol/src/lua_pattern.rs`:
       character classes, `[...]` sets, `^`/`$` anchors, `()` captures
       including position captures, `%1`-`%9` back-references, `*`/`+`/`-`/`?`
@@ -367,7 +373,7 @@ upvalues and final-expression result expansion.
       `!`/`!n`, integers `b`/`B`/`h`/`H`/`i`/`I`/`l`/`L`/`j`/`J`/`T`, floats
       `f`/`d`/`n`, strings `s`/`z`/`c`, padding `x`); the align-without-storing
       `Xop` option is not implemented and errors clearly if used. Broader
-      math/utf8 edge cases remain.
+      remaining math error-provenance edge case is tracked by the manifest.
 - [x] Implement a sandboxed `package`/`require`: an explicit host-provided
       loader (`LuaRuntime::add_module`) registers exact-name in-memory module
       sources; `package.loaded` caches each module's result so repeated
@@ -758,9 +764,9 @@ while proving the typed path retains its defining advantage.
       profile, benchmark environment, and typed regression status. Only move a
       case from `pending` to `pass` with an oracle-backed test.
       `scripts/lua55-dashboard.sh` (new) generates a markdown report with all
-      four: manifest status counts (currently 26 `pending`, 8
-      `host-required`, 0 `pass`/`adapted`/`diverges` - an honest snapshot,
-      not yet a compatibility win), a capability-profile histogram (which
+      four: manifest status counts (currently 22 `pending`, 8
+      `host-required`, 4 `pass`, and 0 `adapted`/`diverges`), a
+      capability-profile histogram (which
       `requires` tag blocks the most cases - `debug-library` currently blocks
       the most, at 8), the local benchmark environment (rustc/cargo/OS/`lua`/
       `luajit` versions, so a published number can be traced to the

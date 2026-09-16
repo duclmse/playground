@@ -47,9 +47,9 @@ note = "blocked-on: `require \"bwcoercion\"` / `require 'bit32'` (lines 6, 210) 
 [[case]]
 path = "bwcoercion.lua"
 category = "numeric-coercion"
-status = "pending"
+status = "pass"
 requires = []
-note = "blocked-on: no persistent shared string metatable; getmetatable(\"\") returns nil (strings are indexable via a special case in index(), not a real metatable object), so `getmetatable(\"\").__band = ...` cannot inject bitwise metamethods onto all strings."
+note = "Oracle-backed: unchanged Lua 5.5.1 case matches the pinned reference after shared string-metatable and numeric-coercion support."
 
 [[case]]
 path = "calls.lua"
@@ -175,7 +175,7 @@ path = "math.lua"
 category = "math-library"
 status = "pending"
 requires = []
-note = "blocked-on: no automatic string-to-number coercion in arithmetic (fails at line 94, `b+\"2\"`/`\"10\"-c`); confirmed even trivial `\"2\"+\"3\"` errors, so coercion is entirely absent, not just an edge case."
+note = "blocked-on: the `math.huge << 1` field-name provenance and the `tonumber` most-negative-integer boundary (`\"-9223372036854775808\"`) now match the reference; the next differential failure is hex-float parsing for very long numerals (`tonumber('0xe03' .. string.rep('0', 1000) .. 'p-4000')`), an arbitrary-precision-adjacent edge case in the hex-float lexer/parser."
 
 [[case]]
 path = "memerr.lua"
@@ -189,14 +189,14 @@ path = "nextvar.lua"
 category = "tables-and-globals"
 status = "pending"
 requires = []
-note = "blocked-on: math.random/math.randomseed are entirely missing from the math table (fails at line 335, `math.randomseed()`); not T-gated, a real gap. Much of the rest of the file is gated behind an unavailable ltests `T` global and is otherwise low-value to chase further."
+note = "blocked-on: math.random/math.randomseed now implement Lua 5.5's xoshiro256** behavior and the case advances beyond its former line-335 blocker; the unchanged case now exhausts Sol's instruction budget in a later table-iteration stress section and still needs isolation. Much of the file is gated behind the unavailable ltests `T` global."
 
 [[case]]
 path = "pm.lua"
-category = "package-library"
-status = "pending"
-requires = ["package-loader"]
-note = "blocked-on: `utf8.charpattern` is nil (fails at line 63 inside `PU()`, first invoked at line 100); needs the same missing UTF-8 pattern constant as utf8.lua, in addition to the already-tracked package-loader gap."
+category = "pattern-library"
+status = "pass"
+requires = []
+note = "Oracle-backed: unchanged Lua 5.5.1 case matches the pinned reference, including pattern errors/frontiers, callable and table gsub replacements, empty-match progression, and source-string identity reuse."
 
 [[case]]
 path = "sort.lua"
@@ -229,16 +229,16 @@ note = "Loads the suite's native tracegc module."
 [[case]]
 path = "utf8.lua"
 category = "utf8-library"
-status = "pending"
+status = "pass"
 requires = []
-note = "blocked-on: utf8.charpattern (the UTF-8 pattern constant) is missing from both the global utf8 table and the require'utf8' table, which only exposes char/codepoint/len; fails at line 24, `\"^\" .. utf8.charpattern .. \"$\"`."
+note = "Oracle-backed: unchanged Lua 5.5.1 case matches the pinned reference, including charpattern, strict/lax decoding, offset, codes, and extended UTF-8 values."
 
 [[case]]
 path = "vararg.lua"
 category = "varargs"
-status = "pending"
+status = "pass"
 requires = []
-note = "blocked-on: Lua 5.5's named-vararg parameter syntax `function f(...t)` (auto-packing extra args into a table `t`) is parsed but not implemented at runtime - `t` never gets bound, so `f()`'s body fails at `assert(x.n == t.n)` (line 27) with `t` nil."
+note = "Oracle-backed: unchanged Lua 5.5.1 case matches the pinned reference, including mutable named packs, live `n`-controlled expansion, variadic loaded chunks, and read-only named bindings."
 
 [[case]]
 path = "verybig.lua"

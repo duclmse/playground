@@ -1,8 +1,8 @@
 # Memory management
 
-> Status: a conservative mark/sweep collector is implemented, now with a real
-> generational split (chunk-granularity promotion, write barriers, remembered
-> sets - see below). Precise (Cranelift-stack-map-backed) collection and
+> Status: a conservative-root mark/sweep collector is implemented, with a real
+> generational split, write barriers, remembered sets, and precise per-object
+> pointer layouts for typed allocations. Precise Cranelift stack roots and
 > incremental/interruptible major GC remain planned.
 
 **Purpose**: provide a real collector for allocations that cannot be removed by
@@ -171,6 +171,14 @@ speed win it isn't, per this document's own established practice (see the
       This is also a minor correctness improvement, not just speed: a scalar
       value that happened to numerically match another live block's address
       could previously cause spurious retention; an atomic block can't.
+- [x] **Typed pointer layouts**: U5 adds `sol_gc_alloc_layout(size, mask)`.
+      Native and typed-bytecode lowering emit one bit per managed pointer slot
+      for records and `any` boxes; array/map headers describe only their buffer
+      pointers. Minor tracing, major tracing, and remembered-set rederivation
+      all honor the same descriptor. `u64::MAX` remains an explicit
+      conservative fallback for legacy/dynamic blocks and layouts with a
+      pointer beyond the compact 64-slot mask. Stack roots are still scanned
+      conservatively; “precise” here describes heap object contents only.
 - [x] Benchmark: `benchmarks/gc_alloc.{lua,fl}` (2,000,000 short-lived 2-field
       allocations) - see `benchmarks/RESULTS.md`'s collector section for the full
       story, in three parts: sol initially **lost to LuaJIT** on this

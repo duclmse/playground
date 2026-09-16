@@ -22,9 +22,11 @@ clean up after scalar replacement.
       struct's field types resolved; field-literal completeness (every field
       required, with no defaults) and unknown-field/non-struct-field-access
       errors covered by `typeck.rs`'s test module.
-- [x] **Struct codegen**: no header at all (simpler than the original plan) - a
-      struct is exactly `fields.len() * 8` raw bytes from `runtime.rs`'s new
-      `sol_alloc`, since every field's type/offset is already fully resolved
+- [x] **Struct codegen**: no language-visible header - a struct is exactly
+      `fields.len() * 8` payload bytes from `runtime.rs`'s
+      `sol_alloc_layout`. Lowering emits a pointer-slot mask from the resolved
+      field types, so the collector traces references without treating scalar
+      bits as possible pointers. Every field's type/offset is fully resolved
       by `typeck.rs` (`field_index`) and `codegen.rs` never needs to look
       anything up by name or struct identity at codegen time.
 - [x] **Escape analysis** (§12): `escape.rs`'s `expr_leaks_local` - deliberately
@@ -46,7 +48,7 @@ clean up after scalar replacement.
       Cranelift IR for a non-escaping `Point` is bare
       `f64const`/`fmul`/`fadd`/`return` - zero calls, zero stores - while the
       escaping case in `structs.sol` still shows a real `call fn0(...)` to the
-      allocator. Bonus finding from the same dump: inlining and escape
+      allocator (`sol_alloc_layout` after U5). Bonus finding from the same dump: inlining and escape
       analysis compose correctly - `structs.sol`'s `dist_squared` gets inlined
       into `main`, and the escape analysis (which runs before inlining, at the
       AST level) still correctly kept `p` heap-allocated, since escaping is

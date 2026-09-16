@@ -43,6 +43,15 @@ private access, duplicate exports, indirect undeclared imports, and import
 cycles, then runs typed module initializers once in dependency order before the
 root `main`.
 
-Importing a dynamic `.lua` interface into typed `.sol` is unsupported until the
-explicit `any` bridge is complete. Implementations must not infer a typed
-interface from dynamic Lua code.
+`sol run` may import a dynamic `.lua` module from typed `.sol` when the called
+function declares a result type and explicitly annotates every parameter. That
+signature is a checked contract, not an inference from the dynamic body. The
+current mixed boundary accepts only `i64`, `f64`, and `bool`; a mismatching
+argument or result is a runtime boundary error.
+
+The canonical import graph loads a source path once. A dynamic module namespace
+loaded by `import` is also installed in `package.loaded`, so a later
+`require("name")` returns that same table and the same exported callable
+identities rather than executing a second module instance. Unannotated dynamic
+functions remain private to typed import. `sol build` and `sol debug` do not yet
+support dynamic module bodies.

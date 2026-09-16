@@ -1,7 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
-> Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U3
-> and U4 completed 2026-09-16; U2's production-object migration remains in progress. This document
+> Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U3,
+> U4, and U5 completed 2026-09-16; U2's production-object migration remains in progress. This document
 > defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
@@ -735,7 +735,7 @@ the annotation-free unified path. Executable fixtures in
 `off`/`infer` results, and the complete compatibility suite remains the
 semantic regression gate.
 
-### U5 — Typed layouts and mixed-module specialization
+### U5 — Typed layouts and mixed-module specialization — **completed 2026-09-16**
 
 **Purpose:** retain the current typed compiler’s strongest performance features
 inside the unified runtime.
@@ -756,6 +756,27 @@ Exit gate: existing typed benchmark IR retains unboxed hot paths; mixed-module
 fixtures pass without duplicate modules or collectors; adding unused dynamic
 support causes no generated-code change to a fully proven function.
 
+Implemented scope: proven scalars remain unboxed; arrays and scalar maps keep
+their specialized buffers; typed records carry pointer-slot masks and are
+scalar-replaced when nonescaping; nonescaping closure captures are
+lambda-lifted as hidden typed parameters. Reference payloads placed in `any`
+retain their original pointer identity. Native and typed-bytecode allocation
+now emit the same precise layouts, while legacy callers deliberately use the
+conservative sentinel. Dynamic `.lua` modules expose a typed import contract
+only when every parameter and result is explicitly annotated; their bodies
+remain generic and the boundary checks scalar arguments/results. Canonical
+paths deduplicate transitive imports, and the loaded namespace is published
+through the same `package.loaded` entry used by `require`.
+
+The exit gate is executable: mixed fixtures require the unified dispatcher and
+compare repeated `require` identity, a diamond dependency contains one module
+body, contract violations fail at the adapter, and an unused dynamic function
+leaves a proven `main`'s bytecode and constants byte-for-byte unchanged. The
+typed IR regression script continues to reject boxing/dynamic calls in hot
+benchmark functions. This does not complete U2: generic Lua tables/closures
+still have transitional `Rc` ownership even though mixed calls share the U3
+semantic ABI and module identity.
+
 ### U6 — Lua 5.5 compatibility completion
 
 **Purpose:** complete semantics before making final performance claims.
@@ -773,6 +794,33 @@ Deliverables:
 Exit gate: the compatibility gates in section 6.2 pass for the declared full
 runtime profile. If the embedding profile remains incomplete, public wording
 must remain source-compatible rather than fully runtime-compatible.
+
+Current U6 progress: the numeric coercion path now shares source-literal
+decimal/hex/hex-float parsing without applying that coercion to comparisons;
+mixed integer/float ordering is exact at the i64 boundary and treats NaN as an
+unordered numeric value. The portable math surface includes Lua 5.5's
+xoshiro256** generator with reference seed vectors, and the UTF-8 library now
+matches the unchanged upstream case in a pinned differential run. Named
+varargs bind a live, mutable auto-packed table whose `n` controls subsequent
+`...` expansion; loaded Lua chunks are variadic and share the default global
+environment; shared string metatables make the unchanged `bwcoercion.lua`
+case match; and `gsub` observes empty-match progression, table `__index`, and
+source identity reuse. Runtime errors record bytecode source lines, and the
+frame header's program counter now stays in step with the instruction being
+executed (not just the last explicit suspension point), so an error that
+propagates without crossing a call boundary attributes the right source line
+instead of a stale one. Bitwise/shift "no integer representation" errors
+annotate their offending operand's field name when it was just loaded by a
+table-field access (e.g. `math.huge << 1` reports "field 'huge'"), matching
+real Lua's `getobjname`-derived wording via a narrow backward bytecode scan
+rather than general debug-name tracking. `tonumber` on a decimal string
+exactly at the most-negative-integer boundary (`"-9223372036854775808"`) now
+converts to that exact integer instead of an imprecise float, mirroring real
+Lua's unsigned-accumulate-then-negate string-to-integer conversion. The
+unchanged `bwcoercion.lua`, `utf8.lua`, `pm.lua`, and `vararg.lua` cases all
+match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
+close but still blocked on hex-float parsing for very long numerals; the
+remaining U6 rows stay pending at their next observed blocker.
 
 ### U7 — Interpreter performance foundation
 

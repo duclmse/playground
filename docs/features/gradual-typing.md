@@ -1,7 +1,7 @@
 # Gradual typing
 
-> Status: explicit contracts and non-rejecting annotation-free inference are
-> implemented; remaining layout specialization belongs to U5.
+> Status: explicit contracts, non-rejecting annotation-free inference, and U5
+> typed layout specialization are implemented.
 
 **Purpose**: provide checked `any` contracts plus a sound inference path for
 ordinary Lua, without making uncertainty a source error or forcing proven code
@@ -34,7 +34,7 @@ implemented; indexing, calls, and fields require narrowing first.
       `{ tag: i64, payload: i64 }` block supporting scalar and documented
       reference families. `typeck.rs`'s `coerce` enforces which values may
       cross the boundary. Allocated through the *same* runtime path as struct
-      literals (`sol_alloc`, self-initializing - see `gc.rs`'s zero-skip
+      literals (`sol_alloc_layout`, self-initializing - see `gc.rs`'s zero-skip
       work) since both fields are always written immediately - no new
       allocator entry point needed at all.
 - [x] **Runtime type checks** at typed/`any` boundaries - both directions
@@ -69,13 +69,20 @@ implemented; indexing, calls, and fields require narrowing first.
 At the unified semantic ABI, dynamic values use `sol_core::Value`; proven scalar
 arguments/results use `BoundaryValue::Unboxed` and therefore allocate no
 two-word `any` block. The legacy typed-only `Type::Any` representation still
-uses a two-word allocation when a value must live in that IR. U5 will converge
-that storage with typed object layouts while preserving identity.
+uses a two-word allocation when a value must live in that IR. U5 gives that
+block a precise payload layout and preserves the original identity of
+reference payloads.
 
-**Remaining work (U5+)**: specialized layouts for capturing closures and
-escaping tables, identity-preserving typed/dynamic object exposure, dynamic
-module contracts, and direct lowering of analysis facts into optimized
-bytecode/native code.
+Dynamic `.lua` module contracts are never inferred: only functions with an
+explicit result and explicit annotations for every parameter are importable by
+typed modules. Their implementation remains generic, with checked scalar
+adapters at the boundary. Capturing closures and tables that remain dynamically
+observable keep the generic representation; nonescaping typed captures and
+records are lambda-lifted/scalar-replaced.
+
+**Remaining work (U6+)**: broaden non-scalar dynamic boundary conversions as
+the U2 object migration completes, and lower additional profile-backed facts
+in later optimization tiers without changing the explicit contract rules.
 
 **Files**: `typeck/inference.rs` (flow lattice and reports), `types.rs`
 (`Type::Any`, `TExprKind::Box`/`Unbox`), `typeck.rs`
