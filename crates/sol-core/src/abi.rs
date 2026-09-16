@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 /// Stable identity of a function inside one loaded runtime image.
@@ -159,6 +160,116 @@ pub trait ExecutablePrototype {
     fn source_map(&self) -> &SourceMap;
     fn instruction_count(&self) -> usize;
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionTier {
+    Generic,
+    Specialized,
+    Native,
+    SemanticAdapter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDescriptor {
+    pub id: FunctionId,
+    pub metadata: PrototypeMetadata,
+    pub tier: ExecutionTier,
+}
+
+/// One identity/catalog domain for generic, specialized, and host functions.
+/// Tier promotion updates a descriptor rather than allocating a second
+/// function identity.
+#[derive(Debug, Default)]
+pub struct FunctionRegistry {
+    entries: HashMap<FunctionId, FunctionDescriptor>,
+    next: u32,
+}
+
+impl FunctionRegistry {
+    pub fn register(
+        &mut self,
+        metadata: PrototypeMetadata,
+        tier: ExecutionTier,
+    ) -> Result<FunctionId, FunctionRegistryError> {
+        while self.entries.contains_key(&FunctionId::new(self.next)) {
+            self.next = self
+                .next
+                .checked_add(1)
+                .ok_or(FunctionRegistryError::IdsExhausted)?;
+        }
+        let id = FunctionId::new(self.next);
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(FunctionRegistryError::IdsExhausted)?;
+        self.insert(id, metadata, tier)?;
+        Ok(id)
+    }
+
+    pub fn insert(
+        &mut self,
+        id: FunctionId,
+        metadata: PrototypeMetadata,
+        tier: ExecutionTier,
+    ) -> Result<(), FunctionRegistryError> {
+        if self.entries.contains_key(&id) {
+            return Err(FunctionRegistryError::Duplicate(id));
+        }
+        self.entries.insert(
+            id,
+            FunctionDescriptor {
+                id,
+                metadata,
+                tier,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get(&self, id: FunctionId) -> Option<&FunctionDescriptor> {
+        self.entries.get(&id)
+    }
+
+    pub fn set_tier(
+        &mut self,
+        id: FunctionId,
+        tier: ExecutionTier,
+    ) -> Result<(), FunctionRegistryError> {
+        let descriptor = self
+            .entries
+            .get_mut(&id)
+            .ok_or(FunctionRegistryError::Unknown(id))?;
+        descriptor.tier = tier;
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionRegistryError {
+    Duplicate(FunctionId),
+    Unknown(FunctionId),
+    IdsExhausted,
+}
+
+impl fmt::Display for FunctionRegistryError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(id) => write!(out, "function ID {} is already registered", id.get()),
+            Self::Unknown(id) => write!(out, "function ID {} is not registered", id.get()),
+            Self::IdsExhausted => out.write_str("function ID space exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for FunctionRegistryError {}
 
 impl PrototypeMetadata {
     pub fn new(
@@ -336,5 +447,20 @@ mod tests {
         };
         assert_eq!(request.function, FunctionId::new(12));
         assert_eq!(request.arguments, vec![7, 8]);
+    }
+
+    #[test]
+    fn one_function_identity_survives_tier_promotion() {
+        let mut registry = FunctionRegistry::default();
+        let id = registry
+            .register(
+                PrototypeMetadata::new("work", 1, false, 2).unwrap(),
+                ExecutionTier::Generic,
+            )
+            .unwrap();
+        registry.set_tier(id, ExecutionTier::Native).unwrap();
+        let descriptor = registry.get(id).unwrap();
+        assert_eq!(descriptor.metadata.name, "work");
+        assert_eq!(descriptor.tier, ExecutionTier::Native);
     }
 }

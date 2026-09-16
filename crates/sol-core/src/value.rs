@@ -50,6 +50,92 @@ pub enum ValueTag {
     Object = 4,
 }
 
+/// Unboxed scalar layouts understood by every semantic call adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarKind {
+    I64,
+    F64,
+    Bool,
+}
+
+/// A value at a dynamic/specialized tier boundary. Proven scalars stay in
+/// their unboxed register representation; every identity-bearing value is a
+/// canonical handle and is therefore passed without copying its object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundaryValue {
+    Unboxed { kind: ScalarKind, bits: u64 },
+    Canonical(Value),
+}
+
+impl BoundaryValue {
+    pub const fn unboxed(kind: ScalarKind, bits: u64) -> Self {
+        Self::Unboxed { kind, bits }
+    }
+
+    pub const fn canonical(value: Value) -> Self {
+        Self::Canonical(value)
+    }
+
+    pub fn boxed(self) -> Value {
+        match self {
+            Self::Unboxed {
+                kind: ScalarKind::I64,
+                bits,
+            } => Value::integer(bits as i64),
+            Self::Unboxed {
+                kind: ScalarKind::F64,
+                bits,
+            } => Value::float(f64::from_bits(bits)),
+            Self::Unboxed {
+                kind: ScalarKind::Bool,
+                bits,
+            } => Value::boolean(bits != 0),
+            Self::Canonical(value) => value,
+        }
+    }
+
+    pub fn checked_unbox(value: Value, expected: ScalarKind) -> Result<Self, BoundaryTypeError> {
+        let bits = match expected {
+            ScalarKind::I64 => value.as_integer().map(|value| value as u64),
+            ScalarKind::F64 => value
+                .as_float()
+                .or_else(|| value.as_integer().map(|value| value as f64))
+                .map(f64::to_bits),
+            ScalarKind::Bool => value.as_bool().map(u64::from),
+        }
+        .ok_or(BoundaryTypeError {
+            expected,
+            actual: value.tag(),
+        })?;
+        Ok(Self::unboxed(expected, bits))
+    }
+
+    pub const fn bits(self) -> Option<u64> {
+        match self {
+            Self::Unboxed { bits, .. } => Some(bits),
+            Self::Canonical(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryTypeError {
+    pub expected: ScalarKind,
+    pub actual: ValueTag,
+}
+
+impl fmt::Display for BoundaryTypeError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            out,
+            "semantic boundary expected {:?}, got {:?}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for BoundaryTypeError {}
+
 /// Canonical runtime register/stack value.
 ///
 /// The explicit tag/payload layout is portable to WebAssembly and native
@@ -202,5 +288,20 @@ mod tests {
         assert!(!Value::NIL.truthy());
         assert!(!Value::boolean(false).truthy());
         assert!(Value::integer(0).truthy());
+    }
+
+    #[test]
+    fn boundary_values_check_scalars_once_and_preserve_object_identity() {
+        let integer = BoundaryValue::checked_unbox(Value::integer(42), ScalarKind::I64).unwrap();
+        assert_eq!(integer.bits(), Some(42));
+        assert_eq!(integer.boxed(), Value::integer(42));
+
+        let widened = BoundaryValue::checked_unbox(Value::integer(7), ScalarKind::F64).unwrap();
+        assert_eq!(widened.boxed(), Value::float(7.0));
+        assert!(BoundaryValue::checked_unbox(Value::boolean(true), ScalarKind::I64).is_err());
+
+        let object = ObjectId::from_raw(1).unwrap();
+        let canonical = BoundaryValue::canonical(Value::object(object));
+        assert_eq!(canonical.boxed().as_object(), Some(object));
     }
 }

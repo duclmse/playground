@@ -6,19 +6,22 @@ types are optional contracts and optimizations, and typed/untyped programs use
 one semantic runtime. The convergence contract and milestones are in the
 [unified runtime plan](../features/unified-sol-runtime-plan.md).
 
-The implementation is still transitional and currently exposes two source
-modes selected by file extension:
+The implementation is still transitional and exposes two syntax profiles by
+file extension, but U3 no longer uses the extension to select execution
+semantics:
 
-- `.sol` currently selects the statically typed frontend. Its compiler preserves unboxed,
-  specialized representations on typed paths.
-- `.lua` currently selects the Lua-compatibility frontend and a separate dynamic value
-  model and interpreter. Compatibility status is documented in
+- `.sol` recognizes optional Sol annotations and extensions; annotation-free
+  source uses the generic Lua semantic engine.
+- `.lua` uses compatibility diagnostics while accepting the shared grammar;
+  explicit supported annotations may select specialized bytecode.
+- Typed and generic bytecode share the U3 call/frame/prototype ABI, while U2
+  continues migrating the production `Rc` and typed arenas onto the canonical
+  heap. Compatibility status is documented in
   [Lua compatibility](lua-compatibility.md).
 
-That split describes shipped behavior, not the desired product boundary. Until
-milestones U1-U3 land, specification sections must clearly distinguish current
-behavior from the accepted future direction rather than pretending convergence
-is already implemented.
+Specification sections must continue to distinguish the remaining U2 object
+ownership split and later optimization work from the accepted final direction;
+U3 completion is not a claim that the entire convergence roadmap is finished.
 
 Implementation rationale and work-in-progress checklists live in
 [`docs/features/`](../features/README.md). If a feature document and this

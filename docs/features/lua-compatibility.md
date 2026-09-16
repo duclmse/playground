@@ -284,7 +284,14 @@ typed top-level function values.
       closure calls replace the active trampoline frame without increasing the
       call-depth charge; native and protected continuations retain the caller
       frame only when their observable error/yield behavior requires it.
-- [ ] Implement the `.sol` bridge for calling dynamic functions as `any` and
+- [x] Implement the typed-to-dynamic semantic bridge with checked scalar
+      signatures and canonical identity-preserving boundary values. The
+      specialized dispatcher represents dynamic functions as semantic slots;
+      returned, raised, yielded, and tail-call outcomes use `sol-core`'s common
+      call ABI. Non-scalar optimized layouts remain U5 work, and unsupported
+      or reentrant graphs stay on the generic runtime rather than being
+      miscompiled.
+- [ ] Extend the `.sol` bridge to arbitrary `any` values and
       checked conversion to a typed function signature. Enforce arity/result
       checks at the bridge; do not let `LuaValue` appear in typed IR absent an
       explicit dynamic operation.
@@ -295,9 +302,9 @@ typed top-level function values.
       as native-candidate or dynamic, then demotes any native-candidate that
       (directly or transitively) calls a dynamic function to a fixed point,
       via `jit::called_functions` over the native call graph. Dynamic code
-      may call into surviving native functions through a one-directional
-      bridge (`lua_runtime::LuaValue::Native`/`NativeBridge`); native code can
-      never call back into the dynamic runtime. Only scalar (`i64`/`f64`
+      may call into surviving native functions through a registered semantic
+      callable. Specialized bytecode can also call dynamic functions through
+      checked semantic slots. Only scalar (`i64`/`f64`
       /`bool`) parameters and returns may cross the bridge — non-scalar
       signatures (strings, tables, structs, arrays, maps, functions) are
       rejected at compile time with a clear error rather than silently boxed

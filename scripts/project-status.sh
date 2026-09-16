@@ -65,7 +65,9 @@ if grep -q '@lua-playground/runtime' "$root_dir/apps/web/src/lua-worker.ts"; the
 if [[ -d "$root_dir/editors/vscode-sol" ]]; then vscode_client=true; else vscode_client=false; fi
 # Frontend configuration no longer selects grammar productions after U1, but
 # that does not make the execution engine unified. The partition bridge remains
-# the explicit migration seam until U3 replaces it with one semantic ABI.
+# the explicit migration seam until U2 moves production objects onto the
+# canonical heap and the final fallback can be removed. U3's shared semantic
+# ABI intentionally keeps this differential seam available during migration.
 if grep -q 'run_lua_partitioned' "$root_dir/crates/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
 if [[ -f "$root_dir/crates/sol-lsp/Cargo.toml" ]]; then lsp_present=true; else lsp_present=false; fi
 if [[ -f "$root_dir/crates/sol-core/src/heap.rs" ]]; then canonical_heap_foundation=true; else canonical_heap_foundation=false; fi

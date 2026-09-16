@@ -1,7 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
-> Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U2 is
-> in progress. This document
+> Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U3
+> completed 2026-09-16; U2's production-object migration remains in progress. This document
 > defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
@@ -634,7 +634,7 @@ production global environment still need to move onto canonical handles before
 the exit gate can be claimed. See
 [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
-### U3 — Unified bytecode, frames, and semantic call ABI — **in progress**
+### U3 — Unified bytecode, frames, and semantic call ABI — **completed 2026-09-16**
 
 **Purpose:** execute typed and untyped functions in one resumable engine.
 
@@ -655,10 +655,13 @@ Exit gate: annotation-free `.lua` and `.sol` run through the same runtime path;
 mixed modules call, error, tail-call, yield, and collect correctly in every
 direction; the legacy partition/fallback path is no longer the default.
 
-Started 2026-09-16. `sol-core` now defines the tier-independent function IDs,
+Completed 2026-09-16. `sol-core` now defines the tier-independent function IDs,
 prototype metadata, arity, value-count, call-site, call-kind, frame-state, and
-call-outcome contracts. Generic Lua and specialized Sol bytecode both expose
-that metadata and project their call instructions onto the same semantic ABI.
+call-outcome contracts, including tail redispatch, returned/yielded/raised
+transitions, portable native-callable IDs, a shared function registry, checked
+boundary values, and instruction source maps. Generic Lua and specialized Sol
+bytecode both implement the same executable-prototype interface and project
+their call instructions onto the same semantic ABI.
 The generic compiler no longer stores Lua's open argument/result convention as
 an untyped `-1` sentinel, and its resumable frames now carry stable function
 IDs and canonical ready/running/suspended/returned state. The typed interpreter
@@ -666,14 +669,31 @@ publishes the same frame-state transitions to its existing zero-cost hooks.
 Both compilers emit explicit semantic tail calls: generic Lua closure frames are
 replaced in the trampoline, and specialized bytecode redispatches in a loop, so
 deep proper tail recursion does not consume native or heap frame depth. U3
-now also routes annotation-free `.lua` and `.sol` through the same generic
+also routes annotation-free `.lua` and `.sol` through the same generic
 runtime based on AST type surface rather than filename; an explicit annotation
-selects the specialized/partitioned path. This exposed and fixed dynamic
+selects specialization without changing the semantic object runtime. This exposed and fixed dynamic
 integer-loop overflow, negative-divisor floor arithmetic, and minimum-integer
-shift discrepancies. U3 remains in progress until every result/error/yield
-transition uses this ABI, the dispatcher can execute both opcode families, and
-the remaining typed/dynamic partition bridge is represented by canonical
-callables rather than a separate raw-pointer path.
+shift discrepancies.
+
+The specialized dispatcher now hosts generic Lua functions as semantic slots,
+so typed bytecode can call dynamic code and propagate normal results, catchable
+errors, proper tail calls, and coroutine yield/resume outcomes without a second
+calling convention. The dynamic dispatcher performs the reverse call through
+registered pointer-free callable IDs; raw machine pointers remain only in its
+host-side provider registry and never enter values, tables, frames, or canonical
+snapshots. Scalar guards use the common boundary adapter, while canonical
+handles cross unchanged to preserve identity. The CLI selects this mixed path
+for an eligible typed caller of a dynamic function and retains
+`SOL_RUNTIME_PATH=legacy-partition` only as the differential switch. Unsupported
+non-scalar specialization and reentrant call graphs safely remain generic; U5
+extends their optimized layouts rather than defining another runtime.
+
+The exit gate is covered by annotation-free `.lua`/`.sol` routing tests,
+dynamic-to-typed call and protected-error tests, typed-to-dynamic source and
+error tests, deep cross-tier tail recursion, a real dynamic coroutine
+yield/resume through a specialized slot, canonical callable collection tests,
+and the legacy/unified differential test. The old raw-pointer value bridge is
+no longer the installed production representation.
 
 ### U4 — Gradual type system and sound static inference
 
