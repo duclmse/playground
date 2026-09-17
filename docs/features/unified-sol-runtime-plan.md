@@ -1050,6 +1050,27 @@ correct). With both worked around, `goto.lua` runs cleanly end-to-end and
 prints `OK`; `tests/lua55/manifest.toml`'s entry stays `pending` because the
 unmodified upstream file does not yet exit 0 under `sol run`.
 
+`constructs.lua`'s manifest note claiming a line-6 `require "debug"` blocker
+was stale (the same `debug` preload work above already covers it). Chasing
+this file further past that point turned up two genuine, now-fixed bugs: a
+table read of a nil or otherwise unhashable key (`t[nil]`, `t[0/0]`) wrongly
+raised `"table index is nil"`/`"table index is NaN"` - real Lua only raises
+that for a *write* (`luaH_newkey`), never a read, so `LuaTable::get` in
+`lua_runtime/value.rs` no longer reuses the write path's key error; and a
+parenthesized multi-value expression (`(f())`) failed to truncate to exactly
+one value the way real Lua requires, instead still expanding all of `f`'s
+results - fixed with a new `ast::ExprKind::Paren` node that the parser wraps
+around a parenthesized `Call`/`CallExpr`/`MethodCall`/`Vararg`, which the
+dynamic bytecode compiler (`lua_bytecode/compile_expr.rs`) compiles as a
+single-value expression. See
+`dynamic_lua_runtime_table_read_of_a_nil_or_unhashable_key_returns_nil_but_a_write_still_errors`/
+`dynamic_lua_runtime_parenthesized_call_truncates_to_one_value` in
+`crates/sol/tests/lua55_dynamic_runtime.rs`. With both fixed, the unmodified
+upstream file now reaches line 244's `checkload` assertion before stopping on
+the same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-
+prefix divergence already noted above for `goto.lua`; `constructs.lua` stays
+`pending` for the same reason.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
