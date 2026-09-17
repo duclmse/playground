@@ -822,6 +822,28 @@ match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
 close but still blocked on hex-float parsing for very long numerals; the
 remaining U6 rows stay pending at their next observed blocker.
 
+Lua 5.4+ `<close>`/to-be-closed-variable support is now implemented end to
+end: parser support for the `<close>` local attribute (typed `.sol` still
+rejects it, falling back to the dynamic runtime, since it is a dynamic-only
+feature); a `MarkClose`/`CloseSlots` bytecode pair the compiler emits at
+every scope-exit path (normal fallthrough, `break`, `return`) that closes
+locals in LIFO declaration order; `__close` metamethod dispatch that passes
+through the in-flight error on an error-driven unwind, consistently across
+`pcall`/`xpcall`, `coroutine.resume`, and the blocking native-call bridge;
+and a generic `for`'s implicit closing of a 4th iterator-list value scoped to
+the whole loop. (A `goto` jumping out of a `<close>` variable's scope is a
+deliberate, documented, out-of-scope limitation.) This resolved
+`nextvar.lua`'s `assert(closed)` blocker and, in turn, reached its previously
+unreached "testing ipairs with metamethods" section, which surfaced one more
+real bug now also fixed: `ipairs`'s iterator read table slots with raw
+access instead of respecting `__index` (Lua's `ipairs` has used ordinary,
+metamethod-respecting indexing since 5.3). With both fixed, `nextvar.lua` now
+runs to completion under elevated instruction/call-depth/allocation budgets;
+its manifest row stays `pending` only because `sol run`'s default
+embedder-sized instruction budget is exhausted mid-file in an unrelated
+hash-collision stress section, a pre-existing budget-sizing gap rather than
+a compatibility bug.
+
 The CLI also had a general output-loss bug affecting every erroring corpus
 case with prior output, not just a display nuance: `print`/`io.write` only
 ever appended to an in-memory buffer that was flushed to real stdout on the
