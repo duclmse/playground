@@ -1071,6 +1071,27 @@ the same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-
 prefix divergence already noted above for `goto.lua`; `constructs.lua` stays
 `pending` for the same reason.
 
+`errors.lua`'s manifest note claiming a line-6 `require "debug"` blocker was
+likewise stale. Chasing this file further turned up two more genuine,
+now-fixed bugs: `error()`'s message argument is optional in real Lua
+(`luaB_error`'s `lua_settop(L, 1)` defaults it to `nil`), but Sol's
+`NativeFunction::Error` required it; and real Lua's `luaG_errormsg` converts a
+thrown `nil` error object to the literal string `"<no error object>"` at the
+moment it is raised, so `pcall`/`xpcall` never observe a raw `nil` from
+`error()`/`error(nil)` - both fixed in `lua_runtime/natives.rs`. Separately,
+Lua's `retstat` grammar only allows `return` (optionally followed by one `;`)
+as a block's *last* statement; Sol's parser silently accepted trailing tokens
+or a second `;` after `return` instead of rejecting them - fixed in
+`parser.rs`'s `parse_block` and the top-level chunk loop in `parse_program`,
+which now consume one optional `;` after a `return`/`MultiReturn` statement
+and then require a block terminator (or end of input at top level). See
+`dynamic_lua_runtime_error_with_no_message_or_a_nil_message_becomes_no_error_object`/
+`dynamic_lua_runtime_return_must_be_the_last_statement_in_a_block` in
+`crates/sol/tests/lua55_dynamic_runtime.rs`. With both fixed, the unmodified
+upstream file now reaches line 65's `checksyntax` call before stopping on the
+same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-prefix
+divergence noted above; `errors.lua` stays `pending` for the same reason.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

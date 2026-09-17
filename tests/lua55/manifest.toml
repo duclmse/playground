@@ -104,8 +104,8 @@ note = "blocked-on: `local debug = require\"debug\"` at line 6; require is sandb
 path = "errors.lua"
 category = "errors"
 status = "pending"
-requires = ["debug-library"]
-note = "blocked-on: `local debug = require\"debug\"` at line 6; require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
+requires = []
+note = "the `local debug = require\"debug\"` at line 6 is no longer a blocker (debug is preloaded). Fixed two genuine bugs found while chasing this file: `error()`/`error(nil)` now default the message to nil and surface it as the string \"<no error object>\" from pcall/xpcall, matching real Lua's luaG_errormsg (dynamic_lua_runtime_error_with_no_message_or_a_nil_message_becomes_no_error_object); and `return` is now rejected unless it is the last statement in its block, matching Lua's retstat grammar (dynamic_lua_runtime_return_must_be_the_last_statement_in_a_block). The file now reaches line 65's `checksyntax` call before stopping on the same pre-existing, out-of-scope `line N:` vs `chunkname:N:` diagnostic-prefix divergence already documented for goto.lua/constructs.lua."
 
 [[case]]
 path = "events.lua"
