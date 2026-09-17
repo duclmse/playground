@@ -979,6 +979,44 @@ implemented feature (`docs/features/lua-compatibility.md`'s Phase 4;
 with "requires resource finalization, which is not implemented yet"), not a
 small bug fix like the ones above.
 
+`goto.lua`'s label/goto validation is now implemented in the dynamic bytecode
+compiler: `FuncState` tracks a live active-local count per scope (mirroring
+real Lua's `fs->nactvar`), clamps a bubbled-out pending goto's count to its
+closing scope's starting count (matching `movegotosout`), and
+`check_goto_scope` compares goto/label counts to reject both a duplicate label
+in the same or a nested open scope and a `goto` that jumps into a local's
+scope, using the same `"<goto NAME> at line L> jumps into the scope of 'V'"`
+wording real Lua uses. `global *`/`global none` declarations (Lua 5.5's
+block-scoped global-declaration statement) also register as goto-scope
+pseudo-locals — occupying a slot in the active-local count without allocating
+a register or resolving as a local on later bareword use — so a goto skipping
+one is caught the same way, matching `goto.lua`'s
+`errmsg([[ goto l2; global *; ::l1:: ::l2:: print(3) ]], "scope of '*'")`
+case. This is a deliberately narrow slice of Lua 5.5's `global` declaration
+feature (goto-scope participation only, not the full
+declare-before-use/`<const>`/`_ENV`/redefinition semantics), scoped to unblock
+this concrete corpus failure rather than building the whole feature
+speculatively.
+
+With that fixed, `goto.lua` advanced from line 30 to line 166, where its only
+`debug.*` dependency, `debug.upvalueid(closure, index)`, was unimplemented.
+Added a `LuaValue::LightUserdata(usize)` variant carrying a closure upvalue
+cell's `Rc::as_ptr` identity, a `NativeFunction::DebugUpvalueid` dispatch that
+reads it out of `LuaClosure.upvals`, and a `debug` library table installed
+like `os`/`io`/`coroutine` (always present as a global/preload entry, with
+`upvalueid` itself gated on the existing, previously-unused
+`capabilities.debug` flag). This satisfies `goto.lua`'s
+upvalue-sharing-topology assertions (lines 168-225, the only `debug.*` calls
+the file makes).
+
+`goto.lua` now runs to line ~293 and fails at line 299, inside a `checkerr`
+helper that expects `load` to reject various malformed `global` declarations
+(`global none` rejecting an undeclared bareword target, globals rejecting
+`<close>`, declare-before-use, `_ENV`/redefinition checks — lines 296-474).
+That is Lua 5.5's fuller `global`-declaration strict-checking feature,
+distinct from and larger than the goto-scope pseudo-local tracking above, and
+remains unimplemented.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
