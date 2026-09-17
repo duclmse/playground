@@ -921,6 +921,42 @@ now fails at line 742, in the "testing floats in numeric for" section (mixed
 integer/float control-value semantics for the numeric `for` loop) — not yet
 root-caused.
 
+That line-742 failure turned out to be two separate bugs in the same region.
+First, `load "for v, k in pairs{} do v = 10 end"` was expected to fail to
+compile ("assign to const variable 'v'") but silently succeeded: a numeric
+`for`'s control variable is registered as an implicitly const local, but the
+bytecode compiler's `GenericFor` case registered its loop variables
+(`v`/`k`) as ordinary, non-const locals. Fixed by registering them as const,
+matching the numeric-for case exactly.
+
+Second (surfaced once the first fix let the corpus reach its next line),
+`for i = 1, 10.9 do checkint(i) end` was expected to run as a ten-iteration,
+all-integer loop (`math.type(i) == "integer"` throughout) but instead ran the
+whole loop in floats: `ForPrep` only took its integer-loop path when *every*
+control value (start/stop/step) was already an integer, so a float limit
+alongside an integer start/step forced the whole loop, and its control
+variable, to floats. Real Lua's `forlimit` instead "fixes" a float limit into
+an integer one whenever start/step are integers — rounding it toward the loop
+(floor when ascending, ceil when descending) and clamping to
+`i64::MAX`/`i64::MIN` when the float is out of `i64` range (needed for cases
+like `for i = m, m - 10, -1 do` where `m = math.maxinteger`) — and only then
+falls back to an all-float loop if start or step themselves aren't integers.
+Fixed by adding a `float_for_limit` helper implementing that exact rounding/
+clamping (including the "no integer can possibly satisfy the loop" case,
+e.g. a NaN limit, which skips the loop entirely) and using it in `ForPrep`
+whenever start/step are integers but the limit isn't.
+
+With both fixed, `nextvar.lua` advances past the entire "testing floats in
+numeric for" section and now fails at line 919, on `assert(closed)` inside a
+block that gives a table a `__pairs` metamethod returning a fourth,
+to-be-closed value from its iterator triple. This needs `<close>`/to-be-
+closed-variable support — including a generic `for`'s implicit closing of
+that fourth value — which is a substantial, already-tracked, not-yet-
+implemented feature (`docs/features/lua-compatibility.md`'s Phase 4;
+`crates/sol/src/parser.rs`'s `parse_attribute` explicitly rejects `<close>`
+with "requires resource finalization, which is not implemented yet"), not a
+small bug fix like the ones above.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
