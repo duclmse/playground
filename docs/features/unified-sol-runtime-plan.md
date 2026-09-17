@@ -1009,13 +1009,46 @@ like `os`/`io`/`coroutine` (always present as a global/preload entry, with
 upvalue-sharing-topology assertions (lines 168-225, the only `debug.*` calls
 the file makes).
 
-`goto.lua` now runs to line ~293 and fails at line 299, inside a `checkerr`
-helper that expects `load` to reject various malformed `global` declarations
-(`global none` rejecting an undeclared bareword target, globals rejecting
-`<close>`, declare-before-use, `_ENV`/redefinition checks — lines 296-474).
-That is Lua 5.5's fuller `global`-declaration strict-checking feature,
-distinct from and larger than the goto-scope pseudo-local tracking above, and
-remains unimplemented.
+`goto.lua`'s fuller `global`-declaration strict-checking assertions (lines
+296-474: `global none` rejecting an undeclared bareword target, globals
+rejecting `<close>`, declare-before-use, `_ENV`/redefinition checks) are now
+implemented too, on top of the goto-scope pseudo-local tracking above.
+`global function NAME(...) end` used to never shadow anything — it compiled
+identically to a plain top-level `function NAME` (ordinary assignment sugar)
+because both share the `Stmt::GlobalFunction` AST variant. Real Lua's
+`globalfunc` declares (and activates) `NAME` as a global *before* compiling
+its body, so a new `Function.is_global_decl` field (set only by the parser's
+genuine `global function` production, never by the other two origins of the
+same AST variant) now drives that same declare-before-body-compile ordering,
+so the body's own recursive self-reference and any later use of the name
+resolve as the declared global rather than an outer local of the same name.
+Separately, `global NAME = value` and `global function NAME` now run the
+runtime `"global '%s' already defined"` guard real Lua's
+`checkglobal`/`OP_ERRNNIL` requires whenever the target's current value is
+non-nil at the moment of declaration — a new `Instr::ErrorIfGlobalDefined`,
+checked via the same `_ENV`-aware read `emit_environment_get` already used
+for ordinary global access, so it also fires correctly through a rebound
+local `_ENV` table (`goto.lua` lines 463-474). See
+`crates/sol/tests/lua55_dynamic_runtime.rs`'s
+`dynamic_lua_runtime_named_global_declaration_is_block_scoped_and_shadows_an_outer_local`/
+`dynamic_lua_runtime_global_function_declaration_shadows_an_outer_local_of_the_same_name`/
+`dynamic_lua_runtime_global_declaration_with_an_initializer_errors_if_already_defined`/
+`dynamic_lua_runtime_global_already_defined_check_also_applies_to_a_rebound_env_table`.
+
+With those fixed, running the unmodified upstream file now reaches line 329
+before stopping on a pre-existing, intentionally out-of-scope divergence:
+Sol always reserves `global` as a hard keyword, while real Lua's
+non-instrumented build (without the `T`/ltests flag) treats it as a
+contextual/soft keyword usable as an ordinary identifier, so
+`load("global = 1; return global")` fails to compile under Sol instead of
+succeeding. Working around only that one line (in
+`crates/sol/scratch/goto_bisect.lua`, never the real corpus file) reaches a
+second, independent, likewise out-of-scope divergence at line 361: the file
+expects real Lua's `chunkname:N:` error-message-prefix convention, but Sol's
+diagnostics use a `line N:` prefix instead (the error content itself is
+correct). With both worked around, `goto.lua` runs cleanly end-to-end and
+prints `OK`; `tests/lua55/manifest.toml`'s entry stays `pending` because the
+unmodified upstream file does not yet exit 0 under `sol run`.
 
 ### U7 — Interpreter performance foundation
 
