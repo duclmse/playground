@@ -1092,6 +1092,32 @@ upstream file now reaches line 65's `checksyntax` call before stopping on the
 same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-prefix
 divergence noted above; `errors.lua` stays `pending` for the same reason.
 
+`literals.lua`'s manifest note claiming a line-8 `require "debug"` blocker was
+likewise stale, but this file also exercises `require"debug".getinfo`/
+`debug.getinfo` inline (lines 38/249), which Sol had never implemented at
+all - added a minimal `debug.getinfo(level)` that only supports the numeric
+stack-level form and only returns a `currentline` field (the one thing this
+file's `lexstring` helper reads), reading the level-th `Frame::Lua` from the
+top of `LuaRuntime::frames` and mapping its `header.pc` through
+`proto.source_map.location` the same way error tracebacks already do.
+Chasing this file also turned up two genuine, now-fixed byte-oriented lexer
+bugs sharing one root cause: Rust's `u8::is_ascii_whitespace` deliberately
+excludes vertical tab (0x0B), but Lua's own lexer treats it as a space
+character alongside `' '`, `'\t'`, and `'\f'` (llex.c's `case ' ': case '\f':
+case '\t': case '\v':`) - both between ordinary tokens and while a `\z`
+string escape is skipping whitespace, so `crates/sol/src/lexer.rs`'s main
+scan loop and its `\z`-escape handler each needed an explicit `|| b == 0x0b`
+alongside `is_ascii_whitespace()`. See
+`dynamic_lua_runtime_vertical_tab_and_form_feed_count_as_whitespace_including_inside_a_z_escape`/
+`dynamic_lua_runtime_debug_getinfo_reports_the_calling_frames_current_line` in
+`crates/sol/tests/lua55_dynamic_runtime.rs`. With all three fixed, the
+unmodified upstream file now reaches line 85's `lexerror` helper, which
+expects a `near '<token>'` phrase in lex/parse error messages that Sol's
+diagnostics don't produce at all - the same out-of-scope diagnostic-format
+divergence noted above for `goto.lua`/`constructs.lua`/`errors.lua`, just its
+"near" half rather than its chunkname-prefix half; `literals.lua` stays
+`pending` for the same reason.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

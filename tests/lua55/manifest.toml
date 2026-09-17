@@ -153,8 +153,8 @@ note = "blocked-on: this test's toomanyidx() loop (`for i = 1, math.huge do a[i]
 path = "literals.lua"
 category = "syntax-and-values"
 status = "pending"
-requires = ["debug-library"]
-note = "blocked-on: `local debug = require \"debug\"` at line 8 (also used inline via require\"debug\".getinfo at lines 38/249); require is sandboxed to explicitly pre-registered in-memory modules and Sol has no debug library implementation to register."
+requires = []
+note = "`local debug = require \"debug\"` at line 8 is no longer a blocker (debug is preloaded); the inline `require\"debug\".getinfo`/`debug.getinfo` calls at lines 38/249 now work too via a new minimal debug.getinfo(level).currentline (dynamic_lua_runtime_debug_getinfo_reports_the_calling_frames_current_line). Also fixed two byte-oriented lexer bugs found while chasing this file: a literal vertical tab (0x0B) was not recognized as whitespace between tokens or while a `\\z` string escape skips whitespace, because Rust's `is_ascii_whitespace` deliberately excludes it unlike Lua's own `lisspace` (dynamic_lua_runtime_vertical_tab_and_form_feed_count_as_whitespace_including_inside_a_z_escape). With all three fixed, the unmodified upstream file now reaches line 85's `lexerror` helper, which expects a `near '<token>'` phrase in lex/parse error messages that Sol's diagnostics don't produce at all - the same out-of-scope diagnostic-format divergence already documented for goto.lua/constructs.lua/errors.lua, just its 'near' half rather than its chunkname-prefix half."
 
 [[case]]
 path = "locals.lua"
