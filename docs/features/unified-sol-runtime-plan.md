@@ -1520,6 +1520,36 @@ previously entirely unimplemented, now makes `f1`'s upvalue `n1` share
 storage with `f2`'s upvalue `n2` by replacing `f1`'s upvalue cell with a
 clone of `f2`'s `Rc<RefCell<LuaValue>>`.
 
+`calls.lua`'s "test for generic load" section made substantial further
+progress (still `pending`, now blocked on a real `_ENV`-upvalue
+architecture - see `tests/lua55/manifest.toml`'s entry for the remaining
+gap). `debug.getinfo` now accepts a function value (not just a numeric
+stack level) as its first argument and reports a `source` field for any
+`Proto` compiled through `load`, taken from the chunkname `load`'s caller
+supplied: `LuaRuntime` gained a `chunk_sources: HashMap<usize, Rc<Vec<u8>>>`
+side table keyed by `Proto` pointer identity (the same pattern as the
+existing `prototype_ids` table), populated by a new
+`compile_chunk_named`/`register_chunk_source` pair that recurses into every
+nested `Proto` a chunk compiles to, matching real Lua's per-chunk (not
+per-function) `source`. `load`'s mode argument (`"b"`/`"t"`/default `"bt"`)
+is now enforced (`lauxlib.c`'s `checkmode`): a chunk is treated as binary
+only if it starts with the `0x1B` signature byte real Lua's binary chunks
+also start with, and a mode mismatch returns `nil` plus the exact
+`"attempt to load a text/binary chunk (mode is '...')"` message the corpus
+checks for via `string.find`. `string.dump` is now implemented, though not
+as real bytecode serialization - Sol has no `Proto` (de)serializer - but as
+an opaque same-process handle (a `0x1B` byte followed by a key) into a new
+`dumped_protos: HashMap<usize, Rc<Proto>>` registry that keeps the dumped
+`Proto` alive; `load(handle, ..., "b")` decodes the handle and rebuilds an
+equivalent closure directly, without going through the lexer/parser at all.
+This is sufficient for same-process round-tripping (the only case the Lua
+5.5 corpus exercises) but not for a chunk written to a file and loaded by a
+different process. Finally, `parser.rs`'s two generic "this token can't
+start a statement/expression" fallback error messages now include the
+literal phrase "unexpected symbol", matching real Lua's `lparser.c` wording
+- the corpus matches parse-error messages by substring via `string.find`,
+so that wording is part of the compatibility contract, not cosmetic.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
