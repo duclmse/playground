@@ -1395,6 +1395,43 @@ supplied beyond a function's named parameters), a separate, unrelated
 feature gap. The manifest row stays `pending` with this updated, precise
 blocker.
 
+That `extraargs` gap is now closed, but its real semantics turned out to be
+different from what its name (and the prior note here) suggested. Reading the
+actual Lua 5.5.1 reference source (`ldebug.c`'s `auxgetinfo`, `ltm.c`'s
+`tryfuncTM`, `ldo.c`'s `luaD_precall`) and confirming empirically against the
+pinned `lua5.5.1` oracle showed that `lua_Debug.extraargs` (populated by
+`debug.getinfo`'s `"t"` option) is *not* a count of a vararg function's
+received arguments beyond its named parameters - that internal quantity
+(`ci->u.l.nextraargs`) exists only for `OP_VARARG`'s own use and is never
+exposed through the debug API. `extraargs` is instead `(ci->callstatus &
+MAX_CCMT) >> CIST_CCMT`: the number of `__call` metamethod hops
+`luaD_precall`'s retry loop walked to reach the currently-inspected closure -
+literally the same counter the U6 `__call`-chain fix above already tracks and
+bounds as `MAX_CALL_CHAIN` (not a coincidence: Lua's `MAX_CCMT` is a 4-bit
+field, capping at exactly 15, matching `MAX_CALL_CHAIN`'s own value). A direct
+call - no `__call` involved - reports 0 regardless of how many actual varargs
+the function received; a call resolved through *n* `__call` hops reports
+exactly *n*. Sol now tracks this as `LuaFrame::call_chain_hops`, set from
+`step_result_for_call`'s existing chain-resolution loop's `hops` count and
+threaded through `StepResult::PushClosure`/`TailClosure` and `new_lua_frame`
+into every pushed frame (the blocking, non-trampolined `LuaRuntime::call`
+bridge's own inline `__call` resolution - used for metamethod calls issued
+directly from native Rust code, not the ordinary `Instr::Call`/`Instr::TailCall`
+path - does not track hops and always reports 0; a documented, narrow gap
+distinct from the trampolined path this feature was verified against).
+`debug.getinfo(level, ...)`'s returned table now always includes `extraargs`
+alongside `currentline`, sourced from the resolved frame the same way
+`currentline` already is. This makes the entirety of `calls.lua`'s "testing
+chains of `__call`" section (line ~195, including the line-212 assertion)
+pass. The corpus file now progresses further and stops at a new, unrelated
+blocker: line 342's `load(read1(x), "modname", "t", _G)` passes a *function*
+reader as the chunk source (real Lua's generic `lua_load` protocol, calling
+the function repeatedly to accumulate source until it signals end-of-input),
+which Sol's `NativeFunction::Load` arm does not support - it unconditionally
+requires argument #1 to already be a `LuaValue::String`, so it raises the
+generic "string expected" error instead of invoking the reader. The manifest
+row stays `pending` with this new, precise blocker.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
