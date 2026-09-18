@@ -822,6 +822,29 @@ match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
 close but still blocked on hex-float parsing for very long numerals; the
 remaining U6 rows stay pending at their next observed blocker.
 
+`package.path`, `package.cpath`, `package.preload`, `package.config`, and a
+real `package.searchpath` now exist (honest Sol-specific defaults, since
+there is no installed share/lib prefix: `package.path =
+"./?.lua;./?/init.lua"`, `package.cpath = ""`), and `require`'s
+module-not-found error matches real Lua 5.5.1 byte-for-byte, including the
+`'package.path' must be a string`-style error when `package.path`/`cpath`
+holds a non-string. This was `attrib.lua`'s real blocker (the manifest's
+prior note was stale). Chasing it further into the file surfaced and fixed a
+second, unrelated bug: `Stmt::MultiAssign` used to resolve each target's own
+table/key sub-expression one at a time, interleaved with that target's own
+store, so an earlier target reassigning a variable could corrupt a later
+target's addressing in the same statement; every target's addressing is now
+resolved before any of the statement's stores run. `attrib.lua` remains
+`pending`: verified against the pinned oracle with `_port` predefined `true`
+(mirroring `all.lua`'s own sandboxing convention, legitimate here because Sol
+has no dynamic C-module loader by design) through the file's "test conflicts
+in multiple assignment" section, it next hits a distinct, pre-existing,
+general parser bug - `parse_postfix` applies call/index/field suffixes to any
+primary expression instead of restricting them to real Lua's `prefixexp`
+grammar, so an immediately-invoked function expression on its own line gets
+absorbed as a call on the previous statement's trailing table constructor -
+left for follow-up.
+
 `big.lua`'s stress case drove four more fixes. Global reads/writes compiled
 against a custom `_ENV` table (via `load`'s fourth argument) now route
 through the same `__index`/`__newindex` metamethod resolution ordinary table
