@@ -205,7 +205,12 @@ Every one of the 26 `pending` manifest rows now carries a specific
   `i64`/`f64`/`bool` can cross the bridge; both files call a boundary
   function with an `any`-typed parameter.
 - **Package/require sandboxing** (`bitwise`, `pm`): need filesystem-backed
-  cross-file `require`, a stated non-goal.
+  cross-file `require`. **Fixed**: `require` now genuinely loads real `.lua`
+  files off disk via `package.path` (gated on `Capabilities::filesystem`,
+  like every other host-filesystem read in this runtime - never a blanket
+  non-goal); see `docs/features/unified-sol-runtime-plan.md`'s U6 section and
+  `tests/lua55/manifest.toml`'s `bitwise.lua`/`pm.lua` entries (both now
+  `pass`).
 - **No automatic string-to-number coercion in arithmetic** (`math`):
   confirmed even trivial `"2"+"3"` errors — coercion is entirely absent,
   not an edge case.

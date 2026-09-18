@@ -1276,6 +1276,58 @@ within "trusted local script" territory per that default's own documented
 rationale (`crates/sol/src/main.rs`'s `lua_dynamic_budgets`), and distinct
 from `heavy.lua`'s still-`pending` genuinely-unbounded stress loop.
 
+`require` now genuinely loads real `.lua` files off the host filesystem,
+gated on `Capabilities::filesystem` like every other host-filesystem read in
+this runtime: real Lua 5.5's `findloader` search order (`package.preload`,
+then `package.path`, then `package.cpath`) is implemented end to end,
+including dotted sub-module names translating to nested paths via
+`package.searchpath`'s `sep`/`rep` substitution, a matched `path` file being
+compiled and cached exactly like `load`/`dofile`, and `package.searchers`
+being type-checked (but not yet actually dispatched through) so a
+non-table replacement fails the same way real Lua's does. A `package.cpath`
+match is a distinct, permanent gap - Sol has no dynamic C-module (native
+`.so`) loader on any platform, matching `AGENTS.md`'s "keep native loading
+capabilities explicit" guardrail - and raises a clear, distinct error rather
+than silently succeeding or misreporting a real match as absent.
+`io.output`/`io.write`/`io.close` (gated on `filesystem`/`stdout`
+respectively) and `os.remove` (gated on `filesystem`) round out real
+file-handle writes and deletion; `package.loadlib` always answers `nil,
+<message>, "absent"`, matching what real Lua itself reports when built
+without dynamic-load support - the one honest, platform-independent answer,
+since Sol never has that support. Two further interpreter bugs surfaced and
+are now fixed while chasing this work through `attrib.lua`: `require`'s
+already-loaded check compared `package.loaded[name]` against `Nil` instead of
+using Lua truthiness, so a module whose loader legitimately caches `false`
+was wrongly treated as permanently loaded instead of reloaded on the next
+`require`, unlike real Lua's `ll_require` (`lua_toboolean` in `loadlib.c`);
+and a bare (non-`local`) `_ENV = {}` reassignment inside a `load`-compiled
+chunk used to compile as an ordinary `SetGlobal("_ENV", ...)`, which only
+stashed a spurious `_ENV` key into the *shared* globals table without
+changing what subsequent plain names in that chunk resolved against, so
+later global writes leaked into the caller's real globals instead of the
+chunk's own replacement table - real Lua treats `_ENV` as an always-present
+implicit per-chunk upvalue, and a bare reassignment replaces only that
+chunk's own upvalue cell. Fixed with a new `Instr::SetEnvironment` bytecode
+op that replaces the current frame's `Globals` in place, emitted by
+`emit_environment_set` specifically for a bare, non-declaring `_ENV`
+assignment with no existing lexical local/upvalue in scope; `local _ENV =
+...` and Sol's own `global _ENV = ...` declaration keyword are unaffected.
+With all of the above, `attrib.lua` now runs correctly through every
+`package`/`require`/`io`/`os` section and the file's own multiple-assignment
+tests, verified against the pinned `lua5.5.1` binary run from inside
+`lua-5.5.1-tests/` with the corpus's prebuilt `libs/*.so` test modules
+present; it stops precisely at line 337's unconditional `require"lib2-v2"` (a
+genuine native-module load, run regardless of whether an earlier
+`package.loadlib` probe succeeded), the permanent native-module boundary
+described above - the manifest now records this row as `host-required`
+(`native-modules`) rather than `pending`, since the remaining gap is a
+principled capability exclusion, not a missing language/runtime feature.
+This same `require` work, as an unplanned side effect, also resolved
+`bitwise.lua`'s real blocker (`require "bwcoercion"`, already a passing
+row) with no changes to `bitwise.lua` itself; both `bitwise.lua`'s
+manifest row and `docs/features/lua-superset-plan.md`'s stale "a stated
+non-goal" wording are updated to match.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
