@@ -62,9 +62,9 @@ note = "blocked-on: 'test for generic load' (line 344) - `debug.getinfo(a).sourc
 [[case]]
 path = "closure.lua"
 category = "closures"
-status = "pending"
+status = "pass"
 requires = []
-note = "blocked-on: lexical `_ENV` tables now execute in the legacy dynamic runtime, but this upstream case next stalls in its GC/weak-table stress section: weak-key/ephemeron behavior is not complete in the legacy collector, so the `while x[1] do ... end` loop (line ~42) exhausts the instruction budget. Canonical weak/ephemeron semantics exist in sol-core but production objects have not migrated."
+note = "Previously blocked at line ~140: a loop-body local captured as an upvalue by a nested closure could be re-assigned the SAME register number as an earlier-compiled, textually-preceding scratch temp within the same loop body (e.g. a `while` guard condition), because ordinary stack-discipline register recycling only protected *already-captured* registers (`retired_floor`) going forward, not registers a still-open loop had used earlier in its own body. Fixed by adding `LoopCtx.reg_floor` (`lua_bytecode/func_state.rs`): the highest register any `alloc_reg` call has handed out anywhere in the current loop's body, which now also floors `reset_to`/`pop_scope`/`end_statement`'s recycling for as long as that loop is being compiled. Also required precisely fixing the top-level `function NAME(...) end` chunk-statement hoisting decision in `parser.rs`: it now hoists into the independently-compiled `functions` list (which can never capture a chunk-scope local as an upvalue) only when the function's name doesn't rebind a preceding chunk-local and a conservative free-variable scan of its body finds no reference to one; otherwise it stays a sequential `Stmt::GlobalFunction` chunk statement, matching real Lua's assignment-sugar semantics for `function NAME(...) end`. Oracle-backed: matches the pinned reference `lua5.5.1` byte-for-byte (aside from Sol's documented top-level return echo) when run standalone from within `lua-5.5.1-tests/`."
 
 [[case]]
 path = "code.lua"

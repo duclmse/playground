@@ -1466,6 +1466,60 @@ numeric stack-level form, and even that form's returned table never
 populates a `source` field (only `currentline`/`extraargs`). The manifest
 row stays `pending` with this new, precise blocker.
 
+`closure.lua` is now promoted to `pass`. Its previous blocker note (weak-table
+GC exhaustion) turned out to be stale from an earlier investigation; the real
+remaining blocker was a register-aliasing bug at line ~140: a loop-body local
+later captured as an upvalue by a nested closure could be assigned the same
+register number as an earlier-compiled, textually-preceding scratch temp
+within the same loop body (e.g. a `while` guard condition's boolean result).
+Ordinary stack-discipline register recycling (`reset_to`/`pop_scope`/
+`end_statement`) only protected *already-captured* registers going forward
+(`retired_floor`), not registers a still-open loop had used earlier in its own
+body - and because a loop's body is compiled once but executed repeatedly, the
+guard condition's scratch-temp code re-runs on every iteration, including ones
+that skip the captured local's own re-initialization via an early
+`return`/`break`, silently overwriting the live closure's captured cell with
+an unrelated boolean/temporary value. Fixed by adding `LoopCtx.reg_floor` in
+`crates/sol/src/lua_bytecode/func_state.rs`: the highest register `alloc_reg`
+has handed out anywhere in the current loop's body so far, which now also
+floors every recycling site's `next_reg` for as long as that loop is being
+compiled (propagated to an enclosing loop, if any, when a nested loop is
+popped). This is the same "costs a few extra registers, never correctness"
+tradeoff `retired_floor` already uses, generalized from "never reuse a
+captured register in the future" to "never reuse a register this loop has
+ever used, for the rest of this loop's compilation."
+
+Fixing this also required making top-level `function NAME(...) end` chunk
+hoisting (`parser.rs`'s `parse_program`) precise rather than all-or-nothing:
+a plain top-level function is hoisted into the independently-compiled
+`functions` list (which has no enclosing scope and can never capture a
+chunk-scope local as an upvalue) only when its own name does not rebind a
+preceding chunk-local and a conservative free-variable scan of its body
+(`function_references_any_name`, walking every `Stmt`/`ExprKind` variant, not
+shadowing-aware by design - a false positive only costs hoist eligibility,
+never correctness) finds no reference to a chunk-local declared earlier in
+the same chunk; otherwise it compiles as an ordinary in-order
+`Stmt::GlobalFunction` chunk statement, matching real Lua's assignment-sugar
+semantics for `function NAME(...) end`. This keeps `sol build`'s AOT/typed
+pipeline eligible for self-contained top-level functions that happen to
+follow an unrelated chunk-local (e.g. `native/strings.lua`'s `concat`/
+`compare`), which a coarser "any chunk-local exists" condition had
+incorrectly disqualified. The decision stays dialect-uniform (no
+`sol_extensions` gate), preserving `tests/frontend_conformance.rs`'s
+invariant that identical `.lua` source parses to an identical AST under both
+`LanguageConfig::LUA` and `LanguageConfig::SOL`.
+
+Separately, `debug.upvalueid`/`debug.upvaluejoin` compatibility gaps
+surfaced while working through `closure.lua`'s upvalue-identity assertions
+were also closed: `debug.upvalueid(f, n)` now returns `nil` for an
+out-of-range upvalue index instead of erroring (matching the real oracle),
+and also accepts a `string.gmatch` iterator value (`LuaValue::GMatchIterator`,
+not a `Closure`) by giving it exactly one opaque identity (its own `Rc`
+pointer) at index 1 and `nil` elsewhere. `debug.upvaluejoin(f1, n1, f2, n2)`,
+previously entirely unimplemented, now makes `f1`'s upvalue `n1` share
+storage with `f2`'s upvalue `n2` by replacing `f1`'s upvalue cell with a
+clone of `f2`'s `Rc<RefCell<LuaValue>>`.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
