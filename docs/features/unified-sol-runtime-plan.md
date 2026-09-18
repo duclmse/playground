@@ -822,6 +822,28 @@ match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
 close but still blocked on hex-float parsing for very long numerals; the
 remaining U6 rows stay pending at their next observed blocker.
 
+`big.lua`'s stress case drove four more fixes. Global reads/writes compiled
+against a custom `_ENV` table (via `load`'s fourth argument) now route
+through the same `__index`/`__newindex` metamethod resolution ordinary table
+indexing uses whenever `_ENV` carries a metatable, instead of reading/writing
+the table directly; a minimal `debug.traceback` native was added, backed by
+new runtime bookkeeping (`pending_frame_label`/`entry_label` on frames pushed
+to run an `__index`/`__newindex` body, and `pending_error_stack` stashed
+before an `xpcall` handler runs, since the erroring Lua frames are already
+unwound by then) so a metamethod body that errors gets an "in metamethod
+'...'" annotation on its traceback, matching `ldebug.c`'s naming for
+table-access-triggered calls; a table constructor with more elements than fit
+in its register-count-sized counter now frees field registers back to the
+table's own register as each field is stored, instead of exhausting the
+`u16` register space; and `#t` is now a real Lua-style O(1)-common-case
+border search instead of an O(n) scan, fixing an O(n^2) blowup in any
+`t[#t + 1] = v` append loop. With those fixed, standalone `big.lua` now
+reaches its own top-level `coroutine.yield` and fails there exactly as the
+pinned real Lua 5.5.1 binary does when invoked the same way — `all.lua`
+itself only ever runs this file wrapped in `coroutine.wrap`, so the manifest
+records this row as `diverges` (an intentional invocation-model gap) rather
+than `pending`.
+
 Lua 5.4+ `<close>`/to-be-closed-variable support is now implemented end to
 end: parser support for the `<close>` local attribute (typed `.sol` still
 rejects it, falling back to the dynamic runtime, since it is a dynamic-only
@@ -1174,6 +1196,62 @@ compatibility gap: real Lua 5.5 never registers a global `unpack` either
 does, and as genuine Lua 5.5 would be run the same way), `sort.lua` hits
 this identically, so it stays `pending` on that harness-only dependency
 rather than a fixable compatibility bug.
+
+`math.lua` now passes end to end (oracle-backed against the pinned Lua 5.5.1
+reference), after fixing a chain of differential bugs found while chasing it
+one failure at a time: hex-float mantissa overflow for very long numerals
+(`tonumber('0xe03' .. string.rep('0', 1000) .. 'p-4000')`) - naively
+accumulating every hex digit into an `f64` overflows to infinity long before a
+numeral's `p`-exponent is ever applied, so the lexer now reimplements real
+Lua's `lua_strx2number` algorithm: cap mantissa accumulation at 30 significant
+hex digits and fold any excess (plus every fractional digit, regardless of the
+cap) into a corrective integer exponent instead; catastrophic-cancellation
+precision loss in the float `%` operator for large magnitudes (`2.0^54 % 3`
+gave `0.0` instead of `1.0`) - `a - floor(a / b) * b` loses all precision once
+`a` is large enough that `a / b` and its floor are themselves already-rounded
+floats, so it now computes the hardware `fmod(a, b)` plus real Lua's
+`luai_nummod` sign correction instead, which stays exact at any magnitude;
+coercion-failure error messages read `"expected number"`/`"expected string"` -
+the words transposed relative to real Lua's own `"number expected"`/`"string
+expected"` wording that `checkerror`'s pattern-matching depends on;
+`math.tointeger` only accepted a live number value, never a numeral string
+(`minint .. ""`, `"34.0"`), even though real Lua's `math_toint` (via
+`lua_tointegerx`) applies the same string-to-number coercion arithmetic does;
+`i64::MAX as f64` rounds up to `2^63` (`i64::MAX` itself isn't exactly
+representable as an `f64`), so an inclusive upper bound of `<= i64::MAX as
+f64` wrongly accepted `2^63` itself - one past the largest representable
+integer - in both `math.tointeger` and the table-key float-to-integer
+normalization that backs indexing a table with a huge float key, both now
+fixed to use the same strict bound real Lua's `luaV_flttointeger` uses;
+`math.max`/`math.min` compared arguments by converting both to `f64` first,
+which loses precision for large integers (`minint` and `minint + 1` both
+round to the same float), so `math.max(minint, minint + 1)` wrongly returned
+`minint` - fixed to compare via the same exact int/float comparison the
+`<`/`>` operators already used; and float-to-string conversion
+(`LuaValue::display_bytes`, backing `tostring`/`print`/concatenation/
+`string.format`'s `%s`) was simply Rust's `f64::to_string`, which never uses
+scientific notation (so huge or tiny magnitudes produced enormous plain-
+decimal digit runs) and never appends the `.0` real Lua uses to keep a whole-
+number float visually distinct from an integer - replaced with a
+`format_lua_float` helper that reuses Rust's `{:e}` formatter (already a
+shortest-round-trip digit generator) as a digit source, then places the
+decimal point using real Lua's plain-vs-scientific `%g`-style rule
+(scientific when the decimal exponent is `< -4` or `>= max(digit count, 15)`,
+verified experimentally against the pinned `lua5.5` reference binary since
+this isn't documented behavior). That reference binary's own shortest-digit
+generator occasionally emits one digit more than strictly necessary in hard
+cases (e.g. `1/3` prints with 17 digits though 16 already round-trip, a known
+characteristic of Grisu-family generators without a slow-path fallback); only
+the round-trip and distinctness properties are load-bearing for Lua
+compatibility (the corpus checks `tonumber(tostring(x)) == x`, never exact
+digit strings), so this divergence is harmless and left as is rather than
+chasing an exact reimplementation of that quirk. Finally, `math.random`'s
+statistical distribution checks are legitimately instruction-heavy (bounded,
+not runaway, but a few million VM instructions), which needed the `sol` CLI's
+default Lua instruction budget raised from 1,000,000 to 20,000,000 - still
+within "trusted local script" territory per that default's own documented
+rationale (`crates/sol/src/main.rs`'s `lua_dynamic_budgets`), and distinct
+from `heavy.lua`'s still-`pending` genuinely-unbounded stress loop.
 
 ### U7 — Interpreter performance foundation
 
