@@ -1328,6 +1328,34 @@ row) with no changes to `bitwise.lua` itself; both `bitwise.lua`'s
 manifest row and `docs/features/lua-superset-plan.md`'s stale "a stated
 non-goal" wording are updated to match.
 
+`calls.lua`'s "C-stack overflow while handling C-stack overflow" section
+(the dynamic call-depth budget being exhausted, real Lua's stand-in for a
+genuine C-stack overflow) previously escaped every enclosing `pcall`/`xpcall`
+unconditionally: four separate call-depth-exhaustion checks in
+`lua_runtime/dispatch.rs`'s trampoline (`drive_result`'s `PushClosure` arm,
+`resolve_call`'s `PushClosure` arm, and `push_native_call`) returned a raw
+`Err` straight out of the driving loop instead of going through
+`unwind_error_to_marker`, the same marker search every other runtime error
+already used to find an enclosing `pcall`/`xpcall` frame. All four now route
+through it, so a call-depth-exhaustion error is caught like any other Lua
+runtime error. This surfaced a second, correctly-modeled gap: real Lua's
+`xpcall` message handler is not retried if invoking it *itself* overflows -
+that "double fault" reports the fixed message `"error in error handling"`
+rather than escaping uncaught or looping. `unwind_error_to_marker`'s marker
+search now also matches its own `Xpcall(XCallStage::Handler)` marker (a case
+its search previously excluded, with an `unreachable!()` guard on the
+now-reachable path) and returns that synthetic message directly, discarding
+the handler's own second failure the same way real Lua's `nCcalls`
+double-overflow detection does, verified byte-for-byte against the pinned
+`lua5.5.1` binary. With this fix, `calls.lua` now runs correctly through this
+entire section; it next stops at line 178's "tail calls x chain of
+`__call`", a different, unrelated gap - calling through a chain of `__call`
+metamethods in tail position is not currently preserved as a real tail call
+(`TailClosure`), so it charges ordinary call-depth budget the way a
+non-tail call does, where real Lua keeps this O(1) C-stack usage via its own
+tail-call/`__call` interaction. The manifest row stays `pending` with this
+updated, precise blocker.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

@@ -57,7 +57,7 @@ path = "calls.lua"
 category = "calls"
 status = "pending"
 requires = []
-note = "blocked-on: dynamic/native boundary only crosses i64/f64/bool; 'deep' is called from dynamic Lua code with an any-typed parameter, which cannot cross the runtime boundary."
+note = "blocked-on: 'tail calls x chain of __call' (line 178) - calling through a chain of __call metamethods in tail position is not preserved as a real tail call (TailClosure), so it charges ordinary call-depth budget the way ordinary non-tail calls do; real Lua keeps this O(1) C-stack. The earlier 'C-stack overflow while handling C-stack overflow' section (line 160) now passes: pcall/xpcall can catch call-depth-budget exhaustion like any other runtime error, and a message handler that itself overflows reports the fixed 'error in error handling' message instead of escaping uncaught."
 
 [[case]]
 path = "closure.lua"
