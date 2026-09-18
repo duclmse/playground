@@ -1118,6 +1118,63 @@ divergence noted above for `goto.lua`/`constructs.lua`/`errors.lua`, just its
 "near" half rather than its chunkname-prefix half; `literals.lua` stays
 `pending` for the same reason.
 
+`sort.lua`'s previous blocker (`table.create`'s hash-size hint not honored)
+is now fixed: `table.create(sizeseq, sizerest)` preallocates both the array
+part (`sizeseq` nils) and the hash part (`IndexMap::with_capacity(sizerest)`,
+which `collectgarbage("count")`'s existing live-heap accounting already
+prices in automatically once the hash part actually has that capacity, with
+no separate manual bookkeeping needed), with the same out-of-range/table-
+overflow argument validation as `ltable.c`'s `luaH_resize`. Chasing the rest
+of the file surfaced and fixed several more real gaps: `table.insert` didn't
+reject a wrong argument count; `debug.getmetatable`/`debug.setmetatable` for
+numbers didn't exist at all (added a `number_metatable` runtime slot, shared
+across `Integer`/`Float` like real Lua's single `LUA_TNUMBER` metatable slot,
+settable only through `debug.setmetatable` since ordinary `setmetatable`
+rejects non-table values); `index_resolve` had a real, previously-hidden bug
+where any non-table/non-string value skipped the metamethod lookup entirely
+and raised "attempt to index" immediately, silently defeating scalar
+metatables regardless of what installed them; `table.unpack` rejected any
+non-table argument even though real Lua's `lua_geti`/`luaL_len`-based
+implementation happily unpacks a proxied scalar; and `length_of` (the
+library-facing "read an actual integer length" helper used by
+`table.insert`/`unpack`/etc., as distinct from the raw `#` operator) raised a
+generic coercion error instead of real Lua's specific "object length is not
+an integer" wording for a non-integer `__len` result. `table.move` did not
+exist at all - implemented `table.move(a1, f, e, t [, a2])` end to end,
+matching `ltablib.c`'s `tmove`/`checktab`: a plain table or a value with the
+needed `__index`/`__newindex` metamethod is accepted as source/destination;
+the forward-vs-backward copy direction is chosen exactly as real Lua does
+(`t > e || t <= f || different tables` copies forward, otherwise backward) so
+that both the final result *and* the exact sequence of reads/writes a side-
+effecting metamethod can observe match real Lua even when an error aborts
+the move partway through; and the "too many elements to move"/"destination
+wrap around" argument checks use `i128`-widened arithmetic mirroring real
+Lua's `LUA_MAXINTEGER`-relative `luaL_argcheck`s, since the corpus exercises
+`math.maxinteger`/`mininteger` boundary ranges directly. This, in turn,
+surfaced two more real bugs in `table.sort`, in both its blocking
+(`call_native`) and coroutine-yield-safe stepped implementations alike: a
+table whose `__len` reports an enormous size (e.g. `math.maxinteger`) made
+the native attempt a huge `Vec::with_capacity` and abort the process instead
+of raising real Lua's "array too big" (`ltablib.c`: `luaL_argcheck(n <
+INT_MAX, ...)`, checked before any allocation); and an invalid (non-strict-
+weak-order) comparator was never detected at all, where real Lua's quicksort
+raises "invalid order function for sorting" via its own partition's boundary
+checks - insertion sort has no equivalent structural signal, so this adds an
+explicit post-hoc pass confirming every adjacent pair is actually in order
+before writing the result back, reusing the same comparator/`__lt` calls
+(including through the stepped sort's coroutine-yield-safe state machine, by
+adding a `validating` phase to `SortState` after the main sort completes).
+With all of that fixed, `sort.lua` now runs to its "testing sort" section's
+`perm{...}` calls, which rely on a bare global `unpack` - not a Sol
+compatibility gap: real Lua 5.5 never registers a global `unpack` either
+(only `table.unpack`/`string.unpack`, confirmed against `ltablib.c`/
+`lstrlib.c`), and this corpus file only has one because the shared
+`all.lua` harness binds a local `unpack = table.unpack` alias before
+`dofile`-ing each individual test module. Run standalone (as this manifest
+does, and as genuine Lua 5.5 would be run the same way), `sort.lua` hits
+this identically, so it stays `pending` on that harness-only dependency
+rather than a fixable compatibility bug.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

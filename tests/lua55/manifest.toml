@@ -203,7 +203,7 @@ path = "sort.lua"
 category = "table-library"
 status = "pending"
 requires = []
-note = "blocked-on: table.create's hash-size hint (2nd arg) isn't honored (fails at line 35, `assert(memdiff > 1024 * 12)`; observed memdiff was only 32 bytes) - no hash-part preallocation actually occurs."
+note = "blocked-on: line 271's `local t = {unpack(s)}` calls a bare global `unpack`, which real Lua 5.5 never registers (only `table.unpack`/`string.unpack` - confirmed against ltablib.c/lstrlib.c); this file only has one because the shared all.lua harness binds a local `unpack = table.unpack` alias before dofile-ing each test module, so it fails identically run standalone (as this manifest does) against genuine Lua 5.5, not just Sol - not a fixable compatibility bug. table.create's hash-size hint, table.insert's argument-count check, debug.getmetatable/setmetatable for numbers, index_resolve's scalar-metatable indexing, table.unpack on non-table proxies plus its range guard, length_of's exact error message, table.move (previously entirely unimplemented), and table.sort's \"array too big\"/\"invalid order function\" checks are all now fixed and verified against this file up to the harness-only blocker."
 
 [[case]]
 path = "strings.lua"
