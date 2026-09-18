@@ -1432,6 +1432,40 @@ requires argument #1 to already be a `LuaValue::String`, so it raises the
 generic "string expected" error instead of invoking the reader. The manifest
 row stays `pending` with this new, precise blocker.
 
+`load`'s generic reader support followed: `NativeFunction::Load` now accepts
+a function (or a number, auto-coerced to its string form, matching real
+Lua's `lua_tolstring` on argument #1) in addition to a plain string. When
+argument #1 is a function, it is called repeatedly with no arguments - via
+`self.call`, the same blocking bridge `table.sort`'s comparator arm already
+uses from inside a native, since natives in this trampoline are permitted to
+call back into Lua synchronously that way - and each call's first return
+value is taken as the next source piece, exactly matching real Lua's
+`lbaselib.c` `generic_reader`/`lzio.c` `luaZ_fill`: a nil or empty-string
+return ends the stream (both treated identically as end-of-input), any other
+non-string/non-number return is a caught error ("reader function must
+return a string"), and all pieces read before the stream ends are
+concatenated into one source buffer that then runs through the exact same
+`compile_chunk` path the string form already used. An error raised by the
+reader itself is likewise caught here rather than propagated, matching real
+Lua's `lua_load` running the whole reader loop under a protected parser -
+only a first argument that is neither string/number/function fails an
+immediate, uncaught argument-type check, matching `luaL_checktype`'s
+placement *before* that protected region. This makes `calls.lua`'s line-342
+`load(read1(x), "modname", "t", _G)` and line-343 assertion pass, along with
+the file's later `load(function () return nil end)`/`load(function () return
+true end)` cases (lines 349-352) and the "small bug" case (lines 356-358)
+where a reader's first returned piece happens to be nil. See
+`dynamic_lua_runtime_load_accepts_a_reader_function_that_returns_pieces`/
+`dynamic_lua_runtime_load_reader_returning_nil_immediately_yields_an_empty_chunk`
+in `crates/sol/tests/lua55_dynamic_runtime.rs`. The corpus file now
+progresses further and stops at a new blocker: line 344's
+`debug.getinfo(a).source` (where `a` is the closure `load` just produced)
+passes a *function value*, not a stack level, as `debug.getinfo`'s first
+argument - Sol's `NativeFunction::DebugGetinfo` arm only implements the
+numeric stack-level form, and even that form's returned table never
+populates a `source` field (only `currentline`/`extraargs`). The manifest
+row stays `pending` with this new, precise blocker.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
