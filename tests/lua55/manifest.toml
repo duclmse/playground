@@ -57,7 +57,7 @@ path = "calls.lua"
 category = "calls"
 status = "pending"
 requires = []
-note = "blocked-on: 'tail calls x chain of __call' (line 178) - calling through a chain of __call metamethods in tail position is not preserved as a real tail call (TailClosure), so it charges ordinary call-depth budget the way ordinary non-tail calls do; real Lua keeps this O(1) C-stack. The earlier 'C-stack overflow while handling C-stack overflow' section (line 160) now passes: pcall/xpcall can catch call-depth-budget exhaustion like any other runtime error, and a message handler that itself overflows reports the fixed 'error in error handling' message instead of escaping uncaught."
+note = "blocked-on: 'testing chains of __call' (line 212) - debug.getinfo's returned table is still minimal (currentline only, see natives.rs's DebugGetinfo arm) and has no 'extraargs' field (the Lua 5.5 count-of-varargs-beyond-named-params extension), so `debug.getinfo(1, 't').extraargs` reads nil instead of a number and the assert comparing it against select('#', ...) fails. The earlier 'tail calls x chain of __call' section (line 178) now passes: step_result_for_call resolves an arbitrarily deep chain of __call metamethods iteratively (matching real Lua's luaD_precall retry loop, with no call_depth charge per hop and a MAX_CALL_CHAIN=15 bound matching real Lua's MAX_CCMT/'__call chain too long'), so a tail call through such a chain becomes a genuine TailClosure and stays O(1) call-depth regardless of how many times it recurses; the 'C-stack overflow while handling C-stack overflow' section (line 160) also continues to pass."
 
 [[case]]
 path = "closure.lua"

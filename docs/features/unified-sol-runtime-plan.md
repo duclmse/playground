@@ -1356,6 +1356,45 @@ non-tail call does, where real Lua keeps this O(1) C-stack usage via its own
 tail-call/`__call` interaction. The manifest row stays `pending` with this
 updated, precise blocker.
 
+`calls.lua`'s "tail calls x chain of `__call`" section is now fixed at its
+root cause in `lua_runtime/dispatch.rs`'s `step_result_for_call`, the single
+resolver shared by every `Instr::Call`/`Instr::TailCall`/metamethod-triggered
+call site. It previously only fast-pathed a `__call` chain exactly one hop
+deep (the immediate `__call` metamethod value had to already be a `Closure`);
+anything deeper fell through to `StepResult::CallLeaf`, which dispatches
+through the blocking, recursive `LuaRuntime::call` bridge - correct in value
+but charging ordinary `call_depth` per hop and, critically, never becoming a
+`StepResult::TailClosure`, so a tail call resolved through such a chain could
+never actually be a tail call. `step_result_for_call` now resolves the whole
+`__call` chain iteratively in a loop (no native-stack recursion, no
+`call_depth` charge per hop), exactly mirroring real Lua's `luaD_precall`
+"retry" loop in `ldo.c`: each hop that isn't itself callable prepends its own
+(still-unresolved) value onto the front of the pending argument list and
+moves on to *its* `__call` metamethod, until landing on a real closure/native
+function or a value with no `__call` at all. Because this loop is the one
+shared resolver, the existing `Instr::TailCall` dispatch (which already
+turned a resolved `PushClosure` into `TailClosure`) now does so correctly
+regardless of `__call` chain depth, with no other change needed - a tail call
+through an arbitrarily deep, repeatedly-invoked `__call` chain is O(1)
+call-depth, matching real Lua. The loop is bounded to a new `MAX_CALL_CHAIN =
+15`, verified empirically against the pinned `lua5.5` oracle (a 15-hop chain
+resolves normally down to an ordinary "attempt to call a ... value", while a
+16-hop chain raises exactly `"'__call' chain too long"`) and matching real
+Lua 5.5's dedicated `MAX_CCMT` bit-packed counter on `CallInfo` in
+`tryfuncTM` - a materially smaller, distinct bound from the existing
+`MAX_METATABLE_CHAIN = 2000` used for `__index`/`__newindex` fallback chains.
+With this fix, `calls.lua` now runs correctly through both the tail-call and
+the value/argument-ordering halves of "testing chains of `__call`" (line
+~195, a 15-deep chain ending in `table.pack`, verified byte-for-byte against
+the oracle including argument order and the `Res.n`/`Res[i]` table-identity
+checks); it next stops at line 212's `debug.getinfo(1, 't').extraargs`
+assertion - `debug.getinfo`'s returned table is still intentionally minimal
+(`currentline` only, per its own doc comment in `natives.rs`) and has no
+`extraargs` field (the Lua 5.5 extension reporting how many varargs a call
+supplied beyond a function's named parameters), a separate, unrelated
+feature gap. The manifest row stays `pending` with this updated, precise
+blocker.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
