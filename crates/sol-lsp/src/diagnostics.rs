@@ -73,7 +73,9 @@ pub fn analyze(text: &str, mode: SourceMode) -> Analysis {
     let mut diagnostics: Vec<_> = bindings
         .errors
         .iter()
-        .map(|error| diagnostic_from_error(text, &format!("line {}: {}", error.line, error.message)))
+        .map(|error| {
+            diagnostic_from_error(text, &format!("line {}: {}", error.line, error.message))
+        })
         .collect();
 
     match sol::compile_program_with_config(syntax.ast.clone(), syntax.config) {

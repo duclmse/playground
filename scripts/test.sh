@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Runs the whole test suite: lua-vm tests, Sol tests/strict lint/conformance and
-# benchmark smoke checks, then a TypeScript typecheck + production web build.
+# Runs the canonical Sol tests/strict lint/conformance and benchmark smoke
+# checks, then a TypeScript typecheck + production web build.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./lib.sh
 
 require_cmd cargo "Install Rust: https://rustup.rs"
-
-log "cargo test (crates/lua-vm: unit tests + conformance suite against conformance/fixtures + conformance/expected)"
-cargo test --manifest-path "$ROOT/crates/lua-vm/Cargo.toml"
 
 log "cargo test + clippy (crates/sol-core: canonical values, heap, roots, and GC)"
 cargo test --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml"
@@ -16,6 +13,16 @@ cargo clippy --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml" --all-
 
 log "cargo test (crates/sol: compiler, bytecode/JIT/AOT, and Lua compatibility)"
 cargo test --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
+
+log "Lua 5.5 embedding ABI and native-module fixtures"
+require_cmd cc "Install a C11 compiler to validate Sol's public Lua headers"
+"$ROOT/scripts/test-sol-c-api.sh"
+if [[ -f "$ROOT/lua-5.5.1-tests/attrib.lua" ]]; then
+  log "Unchanged Lua 5.5 native-module corpus fixture"
+  "$ROOT/scripts/test-sol-native-corpus.sh"
+else
+  log "Skipping native-module corpus fixture (lua-5.5.1-tests checkout unavailable)"
+fi
 
 log "cargo clippy (crates/sol, warnings denied)"
 cargo clippy --offline --manifest-path "$ROOT/crates/sol/Cargo.toml" --all-targets -- -D warnings

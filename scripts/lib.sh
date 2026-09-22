@@ -110,14 +110,20 @@ function emit() {
   if (status != "pass" && status != "adapted" && status != "host-required" && status != "pending" && status != "diverges") {
     die("unknown status \047" status "\047 for " path)
   }
+  if (budget != "" && budget !~ /^[0-9]+$/) {
+    die("expected a positive integer for budget at line " case_line " for " path)
+  }
+  if (alloc_budget != "" && alloc_budget !~ /^[0-9]+$/) {
+    die("expected a positive integer for alloc_budget at line " case_line " for " path)
+  }
   if (seen[path]++) die("duplicate path " path)
-  print path "\034" status "\034" category "\034" requires "\034" fixture "\034" note
+  print path "\034" status "\034" category "\034" requires "\034" fixture "\034" note "\034" budget "\034" alloc_budget
 }
 BEGIN { in_case = 0; bad = 0 }
 /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
 /^[[:space:]]*\[\[case\]\][[:space:]]*$/ {
   emit(); in_case = 1; case_line = NR
-  path = category = status = requires = fixture = note = ""
+  path = category = status = requires = fixture = note = budget = alloc_budget = ""
   next
 }
 {
@@ -132,6 +138,8 @@ BEGIN { in_case = 0; bad = 0 }
     value = string_value(value, key)
   } else if (key == "requires") {
     value = array_value(value, key)
+  } else if (key == "budget" || key == "alloc_budget") {
+    value = trim(value)
   } else {
     die("unknown case key " key " at line " NR); next
   }
@@ -141,6 +149,8 @@ BEGIN { in_case = 0; bad = 0 }
   else if (key == "requires") requires = value
   else if (key == "fixture") fixture = value
   else if (key == "note") note = value
+  else if (key == "budget") budget = value
+  else if (key == "alloc_budget") alloc_budget = value
 }
 END { emit(); exit bad }
 ' "$manifest" >"$entries_file"
@@ -149,8 +159,8 @@ END { emit(); exit bad }
 validate_lua55_corpus_coverage() {
   local entries_file=$1 suite_dir=$2
   local manifest_paths='|' manifest_count=0 corpus_count=0
-  local path status category requires fixture note case_file case_name
-  while IFS=$'\034' read -r path status category requires fixture note; do
+  local path status category requires fixture note budget alloc_budget case_file case_name
+  while IFS=$'\034' read -r path status category requires fixture note budget alloc_budget; do
     if [[ $path == /* || $path == */* || $path == *".."* || ! -f "$suite_dir/$path" ]]; then
       printf 'manifest: source path is not a top-level corpus file: %s\n' "$path" >&2
       return 1

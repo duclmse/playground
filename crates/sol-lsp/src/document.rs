@@ -5,8 +5,8 @@ use sol::{
 };
 use tower_lsp::lsp_types::Url;
 
-use crate::index::{self, SymbolIndex};
 use crate::diagnostics;
+use crate::index::{self, SymbolIndex};
 
 pub struct Document {
     pub text: String,
@@ -54,11 +54,7 @@ pub struct DocumentStore {
 }
 
 impl DocumentStore {
-    pub fn open(
-        &self,
-        uri: Url,
-        text: String,
-    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    pub fn open(&self, uri: Url, text: String) -> Vec<tower_lsp::lsp_types::Diagnostic> {
         let mode = source_mode(&uri);
         let (doc, diagnostics) = Document::new(text, mode);
         self.docs.insert(uri, doc);

@@ -99,6 +99,14 @@ pub struct ThreadObject {
 #[derive(Debug, Clone)]
 pub struct UserdataObject {
     pub host_handle: u64,
+    /// Inline storage for full userdata created through the embedding API.
+    /// The collector owns these bytes together with the userdata identity;
+    /// `host_handle` remains available for hosts that keep payloads in an
+    /// external, capability-controlled registry.
+    pub bytes: Vec<u8>,
+    /// Lua 5.5 user values. These are ordinary traced references owned by
+    /// the userdata object and therefore participate in write barriers.
+    pub user_values: Vec<Value>,
     pub metatable: Option<ObjectId>,
 }
 
@@ -471,8 +479,68 @@ impl Heap {
     pub fn alloc_userdata(&mut self, host_handle: u64) -> ObjectId {
         self.alloc(HeapObject::Userdata(UserdataObject {
             host_handle,
+            bytes: Vec::new(),
+            user_values: Vec::new(),
             metatable: None,
         }))
+    }
+
+    /// Allocates canonically-owned full-userdata storage.
+    pub fn alloc_userdata_bytes(&mut self, size: usize) -> ObjectId {
+        self.alloc_userdata_bytes_with_uservalues(size, 0)
+    }
+
+    pub fn alloc_userdata_bytes_with_uservalues(
+        &mut self,
+        size: usize,
+        user_values: usize,
+    ) -> ObjectId {
+        self.alloc(HeapObject::Userdata(UserdataObject {
+            host_handle: 0,
+            bytes: vec![0; size],
+            user_values: vec![Value::NIL; user_values],
+            metatable: None,
+        }))
+    }
+
+    pub fn userdata_user_value(&self, id: ObjectId, index: usize) -> Result<Value, HeapError> {
+        Ok(self
+            .userdata(id)?
+            .user_values
+            .get(index)
+            .copied()
+            .unwrap_or(Value::NIL))
+    }
+
+    pub fn set_userdata_user_value(
+        &mut self,
+        id: ObjectId,
+        index: usize,
+        value: Value,
+    ) -> Result<bool, HeapError> {
+        let userdata = self.userdata_mut(id)?;
+        let Some(slot) = userdata.user_values.get_mut(index) else {
+            return Ok(false);
+        };
+        *slot = value;
+        self.write_barrier(id, value);
+        Ok(true)
+    }
+
+    pub fn userdata(&self, id: ObjectId) -> Result<&UserdataObject, HeapError> {
+        self.expect_kind(id, ObjectKind::Userdata)?;
+        let HeapObject::Userdata(object) = &self.entry(id)?.object else {
+            unreachable!()
+        };
+        Ok(object)
+    }
+
+    pub fn userdata_mut(&mut self, id: ObjectId) -> Result<&mut UserdataObject, HeapError> {
+        self.expect_kind(id, ObjectKind::Userdata)?;
+        let HeapObject::Userdata(object) = &mut self.entry_mut(id)?.object else {
+            unreachable!()
+        };
+        Ok(object)
     }
 
     pub fn alloc_error(
@@ -552,6 +620,36 @@ impl Heap {
         }
         let key = self.table_key(key)?;
         Ok(table.hash.get(&key).copied().unwrap_or(Value::NIL))
+    }
+
+    /// Snapshot of live table entries in the runtime's iteration order.
+    /// Used by the embedding API's `lua_next`; callers must not assume a
+    /// stable order across structural mutations.
+    pub fn table_entries(&mut self, table: ObjectId) -> Result<Vec<(Value, Value)>, HeapError> {
+        let (array, hash) = {
+            let table = self.table(table)?;
+            (table.array.clone(), table.hash.clone())
+        };
+        let mut entries = array
+            .into_iter()
+            .enumerate()
+            .filter(|(_, value)| *value != Value::NIL)
+            .map(|(index, value)| (Value::integer(index as i64 + 1), value))
+            .collect::<Vec<_>>();
+        for (key, value) in hash {
+            if value == Value::NIL {
+                continue;
+            }
+            let key = match key {
+                TableKey::Boolean(value) => Value::boolean(value),
+                TableKey::Integer(value) => Value::integer(value),
+                TableKey::Float(bits) => Value::float(f64::from_bits(bits)),
+                TableKey::String(bytes) => Value::object(self.alloc_string(&bytes)),
+                TableKey::Object(value) => Value::object(value),
+            };
+            entries.push((key, value));
+        }
+        Ok(entries)
     }
 
     pub fn table_set(
@@ -843,6 +941,9 @@ impl Heap {
                     if let Some(metatable) = userdata.metatable {
                         mark_id(metatable, self, marked, queue);
                     }
+                    for value in &userdata.user_values {
+                        mark_value(*value, self, marked, queue);
+                    }
                 }
                 HeapObject::Error(error) => {
                     mark_value(error.value, self, marked, queue);
@@ -1127,6 +1228,32 @@ mod tests {
 
         heap.remove_root(root);
         assert_eq!(heap.collect_major().reclaimed, 2);
+    }
+
+    #[test]
+    fn userdata_user_values_are_traced_and_use_the_generational_barrier() {
+        let mut heap = Heap::default();
+        let userdata = heap.alloc_userdata_bytes_with_uservalues(8, 1);
+        let root = heap.add_root(Value::object(userdata));
+        heap.collect_major();
+
+        let child = heap.alloc_table();
+        assert!(heap
+            .set_userdata_user_value(userdata, 0, Value::object(child))
+            .unwrap());
+        assert!(heap.remembered.contains(&userdata));
+        heap.collect_minor();
+        assert!(heap.contains(child));
+        assert_eq!(
+            heap.userdata_user_value(userdata, 0).unwrap(),
+            Value::object(child)
+        );
+
+        heap.set_userdata_user_value(userdata, 0, Value::NIL)
+            .unwrap();
+        heap.collect_major();
+        assert!(!heap.contains(child));
+        heap.remove_root(root);
     }
 
     #[test]

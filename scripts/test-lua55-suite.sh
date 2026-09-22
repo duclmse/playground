@@ -40,6 +40,7 @@ if [[ ! -d "$suite_dir" ]]; then
   echo "Lua 5.5 suite directory not found: $suite_dir" >&2
   exit 2
 fi
+suite_dir=$(cd "$suite_dir" && pwd)
 if [[ ! -f "$manifest" ]]; then
   echo "Lua 5.5 manifest not found: $manifest" >&2
   exit 2
@@ -77,6 +78,8 @@ run_case() {
   local path=$1
   local status=$2
   local fixture=$3
+  local budget=$4
+  local alloc_budget=$5
   local source="$suite_dir/$path"
   local target=$source
   if [[ -n "$fixture" ]]; then
@@ -87,7 +90,11 @@ run_case() {
     failed=$((failed + 1))
     return
   fi
-  if "$sol_bin" run "$target" >"$results_dir/$path.log" 2>&1; then
+  # Corpus cases use relative `require`, `dofile`, and filesystem paths.
+  # Run Sol from the same directory as the pinned Lua test driver, just as
+  # the reference runner does, while keeping `target` absolute for adapted
+  # fixtures outside that directory.
+  if (cd "$suite_dir" && SOL_LUA_INSTRUCTION_BUDGET=$budget SOL_LUA_ALLOCATION_BUDGET=$alloc_budget "$sol_bin" run "$target") >"$results_dir/$path.log" 2>&1; then
     case "$status" in
       pass|adapted)
         printf 'PASS  %-18s %s\n' "$path" "$status"
@@ -121,11 +128,11 @@ run_case() {
   fi
 }
 
-while IFS=$'\034' read -r path status category requires fixture note; do
+while IFS=$'\034' read -r path status category requires fixture note budget alloc_budget; do
   case "$status" in
     host-required)
       if [[ $run_host_required == 1 ]]; then
-        run_case "$path" pending "$fixture"
+        run_case "$path" pending "$fixture" "$budget" "$alloc_budget"
       else
         printf 'SKIP  %-18s requires: %s\n' "$path" "${requires:-declared host capability}"
         skipped=$((skipped + 1))
@@ -133,14 +140,14 @@ while IFS=$'\034' read -r path status category requires fixture note; do
       ;;
     pending)
       if [[ $run_pending == 1 ]]; then
-        run_case "$path" "$status" "$fixture"
+        run_case "$path" "$status" "$fixture" "$budget" "$alloc_budget"
       else
         printf 'PEND  %-18s %s\n' "$path" "$note"
         pending=$((pending + 1))
       fi
       ;;
     pass|adapted|diverges)
-      run_case "$path" "$status" "$fixture"
+      run_case "$path" "$status" "$fixture" "$budget" "$alloc_budget"
       ;;
   esac
 done <"$entries_file"

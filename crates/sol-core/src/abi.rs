@@ -3,9 +3,9 @@ use std::fmt;
 
 /// Stable identity of a function inside one loaded runtime image.
 ///
-/// IDs are deliberately wider than either legacy engine's `u8`/`u16`
-/// indices. The canonical dispatcher assigns them when prototypes and native
-/// providers enter the shared runtime.
+/// IDs are deliberately wider than either legacy engine's `u8`/`u16` indices.
+/// The canonical dispatcher assigns them when prototypes and native providers
+/// enter the shared runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FunctionId(u32);
 
@@ -20,9 +20,9 @@ impl FunctionId {
 }
 
 /// Portable identity of a host-provided callable. The provider namespace is
-/// allocated by the owning runtime; `function` is meaningful only within
-/// that provider. Host pointers and Rust object addresses are deliberately
-/// absent from this value.
+/// allocated by the owning runtime; `function` is meaningful only within that
+/// provider. Host pointers and Rust object addresses are deliberately absent
+/// from this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NativeCallableId {
     pub provider: u32,
@@ -110,8 +110,7 @@ pub struct PrototypeMetadata {
     pub registers: u32,
 }
 
-/// The byte-oriented source position associated with one executable
-/// instruction. Columns are byte offsets, matching the shared frontend.
+/// The byte-oriented source position associated with one executable instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLocation {
     pub line: u32,
@@ -177,8 +176,8 @@ pub struct FunctionDescriptor {
 }
 
 /// One identity/catalog domain for generic, specialized, and host functions.
-/// Tier promotion updates a descriptor rather than allocating a second
-/// function identity.
+/// Tier promotion updates a descriptor rather than allocating a second function
+/// identity.
 #[derive(Debug, Default)]
 pub struct FunctionRegistry {
     entries: HashMap<FunctionId, FunctionDescriptor>,
@@ -215,14 +214,8 @@ impl FunctionRegistry {
         if self.entries.contains_key(&id) {
             return Err(FunctionRegistryError::Duplicate(id));
         }
-        self.entries.insert(
-            id,
-            FunctionDescriptor {
-                id,
-                metadata,
-                tier,
-            },
-        );
+        self.entries
+            .insert(id, FunctionDescriptor { id, metadata, tier });
         Ok(())
     }
 
@@ -294,9 +287,9 @@ pub enum CallKind {
     Protected,
 }
 
-/// A tier-independent request to invoke a callable. Arguments use the
-/// caller's current representation; boxing adapters translate the generic
-/// parameter when a request crosses between specialized and dynamic tiers.
+/// A tier-independent request to invoke a callable. Arguments use the caller's
+/// current representation; boxing adapters translate the generic parameter when
+/// a request crosses between specialized and dynamic tiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallRequest<V> {
     pub function: FunctionId,

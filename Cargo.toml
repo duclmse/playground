@@ -1,11 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/dap-server",
     "crates/decompiler",
-    "crates/lua-vm",
     "crates/sol",
     "crates/sol-core",
     "crates/sol-lsp",
 ]
-exclude = ["crates/vm"]
+exclude = ["crates/vm", "crates/lua-vm", "crates/dap-server"]

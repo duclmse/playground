@@ -253,7 +253,7 @@ failure_report="$results_dir/failure-report.md"
 matched=0
 diverged=0
 skipped=0
-while IFS=$'\034' read -r path status category requires fixture note; do
+while IFS=$'\034' read -r path status category requires fixture note budget alloc_budget; do
   case "$status" in
     host-required) skipped=$((skipped + 1)); continue ;;
     pending) [[ $run_pending == 1 ]] || { skipped=$((skipped + 1)); continue; } ;;
@@ -274,7 +274,10 @@ while IFS=$'\034' read -r path status category requires fixture note; do
   ref_out="$results_dir/$path.reference.stdout"
   ref_err="$results_dir/$path.reference.stderr"
 
-  "$sol_bin" run "$target" >"$sol_out" 2>"$sol_err"
+  # Match the reference process's working directory.  Upstream cases use
+  # relative module and file paths, so invoking Sol from the repository root
+  # would turn a harness artifact into a false compatibility mismatch.
+  ( cd "$suite_dir" && SOL_LUA_INSTRUCTION_BUDGET=$budget SOL_LUA_ALLOCATION_BUDGET=$alloc_budget "$sol_bin" run "$target" >"$sol_out" 2>"$sol_err" )
   sol_status=$?
   ( cd "$suite_dir" && "$reference_bin" "$path" >"$ref_out" 2>"$ref_err" )
   ref_status=$?

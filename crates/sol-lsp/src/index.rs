@@ -59,7 +59,11 @@ pub fn render_type(ty: &TypeName) -> String {
             return_type,
         } => format!(
             "fn({}) -> {}",
-            params.iter().map(render_type).collect::<Vec<_>>().join(", "),
+            params
+                .iter()
+                .map(render_type)
+                .collect::<Vec<_>>()
+                .join(", "),
             render_type(return_type)
         ),
     }
@@ -131,7 +135,13 @@ fn walk_block(block: &ast::Block, enclosing: &str, index: &mut SymbolIndex) {
 
 fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
     match stmt {
-        Stmt::Local { name, ty, value, line, .. } => {
+        Stmt::Local {
+            name,
+            ty,
+            value,
+            line,
+            ..
+        } => {
             index.locals.push(LocalSymbol {
                 name: name.clone(),
                 ty: ty.as_ref().map(render_type),
@@ -141,7 +151,7 @@ fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
             walk_expr(value, index);
         }
         Stmt::MultiLocal { names, values, .. } => {
-            for (name, ty, _) in names {
+            for (name, ty, _, _) in names {
                 index.locals.push(LocalSymbol {
                     name: name.clone(),
                     ty: ty.as_ref().map(render_type),
@@ -182,7 +192,9 @@ fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
             }
             walk_expr(value, index);
         }
-        Stmt::MultiAssign { targets, values, .. } => {
+        Stmt::MultiAssign {
+            targets, values, ..
+        } => {
             for target in targets {
                 match target {
                     ast::AssignTarget::Index(a, b) => {
@@ -202,7 +214,12 @@ fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
             walk_block(body, enclosing, index);
             walk_expr(cond, index);
         }
-        Stmt::If { cond, then_block, else_block, .. } => {
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
             walk_expr(cond, index);
             walk_block(then_block, enclosing, index);
             if let Some(e) = else_block {
@@ -213,7 +230,14 @@ fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
             walk_expr(cond, index);
             walk_block(body, enclosing, index);
         }
-        Stmt::NumericFor { var, start, stop, step, body, line } => {
+        Stmt::NumericFor {
+            var,
+            start,
+            stop,
+            step,
+            body,
+            line,
+        } => {
             walk_expr(start, index);
             walk_expr(stop, index);
             if let Some(step) = step {
@@ -227,7 +251,12 @@ fn walk_stmt(stmt: &Stmt, enclosing: &str, index: &mut SymbolIndex) {
             });
             walk_block(body, enclosing, index);
         }
-        Stmt::GenericFor { vars, iterators, body, line } => {
+        Stmt::GenericFor {
+            vars,
+            iterators,
+            body,
+            line,
+        } => {
             for it in iterators {
                 walk_expr(it, index);
             }
@@ -295,9 +324,10 @@ fn walk_expr(expr: &Expr, index: &mut SymbolIndex) {
                 }
             }
         }
-        ExprKind::Unary(_, e) | ExprKind::Len(e) | ExprKind::Field(e, _) => {
-            walk_expr(e, index)
-        }
+        ExprKind::Unary(_, e)
+        | ExprKind::Len(e)
+        | ExprKind::Field(e, _)
+        | ExprKind::Paren(e) => walk_expr(e, index),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
             walk_expr(a, index);
             walk_expr(b, index);

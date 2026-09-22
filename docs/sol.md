@@ -8,11 +8,11 @@ are defined in the
 [unified runtime plan](features/unified-sol-runtime-plan.md).
 
 The implementation has not reached that architecture yet. Typed `.sol` and
-dynamic `.lua` currently take separate compiler/runtime paths, and the browser
-still uses `crates/vm`/`crates/lua-vm`. These are migration baselines and test
-oracles, not permanent product boundaries. Current behavior remains documented
-here and in [the specification](spec/README.md) until each convergence milestone
-lands.
+dynamic `.lua` currently take separate compiler/runtime paths. The vendored
+`crates/vm` fork is retired; its old `crates/lua-vm` browser adapter remains
+outside the canonical workspace as migration history pending the `sol-core`
+WASM adapter. Current behavior remains documented here and in
+[the specification](spec/README.md) until each convergence milestone lands.
 
 ## Status
 

@@ -10,8 +10,8 @@ mod heap;
 mod value;
 
 pub use abi::{
-    CallKind, CallOutcome, CallRequest, CallSite, ExecutablePrototype, ExecutionTier,
-    FrameHeader, FrameState, FunctionArity, FunctionDescriptor, FunctionId, FunctionRegistry,
+    CallKind, CallOutcome, CallRequest, CallSite, ExecutablePrototype, ExecutionTier, FrameHeader,
+    FrameState, FunctionArity, FunctionDescriptor, FunctionId, FunctionRegistry,
     FunctionRegistryError, NativeCallableId, PrototypeMetadata, SourceLocation, SourceMap,
     ValueCount, ValueCountError,
 };

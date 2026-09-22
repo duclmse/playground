@@ -76,7 +76,9 @@ multi-file profiling bug found and fixed), the 28-assertion Playwright
 verification transcript, and the small remaining polish items (`pause()`,
 upvalue inspection, and a couple of others).
 
-What exists:
+What existed before the canonical-runtime migration (the vendored `crates/vm`
+fork is now retired and these entries are retained as historical design
+context):
 
 - `crates/vm` - a vendored fork of piccolo 0.3.3 (Cargo package name `vm`,
   not `piccolo`), patched to expose read-only step-debugging introspection

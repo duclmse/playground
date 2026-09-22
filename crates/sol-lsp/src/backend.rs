@@ -19,7 +19,9 @@ impl Backend {
     }
 
     async fn publish(&self, uri: Url, diagnostics: Vec<Diagnostic>) {
-        self.client.publish_diagnostics(uri, diagnostics, None).await;
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 }
 
@@ -92,13 +94,17 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        Ok(self.docs.with_doc(&uri, |doc| features::hover(doc, pos)).flatten().map(|md| Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: md,
-            }),
-            range: None,
-        }))
+        Ok(self
+            .docs
+            .with_doc(&uri, |doc| features::hover(doc, pos))
+            .flatten()
+            .map(|md| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: md,
+                }),
+                range: None,
+            }))
     }
 
     async fn goto_definition(
@@ -157,10 +163,9 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        Ok(self
-            .docs
-            .with_doc(&uri, |doc| DocumentSymbolResponse::Nested(features::document_symbols(doc)))
-            )
+        Ok(self.docs.with_doc(&uri, |doc| {
+            DocumentSymbolResponse::Nested(features::document_symbols(doc))
+        }))
     }
 
     async fn symbol(

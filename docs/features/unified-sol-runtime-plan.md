@@ -175,10 +175,9 @@ The intended code ownership is:
 - `editors/vscode-sol`: first-party VS Code extension that launches or locates
   `sol-lsp` and registers `.lua` and `.sol` documents.
 
-`crates/vm` and `crates/lua-vm` remain a temporary differential oracle and
-browser fallback. They stop being a production runtime only after the new WASM
-adapter passes the migration gate; vendored code is not rewritten merely to make
-the directory tree look unified.
+The vendored `crates/vm` fork has been retired. `crates/lua-vm` and its DAP
+consumer remain outside the canonical Cargo workspace as migration history
+until the `sol-core` WASM adapter replaces their browser-facing interfaces.
 
 ### 3.2 Runtime value and heap model
 
@@ -795,6 +794,29 @@ Exit gate: the compatibility gates in section 6.2 pass for the declared full
 runtime profile. If the embedding profile remains incomplete, public wording
 must remain source-compatible rather than fully runtime-compatible.
 
+#### U6 exit ledger (2026-09-21)
+
+The manifest is the release ledger, not a substitute for this gate. It
+currently reports 9/34 unchanged upstream cases as oracle-backed passes, with
+11 implementation-pending rows, 10 rows that require the declared native host
+profile, and 4 documented divergences. U6 is complete only when all of the
+following are delivered and the corresponding unchanged rows compare cleanly:
+
+- portable runtime: arbitrary/debug-visible `_ENV` upvalues, full debug
+  metadata and hooks, exact diagnostic/chunk-name formatting, remaining
+  grammar and `string.pack` coverage, and default-budget behavior for bounded
+  corpus programs;
+- GC/runtime identity: tracing-style observable collection and finalization
+  semantics rather than the transitional `Rc`/cycle-collector approximation;
+- native profile: filesystem/locale/stdio behavior, Lua binary chunks, the
+  embedding/C API decision, and native module loading/tests;
+- intentional divergences: replace invocation/model representations with the
+  declared native behavior, or remove the divergence by matching the upstream
+  invocation path.
+
+No manifest classification or public compatibility claim may be widened ahead
+of an unchanged pinned-oracle comparison.
+
 Current U6 progress: the numeric coercion path now shares source-literal
 decimal/hex/hex-float parsing without applying that coercion to comparisons;
 mixed integer/float ordering is exact at the i64 boundary and treats NaN as an
@@ -821,6 +843,13 @@ unchanged `bwcoercion.lua`, `utf8.lua`, `pm.lua`, and `vararg.lua` cases all
 match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
 close but still blocked on hex-float parsing for very long numerals; the
 remaining U6 rows stay pending at their next observed blocker.
+
+The unchanged `coroutine.lua` case now also matches the pinned Lua 5.5.1
+oracle. Weak-value tables no longer retain a suspended `coroutine.wrap`
+result merely through its internal continuation; `table.unpack` rejects a
+one-million-result range before allocating a result list; and the portable
+debug library implements `debug.setupvalue` for Lua closures. This promotes
+the row without relaxing its source or oracle comparison.
 
 `package.path`, `package.cpath`, `package.preload`, `package.config`, and a
 real `package.searchpath` now exist (honest Sol-specific defaults, since

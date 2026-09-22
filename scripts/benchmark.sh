@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Compares this project's Lua VM (crates/vm, a fork of piccolo - see
-# crates/vm/README.md) against the reference Lua interpreter (and LuaJIT,
-# if installed) on the microbenchmarks in benchmarks/. Uses hyperfine for
+# Compares Sol against the reference Lua interpreter (and LuaJIT, if
+# installed) on the microbenchmarks in benchmarks/. Uses hyperfine for
 # statistically sound timing (warmup + multiple runs), so the whole
 # process (interpreter startup + compile + execute) is measured the same
 # way for every implementation - a fair, real-world "run this program"
@@ -144,10 +143,6 @@ append_markdown_summary() {
   } >> "$EXPORT_MARKDOWN"
 }
 
-log "Building crates/vm's interpreter example in release mode"
-cargo build --release --example interpreter --manifest-path "$ROOT/crates/vm/Cargo.toml"
-VM_BIN="$ROOT/crates/vm/target/release/examples/interpreter"
-
 log "Building crates/sol in release mode"
 target_root=$(cargo_target_root)
 CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
@@ -182,7 +177,6 @@ for script in "$ROOT"/benchmarks/*.lua; do
     [ "$runtime" = "lua" ] && label="lua (reference)"
     commands+=(-n "$label" "'$runtime' '$script'")
   done
-  commands+=(-n "vm (this project)" "'$VM_BIN' '$script'")
   # Also run the same .lua source through Sol's own dynamic interpreter
   # (`sol run`, the `.lua`-compatibility path `lua_runtime.rs` implements -
   # see docs/features/lua-superset-plan.md Phase 6) - this is the honest

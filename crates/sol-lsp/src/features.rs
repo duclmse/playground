@@ -13,8 +13,8 @@ use crate::index::SymbolIndex;
 use crate::text::{find_word_occurrences, offset_to_position, word_at_position};
 
 const LUA_KEYWORDS: &[&str] = &[
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
-    "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
 ];
 
 const SOL_KEYWORDS: &[&str] = &[
@@ -30,7 +30,11 @@ fn identifier_range_on_line(text: &str, line: u32, name: &str) -> Range {
 }
 
 fn hover_markdown(language: LanguageConfig, code: String) -> String {
-    let lang = if language.sol_extensions { "sol" } else { "lua" };
+    let lang = if language.sol_extensions {
+        "sol"
+    } else {
+        "lua"
+    };
     format!("```{lang}\n{code}\n```")
 }
 
@@ -49,7 +53,11 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
             .as_ref()
             .map(|r| format!(": {r}"))
             .unwrap_or_default();
-        let kw = if f.is_extern { "extern function" } else { "function" };
+        let kw = if f.is_extern {
+            "extern function"
+        } else {
+            "function"
+        };
         return Some(hover_markdown(
             doc.language,
             format!("{kw} {}({params}){ret}", f.name),
@@ -72,7 +80,10 @@ pub fn hover(doc: &Document, pos: Position) -> Option<String> {
     let enclosing = doc.index.enclosing_function_at(&doc.text, pos.line + 1);
     if let Some(local) = doc.index.find_local(&word, &enclosing, pos.line + 1) {
         let ty = local.ty.clone().unwrap_or_else(|| "any".to_string());
-        return Some(hover_markdown(doc.language, format!("local {}: {ty}", local.name)));
+        return Some(hover_markdown(
+            doc.language,
+            format!("local {}: {ty}", local.name),
+        ));
     }
 
     None
@@ -166,7 +177,12 @@ pub fn document_symbols(doc: &Document) -> Vec<DocumentSymbol> {
     out
 }
 
-pub fn completions(index: &SymbolIndex, language: LanguageConfig, enclosing: &str, line: u32) -> Vec<CompletionItem> {
+pub fn completions(
+    index: &SymbolIndex,
+    language: LanguageConfig,
+    enclosing: &str,
+    line: u32,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     for f in &index.functions {
         let params = f
@@ -199,10 +215,13 @@ pub fn completions(index: &SymbolIndex, language: LanguageConfig, enclosing: &st
             });
         }
     }
-    for kw in LUA_KEYWORDS
-        .iter()
-        .chain(language.sol_extensions.then_some(SOL_KEYWORDS).into_iter().flatten())
-    {
+    for kw in LUA_KEYWORDS.iter().chain(
+        language
+            .sol_extensions
+            .then_some(SOL_KEYWORDS)
+            .into_iter()
+            .flatten(),
+    ) {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
@@ -303,7 +322,8 @@ mod tests {
 
     #[test]
     fn definition_uses_lexical_bindings_for_shadowed_locals() {
-        let text = "local value = 1\ndo\n  local value = 2\n  return value\nend\nreturn value\n".to_string();
+        let text = "local value = 1\ndo\n  local value = 2\n  return value\nend\nreturn value\n"
+            .to_string();
         let (document, diagnostics) = Document::new(text, sol::parser::SourceMode::Lua);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let uri = Url::parse("file:///shadowing.lua").unwrap();

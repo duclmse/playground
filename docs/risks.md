@@ -68,7 +68,8 @@ against piccolo's public API as-is - none of that needs frame introspection. The
 debugger (Phases 3–8) stays explicitly blocked on the fork-vs-upstream decision
 above and is not part of this MVP slice.
 
-**Update: decision made, fork-and-vendor (option (b)).** Upstreaming was
+**Historical decision (superseded by retirement of `crates/vm`): fork and
+vendor (option (b)).** Upstreaming was
 rejected for this project's timeline - piccolo's last release is 0.3.3 and
 there's no indication a maintainer would review/merge a debug-introspection
 PR on a useful schedule, and "wait on upstream" would block Phase 3
