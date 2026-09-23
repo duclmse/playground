@@ -1476,7 +1476,24 @@ impl LuaRuntime {
                         method,
                         args: vec![value.clone(), value],
                     }),
-                    None => Err(error),
+                    // Real Lua's `luaV_execute`'s `OP_BNOT` falls back to
+                    // `luaG_opinterror(L, p1, p1, "perform bitwise operation
+                    // on")` when there's no `__bnot` metamethod, which
+                    // reports the operand's type (including a `FILE*`
+                    // userdata's `__name`) rather than the generic "number
+                    // expected" `coerce_integer` raises for any non-number -
+                    // matching the binary bitwise operators' `BitAnd | BitOr
+                    // | ...` arm above. A float with no integer
+                    // representation (e.g. `~-3.009`) still keeps its own,
+                    // more specific message.
+                    None => Err(if error.message.contains("no integer representation") {
+                        error
+                    } else {
+                        LuaError::new(format!(
+                            "attempt to perform bitwise operation on a {} value",
+                            self.error_type_label(&value)
+                        ))
+                    }),
                 },
             },
         }

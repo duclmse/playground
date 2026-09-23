@@ -1170,15 +1170,31 @@ and then require a block terminator (or end of input at top level). See
 `near <eof>` diagnostic suffix (see `literals.lua` below) unblocks this file's
 `checksyntax` helper too, which asserts on both that suffix and `load`'s
 `chunkname:N:` prefix together - the line-65 `checksyntax` call, previously
-this file's stopping point, now passes. The unmodified upstream file runs on
-to line ~277, inside the `do -- named objects` block, where
-`checkmessage("return ~io.stdin", "on a FILE* value")` fails: Sol's
-bitwise-NOT operator reports a generic "number expected" for a `FILE*`
+this file's stopping point, now passes. The unmodified upstream file then ran
+on to line 277, inside the `do -- named objects` block, where
+`checkmessage("return ~io.stdin", "on a FILE* value")` failed: Sol's
+bitwise-NOT operator reported a generic "number expected" for a `FILE*`
 userdata operand instead of real Lua's "attempt to perform bitwise operation
-on a FILE* value" - a distinct, unrelated, not-yet-fixed bug in
-userdata-operand error messages for bitwise operators; `errors.lua` stays
-`pending` for that reason (the `checksyntax` cluster at lines 686-697 is not
-yet reached/verified).
+on a FILE* value" - fixed by having the unary `BitNot` arm in
+`dispatch.rs`'s `unary_resolve` build the same `error_type_label`-based
+message the binary bitwise/arithmetic operators already used, while still
+preserving the more specific "number has no integer representation" message
+for a float operand with no exact integer value. See
+`bitwise_not_on_a_non_number_operand_reports_the_operand_type` in
+`crates/sol/tests/lua55.rs`. With that fixed, the file runs on to line 309's
+`checkerr("^%?:%?:", f, {})`, inside the `-- errors in functions without
+debug info` block: it loads a closure re-dumped with `string.dump(f, true)`'s
+strip flag and expects a runtime error raised inside it to report its
+location as the literal `?:?` real Lua uses for a function with no debug
+info, rather than a real source position. Sol's dumped/reloaded closure does
+still run and does still error on the bad call, but with a different message
+entirely ("attempt to perform arithmetic on incompatible Lua values" with no
+`?:?:`-style location prefix, instead of real Lua's location-prefixed
+"attempt to perform arithmetic on a table value") - a distinct, unrelated,
+larger gap in how errors are attributed/formatted for closures with stripped
+debug info, not yet investigated; `errors.lua` stays `pending` for that
+reason (the `checksyntax` cluster at lines 686-697 is not yet
+reached/verified).
 
 `literals.lua`'s manifest note claiming a line-8 `require "debug"` blocker was
 likewise stale, but this file also exercises `require"debug".getinfo`/

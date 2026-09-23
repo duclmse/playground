@@ -495,6 +495,45 @@ fn lexer_reports_a_malformed_number_not_a_malformed_numeral() {
     }
 }
 
+/// Real Lua's `luaG_opinterror` reports a bitwise-NOT type error using the
+/// operand's Lua-visible type name (a `FILE*` userdata's synthetic label,
+/// here), e.g. "attempt to perform bitwise operation on a FILE* value" - not
+/// the generic "number expected" that a naive `coerce_integer` propagation
+/// would produce. A float with no exact integer representation must still
+/// report the more specific "number has no integer representation" instead.
+#[test]
+fn bitwise_not_on_a_non_number_operand_reports_the_operand_type() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_bnot_type_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local st1, err1 = pcall(function() return ~io.stdin end)
+        assert(not st1 and string.find(err1, "on a FILE%* value"), err1)
+
+        local st2, err2 = pcall(function() return ~(-3.009) end)
+        assert(not st2 and string.find(err2, "no integer representation"), err2)
+
+        local st3, err3 = pcall(function() return ~(-3e40) end)
+        assert(not st3 and string.find(err3, "no integer representation"), err3)
+
+        print("bnot type errors ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("bnot type errors ok"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();
