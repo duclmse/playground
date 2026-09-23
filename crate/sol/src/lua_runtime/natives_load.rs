@@ -298,7 +298,12 @@ impl LuaRuntime {
                 let result = if is_binary_chunk {
                     self.load_binary_chunk(&source, env, Some(Rc::new(chunkname)))
                 } else {
-                    self.compile_chunk_named(&source, env, Some(Rc::new(chunkname)))
+                    // `load()` never skips a leading `#` shebang line - that
+                    // skip is `lauxlib.c`'s `luaL_loadfilex`-only behavior
+                    // (`skipcomment`), not something `lua_load`/`llex.c`
+                    // itself does, so a string like `load("#=1")` must be
+                    // parsed as real code starting with `#`, not skipped.
+                    self.compile_chunk_named(&source, env, Some(Rc::new(chunkname)), false)
                 };
                 match result {
                     Ok(closure) => Ok(vec![closure]),
@@ -369,7 +374,10 @@ impl LuaRuntime {
         source: &[u8],
         env: Option<LuaValue>,
     ) -> Result<LuaValue, String> {
-        self.compile_chunk_named(source, env, None)
+        // File-oriented caller (`require`'s Lua searcher, `dofile`) - real
+        // Lua's `luaL_loadfilex` (`lauxlib.c`'s `skipcomment`) always skips a
+        // leading `#` shebang line for these.
+        self.compile_chunk_named(source, env, None, true)
     }
 
     pub(super) fn compile_chunk_named(
@@ -377,12 +385,17 @@ impl LuaRuntime {
         source: &[u8],
         env: Option<LuaValue>,
         chunkname: Option<Rc<Vec<u8>>>,
+        skip_shebang: bool,
     ) -> Result<LuaValue, String> {
         let format_error = |error: String| match &chunkname {
             Some(chunkname) => format_chunk_diagnostic(chunkname, source, &error),
             None => error,
         };
-        let tokens = crate::lexer::lex_bytes(source).map_err(&format_error)?;
+        let tokens = if skip_shebang {
+            crate::lexer::lex_bytes(source).map_err(&format_error)?
+        } else {
+            crate::lexer::lex_bytes_no_shebang(source).map_err(&format_error)?
+        };
         let program = crate::parser::parse_lua(tokens).map_err(&format_error)?;
         let chunk_globals = match env {
             Some(value) => Globals::from_value(value),

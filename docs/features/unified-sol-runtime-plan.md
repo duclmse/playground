@@ -1213,16 +1213,45 @@ structural cases real Lua's own lexer reaches with no partial escape pending:
 a bare unterminated string/long-string, and a trailing backslash with nothing
 after it. See `lexer_errors_report_lua_compatible_near_text` in
 `crates/sol/tests/lua55.rs`. With this fixed, all ~30 of the file's
-`lexerror` calls (lines 78-122) now pass. The unmodified upstream file runs on
-to line 127's "valid characters in variable names" loop
-(`load(s .. "=1", "")` for every byte 0-255) and fails at byte 35 (`#`):
-Sol's lexer treats a leading `#` as a shebang-comment to skip even when
-reached through `load` on an in-memory string (the shebang-skip is meant only
-for `sol run`/`sol build`'s own file loading), so `load("#=1", "")` succeeds
-where real Lua's `load` - which never skips shebangs, only the standalone
-`lua` CLI's file loader does - would reject `#` as an invalid statement
-start. A distinct, unrelated, not-yet-fixed bug; `literals.lua` stays
-`pending` for that reason.
+`lexerror` calls (lines 78-122) now pass. The file's former next stopping
+point, line 127's "valid characters in variable names" loop
+(`load(s .. "=1", "")` for every byte 0-255) failing at byte 35 (`#`), is now
+fixed too: real Lua's shebang skip lives only in `lauxlib.c`'s
+`luaL_loadfilex` (a file-loading helper), never in the lexer (`llex.c`) or
+`lua_load`'s generic reader path that `load()` uses, so `load("#=1", "")`
+must reject `#` as an invalid statement start rather than silently skipping
+it as a comment. `crates/sol/src/lexer.rs`'s `Scanner` now takes a
+`skip_shebang: bool` (`Scanner::new`, plus a new `lex_bytes_no_shebang`
+sibling to `lex_bytes`), threaded through `compile_chunk_named` in
+`crates/sol/src/lua_runtime/natives_load.rs`: `load()`'s call site passes
+`false`, while `dofile` and `require`'s Lua searcher keep passing `true` and
+still skip a real shebang line. See
+`load_does_not_skip_a_shebang_but_file_loading_still_does` in
+`crates/sol/tests/lua55.rs`.
+
+With that fixed, the unmodified upstream file runs substantially further and
+now reaches line 227, inside the `do -- reuse of long strings` block (lines
+213-234): `assert(a1 == getadd(s2))` fails because Sol's compiler gives every
+string constant its own fresh allocation - `crates/sol/src/lua_bytecode/
+func_state.rs`'s `push_const`/`push_name_const` perform no deduplication at
+all - while real Lua's lexer (`llex.c`'s `luaX_newstring`/`anchorstr`)
+anchors every string token it produces in a table scoped to the whole
+compile (`LexState.h`, `ls->h` - not per-function), so any two byte-identical
+string tokens lexed anywhere in the same chunk, even across nested function
+bodies (like `s1`'s enclosing scope and `foo2()`'s own inline literal), end
+up sharing one `TString` object for that compile's lifetime. This is
+distinct from real Lua's ordinary VM-wide short-string interning (the test
+literal is 50 bytes, past `LUAI_MAXSHORTLEN`'s 40-byte cutoff, so that
+mechanism doesn't apply here) and from `lcode.c`'s per-`FuncState`
+constant-table cache (`fs->kcache`), which is too narrowly scoped on its own
+to explain sharing across nested functions. The test's own `sd = "0123456789"
+.. "01234...39"` runtime concatenation of equal content is required to NOT
+share the address (line 233), confirming this is a compile-time/lexer-level
+phenomenon rather than a general same-content-implies-same-object runtime
+invariant. Not yet fixed - would need a chunk-scoped string-anchoring table
+during Sol's own lexing/compilation, distinct from (and additional to) any
+future per-function constant-pool dedup; `literals.lua` stays `pending` for
+that reason.
 
 `sort.lua`'s previous blocker (`table.create`'s hash-size hint not honored)
 is now fixed: `table.create(sizeseq, sizerest)` preallocates both the array

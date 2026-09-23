@@ -378,6 +378,54 @@ fn lexer_errors_report_lua_compatible_near_text() {
     }
 }
 
+/// Real Lua's shebang skip lives only in `lauxlib.c`'s `luaL_loadfilex`
+/// (`skipcomment`), a file-loading helper - never in the lexer itself
+/// (`llex.c`) or `lua_load`'s generic reader path. `load()` on an in-memory
+/// string must therefore parse a leading `#` as ordinary code (the unary
+/// length operator, invalid at statement start), while file-oriented loads
+/// (a `sol run` script argument) must still skip a shebang line.
+#[test]
+fn load_does_not_skip_a_shebang_but_file_loading_still_does() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_shebang_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br##"
+        local chunk, err = load("#comment\nreturn 1")
+        assert(chunk == nil, "load() must not treat a leading '#' as a shebang comment")
+        assert(err ~= nil)
+        print("load ok")
+    "##,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("load ok"));
+
+    let shebang_path =
+        std::env::temp_dir().join(format!("sol_lua55_shebang_file_{}.lua", std::process::id()));
+    std::fs::write(&shebang_path, b"#!/usr/bin/env lua\nprint(\"ran\")\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", shebang_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&shebang_path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();

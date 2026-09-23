@@ -87,14 +87,23 @@ pub fn lex(source: &str) -> Result<Vec<Spanned>, String> {
 /// Lex Lua source as bytes. Lua source and string literals are byte-oriented;
 /// callers that load `.lua` files must use this entry point rather than first
 /// decoding the entire file as UTF-8.
+///
+/// Skips a leading `#` shebang line, matching real Lua's
+/// `luaL_loadfilex`/`skipcomment` (`lauxlib.c`) - use this for any
+/// file-oriented load path (a CLI script argument, `dofile`, `require`'s Lua
+/// searcher). `load()` on an in-memory string/reader must use
+/// [`lex_bytes_no_shebang`] instead: real Lua's `lua_load`/`llex.c` never
+/// skips a shebang, since that skip lives only in the file-loading helper,
+/// not the lexer itself.
 pub fn lex_bytes(source: &[u8]) -> Result<Vec<Spanned>, String> {
-    Scanner {
-        bytes: source,
-        pos: 0,
-        line: 1,
-        line_start: 0,
-    }
-    .scan()
+    Scanner::new(source, true).scan()
+}
+
+/// Like [`lex_bytes`], but never skips a leading `#` shebang line. For
+/// `load()`'s in-memory string/reader source, which real Lua's `lua_load`
+/// parses as ordinary code even when it starts with `#`.
+pub fn lex_bytes_no_shebang(source: &[u8]) -> Result<Vec<Spanned>, String> {
+    Scanner::new(source, false).scan()
 }
 
 struct Scanner<'a> {
@@ -102,6 +111,19 @@ struct Scanner<'a> {
     pos: usize,
     line: u32,
     line_start: usize,
+    skip_shebang: bool,
+}
+
+impl<'a> Scanner<'a> {
+    fn new(bytes: &'a [u8], skip_shebang: bool) -> Self {
+        Scanner {
+            bytes,
+            pos: 0,
+            line: 1,
+            line_start: 0,
+            skip_shebang,
+        }
+    }
 }
 
 impl Scanner<'_> {
@@ -483,7 +505,7 @@ impl Scanner<'_> {
         if self.bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
             self.pos = 3;
         }
-        if self.peek() == Some(b'#') {
+        if self.skip_shebang && self.peek() == Some(b'#') {
             while !matches!(self.peek(), None | Some(b'\r' | b'\n')) {
                 self.pos += 1;
             }
