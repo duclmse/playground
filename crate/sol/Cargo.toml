@@ -1,0 +1,27 @@
+[package]
+name = "sol"
+version = "0.1.0"
+edition = "2021"
+description = "A typed, Lua-compatible language compiled straight to native code via Cranelift. See docs/sol.md."
+
+[lib]
+name = "sol"
+crate-type = ["rlib", "staticlib", "cdylib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sol"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+sol-core = { path = "../sol-core" }
+cranelift-codegen = "0.134"
+cranelift-frontend = "0.134"
+cranelift-jit = "0.134"
+cranelift-module = "0.134"
+cranelift-object = "0.134"
+cranelift-native = "0.134"
+indexmap = "2"
+
+[dev-dependencies]

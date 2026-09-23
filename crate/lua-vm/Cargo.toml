@@ -1,0 +1,19 @@
+[package]
+name = "lua-vm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The Piccolo-backed implementation is retained only as migration history;
+# it is excluded from the canonical workspace after retiring crates/vm.
+gc-arena = "0.5.3"
+wasm-bindgen = "=0.2.100"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
