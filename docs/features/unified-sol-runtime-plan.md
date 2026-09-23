@@ -1860,6 +1860,20 @@ line-info fixes above - `natives_debug.rs` already documents this as a
 known, deliberate gap (only a callee's own declared-local-function name is
 resolved today).
 
+`verybig.lua`'s case is re-verified end to end under its own elevated
+`budget`/`alloc_budget` manifest overrides (see `tests/lua55/manifest.toml`,
+same mechanism as `sort.lua`/`nextvar.lua`), now that the `os.tmpname`/
+`dofile` real-filesystem-fallback fixes documented on its case let it reach
+that far. It runs to completion and prints `OK`; a direct diff against a
+freshly-run oracle shows exactly one difference, the trailing top-level
+return-value line `sol run`'s CLI harness prints after every script's
+output (the same pre-existing artifact documented on `literals.lua`/
+`nextvar.lua`) - the prior note's claim of a byte-identical oracle match was
+unverified and incorrect. The case is promoted from `pending` to `diverges`
+for that one cosmetic reason; its ~three-minute run time under Sol's
+interpreter tier versus the oracle's ~0.2s is a real, separately-tracked
+performance gap, not a correctness one.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.
