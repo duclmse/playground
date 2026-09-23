@@ -572,6 +572,64 @@ fn arithmetic_on_a_plain_table_or_non_numeric_string_names_the_operand_type() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("arithmetic type errors ok"));
 }
 
+/// Real Lua's `luaL_where` prepends a "{short_src}:{line}: " position to a
+/// string error message - `error(msg)`'s default `level` of 1 uses the
+/// position of whichever line called `error`, `level` can walk further up
+/// the call stack, `level == 0` (or a non-string message) skips the prefix
+/// entirely, and `assert`'s failure message (explicit or the default
+/// "assertion failed!") gets the same treatment since real Lua's
+/// `luaB_assert` is a plain tail call into `luaB_error`.
+#[test]
+fn error_and_assert_add_a_luals_where_style_position_prefix() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_where_prefix_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local ok1, msg1 = pcall(function() error("boom") end)
+        assert(not ok1 and string.find(msg1, ":%d+: boom$"), msg1)
+
+        local ok2, msg2 = pcall(function() error("boom", 0) end)
+        assert(not ok2 and msg2 == "boom", msg2)
+
+        local function inner() error("deep", 2) end
+        local function outer() inner() end
+        local ok3, msg3 = pcall(outer)
+        assert(not ok3 and string.find(msg3, ":%d+: deep$"), msg3)
+
+        local ok4, msg4 = pcall(function() error({code = 1}) end)
+        assert(not ok4 and type(msg4) == "table" and msg4.code == 1)
+
+        local ok5, msg5 = pcall(function() assert(false) end)
+        assert(not ok5 and string.find(msg5, ":%d+: assertion failed!$"), msg5)
+
+        local ok6, msg6 = pcall(function() assert(false, "custom") end)
+        assert(not ok6 and string.find(msg6, ":%d+: custom$"), msg6)
+
+        local ok7, msg7 = pcall(function() assert(false, {code = 9}) end)
+        assert(not ok7 and type(msg7) == "table" and msg7.code == 9)
+
+        local f = load("error('loaded boom')")
+        local ok8, msg8 = pcall(f)
+        assert(not ok8 and msg8 == "[string \"error('loaded boom')\"]:1: loaded boom", msg8)
+
+        print("where prefix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("where prefix ok"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();

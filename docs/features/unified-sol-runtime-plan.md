@@ -1196,10 +1196,28 @@ diagnostic label equalled its plain type name (i.e. whenever it had no
 table, a non-numeric string, and so on) - instead of always using real Lua's
 `luaG_typeerror` wording, "attempt to perform arithmetic on a {type} value".
 See `arithmetic_on_a_plain_table_or_non_numeric_string_names_the_operand_type`
-in `crates/sol/tests/lua55.rs`. Even with the wording fixed, the error still
-has no `?:?:`-style location prefix at all - a distinct, unrelated, larger
-gap in how errors are attributed/formatted for closures with stripped debug
-info, not yet investigated; `errors.lua` stays `pending` for that reason (the
+in `crates/sol/tests/lua55.rs`. A third, broader bug surfaced separately
+while chasing this file's later `checkmessage`/`checkerr` calls: real Lua's
+`luaL_where` prepends a `"{short_src}:{line}: "` position prefix to a
+string error message raised via `error(msg[, level])`, and `assert`'s
+failure message gets the same treatment via `luaB_assert`'s plain C-level
+tail call into `luaB_error` - but Sol's `NativeFunction::Error` silently
+ignored the `level` argument entirely and never added any prefix, for any
+error source. Fixed by adding `LuaRuntime::where_prefix(level)`
+(`natives_core.rs`), which walks `self.frames` to the requested level the
+same way `DebugGetinfo`'s numeric-level lookup already does, then formats
+the resolved frame's `short_src`/current line (or returns `None` for a
+native frame, an out-of-range level, `level <= 0`, or a chunk with no
+registered source, matching `luaL_where`'s own silent empty-prefix
+fallback), and wiring both `NativeFunction::Error` and `NativeFunction::Assert`
+through it. See
+`error_and_assert_add_a_luals_where_style_position_prefix` in
+`crates/sol/tests/lua55.rs`. This does not change this file's own stopping
+point: the error still has no `?:?:`-style location prefix at all for a
+closure with stripped debug info - a distinct, unrelated, larger gap in how
+*implicit* VM-runtime errors (real Lua's `luaG_runerror`/`luaG_addinfo`, as
+opposed to an explicit `error()`/`assert()` call) are attributed/formatted,
+not yet investigated; `errors.lua` stays `pending` for that reason (the
 `checksyntax` cluster at lines 686-697 is not yet reached/verified).
 
 `literals.lua`'s manifest note claiming a line-8 `require "debug"` blocker was

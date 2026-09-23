@@ -3,6 +3,7 @@
 //! Split out of natives.rs, which holds the shared `call_native` dispatch
 //! table and its small cross-cutting coercion helpers.
 
+use super::frame::Frame;
 use super::util::*;
 use super::*;
 
@@ -43,14 +44,35 @@ impl LuaRuntime {
                     // e.g. a table), and only falls back to the literal
                     // string "assertion failed!" when it's omitted - it
                     // never uses the (falsy) condition value itself as the
-                    // error message.
+                    // error message. Both cases are a plain tail call into
+                    // `luaB_error` in real Lua (`lbaselib.c`'s
+                    // `luaB_assert`), so a string message - explicit or the
+                    // default - gets the same level-1 position prefix
+                    // `error()` adds (see `where_prefix`), using assert's own
+                    // caller as the position since the C-level tail call
+                    // shares one Lua-visible call frame.
+                    let prefix = self.where_prefix(1).unwrap_or_default();
                     Err(match args.get(1) {
+                        Some(LuaValue::String(bytes)) => {
+                            let message =
+                                format!("{prefix}{}", String::from_utf8_lossy(bytes));
+                            LuaError::raised(
+                                LuaValue::String(Rc::new(message.clone().into_bytes())),
+                                message,
+                            )
+                        }
                         Some(message) => {
                             let display =
                                 String::from_utf8_lossy(&message.display_bytes()).into_owned();
                             LuaError::raised(message.clone(), display)
                         }
-                        None => LuaError::new("assertion failed!"),
+                        None => {
+                            let message = format!("{prefix}assertion failed!");
+                            LuaError::raised(
+                                LuaValue::String(Rc::new(message.clone().into_bytes())),
+                                message,
+                            )
+                        }
                     })
                 }
             }
@@ -193,6 +215,18 @@ impl LuaRuntime {
                 // string "<no error object>" at the moment it is thrown, so
                 // that's what `pcall`/`xpcall` observe, not a raw nil.
                 let value = args.first().cloned().unwrap_or(LuaValue::Nil);
+                // `level` (default 1) selects which active frame's position
+                // real Lua's `luaL_where` reports: level 1 is the function
+                // that called `error`, i.e. the topmost frame already on
+                // `self.frames` (this native call's own caller, pushed back
+                // before dispatch - same convention `DebugGetinfo` documents
+                // above). Only a string message gets a position prefix
+                // (`luaB_error`'s `lua_type(L, 1) == LUA_TSTRING` check) and
+                // only when `level > 0`.
+                let level = match args.get(1) {
+                    Some(value) => coerce_integer(value)?,
+                    None => 1,
+                };
                 Err(match &value {
                     LuaValue::Nil => {
                         let text: &[u8] = b"<no error object>";
@@ -203,7 +237,14 @@ impl LuaRuntime {
                     }
                     LuaValue::String(bytes) => {
                         let message = String::from_utf8_lossy(bytes).into_owned();
-                        LuaError::raised(value, message)
+                        let message = match self.where_prefix(level) {
+                            Some(prefix) => format!("{prefix}{message}"),
+                            None => message,
+                        };
+                        LuaError::raised(
+                            LuaValue::String(Rc::new(message.clone().into_bytes())),
+                            message,
+                        )
                     }
                     other => {
                         let message = format!("(error object is a {} value)", other.type_name());
@@ -415,5 +456,43 @@ impl LuaRuntime {
             }
         }
         Ok(value.display_bytes())
+    }
+
+    /// Real Lua's `luaL_where`: the "{short_src}:{line}: " position prefix
+    /// for the frame `level` levels up the call stack (level 1 is this
+    /// native call's own caller, matching `DebugGetinfo`'s numeric-level
+    /// convention above), or `None` when that frame has no line info - a
+    /// native/C frame, a level past the bottom of the stack, or a Lua frame
+    /// whose chunk has no registered source - exactly `luaL_where`'s own
+    /// silent fallback to an empty prefix.
+    fn where_prefix(&self, level: i64) -> Option<String> {
+        if level <= 0 {
+            return None;
+        }
+        let mut remaining = level;
+        let mut found = None;
+        for frame in self.frames.iter().rev() {
+            remaining -= 1;
+            if remaining == 0 {
+                found = Some(frame);
+                break;
+            }
+        }
+        let Frame::Lua(lua_frame) = found? else {
+            return None;
+        };
+        let line = lua_frame
+            .proto
+            .source_map
+            .location(lua_frame.header.pc)
+            .map(|location| location.line as i64)?;
+        if line <= 0 {
+            return None;
+        }
+        let source = self
+            .chunk_sources
+            .get(&(Rc::as_ptr(&lua_frame.proto) as usize))?;
+        let short_src = Self::short_src(source);
+        Some(format!("{}:{line}: ", String::from_utf8_lossy(&short_src)))
     }
 }

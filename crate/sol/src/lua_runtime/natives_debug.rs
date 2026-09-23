@@ -656,7 +656,7 @@ impl LuaRuntime {
     /// (truncated), `@path` sources report `path` (truncated, keeping the
     /// tail), and anything else (a literal chunk of source text, e.g. from
     /// `load`) reports `[string "first line..."]`.
-    fn short_src(source: &[u8]) -> Vec<u8> {
+    pub(super) fn short_src(source: &[u8]) -> Vec<u8> {
         const MAX: usize = 60;
         if let Some(rest) = source.strip_prefix(b"=") {
             let mut short = rest.to_vec();
