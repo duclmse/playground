@@ -63,6 +63,14 @@ fn read_source(path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Real Lua's own `@`-prefixed `debug.getinfo` chunk-name convention for a
+/// file loaded from disk (see `lua_State`/`lua_load`'s `chunkname`), applied
+/// to the CLI's own top-level compile so a running script's `source`/
+/// `short_src` resolve the same way a `load`ed chunk's do.
+fn cli_chunk_name(path: &str) -> Vec<u8> {
+    format!("@{path}").into_bytes()
+}
+
 fn language_config(path: &str) -> LanguageConfig {
     let mut config = if Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("lua") {
         LanguageConfig::LUA
@@ -831,6 +839,7 @@ fn run_lua_partitioned(
                 max_call_depth,
                 allocation_budget,
                 lua_gc_stress_enabled(),
+                Some(cli_chunk_name(path)),
             )
             .map_err(report_lua_error)?;
             write_lua_run(result)?;
@@ -938,6 +947,7 @@ fn run_lua_partitioned(
         max_call_depth,
         allocation_budget,
         lua_gc_stress_enabled(),
+        Some(cli_chunk_name(path)),
     )
     .map_err(report_lua_error)?;
     write_lua_run(result)?;
@@ -987,6 +997,7 @@ fn run(
                     allocation_budget,
                     lua_gc_stress_enabled(),
                     &analysis.optimization_plan,
+                    Some(cli_chunk_name(path)),
                 )
             }
             _ => sol::lua_runtime::run_program_with_natives_and_budgets(
@@ -998,6 +1009,7 @@ fn run(
                 max_call_depth,
                 allocation_budget,
                 lua_gc_stress_enabled(),
+                Some(cli_chunk_name(path)),
             ),
         }
         .map_err(report_lua_error)?;

@@ -506,7 +506,7 @@ impl LuaRuntime {
         }))))
     }
 
-    fn register_chunk_source(&mut self, proto: &Rc<Proto>, chunkname: &Rc<Vec<u8>>) {
+    pub(super) fn register_chunk_source(&mut self, proto: &Rc<Proto>, chunkname: &Rc<Vec<u8>>) {
         self.chunk_sources
             .insert(Rc::as_ptr(proto) as usize, chunkname.clone());
         for nested in &proto.nested {

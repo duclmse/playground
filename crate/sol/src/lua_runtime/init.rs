@@ -63,6 +63,7 @@ impl LuaRuntime {
             pending_error_stack: None,
             prototype_ids: HashMap::new(),
             chunk_sources: HashMap::new(),
+            default_chunk_name: None,
             dumped_protos: HashMap::new(),
             function_registry: sol_core::FunctionRegistry::default(),
             native_bridges: HashMap::new(),
@@ -674,6 +675,17 @@ impl LuaRuntime {
         self.preload(b"debug", LuaValue::Table(debug));
     }
 
+    /// Registers `name` (real Lua's `@`-prefixed filename convention, e.g.
+    /// `@path/to/file.lua`) as the chunk name every top-level function this
+    /// runtime subsequently compiles (`load_in_globals`) reports through
+    /// `debug.getinfo`'s `source`/`short_src` fields. Embedders that never
+    /// call this get today's existing behavior: no `chunk_sources` entry for
+    /// the program's own top-level compile, so those fields are simply
+    /// omitted.
+    pub fn set_chunk_name(&mut self, name: Vec<u8>) {
+        self.default_chunk_name = Some(Rc::new(name));
+    }
+
     pub fn run(&mut self, program: &Program) -> LuaResult<LuaValue> {
         let globals = self.globals.clone();
         self.run_in_globals(program, &globals, &HashSet::new(), &HashMap::new())
@@ -778,6 +790,9 @@ impl LuaRuntime {
                 None => Compiler::compile_top_level(function),
             }
             .map_err(LuaError::new)?;
+            if let Some(chunk_name) = self.default_chunk_name.clone() {
+                self.register_chunk_source(&proto, &chunk_name);
+            }
             self.charge_allocation(std::mem::size_of::<LuaClosure>())?;
             let closure = self.track_closure(Rc::new(LuaClosure {
                 proto,

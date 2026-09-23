@@ -1613,8 +1613,31 @@ distinct, previously-hidden `debug.getinfo` gap unrelated to hooks (the
 `func` and `activelines` fields are never populated, and `short_src`/`source`
 resolve to `nil` for any chunk not compiled through `load` - including the
 CLI's own top-level `sol run file.lua` compilation, which never registers a
-`chunk_sources` entry at all), so `db.lua` stays `pending` on that narrower,
-newly-identified blocker rather than being promoted.
+`chunk_sources` entry at all).
+
+That `debug.getinfo` gap is now closed too: the direct-function-value lookup
+case (`LuaValue::Closure` in `natives_debug.rs`'s `DebugGetinfo`) sets `func`
+to the exact closure passed in (the level-based stack-frame lookup still
+leaves `func` unset, deliberately - a `LuaFrame` doesn't retain the original
+closure `Rc`, only its unpacked `proto`/`upvals`/`globals`, and reconstructing
+one would fail `Rc::ptr_eq`-based `LuaValue` equality against the real
+closure); `describe_lua_proto` builds `activelines` as a line-to-`true` set
+from `proto.source_map`; and a new `LuaRuntime::set_chunk_name`, called from
+all three `sol run` call sites in `main.rs` with the `@`-prefixed script
+path, registers a `chunk_sources` entry for the CLI's own top-level compile
+the same way `load`/`loadfile` already do, so `debug.getinfo(1).source`/
+`.short_src` are no longer `nil` for the running main chunk. Running `db.lua`
+against the pinned oracle past this fix surfaces two further, distinct,
+previously-hidden gaps - both in the bytecode compiler's line-info
+generation, not in the `debug` library: `lastlinedefined` is approximated as
+the maximum line number appearing anywhere in `proto.source_map` rather than
+the actual line of the function's closing `end` token (no end-line is
+tracked anywhere today - `ast::Function`/`Proto` only carry a start line),
+and at least one prologue instruction in a function's own bytecode is
+attributed to its declaration line itself rather than its first body
+statement's line, so `activelines` incorrectly includes the declaration
+line. `db.lua` stays `pending` on these two narrower, newly-identified
+compiler gaps rather than being promoted.
 
 ### U7 — Interpreter performance foundation
 

@@ -364,3 +364,113 @@ fn dynamic_lua_runtime_debug_getinfo_accepts_a_function_value_and_reports_loads_
         .unwrap();
     assert_eq!(value, LuaValue::Bool(true));
 }
+
+#[test]
+fn dynamic_lua_runtime_debug_getinfo_reports_func_for_a_closure_value() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `lua-5.5.1-tests/db.lua` line 39-42: `debug.getinfo(test, "SfL")`
+    // (looked up by function *value*, not stack level) must set `func` to
+    // the exact closure passed in, so `b.func == test` holds under
+    // `LuaValue`'s `Rc::ptr_eq`-based closure equality. This is only wired
+    // for the direct-value lookup - the level-based lookup unpacks a
+    // `LuaFrame`'s `proto`/`upvals` rather than keeping the original closure
+    // `Rc`, so it still leaves `func` unset (see `natives_debug.rs`).
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let value = runtime
+        .run(&parse(
+            br#"
+            local function test(a, b) return a + b end
+            local info = debug.getinfo(test, "SfL")
+            return info.func == test
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_debug_getinfo_builds_activelines_from_the_source_map() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `lua-5.5.1-tests/db.lua` line 43-46: `activelines` is a set (line ->
+    // `true`) of lines this prototype's own bytecode maps to. This only
+    // checks the set is actually populated from `source_map` and doesn't leak
+    // lines from an unrelated scope; `db.lua`'s own stricter boundary checks
+    // (excluding the declaration/closing lines exactly, and an empty set for
+    // a debug-info-stripped dump) are still blocked by separate, pre-existing
+    // gaps - see `tests/lua55/manifest.toml`'s `db.lua` entry.
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let value = runtime
+        .run(&parse(
+            br#"
+            local function test(a, b)
+                local sum = a + b
+                return sum
+            end
+            local info = debug.getinfo(test, "L")
+            local has_body_line = info.activelines[info.linedefined + 1] == true
+            local excludes_unrelated_line = not info.activelines[info.linedefined - 1]
+            return has_body_line and excludes_unrelated_line
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_debug_getinfo_omits_activelines_for_native_functions() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `lua-5.5.1-tests/db.lua` line 37-38: `debug.getinfo(print, "L").activelines`
+    // must be `nil` for a C/native function - there is no bytecode source map
+    // to build a line set from.
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let value = runtime
+        .run(&parse(b"return debug.getinfo(print, \"L\").activelines == nil"))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_set_chunk_name_registers_the_top_level_chunks_source() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // The `sol` CLI's own top-level compile (`main.rs`'s `run`) never went
+    // through `load`/`loadfile`, so `chunk_sources` had no entry for the
+    // running main chunk and `debug.getinfo(1).source`/`.short_src` were
+    // `nil`. `LuaRuntime::set_chunk_name`, called before `run`, registers the
+    // program's own top-level functions the same way `load` registers a
+    // chunk's, using the `@`-prefixed filename convention.
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    runtime.set_chunk_name(b"@script.lua".to_vec());
+    let value = runtime
+        .run(&parse(
+            br#"
+            local info = debug.getinfo(1)
+            return info.source == "@script.lua" and info.short_src == "script.lua"
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}

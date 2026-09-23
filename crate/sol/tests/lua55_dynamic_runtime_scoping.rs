@@ -245,6 +245,7 @@ fn dynamic_lua_runtime_capabilities_and_budgets_can_be_overridden_together() {
         1_000,
         64 * 1024 * 1024,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(

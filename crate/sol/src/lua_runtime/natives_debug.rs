@@ -282,6 +282,14 @@ impl LuaRuntime {
                             b"nups",
                             LuaValue::Integer(closure.upvals.borrow().len() as i64),
                         );
+                        // Only this direct-value lookup has the real closure
+                        // `Rc` in hand. The level-based lookup below unpacks a
+                        // `LuaFrame`'s `proto`/`upvals`/`globals` rather than
+                        // keeping the original closure, and reconstructing one
+                        // would fail `Rc::ptr_eq`-based `LuaValue` equality
+                        // against the actual running closure - worse than
+                        // leaving `func` unset there.
+                        set(b"func", LuaValue::Closure(closure.clone()));
                     }
                     LuaValue::NativeFunction(_)
                     | LuaValue::Native(_)
@@ -570,11 +578,20 @@ impl LuaRuntime {
         set(b"extraargs", LuaValue::Integer(extraargs));
         let linedefined = proto.line_defined as i64;
         let mut lastlinedefined = linedefined;
+        // `activelines`: real Lua's `funcinfo` builds this as a set (line ->
+        // `true`) of every line this prototype's own bytecode maps to - not
+        // its nested closures', which carry separate `Proto`s/source maps.
+        let activelines = Rc::new(RefCell::new(LuaTable::default()));
         for pc in 0..proto.source_map.len() as u32 {
             if let Some(location) = proto.source_map.location(pc) {
                 lastlinedefined = lastlinedefined.max(location.line as i64);
+                activelines
+                    .borrow_mut()
+                    .set(LuaValue::Integer(location.line as i64), LuaValue::Bool(true))
+                    .unwrap();
             }
         }
+        set(b"activelines", LuaValue::Table(activelines));
         set(b"linedefined", LuaValue::Integer(linedefined));
         set(b"lastlinedefined", LuaValue::Integer(lastlinedefined));
         set(b"isvararg", LuaValue::Bool(proto.metadata.arity.variadic));

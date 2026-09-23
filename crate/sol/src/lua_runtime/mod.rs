@@ -235,14 +235,22 @@ pub struct LuaRuntime {
     /// legacy-side lookup key; frames themselves carry portable IDs.
     prototype_ids: HashMap<usize, sol_core::FunctionId>,
     /// `debug.getinfo`'s `source` field for every `Proto` compiled through
-    /// `compile_chunk` (i.e. every `load`ed chunk), keyed by `Rc<Proto>`
-    /// pointer identity - real Lua stores this per-`Proto` uniformly across
-    /// a whole chunk (main function and every nested one), set once from the
-    /// chunk name given to `load`/`lua_load`. Absent for protos compiled
-    /// outside `compile_chunk` (the top-level script `sol run` executes
-    /// directly); `debug.getinfo` simply omits the `source` field then,
-    /// rather than guessing a default.
+    /// `compile_chunk` (i.e. every `load`ed chunk) or the CLI's own top-level
+    /// compile (see `default_chunk_name`), keyed by `Rc<Proto>` pointer
+    /// identity - real Lua stores this per-`Proto` uniformly across a whole
+    /// chunk (main function and every nested one), set once from the chunk
+    /// name given to `load`/`lua_load`. Absent for protos compiled without a
+    /// chunk name at all (e.g. embedders calling `run_program` directly);
+    /// `debug.getinfo` simply omits the `source` field then, rather than
+    /// guessing a default.
     chunk_sources: HashMap<usize, Rc<Vec<u8>>>,
+    /// Chunk name applied to every top-level function `load_in_globals`
+    /// compiles, `@`-prefixed like a `load`/`loadfile` filename source (see
+    /// `chunk_sources`). Set once via `set_chunk_name` by the CLI right after
+    /// constructing the runtime, so the program's own top-level compile
+    /// registers a `chunk_sources` entry the same way `load`/`loadfile` do -
+    /// otherwise `debug.getinfo(1).source` on the running main chunk is nil.
+    default_chunk_name: Option<Rc<Vec<u8>>>,
     /// `string.dump`'s process-local prototype registry. Sol's dump envelope
     /// starts with the canonical Lua 5.5 binary header and validates every
     /// byte of it, but its body is still an opaque key into this map rather
@@ -438,7 +446,11 @@ pub fn run_program_with_natives(
 
 /// Like `run_program_with_natives`, but also overrides the resource budgets
 /// (see `LuaRuntime::with_capabilities_and_budgets`) and optionally enables
-/// GC stress mode (see `LuaRuntime::set_gc_stress`) for the run.
+/// GC stress mode (see `LuaRuntime::set_gc_stress`) for the run. `chunk_name`,
+/// when given, is registered as the top-level chunk's `debug.getinfo` source
+/// (see `LuaRuntime::set_chunk_name`) - the `sol` CLI passes its `@`-prefixed
+/// script path here so the running main chunk reports `source`/`short_src`
+/// the same way a `load`ed chunk does.
 #[allow(clippy::too_many_arguments)]
 pub fn run_program_with_natives_and_budgets(
     program: &Program,
@@ -449,6 +461,7 @@ pub fn run_program_with_natives_and_budgets(
     max_call_depth: usize,
     allocation_budget: usize,
     gc_stress: bool,
+    chunk_name: Option<Vec<u8>>,
 ) -> LuaResult<LuaRun> {
     let mut runtime = LuaRuntime::with_capabilities_and_budgets(
         capabilities,
@@ -457,6 +470,9 @@ pub fn run_program_with_natives_and_budgets(
         allocation_budget,
     );
     runtime.set_gc_stress(gc_stress);
+    if let Some(chunk_name) = chunk_name {
+        runtime.set_chunk_name(chunk_name);
+    }
     match runtime.run_with_natives(program, native_names, natives) {
         Ok(value) => Ok(LuaRun {
             value,
@@ -480,6 +496,7 @@ pub fn run_program_with_natives_budgets_and_plan(
     allocation_budget: usize,
     gc_stress: bool,
     optimization_plan: &crate::typeck::inference::OptimizationPlan,
+    chunk_name: Option<Vec<u8>>,
 ) -> LuaResult<LuaRun> {
     let mut runtime = LuaRuntime::with_capabilities_and_budgets(
         capabilities,
@@ -488,6 +505,9 @@ pub fn run_program_with_natives_budgets_and_plan(
         allocation_budget,
     );
     runtime.set_gc_stress(gc_stress);
+    if let Some(chunk_name) = chunk_name {
+        runtime.set_chunk_name(chunk_name);
+    }
     match runtime.run_with_natives_and_plan(program, native_names, natives, optimization_plan) {
         Ok(value) => Ok(LuaRun {
             value,
