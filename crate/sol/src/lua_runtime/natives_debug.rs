@@ -577,14 +577,13 @@ impl LuaRuntime {
         set(b"currentline", LuaValue::Integer(current_line));
         set(b"extraargs", LuaValue::Integer(extraargs));
         let linedefined = proto.line_defined as i64;
-        let mut lastlinedefined = linedefined;
+        let lastlinedefined = proto.last_line_defined as i64;
         // `activelines`: real Lua's `funcinfo` builds this as a set (line ->
         // `true`) of every line this prototype's own bytecode maps to - not
         // its nested closures', which carry separate `Proto`s/source maps.
         let activelines = Rc::new(RefCell::new(LuaTable::default()));
         for pc in 0..proto.source_map.len() as u32 {
             if let Some(location) = proto.source_map.location(pc) {
-                lastlinedefined = lastlinedefined.max(location.line as i64);
                 activelines
                     .borrow_mut()
                     .set(LuaValue::Integer(location.line as i64), LuaValue::Bool(true))

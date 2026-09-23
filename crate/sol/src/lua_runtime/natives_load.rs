@@ -417,6 +417,7 @@ impl LuaRuntime {
             return_type: None,
             body: Vec::new(),
             line: 1,
+            end_line: 1,
             is_global_decl: false,
             source_span: crate::diagnostic::SourceSpan::new(0, 0, 1, 1),
         });

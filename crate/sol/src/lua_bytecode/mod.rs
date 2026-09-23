@@ -180,10 +180,14 @@ impl Compiler {
             self.stack.pop();
             return Err(error);
         }
-        // Implicit `return` at the end of a function body.
+        // Implicit `return` at the end of a function body - attributed to
+        // the closing `end`'s line, matching real Lua (`luaK_ret` emitted
+        // from `close_func`/`lparser.c` after the body, at the `end` token's
+        // line) - not the function's own declaration line, so this doesn't
+        // fold into `activelines[linedefined]`.
         let level = self.level();
-        self.stack[level].emit(Instr::Return(0, ValueCount::ZERO), function.line);
-        if let Err(error) = self.stack[level].pop_scope(function.line) {
+        self.stack[level].emit(Instr::Return(0, ValueCount::ZERO), function.end_line);
+        if let Err(error) = self.stack[level].pop_scope(function.end_line) {
             self.stack.pop();
             return Err(error);
         }
@@ -223,6 +227,7 @@ impl Compiler {
             captured_cell_count,
             nested: std::mem::take(&mut state.nested),
             line_defined: function.line,
+            last_line_defined: function.end_line,
         }))
     }
 

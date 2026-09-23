@@ -429,6 +429,52 @@ fn dynamic_lua_runtime_debug_getinfo_builds_activelines_from_the_source_map() {
 }
 
 #[test]
+fn dynamic_lua_runtime_debug_getinfo_reports_lastlinedefined_as_the_closing_end_line() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `lua-5.5.1-tests/db.lua` lines 41-48, reproduced exactly: `test` spans
+    // 10 source lines (declaration through closing `end`), so
+    // `lastlinedefined == linedefined + 10` must hold, and `activelines` must
+    // include the closing `end` line (the implicit `return` lands there) but
+    // exclude the declaration line itself - regression coverage for two
+    // compiler line-info bugs: `lastlinedefined` was approximated as the max
+    // line in the source map instead of the real closing-`end` line, and the
+    // implicit `return`/`CloseSlots` at function exit were attributed to the
+    // declaration line instead of the closing `end` line.
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let value = runtime
+        .run(&parse(
+            br#"
+            local function test (s, l, p)     -- line 1
+              collectgarbage()                -- line 2
+              local function f (event, line)  -- line 3
+                assert(event == 'line')       -- line 4
+                local l = table.remove(l, 1)  -- line 5
+                if p then print(l, line) end  -- line 6
+                assert(l == line, "x")        -- line 7
+              end                             -- line 8
+              debug.sethook(f,"l")            -- line 9
+              print(1)                        -- line 10
+            end                               -- line 11
+            local b = debug.getinfo(test, "SfL")
+            local ok = b.lastlinedefined == b.linedefined + 10
+              and b.activelines[b.linedefined + 1]
+              and b.activelines[b.lastlinedefined]
+              and not b.activelines[b.linedefined]
+              and not b.activelines[b.lastlinedefined + 1]
+            return ok
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_debug_getinfo_omits_activelines_for_native_functions() {
     use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
 

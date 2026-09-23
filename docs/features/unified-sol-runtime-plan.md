@@ -1627,17 +1627,29 @@ all three `sol run` call sites in `main.rs` with the `@`-prefixed script
 path, registers a `chunk_sources` entry for the CLI's own top-level compile
 the same way `load`/`loadfile` already do, so `debug.getinfo(1).source`/
 `.short_src` are no longer `nil` for the running main chunk. Running `db.lua`
-against the pinned oracle past this fix surfaces two further, distinct,
-previously-hidden gaps - both in the bytecode compiler's line-info
-generation, not in the `debug` library: `lastlinedefined` is approximated as
-the maximum line number appearing anywhere in `proto.source_map` rather than
-the actual line of the function's closing `end` token (no end-line is
-tracked anywhere today - `ast::Function`/`Proto` only carry a start line),
-and at least one prologue instruction in a function's own bytecode is
-attributed to its declaration line itself rather than its first body
-statement's line, so `activelines` incorrectly includes the declaration
-line. `db.lua` stays `pending` on these two narrower, newly-identified
-compiler gaps rather than being promoted.
+against the pinned oracle past this fix surfaced two further, distinct
+bytecode-compiler line-info gaps, both now fixed: `lastlinedefined` was
+approximated as the maximum line number appearing anywhere in
+`proto.source_map` rather than the actual line of the function's closing
+`end` token; fixed by adding `ast::Function::end_line` (populated at all 3
+parser construction sites from the closing-token span the parser already
+computed and discarded) and a parallel `Proto::last_line_defined`, with
+`describe_lua_proto` reporting it directly instead of scanning for a max.
+Separately, the implicit `return` synthesized at the end of every function
+body, and the `CloseSlots` instruction emitted when popping the function's
+outermost scope, were both attributed to the function's declaration line
+instead of its closing `end` line (matching real Lua's `luaK_ret`/
+`close_func` in `lparser.c`), which incorrectly folded the declaration line
+into `activelines`; fixed in `Compiler::compile_function`
+(`crate/sol/src/lua_bytecode/mod.rs`) by emitting both at `function.end_line`.
+With both fixed, `db.lua`'s full `linedefined`/`lastlinedefined`/
+`activelines` boundary assertions (lines 41-48) now pass exactly against the
+oracle. `db.lua` stays `pending`: it now progresses to line 57's
+`assert(#actl == 0)`, which needs `string.dump(f, true)`'s strip flag to
+actually omit debug info from the dumped/reloaded closure - Sol's
+`string.dump` is an opaque key into a process-local prototype registry, not a
+real bytecode serializer, so the strip flag is currently a no-op. That is a
+separate, pre-existing gap, out of scope for this line-info fix.
 
 ### U7 — Interpreter performance foundation
 

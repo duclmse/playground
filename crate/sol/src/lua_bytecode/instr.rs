@@ -201,6 +201,13 @@ pub struct Proto {
     /// coincide for a one-line function but not for a multi-line signature
     /// or an empty body whose first instruction is the implicit `return`.
     pub line_defined: u32,
+    /// The line of this function's closing `end` - real Lua's
+    /// `debug.getinfo`'s `lastlinedefined` (`lua_Debug::lastlinedefined`,
+    /// set once in `close_func`/`lparser.c` from the `end`/EOZ token's own
+    /// line). Not derived from where the last instruction happens to land -
+    /// no code executes *on* the `end` line itself, so scanning instruction
+    /// line info can never recover it. From `ast::Function::end_line`.
+    pub last_line_defined: u32,
 }
 
 impl ExecutablePrototype for Proto {

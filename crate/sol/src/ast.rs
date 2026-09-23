@@ -84,6 +84,13 @@ pub struct Function {
     pub return_type: Option<TypeName>,
     pub body: Block,
     pub line: u32,
+    /// The line of this function's closing `end` (real Lua's own
+    /// `lastlinedefined`, tracked in `close_func`/`lparser.c` at the
+    /// `end`/EOZ token) - the top-level "main" chunk (no explicit `function`
+    /// keyword) uses the source's last token's line instead, since it has no
+    /// `end` of its own. Distinct from `source_span.line`, which is this
+    /// function's *starting* line.
+    pub end_line: u32,
     /// Full byte range of the declaration, from `function`/`fn` through its
     /// closing `end`. `source_file` supplies the file component when loaded as
     /// part of a module graph.

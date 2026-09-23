@@ -616,6 +616,7 @@ impl Parser {
                 return_type: None,
                 body: chunk,
                 line: 1,
+                end_line: self.tokens.last().map_or(1, |last| last.span.line),
                 is_global_decl: false,
                 source_span: match (self.tokens.first(), self.tokens.last()) {
                     (Some(first), Some(last)) => crate::diagnostic::SourceSpan::new(
@@ -719,6 +720,7 @@ impl Parser {
             return_type,
             body,
             line,
+            end_line: end.line,
             is_global_decl: false,
             source_span: crate::diagnostic::SourceSpan::new(
                 start.start,
@@ -1528,6 +1530,7 @@ impl Parser {
                         return_type: None,
                         body,
                         line,
+                        end_line: end.line,
                         is_global_decl: false,
                         source_span: crate::diagnostic::SourceSpan::new(
                             start.start,
