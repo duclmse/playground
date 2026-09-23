@@ -597,6 +597,8 @@ pub(super) enum LuaKey {
     GMatchIterator(RcRef<GMatchState>),
     Thread(Rc<LuaCoroutine>),
     CoroutineWrapper(Rc<LuaCoroutine>),
+    Userdata(CanonicalUserdata),
+    LightUserdata(usize),
 }
 
 impl PartialEq for LuaKey {
@@ -616,6 +618,8 @@ impl PartialEq for LuaKey {
             (Self::GMatchIterator(a), Self::GMatchIterator(b)) => Rc::ptr_eq(a, b),
             (Self::Thread(a), Self::Thread(b)) => Rc::ptr_eq(a, b),
             (Self::CoroutineWrapper(a), Self::CoroutineWrapper(b)) => Rc::ptr_eq(a, b),
+            (Self::Userdata(a), Self::Userdata(b)) => a.object_id() == b.object_id(),
+            (Self::LightUserdata(a), Self::LightUserdata(b)) => a == b,
             _ => false,
         }
     }
@@ -641,6 +645,8 @@ impl std::hash::Hash for LuaKey {
             Self::GMatchIterator(value) => (Rc::as_ptr(value) as usize).hash(state),
             Self::Thread(value) => (Rc::as_ptr(value) as usize).hash(state),
             Self::CoroutineWrapper(value) => (Rc::as_ptr(value) as usize).hash(state),
+            Self::Userdata(value) => value.object_id().hash(state),
+            Self::LightUserdata(value) => value.hash(state),
         }
     }
 }
@@ -1184,8 +1190,9 @@ impl LuaValue {
             Self::GMatchIterator(value) => Ok(LuaKey::GMatchIterator(value.clone())),
             Self::Thread(value) => Ok(LuaKey::Thread(value.clone())),
             Self::CoroutineWrapper(value) => Ok(LuaKey::CoroutineWrapper(value.clone())),
+            Self::Userdata(value) => Ok(LuaKey::Userdata(value.clone())),
+            Self::LightUserdata(value) => Ok(LuaKey::LightUserdata(*value)),
             Self::Nil => Err(LuaError::new("table index is nil")),
-            _ => Err(LuaError::new("table index has an unsupported type")),
         }
     }
 
@@ -1525,6 +1532,8 @@ impl LuaKey {
             Self::GMatchIterator(value) => LuaValue::GMatchIterator(value.clone()),
             Self::Thread(value) => LuaValue::Thread(value.clone()),
             Self::CoroutineWrapper(value) => LuaValue::CoroutineWrapper(value.clone()),
+            Self::Userdata(value) => LuaValue::Userdata(value.clone()),
+            Self::LightUserdata(value) => LuaValue::LightUserdata(*value),
         }
     }
 }

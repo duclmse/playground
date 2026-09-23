@@ -1053,6 +1053,44 @@ implemented feature (`docs/features/lua-compatibility.md`'s Phase 4;
 with "requires resource finalization, which is not implemented yet"), not a
 small bug fix like the ones above.
 
+`<close>`/to-be-closed-variable support has since been implemented in full
+(see the `goto.lua`/`debug.upvalueid` work below and
+`tests/lua55/manifest.toml`'s `nextvar.lua` entry for the complete history),
+unblocking `assert(closed)` and letting `nextvar.lua` reach its "testing
+ipairs with metamethods" section, where `ipairs`'s iterator read table slots
+with raw access instead of routing through `__index` (Lua's `ipairs` has used
+ordinary, metamethod-respecting indexing since 5.3); fixed by routing it
+through the same metamethod-aware `LuaRuntime::index_get` helper
+`table.insert`/`remove`/`concat`/`unpack`/`sort` already use. With everything
+above fixed, the file's only remaining blocker was `sol run`'s default
+sandboxed-embedder-sized instruction/allocation budgets (sized for untrusted
+code, not this file's own hash-collision and 50,000-element stress sections).
+Re-tested under this case's own elevated `budget`/`alloc_budget` manifest
+overrides — the same mechanism `sort.lua` already uses, rather than touching
+`sol run`'s product-wide defaults — the file progressed further still and
+surfaced one more genuine, previously-masked bug in its "testing next with
+all kinds of keys" section (line 479): `LuaValue::key()` and its companion
+`LuaKey` enum (`crates/sol/src/lua_runtime/value.rs`) explicitly handled
+every `LuaValue` variant usable as a table key except `Userdata` and
+`LightUserdata`, so indexing a table with a userdata key (e.g. `[io.stdin] =
+9`, a file handle) fell through to the generic "table index has an
+unsupported type" catch-all instead of keying by the userdata's object
+identity the way `CanonicalTable`/`CFunction` already do. Fixed by adding
+`Userdata`/`LightUserdata` arms to `LuaKey`, its `PartialEq`/`Hash` impls,
+`LuaValue::key()`, and `LuaKey::value()` (mirroring the existing
+`object_id()`-based identity `CanonicalTable` already uses), which also let
+the now-exhaustive match in `key()` drop its unreachable catch-all arm. With
+that fixed, `nextvar.lua` runs to completion and prints `OK` under the budget
+override, matching the pinned oracle line-for-line except two pre-existing,
+unrelated, cosmetic differences: the file's own `math.randomseed()`-derived
+seed-report line is inherently non-deterministic (differs between any two
+runs, oracle included), and `sol run`'s CLI harness prints the top-level
+chunk's own return value as a trailing line after every script's output (the
+same pre-existing artifact already documented on `literals.lua`'s case). The
+manifest entry moves from `pending` to `diverges` (not `pass`) for those two
+reasons alone, with `budget = 200000000`/`alloc_budget = 268435456`
+overrides.
+
 `goto.lua`'s label/goto validation is now implemented in the dynamic bytecode
 compiler: `FuncState` tracks a live active-local count per scope (mirroring
 real Lua's `fs->nactvar`), clamps a bubbled-out pending goto's count to its

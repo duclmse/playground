@@ -670,6 +670,55 @@ fn parser_reports_the_lua_compatible_near_token_or_near_eof_suffix_for_an_unexpe
     assert!(String::from_utf8_lossy(&output.stdout).contains("near suffix ok"));
 }
 
+/// `LuaValue::key()`/its companion `LuaKey` enum used to handle every table
+/// key type except `Userdata`/`LightUserdata`, so indexing a table with a
+/// userdata key (e.g. `[io.stdin] = ...`, a `FILE*` handle) fell through to
+/// the generic "table index has an unsupported type" catch-all instead of
+/// keying by the userdata's object identity the way `CanonicalTable` already
+/// does - surfaced by `nextvar.lua`'s "testing next with all kinds of keys"
+/// section. `debug.upvalueid` values (`LightUserdata`) hit the same gap.
+#[test]
+fn a_userdata_or_light_userdata_value_can_be_used_as_a_table_key() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_userdata_key_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local t = {}
+        t[io.stdin] = "stdin"
+        t[io.stdout] = "stdout"
+        assert(t[io.stdin] == "stdin")
+        assert(t[io.stdout] == "stdout")
+        assert(next(t) ~= nil)
+
+        local function outer()
+            local x = 1
+            local function inner() return x end
+            return inner
+        end
+        local c1, c2 = outer(), outer()
+        local u = {}
+        u[debug.upvalueid(c1, 1)] = "c1"
+        assert(u[debug.upvalueid(c1, 1)] == "c1")
+        assert(u[debug.upvalueid(c2, 1)] == nil)
+
+        print("userdata key ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("userdata key ok"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();
