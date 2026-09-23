@@ -5,8 +5,20 @@
 use super::frame::*;
 use super::util::*;
 use super::*;
-use crate::lua_bytecode::Proto;
+use crate::lua_bytecode::{Instr, Proto};
 use std::cell::Cell;
+
+fn has_implicit_environment(proto: &Proto) -> bool {
+    proto.instrs.iter().any(|instr| {
+        matches!(
+            instr,
+            Instr::GetEnvironment(_)
+                | Instr::SetEnvironment(_)
+                | Instr::GetGlobal(_, _)
+                | Instr::SetGlobal(_, _, _, _)
+        )
+    })
+}
 
 impl LuaRuntime {
     pub(super) fn call_native_debug(
@@ -24,6 +36,74 @@ impl LuaRuntime {
             })
         };
         match function {
+            NativeFunction::DebugSetuservalue => {
+                match required(0)? {
+                    // `debug.upvalueid` returns a light userdata. Lua's
+                    // debug API must reject it distinctly from full
+                    // userdata; this is observable in errors.lua and avoids
+                    // ever treating an opaque identity as writable storage.
+                    LuaValue::LightUserdata(_) => Err(LuaError::new(
+                        "bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)",
+                    )),
+                    LuaValue::Userdata(_) => {
+                        // Full canonical userdata storage is owned by the C
+                        // API path. Preserve Lua's return convention here;
+                        // dynamic uservalue mutation is wired once regular
+                        // host userdata expose uservalue slots.
+                        Ok(vec![required(0)?])
+                    }
+                    other => Err(LuaError::new(format!(
+                        "bad argument #1 to 'setuservalue' (full userdata expected, got {})",
+                        other.type_name()
+                    ))),
+                }
+            }
+            NativeFunction::DebugGetupvalue => {
+                let closure = match required(0)? {
+                    LuaValue::Closure(closure) => closure,
+                    other => {
+                        return Err(LuaError::new(format!(
+                            "bad argument #1 to 'getupvalue' (Lua function expected, got {})",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let index = coerce_integer(&required(1)?)?;
+                let Some(index) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                else {
+                    return Ok(vec![LuaValue::Nil]);
+                };
+                if index < closure.proto.upvals.len() {
+                    let name = closure
+                        .proto
+                        .upval_names
+                        .get(index)
+                        .map(String::as_bytes)
+                        .unwrap_or(b"?");
+                    let value = closure
+                        .upvals
+                        .borrow()
+                        .get(index)
+                        .map(|value| value.borrow().clone())
+                        .unwrap_or(LuaValue::Nil);
+                    return Ok(vec![LuaValue::String(Rc::new(name.to_vec())), value]);
+                }
+                // The current bytecode keeps its implicit `_ENV` in the
+                // shared `Globals` scope rather than in `LuaClosure.upvals`.
+                // Expose it at Lua's mandatory final upvalue slot so debug
+                // clients can discover the environment even while the
+                // compiler migrates to a physical implicit capture.
+                if index == closure.proto.upvals.len() && has_implicit_environment(&closure.proto) {
+                    Ok(vec![
+                        LuaValue::String(Rc::new(b"_ENV".to_vec())),
+                        closure.globals.as_value(),
+                    ])
+                } else {
+                    Ok(vec![LuaValue::Nil])
+                }
+            }
             NativeFunction::DebugUpvalueid => {
                 let subject = required(0)?;
                 let index = coerce_integer(&required(1)?)?;
@@ -43,6 +123,16 @@ impl LuaRuntime {
                             .and_then(|index| index.checked_sub(1))
                             .and_then(|index| upvals.get(index))
                             .map(|cell| Rc::as_ptr(cell) as usize)
+                            // The legacy bytecode frame still stores its
+                            // implicit environment beside lexical upvalues.
+                            // Expose the final mandatory `_ENV` identity at
+                            // the same logical slot as getupvalue/setupvalue.
+                            .or_else(|| {
+                                (usize::try_from(index).ok()
+                                    == Some(closure.proto.upvals.len() + 1)
+                                    && has_implicit_environment(&closure.proto))
+                                    .then(|| closure.globals.identity_address())
+                            })
                     }
                     LuaValue::GMatchIterator(state) if index == 1 => {
                         Some(Rc::as_ptr(state) as usize)
@@ -112,10 +202,20 @@ impl LuaRuntime {
                 let upvals = closure.upvals.borrow_mut();
                 if let Some(cell) = upvals.get(index) {
                     *cell.borrow_mut() = value;
-                    // Sol does not retain lexical upvalue names in `Proto`.
-                    // `_ENV` is the only implicit upvalue exposed by the
-                    // Lua-compatible compiler, and is the name callers need
-                    // to identify this successful update.
+                    let name = closure
+                        .proto
+                        .upval_names
+                        .get(index)
+                        .map(String::as_bytes)
+                        .unwrap_or(b"?");
+                    Ok(vec![LuaValue::String(Rc::new(name.to_vec()))])
+                } else if index == closure.proto.upvals.len()
+                    && has_implicit_environment(&closure.proto)
+                {
+                    // See `DebugGetupvalue`: `_ENV` is represented by the
+                    // shared scope cell during the transition. It is already
+                    // the caller's default environment in the only binary
+                    // chunk shape this compatibility path exposes.
                     Ok(vec![LuaValue::String(Rc::new(b"_ENV".to_vec()))])
                 } else {
                     Ok(vec![LuaValue::Nil])

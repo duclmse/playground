@@ -28,7 +28,7 @@ impl LuaRuntime {
         let mut heap = sol_core::Heap::new(Capabilities::default());
         let c_registry = heap.alloc_table();
         let c_registry_root = heap.add_root(sol_core::Value::object(c_registry));
-        let runtime = Self {
+        let mut runtime = Self {
             canonical_heap: Rc::new(RefCell::new(heap)),
             c_registry,
             _c_registry_root: c_registry_root,
@@ -49,6 +49,7 @@ impl LuaRuntime {
             weak_tables: Vec::new(),
             gc_tables: RefCell::new(Vec::new()),
             gc_closures: RefCell::new(Vec::new()),
+            charge_ledger: RefCell::new(HashMap::new()),
             coroutine_stack: Vec::new(),
             main_coroutine: LuaCoroutine::main_thread(),
             gc_stress: false,
@@ -69,6 +70,7 @@ impl LuaRuntime {
             c_function_ids: HashMap::new(),
             c_light_userdata: RefCell::new(HashMap::new()),
             c_light_userdata_reverse: RefCell::new(HashMap::new()),
+            file_userdata: HashSet::new(),
             c_warning_function: None,
             c_warning_data: std::ptr::null_mut(),
             c_thread_states: RefCell::new(HashMap::new()),
@@ -174,7 +176,7 @@ impl LuaRuntime {
             .unwrap();
     }
 
-    fn install_base(&self) {
+    fn install_base(&mut self) {
         self.globals.define(
             "print",
             LuaValue::NativeFunction(NativeFunction::Print),
@@ -543,6 +545,7 @@ impl LuaRuntime {
         for (name, function) in [
             ("write", NativeFunction::IoWrite),
             ("read", NativeFunction::IoRead),
+            ("input", NativeFunction::IoInput),
             ("output", NativeFunction::IoOutput),
             ("close", NativeFunction::FileClose),
         ] {
@@ -593,13 +596,29 @@ impl LuaRuntime {
                 LuaValue::Table(self.io_stderr.clone()),
             )
             .unwrap();
-        // Stable default-input handle. The portable sandbox exposes reading
-        // through `io.read`; retaining a real object here still matches
-        // Lua's identity/type behavior for `io.stdin` (notably `%p`).
+        // Stable default-input handle. File handles are full userdata, not
+        // tables, so `rawlen` and numeric-for diagnostics retain Lua's type
+        // distinction without exposing host storage to ordinary indexing.
+        let stdin = self.new_userdata(0);
+        if let LuaValue::Userdata(userdata) = &stdin {
+            self.file_userdata.insert(userdata.object_id());
+            let metatable = CanonicalTable::allocate(self.canonical_heap.clone());
+            let mut heap = self.canonical_heap.borrow_mut();
+            let name_key = heap.alloc_string(b"__name");
+            let name_value = heap.alloc_string(b"FILE*");
+            heap.table_set(
+                metatable.object_id(),
+                sol_core::Value::object(name_key),
+                sol_core::Value::object(name_value),
+            )
+            .expect("fresh canonical file metatable accepts __name");
+            heap.set_metatable(userdata.object_id(), Some(metatable.object_id()))
+                .expect("fresh canonical file userdata accepts a metatable");
+        }
         io.borrow_mut()
             .set(
                 LuaValue::String(Rc::new(b"stdin".to_vec())),
-                LuaValue::Table(Rc::new(RefCell::new(LuaTable::default()))),
+                stdin,
             )
             .unwrap();
         let coroutine = Rc::new(RefCell::new(LuaTable::default()));
@@ -630,6 +649,7 @@ impl LuaRuntime {
 
         let debug = Rc::new(RefCell::new(LuaTable::default()));
         for (name, function) in [
+            ("getupvalue", NativeFunction::DebugGetupvalue),
             ("upvalueid", NativeFunction::DebugUpvalueid),
             ("upvaluejoin", NativeFunction::DebugUpvaluejoin),
             ("setupvalue", NativeFunction::DebugSetupvalue),
@@ -639,6 +659,7 @@ impl LuaRuntime {
             ("traceback", NativeFunction::DebugTraceback),
             ("sethook", NativeFunction::DebugSethook),
             ("gethook", NativeFunction::DebugGethook),
+            ("setuservalue", NativeFunction::DebugSetuservalue),
         ] {
             debug
                 .borrow_mut()

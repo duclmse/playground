@@ -38,7 +38,8 @@ impl LuaRuntime {
             {
                 Some("filesystem")
             }
-            NativeFunction::DebugUpvalueid
+            NativeFunction::DebugGetupvalue
+            | NativeFunction::DebugUpvalueid
             | NativeFunction::DebugUpvaluejoin
             | NativeFunction::DebugSetupvalue
             | NativeFunction::DebugGetinfo
@@ -47,6 +48,7 @@ impl LuaRuntime {
             | NativeFunction::DebugTraceback
             | NativeFunction::DebugSethook
             | NativeFunction::DebugGethook
+            | NativeFunction::DebugSetuservalue
                 if !self.capabilities.debug =>
             {
                 Some("debug")
@@ -149,7 +151,8 @@ impl LuaRuntime {
             | NativeFunction::OsRemove
             | NativeFunction::OsSetlocale
             | NativeFunction::OsTmpname
-            | NativeFunction::IoRead => self.call_native_os_io(function, args),
+            | NativeFunction::IoRead
+            | NativeFunction::IoInput => self.call_native_os_io(function, args),
             NativeFunction::CoroutineCreate
             | NativeFunction::CoroutineResume
             | NativeFunction::CoroutineYield
@@ -158,7 +161,8 @@ impl LuaRuntime {
             | NativeFunction::CoroutineRunning
             | NativeFunction::CoroutineIsYieldable
             | NativeFunction::CoroutineClose => self.call_native_coroutine(function, args),
-            NativeFunction::DebugUpvalueid
+            NativeFunction::DebugGetupvalue
+            | NativeFunction::DebugUpvalueid
             | NativeFunction::DebugUpvaluejoin
             | NativeFunction::DebugSetupvalue
             | NativeFunction::DebugGetinfo
@@ -166,7 +170,8 @@ impl LuaRuntime {
             | NativeFunction::DebugSetmetatable
             | NativeFunction::DebugTraceback
             | NativeFunction::DebugSethook
-            | NativeFunction::DebugGethook => self.call_native_debug(function, args),
+            | NativeFunction::DebugGethook
+            | NativeFunction::DebugSetuservalue => self.call_native_debug(function, args),
             NativeFunction::Require
             | NativeFunction::PackageSearchPath
             | NativeFunction::PackageSearcherPreload

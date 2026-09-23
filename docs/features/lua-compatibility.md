@@ -195,12 +195,19 @@ represented by the current scalar-only `any` box.
 - [~] Give every Lua module its own `_ENV` table and resolve reads/writes via
       that environment. Implement `global` declarations through explicit
       environment slots/metadata, including their const constraints. The
-      legacy dynamic runtime now backs each `Globals` scope with a real
+      legacy dynamic runtime backs each `Globals` scope by default with a real
       `LuaTable`, exposes the root table as `_G`, returns it for the implicit
       `_ENV`, and compiles global reads/writes through a lexically rebound
-      local or captured `_ENV` when present. Closures therefore share mutations
-      to an explicitly supplied environment. The remaining U2 work is to move
-      these tables/cells onto canonical `sol-core` handles, make default global
+      local or captured `_ENV` when present. `_ENV` is a real, arbitrary-value
+      upvalue rather than a table-only binding: `Globals::from_value`/
+      `set_value` let a closure capture and rebind `_ENV` to any `LuaValue`
+      (including a plain table assembled at runtime, not only the module's own
+      root table), and `debug.getupvalue`/`setupvalue` expose the implicit
+      `_ENV` upvalue like any other captured local. Closures therefore share
+      mutations to an explicitly supplied environment. The upstream `calls.lua`
+      corpus file, which exercises exactly this arbitrary-`_ENV` pattern, now
+      passes against the pinned oracle. The remaining U2 work is to move these
+      tables/cells onto canonical `sol-core` handles, make default global
       accesses use the complete table metamethod path, and define how Sol's
       `global <const>` metadata behaves when `_ENV` is an arbitrary user table.
       A bare `global name1, name2` declaration (no `= value`) retains each
@@ -265,7 +272,16 @@ typed top-level function values.
       error values and a bounded, useful stack trace. Add recursion/instruction
       budgets before host-exposed sandbox use. Recursion, instruction/backedge,
       and heap table/closure allocation budgets are enforced; exact byte and
-      environment accounting awaits the dynamic GC allocator. `assert(v)` with
+      environment accounting awaits the dynamic GC allocator. Growing an
+      existing table past its allocation budget (not just creating a new one)
+      now goes through the same charge path (`charge_new_table_entry`,
+      `LuaTable::charged_bytes`, with `collect_cycles` crediting back
+      collected bytes), so unbounded table growth raises a catchable
+      `LuaError` instead of an uncharged/uncatchable overflow; the upstream
+      `heavy.lua` corpus file now runs to completion under `pcall` and matches
+      the pinned oracle's structural behavior (differing only in exact error
+      text and byte counts, tracked as `diverges` in the manifest, the same
+      category as `sort.lua`'s non-deterministic timing output). `assert(v)` with
       no explicit message now raises the literal `"assertion failed!"` on a
       falsy `v` (previously it stringified the falsy `v` itself as the error
       message, e.g. `assert(false)` raised `"false"`). `LuaError` now carries
@@ -371,9 +387,13 @@ upvalues and final-expression result expansion.
       `string.pack`/`unpack`/`packsize` are implemented
       (`crates/sol/src/lua_pack.rs`: endianness `<`/`>`/`=`, alignment
       `!`/`!n`, integers `b`/`B`/`h`/`H`/`i`/`I`/`l`/`L`/`j`/`J`/`T`, floats
-      `f`/`d`/`n`, strings `s`/`z`/`c`, padding `x`); the align-without-storing
-      `Xop` option is not implemented and errors clearly if used. Broader
-      remaining math error-provenance edge case is tracked by the manifest.
+      `f`/`d`/`n`, strings `s`/`z`/`c`, padding `x`), including the
+      align-without-storing `X` option (`x_alignment`/`align_pad`/
+      `align_skip`: `X` reads the option that follows it and pads to that
+      option's natural alignment without consuming or emitting any bytes of
+      its own). The upstream `tpack.lua` corpus file now passes against the
+      pinned oracle. Broader remaining math error-provenance edge case is
+      tracked by the manifest.
 - [x] Implement a sandboxed `package`/`require`: an explicit host-provided
       loader (`LuaRuntime::add_module`) registers exact-name in-memory module
       sources; `package.loaded` caches each module's result so repeated

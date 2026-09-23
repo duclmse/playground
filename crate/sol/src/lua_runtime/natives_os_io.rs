@@ -6,6 +6,27 @@ use super::util::*;
 use super::*;
 
 impl LuaRuntime {
+    /// Whether a value is one of the host-owned full-userdata file handles.
+    /// Keeping this beside the I/O natives makes the capability boundary
+    /// explicit: no other native subsystem may treat userdata as a file.
+    pub(super) fn is_file_userdata(&self, value: &LuaValue) -> bool {
+        matches!(value, LuaValue::Userdata(userdata) if self.file_userdata.contains(&userdata.object_id()))
+    }
+
+    /// Returns the stable standard-input userdata installed by `init.rs`.
+    /// `io.input()` is allowed to expose this identity without performing a
+    /// read; `io.read()` remains capability-gated separately.
+    pub(super) fn stdin_handle(&self) -> LuaValue {
+        let LuaValue::Table(io) = self.globals.get("io") else {
+            return LuaValue::Nil;
+        };
+        let stdin = io
+            .borrow()
+            .get(&LuaValue::String(Rc::new(b"stdin".to_vec())))
+            .unwrap_or(LuaValue::Nil);
+        stdin
+    }
+
     pub(super) fn call_native_os_io(
         &mut self,
         function: NativeFunction,
@@ -333,6 +354,14 @@ impl LuaRuntime {
                     ))),
                 }
             }
+            NativeFunction::IoInput => match args.first() {
+                None | Some(LuaValue::Nil) => Ok(vec![self.stdin_handle()]),
+                Some(value) if self.is_file_userdata(value) => Ok(vec![value.clone()]),
+                Some(value) => Err(LuaError::new(format!(
+                    "bad argument #1 to 'input' (FILE* expected, got {})",
+                    self.error_type_label(value)
+                ))),
+            },
             _ => unreachable!("call_native_os_io received a non-os_io NativeFunction"),
         }
     }

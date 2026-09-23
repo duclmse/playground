@@ -92,6 +92,106 @@ fn dynamic_lua_runtime_reclaims_reference_cycles_via_collectgarbage() {
 }
 
 #[test]
+fn dynamic_lua_runtime_charges_growth_of_a_single_table_against_allocation_budget() {
+    use sol::lua_runtime::LuaRuntime;
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // Table *creation* charges only the fixed `LuaTable` header
+    // (`Instr::NewTable`). Before `charge_new_table_entry`, growing that same
+    // table with new keys (`t[i] = i`) was unmetered, so a loop like this one
+    // ran until only the separate, non-resettable instruction budget stopped
+    // it, never the allocation budget. A single long-lived table growing well
+    // past a small allocation budget must now be caught here too.
+    let mut runtime = LuaRuntime::with_budgets(1_000_000, 100, 512);
+    let error = runtime
+        .run(&parse(
+            b"local t = {} for i = 1, 1000000 do t[i] = i end return true",
+        ))
+        .unwrap_err();
+    assert!(error.message.contains("allocation budget"), "{error}");
+}
+
+#[test]
+fn dynamic_lua_runtime_reclaims_a_non_cyclic_parent_table_dropped_by_plain_reassignment() {
+    use sol::lua_runtime::LuaRuntime;
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // `nodes` itself is never part of a cycle - it only holds array
+    // references *down* into `nodes[1]`/`nodes[2]`, which reference each
+    // other (but never back up to `nodes`) to form the cycle. Each loop
+    // iteration's `nodes` binding is dropped by plain `Rc` refcounting the
+    // instant the next iteration's `local nodes = {}` re-declares it -
+    // `collect_cycles`'s trial-deletion reachability walk never runs on it at
+    // all, since its `Weak` entry in `gc_tables` is already dead by the time
+    // any pass observes it. Only `collect_cycles`'s ledger-based rundown
+    // (`record_charge_ledger`/`credit_dead_ledger_entries`) catches this: it
+    // must still credit `nodes`'s header and growth charges back on the very
+    // next `collectgarbage()` call, or this budget - sized to hold only a
+    // couple of iterations' worth of tables - is exhausted long before the
+    // loop completes.
+    let mut runtime = LuaRuntime::with_budgets(1_000_000, 100, 2048);
+    let result = runtime
+        .run(&parse(
+            br#"
+                for i = 1, 200 do
+                    local nodes = {}
+                    nodes[1] = {}
+                    nodes[2] = {}
+                    nodes[1].next = nodes[2]
+                    nodes[2].next = nodes[1]
+                    collectgarbage()
+                end
+                return true
+            "#,
+        ))
+        .unwrap();
+    assert_eq!(result, sol::lua_runtime::LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_table_growth_allocation_budget_is_catchable_via_pcall() {
+    use sol::lua_runtime::{LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // Unlike the hard instruction/call-depth budgets, the allocation budget
+    // that `charge_new_table_entry` enforces must be a genuine, `pcall`-
+    // catchable Lua error - matching real Lua's allocator-driven out-of-
+    // memory error - and the script must be able to keep running afterward
+    // instead of the error unwinding the whole program. This mirrors the
+    // upstream `heavy.lua` corpus file's own `toomanyidx()` shape exactly:
+    // `t` is declared *outside* the `pcall`'d closure (captured as an
+    // upvalue) and stays reachable through the catch. The budget here must
+    // stay well above `charge_new_table_entry`'s per-charge size: boxing `t`
+    // into an upvalue cell and allocating the closure itself both charge the
+    // allocation budget too, and both happen in the *outer* frame before
+    // `pcall` is ever called, so a budget too small to cover that setup
+    // fails outside the protected call instead of inside it.
+    let mut runtime = LuaRuntime::with_budgets(1_000_000, 100, 4096);
+    let result = runtime
+        .run(&parse(
+            br#"
+                local t = {}
+                local ok, err = pcall(function()
+                    for i = 1, 1000000 do t[i] = i end
+                end)
+                local size = #t
+                return (not ok)
+                    and type(err) == "string"
+                    and string.find(err, "allocation budget") ~= nil
+                    and size > 0
+            "#,
+        ))
+        .unwrap();
+    assert_eq!(result, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_reclaims_table_closure_reference_cycles() {
     use sol::lua_runtime::LuaRuntime;
 

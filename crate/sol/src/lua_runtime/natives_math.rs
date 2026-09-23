@@ -120,7 +120,13 @@ impl LuaRuntime {
             | NativeFunction::MathDeg
             | NativeFunction::MathRad => {
                 let input = required(0)?;
-                let value = match coerce_number(&input)? {
+                let value = match coerce_number(&input).map_err(|_| {
+                    LuaError::new(format!(
+                        "bad argument #1 to '{}' (number expected, got {})",
+                        function.name(),
+                        self.error_type_label(&input)
+                    ))
+                })? {
                     Number::Integer(value) => value as f64,
                     Number::Float(value) => value,
                 };

@@ -179,6 +179,16 @@ impl Compiler {
                 value,
                 line,
             } => {
+                // Capturing a name on the left side of a simple assignment
+                // establishes its Lua upvalue slot before captures in the
+                // right-side expression. This matters after string.dump:
+                // `a = b + 1` must retain `a` as upvalue #1 and `b` as #2,
+                // even though the RHS executes first at runtime.
+                if matches!(target, AssignTarget::Name(_)) {
+                    let prepared = self.prepare_assign_target(target, *line)?;
+                    let value_reg = self.compile_expr(value)?;
+                    return self.commit_prepared_target(&prepared, value_reg, *line);
+                }
                 let value_reg = self.compile_expr(value)?;
                 self.compile_assign(target, value_reg, *line)
             }
@@ -705,6 +715,14 @@ impl Compiler {
                 self.stack[level].goto_stmt(name, patch_site, *line)
             }
             Stmt::MultiReturn { values, line } => {
+                // Lua's bytecode encodes a fixed return count in an 8-bit
+                // field where zero means the open/multi-result form.  Its
+                // largest representable explicit list is therefore 254
+                // values; reject a longer source list at compile time rather
+                // than silently accepting bytecode native Lua cannot load.
+                if values.len() > 254 {
+                    return Err(format!("line {line}: too many returns"));
+                }
                 let total_close = self.total_close_count(level);
                 if total_close == 0 {
                     if let [value] = values.as_slice() {

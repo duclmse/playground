@@ -409,6 +409,7 @@ pub enum NativeFunction {
     OsExit,
     IoWrite,
     IoRead,
+    IoInput,
     FileWrite,
     IoOutput,
     FileClose,
@@ -429,6 +430,7 @@ pub enum NativeFunction {
     CoroutineRunning,
     CoroutineIsYieldable,
     CoroutineClose,
+    DebugGetupvalue,
     DebugUpvalueid,
     DebugUpvaluejoin,
     DebugSetupvalue,
@@ -438,6 +440,7 @@ pub enum NativeFunction {
     DebugTraceback,
     DebugSethook,
     DebugGethook,
+    DebugSetuservalue,
 }
 
 impl NativeFunction {
@@ -536,6 +539,7 @@ impl NativeFunction {
             Self::OsExit => "exit",
             Self::IoWrite => "write",
             Self::IoRead => "read",
+            Self::IoInput => "input",
             Self::FileWrite => "write",
             Self::IoOutput => "output",
             Self::FileClose => "close",
@@ -556,6 +560,7 @@ impl NativeFunction {
             Self::CoroutineRunning => "running",
             Self::CoroutineIsYieldable => "isyieldable",
             Self::CoroutineClose => "close",
+            Self::DebugGetupvalue => "getupvalue",
             Self::DebugUpvalueid => "upvalueid",
             Self::DebugUpvaluejoin => "upvaluejoin",
             Self::DebugSetupvalue => "setupvalue",
@@ -565,6 +570,7 @@ impl NativeFunction {
             Self::DebugTraceback => "traceback",
             Self::DebugSethook => "sethook",
             Self::DebugGethook => "gethook",
+            Self::DebugSetuservalue => "setuservalue",
         }
     }
 }
@@ -673,6 +679,14 @@ pub struct LuaTable {
     /// Set once this table's `__gc` metamethod (if any) has been called by
     /// `collect_cycles`, so a finalizer never runs twice for the same table.
     pub(super) finalized: bool,
+    /// Cumulative allocation-budget bytes `charge_new_table_entry` has
+    /// charged for this table's own field growth (beyond its fixed header,
+    /// which `charge_allocation(size_of::<LuaTable>())` already covers at
+    /// creation). `collect_cycles` credits this back alongside the header
+    /// when reclaiming the table, so a script that keeps a table's fields
+    /// churning under `collectgarbage()` doesn't leak budget it never
+    /// actually keeps allocated - see `set_index_resolve`/`raw_set_index`.
+    pub(super) charged_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -833,42 +847,81 @@ pub(super) struct Globals(Rc<GlobalsInner>);
 #[derive(Debug)]
 struct GlobalsInner {
     table: RcRef<LuaTable>,
+    /// The live `_ENV` value shared by every closure compiled against this
+    /// scope.  Lua permits it to be any value; global reads/writes then use
+    /// ordinary indexing semantics and naturally fail for non-indexable
+    /// values. `table` remains the root/module bookkeeping table for the
+    /// legacy module loader while production objects migrate to sol-core.
+    environment: RefCell<LuaValue>,
     constants: RefCell<HashSet<String>>,
     base: Option<Globals>,
 }
 
 impl Globals {
+    pub(super) fn identity_address(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     pub(super) fn root() -> Self {
+        let table = Rc::new(RefCell::new(LuaTable::default()));
         Globals(Rc::new(GlobalsInner {
-            table: Rc::new(RefCell::new(LuaTable::default())),
+            table: table.clone(),
+            environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
             base: None,
         }))
     }
 
     pub(super) fn module(base: &Globals) -> Self {
+        let table = Rc::new(RefCell::new(LuaTable::default()));
         Globals(Rc::new(GlobalsInner {
-            table: Rc::new(RefCell::new(LuaTable::default())),
+            table: table.clone(),
+            environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
             base: Some(base.clone()),
         }))
     }
 
-    /// Wraps an existing, caller-visible table as a chunk's `_ENV` (real
-    /// Lua's `load(chunk, name, mode, env)` fourth argument): unlike
-    /// `module`, this shares `table` itself rather than allocating a private
-    /// one, so global reads/writes from inside the loaded chunk are visible
-    /// to the caller through its own reference to the same table.
-    pub(super) fn from_table(table: RcRef<LuaTable>) -> Self {
+    /// Wraps an arbitrary Lua value as a chunk's `_ENV`. This is valid Lua:
+    /// the value is only required to be a table when the chunk actually
+    /// indexes a global name.
+    pub(super) fn from_value(value: LuaValue) -> Self {
+        let table = match &value {
+            LuaValue::Table(table) => table.clone(),
+            _ => Rc::new(RefCell::new(LuaTable::default())),
+        };
         Globals(Rc::new(GlobalsInner {
             table,
+            environment: RefCell::new(value),
             constants: RefCell::new(HashSet::new()),
             base: None,
         }))
     }
 
     pub(super) fn as_value(&self) -> LuaValue {
-        LuaValue::Table(self.0.table.clone())
+        self.0.environment.borrow().clone()
+    }
+
+    /// Gives a `load()`ed chunk with no explicit fourth argument its own
+    /// `_ENV` upvalue cell, starting out at this scope's current value (so
+    /// ordinary global reads/writes still land in the same shared table)
+    /// but independent of it (so a bare `_ENV = ...` reassignment inside the
+    /// loaded chunk rebinds only that chunk's own cell, matching real Lua -
+    /// `Globals::clone` is an `Rc` clone that shares one mutable cell across
+    /// every closure holding it, which `load` must not do here).
+    pub(super) fn snapshot_for_load(&self) -> Self {
+        let mut snapshot = Globals::from_value(self.as_value());
+        Rc::get_mut(&mut snapshot.0)
+            .expect("snapshot_for_load: freshly constructed Rc has no other owner yet")
+            .base = self.0.base.clone();
+        snapshot
+    }
+
+    /// Rebinds this scope's implicit `_ENV` upvalue. The shared inner cell
+    /// means closures which already captured this scope observe the new
+    /// value too, as they do in Lua.
+    pub(super) fn set_value(&self, value: LuaValue) {
+        *self.0.environment.borrow_mut() = value;
     }
 
     /// Whether this scope falls back to a `base` scope on a raw miss (real
@@ -897,7 +950,10 @@ impl Globals {
 
     pub(super) fn get(&self, name: &str) -> LuaValue {
         let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
-        let value = self.0.table.borrow().get(&key).unwrap();
+        let value = match &*self.0.environment.borrow() {
+            LuaValue::Table(table) => table.borrow().get(&key).unwrap(),
+            _ => LuaValue::Nil,
+        };
         if value != LuaValue::Nil {
             return value;
         }

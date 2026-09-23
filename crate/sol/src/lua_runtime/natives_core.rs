@@ -139,6 +139,22 @@ impl LuaRuntime {
                         .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
+                    LuaValue::Userdata(userdata) => {
+                        let metatable = {
+                            let heap = self.canonical_heap.borrow();
+                            heap.userdata(userdata.object_id())
+                                .ok()
+                                .and_then(|value| value.metatable)
+                        };
+                        Ok(vec![metatable
+                            .map(|metatable| {
+                                LuaValue::CanonicalTable(CanonicalTable::root_existing(
+                                    self.canonical_heap.clone(),
+                                    metatable,
+                                ))
+                            })
+                            .unwrap_or(LuaValue::Nil)])
+                    }
                     _ => Ok(vec![LuaValue::Nil]),
                 }
             }

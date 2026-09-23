@@ -75,6 +75,25 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Charges a genuinely new table entry (a key that did not previously
+    /// exist on `table`) against the allocation budget and records the
+    /// charge on the table itself so `collect_cycles` can credit it back
+    /// when the table becomes garbage. Table *creation* already charges
+    /// `size_of::<LuaTable>()` (`Instr::NewTable`) for the fixed header;
+    /// this covers the otherwise-unbounded per-field growth a loop like
+    /// `for i = 1, math.huge do t[i] = i end` drives, which previously ran
+    /// unmetered until only the hard, non-resettable instruction budget
+    /// stopped it - unlike real Lua's allocator-driven, `pcall`-catchable
+    /// out-of-memory error, that isn't attributable to a *specific*
+    /// allocation and can't be recovered from by continuing the script
+    /// after a `pcall` catches it.
+    pub(super) fn charge_new_table_entry(&mut self, table: &RcRef<LuaTable>) -> LuaResult<()> {
+        let cost = 2 * std::mem::size_of::<LuaValue>();
+        self.charge_allocation(cost)?;
+        table.borrow_mut().charged_bytes += cost;
+        Ok(())
+    }
+
     /// Approximate the currently live, runtime-managed heap for Lua's
     /// `collectgarbage("count")`. Allocation-budget consumption is
     /// intentionally not used here: that counter is cumulative and would
@@ -163,6 +182,8 @@ impl LuaRuntime {
     /// function below must therefore visit each stored `Rc` slot exactly
     /// once.
     pub(super) fn collect_cycles(&mut self) {
+        self.record_charge_ledger();
+
         let tables: Vec<RcRef<LuaTable>> = self
             .gc_tables
             .borrow()
@@ -297,7 +318,6 @@ impl LuaRuntime {
             let _ = self.call(finalizer, vec![LuaValue::Table(table)]);
         }
 
-        let mut reclaimed: usize = 0;
         for table in &tables {
             let ptr = Rc::as_ptr(table) as usize;
             if !reachable.contains(&ptr) {
@@ -307,21 +327,23 @@ impl LuaRuntime {
                 borrowed.hash.clear();
                 borrowed.metatable = None;
                 borrowed.version = borrowed.version.wrapping_add(1);
-                reclaimed += std::mem::size_of::<LuaTable>();
+                borrowed.charged_bytes = 0;
             }
         }
         for closure in &closures {
             let ptr = Rc::as_ptr(closure) as usize;
             if !reachable.contains(&ptr) {
                 closure.upvals.borrow_mut().clear();
-                reclaimed += std::mem::size_of::<LuaClosure>();
             }
         }
-        // Credit reclaimed memory back to the allocation budget - otherwise a
-        // script that allocates cyclic garbage in a loop would exhaust its
-        // budget even though `collectgarbage()` is actually reclaiming it.
-        self.allocation_remaining =
-            (self.allocation_remaining + reclaimed).min(self.allocation_budget);
+
+        // Drop these strong-ref snapshots before crediting so anything just
+        // cleared above - and with no other referrer left - actually reaches
+        // `Rc` strong count zero now, matching `credit_dead_ledger_entries`'s
+        // liveness check against reality instead of against a table this
+        // function is itself still (transitively) keeping alive.
+        drop(tables);
+        drop(closures);
 
         self.gc_tables
             .borrow_mut()
@@ -329,5 +351,73 @@ impl LuaRuntime {
         self.gc_closures
             .borrow_mut()
             .retain(|weak| weak.strong_count() > 0);
+
+        self.credit_dead_ledger_entries();
+    }
+
+    /// Snapshots every currently-alive tracked table/closure's total
+    /// allocation-budget charge (header +, for tables, accumulated field
+    /// growth) into `charge_ledger`, keyed by `Rc` pointer identity. Called
+    /// at the very start of every `collect_cycles` pass, before any clearing,
+    /// so growth since the previous pass is captured ahead of
+    /// `credit_dead_ledger_entries`'s comparison at the end of this one.
+    fn record_charge_ledger(&mut self) {
+        let mut ledger = self.charge_ledger.borrow_mut();
+        for weak in self.gc_tables.borrow().iter() {
+            if let Some(table) = weak.upgrade() {
+                let charge = std::mem::size_of::<LuaTable>() + table.borrow().charged_bytes;
+                ledger.insert(Rc::as_ptr(&table) as usize, charge);
+            }
+        }
+        for weak in self.gc_closures.borrow().iter() {
+            if let Some(closure) = weak.upgrade() {
+                ledger.insert(
+                    Rc::as_ptr(&closure) as usize,
+                    std::mem::size_of::<LuaClosure>(),
+                );
+            }
+        }
+    }
+
+    /// Credits back every `charge_ledger` entry whose tracked table/closure
+    /// has since died - either from this same `collect_cycles` pass's own
+    /// trial deletion, or from ordinary `Rc` refcounting sometime between the
+    /// previous pass and this one. The latter is what a non-cyclic table
+    /// dropped by plain scope exit (e.g. a loop-local table reassigned on the
+    /// next iteration) hits: `collect_cycles`'s reachability walk never sees
+    /// it at all, because its `Weak` entry in `gc_tables` is already dead by
+    /// the time any pass runs. Comparing against the last-recorded charge
+    /// (rather than re-deriving it from the table, which no longer exists) is
+    /// what makes that case creditable here.
+    fn credit_dead_ledger_entries(&mut self) {
+        let alive: HashSet<usize> = self
+            .gc_tables
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|table| Rc::as_ptr(&table) as usize)
+            .chain(
+                self.gc_closures
+                    .borrow()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .map(|closure| Rc::as_ptr(&closure) as usize),
+            )
+            .collect();
+        let mut reclaimed = 0usize;
+        self.charge_ledger.borrow_mut().retain(|ptr, charge| {
+            if alive.contains(ptr) {
+                true
+            } else {
+                reclaimed += *charge;
+                false
+            }
+        });
+        // Credit reclaimed memory back to the allocation budget - otherwise a
+        // script that allocates garbage (cyclic or not) in a loop would
+        // exhaust its budget even though `collectgarbage()` is actually
+        // reclaiming it.
+        self.allocation_remaining =
+            (self.allocation_remaining + reclaimed).min(self.allocation_budget);
     }
 }

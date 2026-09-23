@@ -160,6 +160,17 @@ impl Compiler {
                             .emit(Instr::JumpIfTrue(dst, 0), line),
                     };
                     self.compile_into(right, dst)?;
+                    // The result of `and`/`or` comes from one of two
+                    // control-flow paths, so it has no single Lua source
+                    // name.  A self-move is a semantic no-op but serves as
+                    // a compact bytecode debug-name barrier for
+                    // `describe_register`; without it, an error raised by
+                    // a later use of the joined value is incorrectly
+                    // attributed to the right-hand branch's name.
+                    self.stack
+                        .last_mut()
+                        .unwrap()
+                        .emit(Instr::Move(dst, dst), line);
                     let end = self.stack.last_mut().unwrap().here();
                     self.stack.last_mut().unwrap().patch_jump(jump, end as i32);
                     return Ok(dst);

@@ -294,3 +294,42 @@ fn dynamic_lua_runtime_string_dump_round_trips_through_load_in_binary_mode() {
     "#;
     assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
 }
+
+#[test]
+fn dynamic_lua_runtime_dump_has_lua55_header_and_rejects_truncated_data() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // This is the same header layout used by Lua 5.5's `ldump.c`: ensure
+    // Sol's in-process body does not leak into the portable prefix that
+    // callers inspect with `string.unpack`, and every incomplete prefix is
+    // diagnosed as truncated rather than parsed as source.
+    let source = br#"
+        local dump = string.dump(function () return 10 end)
+        local signature, version, format, data, intsize, intcheck,
+              instructionsize, instructioncheck, integersize, integercheck,
+              numbersize, numbercheck = string.unpack("c4BBc6BiBI4BjBn", dump)
+        local header_ok = signature == "\27Lua" and version == 0x55 and format == 0 and
+            data == "\x19\x93\r\n\x1a\n" and intsize == string.packsize("i") and
+            intcheck == -0x5678 and instructionsize == 4 and
+            instructioncheck == 0x12345678 and integersize == string.packsize("j") and
+            integercheck == -0x5678 and numbersize == string.packsize("n") and
+            numbercheck == -370.5
+        local _, err = load(string.sub(dump, 1, #dump - 1))
+        return header_ok and err:find("truncated") ~= nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_limits_explicit_return_lists_to_lua55s_254_values() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    let accepted = std::iter::repeat_n("10", 254).collect::<Vec<_>>().join(",");
+    let rejected = std::iter::repeat_n("10", 255).collect::<Vec<_>>().join(",");
+    let source = format!(
+        "local good = assert(load('return {accepted}'))()\n\
+         local bad, message = load('return {rejected}')\n\
+         return good == 10 and bad == nil and message:find('too many returns') ~= nil"
+    );
+    assert_eq!(run_source(source.as_bytes()).unwrap().value, LuaValue::Bool(true));
+}

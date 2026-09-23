@@ -722,6 +722,31 @@ fn dynamic_lua_runtime_error_names_direct_and_tail_call_sources() {
         unary_error.message.contains("global 'value'"),
         "{unary_error}"
     );
+    for source in [
+        b"global_value = {}; result = (global_value or global_value) + (global_value and global_value)"
+            .as_slice(),
+        b"global_value = {}; (global_value or global_value)()",
+    ] {
+        let error = run_source(source).unwrap_err();
+        assert!(
+            !error.message.contains("'global_value'"),
+            "{error}"
+        );
+    }
+    for (source, expected) in [
+        (b"print(print < 10)".as_slice(), "function with number"),
+        (b"print(print < print)", "two function values"),
+        (b"print('10' < 10)", "string with number"),
+        (b"print(10 < '23')", "number with string"),
+    ] {
+        let error = run_source(source).unwrap_err();
+        assert!(error.message.contains(expected), "{error}");
+    }
+    let bitwise_error = run_source(b"return 34 >> {}").unwrap_err();
+    assert!(
+        bitwise_error.message.contains("table value"),
+        "{bitwise_error}"
+    );
 
     let source = br#"
         local function message(source)

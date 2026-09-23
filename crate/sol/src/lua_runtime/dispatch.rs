@@ -84,6 +84,10 @@ fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
     let mut dotted_field = None;
     for (index, instr) in proto.instrs[..pc].iter().enumerate().rev() {
         match instr {
+            // `compile_expr` emits this self-move only after an `and`/`or`
+            // join. The value may have come from either branch, so Lua has
+            // no stable source name to expose in a later diagnostic.
+            Instr::Move(dst, src) if *dst == target && *src == target => return None,
             Instr::Move(dst, src) if *dst == target => target = *src,
             Instr::NewLocal(dst, _, name_idx) if *dst == target => {
                 if let Some(field) = dotted_field {
@@ -1569,6 +1573,8 @@ impl LuaRuntime {
                 if let Some(result) = primitive {
                     return Ok(BinaryResolution::Value(LuaValue::Bool(result)));
                 }
+                let left_type = self.error_type_label(&left);
+                let right_type = self.error_type_label(&right);
                 let (method_name, first, second) = match op {
                     Lt => (b"__lt".as_slice(), left, right),
                     Le => (b"__le".as_slice(), left, right),
@@ -1592,7 +1598,12 @@ impl LuaRuntime {
                         });
                     }
                 }
-                Err(LuaError::new("attempt to compare incompatible Lua values"))
+                let message = if left_type == right_type {
+                    format!("attempt to compare two {left_type} values")
+                } else {
+                    format!("attempt to compare {left_type} with {right_type}")
+                };
+                Err(LuaError::new(message))
             }
             Concat => {
                 let primitive = |value: &LuaValue| match value {
@@ -1665,9 +1676,14 @@ impl LuaRuntime {
                         {
                             primitive_error.with_operand_hint(failing_side)
                         } else {
-                            LuaError::new(
-                                "attempt to perform bitwise operation on incompatible Lua values",
-                            )
+                            let value = match failing_side {
+                                OperandSide::Left => &left,
+                                OperandSide::Right => &right,
+                            };
+                            LuaError::new(format!(
+                                "attempt to perform bitwise operation on a {} value",
+                                self.error_type_label(value)
+                            ))
                         },
                     ),
                 }
@@ -1698,10 +1714,19 @@ impl LuaRuntime {
                         args: vec![left, right],
                         continuation: BinaryContinuation::Raw,
                     }),
-                    None => Err(LuaError::new(
-                        "attempt to perform arithmetic on incompatible Lua values",
-                    )
-                    .with_operand_hint(failing_side)),
+                    None => {
+                        let failing_value = match failing_side {
+                            OperandSide::Left => &left,
+                            OperandSide::Right => &right,
+                        };
+                        let label = self.error_type_label(failing_value);
+                        let message = if label != failing_value.type_name() {
+                            format!("attempt to perform arithmetic on a {label} value")
+                        } else {
+                            "attempt to perform arithmetic on incompatible Lua values".to_string()
+                        };
+                        Err(LuaError::new(message).with_operand_hint(failing_side))
+                    }
                 }
             }
         }
@@ -1824,12 +1849,17 @@ impl LuaRuntime {
     }
 
     pub(super) fn raw_set_index(
-        &self,
+        &mut self,
         value: LuaValue,
         key: LuaValue,
         new_value: LuaValue,
     ) -> LuaResult<()> {
-        self.expect_table(&value)?.borrow_mut().set(key, new_value)
+        let table = self.expect_table(&value)?;
+        if table.borrow().get(&key)? == LuaValue::Nil {
+            self.charge_new_table_entry(&table)?;
+        }
+        let result = table.borrow_mut().set(key, new_value);
+        result
     }
 
     pub(super) fn metamethod(&self, value: &LuaValue, name: &[u8]) -> LuaResult<Option<LuaValue>> {
@@ -1923,12 +1953,17 @@ impl LuaRuntime {
                 Some(LuaValue::CanonicalTable(fallback)) => {
                     value = LuaValue::CanonicalTable(fallback)
                 }
-                Some(method) => {
+                Some(method) if method.type_name() == "function" => {
                     return Ok(IndexResolution::Call {
                         method,
                         args: vec![value, key],
                     })
                 }
+                // Lua follows a non-function `__index` value as the next
+                // object in the chain. This is observable when the value is
+                // a number: the next iteration, not an attempted call,
+                // raises "attempt to index a number value".
+                Some(fallback) => value = fallback,
                 None if matches!(
                     value,
                     LuaValue::Table(_) | LuaValue::CanonicalTable(_) | LuaValue::String(_)
@@ -1997,7 +2032,14 @@ impl LuaRuntime {
                 }
                 None => {
                     match &value {
-                        LuaValue::Table(table) => table.borrow_mut().set(key, new_value)?,
+                        LuaValue::Table(table) => {
+                            // `raw` was `Nil` above with no `__newindex` to
+                            // fall back to, so this key is genuinely new to
+                            // `table` - not an overwrite of an existing
+                            // (possibly nil-tombstoned) entry.
+                            self.charge_new_table_entry(table)?;
+                            table.borrow_mut().set(key, new_value)?
+                        }
                         LuaValue::CanonicalTable(table) => {
                             let key = c_api::lua_to_canonical(self, &key)?;
                             let new_value = c_api::lua_to_canonical(self, &new_value)?;

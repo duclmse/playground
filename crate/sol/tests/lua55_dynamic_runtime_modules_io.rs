@@ -372,6 +372,25 @@ fn dynamic_lua_runtime_implements_io_write_and_load() {
 }
 
 #[test]
+fn dynamic_lua_runtime_exposes_stdin_as_opaque_file_userdata() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    let source = br#"
+        local type_is_userdata = type(io.stdin) == "userdata"
+        local input_returns_stdin = io.input() == io.stdin
+        local has_file_metatable = getmetatable(io.stdin).__name == "FILE*"
+        local rawlen_rejected = not pcall(rawlen, io.stdin)
+        local ok, message = pcall(function ()
+            for i = io.stdin, 1 do end
+        end)
+        return type_is_userdata and input_returns_stdin and has_file_metatable and rawlen_rejected and not ok and
+            message:find("FILE", 1, true) ~= nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+
+#[test]
 fn dynamic_lua_runtime_load_with_custom_env_redirects_globals() {
     use sol::lua_runtime::{run_source, LuaValue};
 
@@ -380,6 +399,22 @@ fn dynamic_lua_runtime_load_with_custom_env_redirects_globals() {
         local f = assert(load("X = Y + 1", nil, nil, env))
         f()
         return env.X == 11 and X == nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_load_preserves_an_arbitrary_env_value() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // Lua accepts any fourth `load` argument as `_ENV`; merely returning
+    // that upvalue must not require it to be a table. A later global access
+    // is what performs indexing and therefore raises the normal error.
+    let source = br#"
+        local f = assert(load("return _ENV", nil, nil, 123))
+        local g = assert(load("return missing", nil, nil, 123))
+        local ok, err = pcall(g)
+        return f() == 123 and not ok and type(err) == "string"
     "#;
     assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
 }

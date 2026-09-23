@@ -39,6 +39,52 @@ fn dynamic_lua_runtime_implements_debug_upvalueid() {
 }
 
 #[test]
+fn dynamic_lua_runtime_debug_getupvalue_reports_named_captures_and_env() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+
+    let source = br#"
+        local captured = 42
+        local function f() return captured end
+        local name, value = debug.getupvalue(f, 1)
+        local env_name = debug.getupvalue(f, 2)
+        local function reads_global() return global_value end
+        local global_env_name, global_env = debug.getupvalue(reads_global, 1)
+        return name == "captured" and value == 42 and env_name == nil and
+            global_env_name == "_ENV" and global_env == _G
+    "#;
+    assert_eq!(runtime.run(&parse(source)).unwrap(), LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_dumped_closure_preserves_assignment_target_upvalue_order() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let source = br#"
+        local a, b = 20, 30
+        local dumped = string.dump(function (x)
+            if x == "set" then a = 10 + b; b = b + 1 else return a end
+        end)
+        local f = assert(load(dumped, "", "b"))
+        return debug.setupvalue(f, 1, "hi") == "a" and f() == "hi" and
+            debug.setupvalue(f, 2, 13) == "b"
+    "#;
+    assert_eq!(runtime.run(&parse(source)).unwrap(), LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_debug_upvalueid_returns_nil_out_of_range_and_supports_gmatch_iterators() {
     // Regression test: real Lua's `debug.upvalueid` returns `nil` for an
     // out-of-range upvalue index instead of erroring, and also works on a
@@ -120,7 +166,7 @@ fn dynamic_lua_runtime_debug_setupvalue_replaces_a_closure_upvalue() {
         end
         local f = make()
         local name = debug.setupvalue(f, 1, 42)
-        return name ~= nil and f() == 42 and debug.setupvalue(f, 2, 0) == nil
+        return name == "captured" and f() == 42 and debug.setupvalue(f, 2, 0) == nil
     "#;
     assert_eq!(runtime.run(&parse(source)).unwrap(), LuaValue::Bool(true));
 }

@@ -118,12 +118,13 @@ impl LuaRuntime {
                 Ok(vec![LuaValue::String(Rc::new(output))])
             }
             NativeFunction::StringDump => {
-                // See `dumped_protos`'s doc comment: this doesn't encode
-                // `Proto` instructions the way real `string.dump` does, only
-                // a same-process handle to the closure's already-compiled
-                // `Proto` tree, prefixed with the same `0x1B` signature byte
-                // real binary chunks start with so `load`'s text/binary mode
-                // check treats the result as binary.
+                // The body is still a same-process handle (see
+                // `dumped_protos`), but it follows Lua 5.5's complete binary
+                // header rather than exposing a private nine-byte prefix.
+                // Include source metadata and pooled strings in the opaque
+                // payload too: native dumps write each once, and this keeps
+                // byte-oriented dump consumers (including the corpus's
+                // string-reuse check) observably compatible.
                 let closure = match required(0)? {
                     LuaValue::Closure(closure) => closure,
                     other => {
@@ -135,8 +136,16 @@ impl LuaRuntime {
                 };
                 let key = Rc::as_ptr(&closure.proto) as usize;
                 self.dumped_protos.insert(key, closure.proto.clone());
-                let mut bytes = vec![0x1Bu8];
+                let mut payload = Vec::new();
+                if let Some(source) = self.chunk_sources.get(&key) {
+                    payload.extend_from_slice(source);
+                }
+                append_dump_constants(&closure.proto, &mut payload);
+                let mut bytes = super::natives_load::lua55_binary_chunk_header();
+                bytes.extend_from_slice(super::natives_load::SOL_DUMP_MAGIC);
                 bytes.extend_from_slice(&(key as u64).to_le_bytes());
+                bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(&payload);
                 Ok(vec![LuaValue::String(Rc::new(bytes))])
             }
             NativeFunction::StringSub => {
@@ -822,5 +831,16 @@ impl LuaRuntime {
             minus,
             zero && !matches!(conversion, b's' | b'q' | b'c'),
         ))
+    }
+}
+
+fn append_dump_constants(proto: &crate::lua_bytecode::Proto, out: &mut Vec<u8>) {
+    for constant in &proto.consts {
+        if let crate::lua_bytecode::Const::Str(bytes) = constant {
+            out.extend_from_slice(bytes);
+        }
+    }
+    for nested in &proto.nested {
+        append_dump_constants(nested, out);
     }
 }

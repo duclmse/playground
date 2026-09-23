@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-use crate::lua_bytecode::{Const, Instr, Proto};
+use crate::lua_bytecode::{Const, Proto};
 
 use super::*;
 
@@ -76,54 +76,6 @@ pub(super) fn name_const(proto: &Proto, index: u32) -> Rc<Vec<u8>> {
         Const::Str(value) => value.clone(),
         _ => unreachable!("GetField/SetField name operand must be a Const::Str"),
     }
-}
-
-/// Best-effort lookup of the table-field name (if any) that most recently
-/// loaded `reg`, by scanning backward from `pc` - a narrow analogue of real
-/// Lua's `getobjname`/`varinfo`, scoped just to annotating the "no integer
-/// representation" bitwise/shift error with `(field 'name')`. Conservative:
-/// stops (returns `None`) at the first instruction it can't positively rule
-/// out as overwriting `reg` some other way, rather than risk reporting a
-/// stale or wrong name.
-pub(super) fn field_name_for_register(proto: &Proto, pc: usize, reg: usize) -> Option<String> {
-    for instr in proto.instrs[..pc].iter().rev() {
-        match instr {
-            Instr::GetField(dst, _, name) if *dst as usize == reg => {
-                return Some(String::from_utf8_lossy(&name_const(proto, *name)).into_owned());
-            }
-            Instr::LoadConst(dst, _)
-            | Instr::LoadNil(dst)
-            | Instr::LoadBool(dst, _)
-            | Instr::Move(dst, _)
-            | Instr::NewLocal(dst, _, _)
-            | Instr::GetUpval(dst, _)
-            | Instr::GetEnvironment(dst)
-            | Instr::GetGlobal(dst, _)
-            | Instr::NewTable(dst)
-            | Instr::NewClosure(dst, _)
-            | Instr::GetField(dst, _, _)
-            | Instr::GetIndex(dst, _, _)
-            | Instr::Len(dst, _)
-            | Instr::Not(dst, _)
-            | Instr::Neg(dst, _)
-            | Instr::BitNot(dst, _)
-            | Instr::Binary(_, dst, _, _)
-            | Instr::IntegerBinary(_, dst, _, _)
-                if *dst as usize != reg =>
-            {
-                continue;
-            }
-            Instr::SetUpval(_, _)
-            | Instr::SetGlobal(_, _, _, _)
-            | Instr::ErrorIfGlobalDefined(_, _)
-            | Instr::SetField(_, _, _)
-            | Instr::SetIndex(_, _, _)
-            | Instr::SetArrayItem(_, _, _)
-            | Instr::SetArrayMulti(_, _, _) => continue,
-            _ => return None,
-        }
-    }
-    None
 }
 
 pub(super) fn const_to_value(value: &Const) -> LuaValue {
@@ -430,7 +382,9 @@ pub(super) fn floor_div(a: i64, b: i64) -> LuaResult<i64> {
 
 pub(super) fn floor_mod(a: i64, b: i64) -> LuaResult<i64> {
     if b == 0 {
-        Err(LuaError::new("attempt to divide by zero"))
+        // Lua distinguishes integer remainder from floor division in its
+        // diagnostic (`n%0` versus "divide by zero").
+        Err(LuaError::new("attempt to perform 'n%0'"))
     } else if a == i64::MIN && b == -1 {
         Ok(0)
     } else {

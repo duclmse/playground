@@ -150,17 +150,10 @@ impl LuaRuntime {
                 }
                 Instr::SetEnvironment(src) => {
                     let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    match value {
-                        LuaValue::Table(table) => {
-                            frame.globals = Globals::from_table(table);
-                        }
-                        other => {
-                            return Err(LuaError::new(format!(
-                                "cannot use a {} value as an environment",
-                                other.type_name()
-                            )));
-                        }
-                    }
+                    // `_ENV` is an ordinary upvalue in Lua and can hold any
+                    // value. A later global access indexes that value and
+                    // produces the usual Lua indexing error if needed.
+                    frame.globals.set_value(value);
                 }
                 Instr::GetGlobal(dst, name) => {
                     // Real Lua desugars every global read to `_ENV.name`, an
@@ -354,7 +347,11 @@ impl LuaRuntime {
                     let mut index = *start_index;
                     for r in (*from as usize)..top {
                         let value = reg_get(&frame.regs, &frame.cells, r);
-                        table.borrow_mut().set(LuaValue::Integer(index), value)?;
+                        let key = LuaValue::Integer(index);
+                        if table.borrow().get(&key)? == LuaValue::Nil {
+                            self.charge_new_table_entry(&table)?;
+                        }
+                        table.borrow_mut().set(key, value)?;
                         index += 1;
                     }
                 }
@@ -457,10 +454,19 @@ impl LuaRuntime {
                                     OperandSide::Left => left_reg,
                                     OperandSide::Right => right_reg,
                                 };
-                                if let Some(name) = field_name_for_register(&proto, pc, reg) {
+                                if let Some(description) = describe_register(&proto, pc, reg as Reg)
+                                {
+                                    // Lua's integer-representation errors
+                                    // spell a local source without the
+                                    // quotes used by call/index diagnostics.
+                                    let description = description
+                                        .strip_prefix("local '")
+                                        .and_then(|name| name.strip_suffix('\''))
+                                        .map(|name| format!("local {name}"))
+                                        .unwrap_or(description);
                                     error.message = error.message.replacen(
                                         "number has",
-                                        &format!("number (field '{name}') has"),
+                                        &format!("number ({description}) has"),
                                         1,
                                     );
                                 }
@@ -711,8 +717,12 @@ impl LuaRuntime {
                         let stop = match &stop_value {
                             LuaValue::Integer(stop) => Some(*stop),
                             _ => {
-                                let limit = number_as_f64(&stop_value)
-                                    .map_err(|_| LuaError::new("'for' limit must be a number"))?;
+                                let limit = number_as_f64(&stop_value).map_err(|_| {
+                                    LuaError::new(format!(
+                                        "'for' limit must be a number ({})",
+                                        self.error_type_name(&stop_value)
+                                    ))
+                                })?;
                                 float_for_limit(limit, step > 0)
                             }
                         };
@@ -750,12 +760,24 @@ impl LuaRuntime {
                             continue 'exec;
                         }
                     } else {
-                        let start = number_as_f64(&start_value)
-                            .map_err(|_| LuaError::new("'for' initial value must be a number"))?;
-                        let stop = number_as_f64(&stop_value)
-                            .map_err(|_| LuaError::new("'for' limit must be a number"))?;
-                        let step = number_as_f64(&step_value)
-                            .map_err(|_| LuaError::new("'for' step must be a number"))?;
+                        let start = number_as_f64(&start_value).map_err(|_| {
+                            LuaError::new(format!(
+                                "'for' initial value must be a number ({})",
+                                self.error_type_name(&start_value)
+                            ))
+                        })?;
+                        let stop = number_as_f64(&stop_value).map_err(|_| {
+                            LuaError::new(format!(
+                                "'for' limit must be a number ({})",
+                                self.error_type_name(&stop_value)
+                            ))
+                        })?;
+                        let step = number_as_f64(&step_value).map_err(|_| {
+                            LuaError::new(format!(
+                                "'for' step must be a number ({})",
+                                self.error_type_name(&step_value)
+                            ))
+                        })?;
                         if step == 0.0 {
                             return Err(LuaError::new("'for' step is zero"));
                         }

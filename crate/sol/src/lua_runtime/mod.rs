@@ -20,6 +20,8 @@
 //!   `LuaRuntime` methods (driven by the same trampoline as ordinary calls).
 //! - `init` - `LuaRuntime` construction/configuration and the top-level
 //!   `run*` entry points.
+//! - `diagnostics` - Lua-visible type labels used by errors across the
+//!   dispatcher and native libraries.
 //! - `gc` - allocation-budget charging, weak-table sweeping, and the
 //!   trial-deletion cycle collector.
 //! - `natives` - `call_native` and the standard-library function bodies.
@@ -36,6 +38,7 @@ use crate::ast::Program;
 pub mod c_api;
 mod canonical;
 mod coroutine;
+mod diagnostics;
 mod dispatch;
 mod format;
 mod frame;
@@ -121,6 +124,21 @@ pub struct LuaRuntime {
     /// subtracted from each candidate's real `Rc::strong_count`.
     gc_tables: RefCell<Vec<WeakRef<LuaTable>>>,
     gc_closures: RefCell<Vec<Weak<LuaClosure>>>,
+    /// Last-recorded total allocation-budget charge (header + growth) for
+    /// every tracked table/closure that was alive as of the most recent
+    /// `collect_cycles` pass, keyed by `Rc` pointer identity. `collect_cycles`
+    /// refreshes this for everything still alive at the *start* of each pass,
+    /// then - after clearing whatever its own trial deletion just made
+    /// unreachable and dropping its strong-ref snapshots - credits back every
+    /// entry whose table/closure has since died, whether from its own cycle
+    /// collection this pass or from ordinary `Rc` refcounting sometime
+    /// between the previous pass and this one (e.g. a non-cyclic table whose
+    /// local variable went out of scope). That second case has no
+    /// `collect_cycles`-driven reachability signal at all - by the time it
+    /// runs, the table's `Weak` entry in `gc_tables` is already dead - so
+    /// crediting it back requires having captured its charge while it was
+    /// still alive, which is exactly what this ledger is for.
+    charge_ledger: RefCell<HashMap<usize, usize>>,
     /// The currently active chain of resumed coroutines, innermost last.
     /// Empty means the main chunk (not inside any coroutine) is running.
     /// Doubles as: (a) whether `coroutine.yield` is even legal right now
@@ -225,18 +243,12 @@ pub struct LuaRuntime {
     /// directly); `debug.getinfo` simply omits the `source` field then,
     /// rather than guessing a default.
     chunk_sources: HashMap<usize, Rc<Vec<u8>>>,
-    /// `string.dump`'s output registry: Sol has no portable bytecode-file
-    /// format (no `Proto` (de)serializer), so `string.dump` cannot actually
-    /// encode a `Proto`'s instructions into its returned byte string the way
-    /// real Lua's `lundump.c`/`ldump.c` do. Instead the returned bytes are an
-    /// opaque handle (a `0x1B` binary-chunk signature byte, matching real
-    /// Lua's `LUA_SIGNATURE[0]` so `load`'s text/binary mode check still
-    /// works, followed by this map's key) into this process-local table,
-    /// which keeps the dumped `Rc<Proto>` alive so `load(..., "b")` can look
-    /// it up and rebuild an equivalent closure directly - sufficient for
-    /// same-process round-tripping (the only case the Lua 5.5 test corpus
-    /// exercises) but not for a chunk written to a file and loaded by a
-    /// different process.
+    /// `string.dump`'s process-local prototype registry. Sol's dump envelope
+    /// starts with the canonical Lua 5.5 binary header and validates every
+    /// byte of it, but its body is still an opaque key into this map rather
+    /// than a portable serialization of `Proto` instructions. That permits
+    /// faithful header/malformed-chunk behavior and same-process
+    /// round-tripping while a real bytecode serializer remains outstanding.
     dumped_protos: HashMap<usize, Rc<crate::lua_bytecode::Proto>>,
     function_registry: sol_core::FunctionRegistry,
     /// Host-owned implementations keyed by portable callable identity. Raw
@@ -247,6 +259,10 @@ pub struct LuaRuntime {
     c_function_ids: HashMap<usize, sol_core::NativeCallableId>,
     c_light_userdata: RefCell<HashMap<usize, sol_core::ObjectId>>,
     c_light_userdata_reverse: RefCell<HashMap<sol_core::ObjectId, usize>>,
+    /// Canonical userdata identities used for host file handles. The payload
+    /// lives in host-side I/O registries, while Lua sees a real full userdata
+    /// instead of a table-shaped approximation.
+    file_userdata: HashSet<sol_core::ObjectId>,
     c_warning_function: Option<c_api::LuaWarnFunction>,
     c_warning_data: *mut std::ffi::c_void,
     c_thread_states: RefCell<HashMap<usize, *mut c_api::lua_State>>,

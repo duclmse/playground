@@ -8,6 +8,29 @@ use crate::lua_bytecode::{Compiler, Proto};
 use super::util::*;
 use super::*;
 
+/// The fixed prefix specified by Lua 5.5's `ldump.c`. Keeping this separate
+/// from Sol's process-local dump envelope lets `string.unpack` clients and
+/// `load`'s malformed-header checks see the same ABI shape as a native Lua
+/// binary chunk.
+pub(super) fn lua55_binary_chunk_header() -> Vec<u8> {
+    let mut header = Vec::with_capacity(40);
+    header.extend_from_slice(b"\x1bLua");
+    header.push(0x55); // LUAC_VERSION
+    header.push(0); // LUAC_FORMAT
+    header.extend_from_slice(b"\x19\x93\r\n\x1a\n"); // LUAC_DATA
+    header.push(std::mem::size_of::<i32>() as u8);
+    header.extend_from_slice(&(-0x5678i32).to_ne_bytes()); // LUAC_INT
+    header.push(4); // sizeof(Instruction)
+    header.extend_from_slice(&0x1234_5678u32.to_ne_bytes()); // LUAC_INSTRUCTION
+    header.push(std::mem::size_of::<i64>() as u8);
+    header.extend_from_slice(&(-0x5678i64).to_ne_bytes()); // LUAC_INT
+    header.push(std::mem::size_of::<f64>() as u8);
+    header.extend_from_slice(&(-370.5f64).to_ne_bytes()); // LUAC_NUM
+    header
+}
+
+pub(super) const SOL_DUMP_MAGIC: &[u8; 8] = b"SolDmp\0\0";
+
 impl LuaRuntime {
     pub(super) fn call_native_load(
         &mut self,
@@ -145,8 +168,8 @@ impl LuaRuntime {
             NativeFunction::Load => {
                 let chunk_arg = required(0)?;
                 let env = match args.get(3) {
-                    Some(LuaValue::Table(table)) => Some(table.clone()),
-                    _ => None,
+                    Some(LuaValue::Nil) | None => None,
+                    Some(value) => Some(value.clone()),
                 };
                 // Real Lua's `luaB_load` (`lbaselib.c`) first tries
                 // `lua_tolstring` on argument #1, which succeeds not only for
@@ -344,7 +367,7 @@ impl LuaRuntime {
     pub(super) fn compile_chunk(
         &mut self,
         source: &[u8],
-        env: Option<RcRef<LuaTable>>,
+        env: Option<LuaValue>,
     ) -> Result<LuaValue, String> {
         self.compile_chunk_named(source, env, None)
     }
@@ -352,7 +375,7 @@ impl LuaRuntime {
     pub(super) fn compile_chunk_named(
         &mut self,
         source: &[u8],
-        env: Option<RcRef<LuaTable>>,
+        env: Option<LuaValue>,
         chunkname: Option<Rc<Vec<u8>>>,
     ) -> Result<LuaValue, String> {
         let format_error = |error: String| match &chunkname {
@@ -362,8 +385,8 @@ impl LuaRuntime {
         let tokens = crate::lexer::lex_bytes(source).map_err(&format_error)?;
         let program = crate::parser::parse_lua(tokens).map_err(&format_error)?;
         let chunk_globals = match env {
-            Some(table) => Globals::from_table(table),
-            None => self.globals.clone(),
+            Some(value) => Globals::from_value(value),
+            None => self.globals.snapshot_for_load(),
         };
         let mut main_function: Option<Function> = None;
         for function in &program.functions {
@@ -413,14 +436,48 @@ impl LuaRuntime {
     fn load_binary_chunk(
         &mut self,
         source: &[u8],
-        env: Option<RcRef<LuaTable>>,
+        env: Option<LuaValue>,
         chunkname: Option<Rc<Vec<u8>>>,
     ) -> Result<LuaValue, String> {
+        let header = lua55_binary_chunk_header();
+        if source.len() < header.len() {
+            return Err("truncated binary chunk".to_string());
+        }
+        if !source.starts_with(&header) {
+            return Err("bad header in precompiled chunk".to_string());
+        }
+        let envelope_len = header
+            .len()
+            .checked_add(SOL_DUMP_MAGIC.len())
+            .and_then(|len| len.checked_add(std::mem::size_of::<u64>() * 2))
+            .expect("fixed dump envelope fits in usize");
+        if source.len() < envelope_len {
+            return Err("truncated binary chunk".to_string());
+        }
+        if &source[header.len()..header.len() + SOL_DUMP_MAGIC.len()] != SOL_DUMP_MAGIC {
+            return Err("bad header in precompiled chunk".to_string());
+        }
+        let key_offset = header.len() + SOL_DUMP_MAGIC.len();
         let key = source
-            .get(1..9)
+            .get(key_offset..key_offset + std::mem::size_of::<u64>())
             .and_then(|bytes| bytes.try_into().ok())
             .map(u64::from_le_bytes)
             .ok_or_else(|| "bad header in precompiled chunk".to_string())?;
+        let payload_len_offset = key_offset + std::mem::size_of::<u64>();
+        let payload_len = source
+            .get(payload_len_offset..payload_len_offset + std::mem::size_of::<u64>())
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| "truncated binary chunk".to_string())?;
+        let expected_len = envelope_len
+            .checked_add(usize::try_from(payload_len).map_err(|_| "bad binary chunk size")?)
+            .ok_or_else(|| "bad binary chunk size".to_string())?;
+        if source.len() < expected_len {
+            return Err("truncated binary chunk".to_string());
+        }
+        if source.len() != expected_len {
+            return Err("bad binary chunk size".to_string());
+        }
         let proto = self
             .dumped_protos
             .get(&(key as usize))
@@ -430,14 +487,21 @@ impl LuaRuntime {
             self.register_chunk_source(&proto, chunkname);
         }
         let chunk_globals = match env {
-            Some(table) => Globals::from_table(table),
-            None => self.globals.clone(),
+            Some(value) => Globals::from_value(value),
+            None => self.globals.snapshot_for_load(),
         };
         self.charge_allocation(std::mem::size_of::<LuaClosure>())
             .map_err(|error| error.message)?;
+        // A dumped Lua function retains its upvalue *descriptors* but not
+        // their captured values. `load` creates one nil cell per descriptor
+        // (Lua callers can then discover/rebind the final implicit `_ENV`
+        // slot through debug.getupvalue/setupvalue).
+        let upvals = (0..proto.upvals.len())
+            .map(|_| Rc::new(RefCell::new(LuaValue::Nil)))
+            .collect();
         Ok(LuaValue::Closure(self.track_closure(Rc::new(LuaClosure {
             proto,
-            upvals: RefCell::new(Vec::new()),
+            upvals: RefCell::new(upvals),
             globals: chunk_globals,
         }))))
     }
@@ -678,7 +742,7 @@ fn format_chunk_diagnostic(chunkname: &[u8], source: &[u8], diagnostic: &str) ->
 fn is_eof_table_diagnostic(message: &str) -> bool {
     matches!(
         message.strip_suffix(" [EPARSE001]"),
-        Some("expected RBrace, found end of input")
+        Some("expected RBrace, found end of input" | "unexpected end of input inside table constructor")
     )
 }
 
@@ -689,7 +753,10 @@ fn is_eof_table_diagnostic(message: &str) -> bool {
 fn lua_syntax_message<'a>(source: &[u8], message: &'a str) -> std::borrow::Cow<'a, str> {
     const PARSER_SUFFIX: &str = " [EPARSE001]";
     let message = message.strip_suffix(PARSER_SUFFIX).unwrap_or(message);
-    if message != "expected RBrace, found end of input" {
+    if !matches!(
+        message,
+        "expected RBrace, found end of input" | "unexpected end of input inside table constructor"
+    ) {
         return std::borrow::Cow::Borrowed(message);
     }
     let opening_line = source

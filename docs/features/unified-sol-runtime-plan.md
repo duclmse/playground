@@ -797,9 +797,9 @@ must remain source-compatible rather than fully runtime-compatible.
 #### U6 exit ledger (2026-09-21)
 
 The manifest is the release ledger, not a substitute for this gate. It
-currently reports 9/34 unchanged upstream cases as oracle-backed passes, with
-11 implementation-pending rows, 10 rows that require the declared native host
-profile, and 4 documented divergences. U6 is complete only when all of the
+currently reports 11/34 unchanged upstream cases as oracle-backed passes, with
+8 implementation-pending rows, 10 rows that require the declared native host
+profile, and 5 documented divergences. U6 is complete only when all of the
 following are delivered and the corresponding unchanged rows compare cleanly:
 
 - portable runtime: arbitrary/debug-visible `_ENV` upvalues, full debug
@@ -1578,6 +1578,43 @@ start a statement/expression" fallback error messages now include the
 literal phrase "unexpected symbol", matching real Lua's `lparser.c` wording
 - the corpus matches parse-error messages by substring via `string.find`,
 so that wording is part of the compatibility contract, not cosmetic.
+
+Four more previously-`pending` gaps are now closed. `_ENV` is a real,
+arbitrary-`LuaValue` upvalue rather than a table-only `Globals` wrapper
+(`Globals::from_value`/`set_value` in `lua_runtime/value.rs`), and
+`debug.getupvalue`/`setupvalue` expose it as a closure's implicit final
+upvalue slot, unblocking `calls.lua`'s "any value is valid for _ENV" and
+"load when _ENV is not first upvalue" sections; the file now matches the
+pinned oracle byte-for-byte and is promoted to `pass`.
+`string.pack`/`unpack`/`packsize`'s `X` alignment-only directive (align to
+the following fixed-size option's natural alignment without consuming a
+value or emitting bytes) is implemented in `lua_pack.rs`, and `tpack.lua`
+now matches the pinned oracle byte-for-byte and is promoted to `pass`. A
+real, pcall-catchable out-of-memory error now exists: table array/hash
+growth is charged against the allocation budget per genuinely-new key
+(`gc.rs`'s `charge_new_table_entry`, called from `dispatch.rs` and
+`dispatch/bytecode.rs`'s table-write sites, with a `LuaTable::charged_bytes`
+field so `collect_cycles` credits the exact amount back on reclaim) instead
+of only charging a table's fixed header at creation, so an unbounded
+`t[i] = i` growth loop now raises a normal, catchable `LuaError` instead of
+cascading into the non-catchable instruction budget; `heavy.lua`'s
+`toomanyidx()` now reaches `print "OK"` under elevated budgets, matching the
+pinned oracle's own structural behavior (a catchable error inside the same
+pcall, then `OK`), though the exact error text and memory-usage numbers
+differ from real Lua's own allocator accounting, so this row is promoted to
+`diverges` rather than `pass` - the same category of unavoidable divergence
+already documented for `sort.lua`'s non-deterministic timing output.
+Finally,
+`debug.sethook`/`gethook` and dispatch-loop call/return/line/count hook
+firing were confirmed already implemented and correct (`fire_hook`,
+`HookState`, `active_hook`/`running_hook`), unblocking `db.lua`'s
+`debug.gethook`/line-tracing sections; chasing that file further surfaced a
+distinct, previously-hidden `debug.getinfo` gap unrelated to hooks (the
+`func` and `activelines` fields are never populated, and `short_src`/`source`
+resolve to `nil` for any chunk not compiled through `load` - including the
+CLI's own top-level `sol run file.lua` compilation, which never registers a
+`chunk_sources` entry at all), so `db.lua` stays `pending` on that narrower,
+newly-identified blocker rather than being promoted.
 
 ### U7 — Interpreter performance foundation
 
