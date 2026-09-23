@@ -435,11 +435,11 @@ impl Scanner<'_> {
             let exp = match split.next() {
                 Some(e) => e
                     .parse::<i32>()
-                    .map_err(|_| self.error("malformed numeral"))?,
+                    .map_err(|_| self.error("malformed number"))?,
                 None => 0,
             };
             if split.next().is_some() {
-                return Err(self.error("malformed numeral"));
+                return Err(self.error("malformed number"));
             }
             // Mirrors real Lua's `lua_strx2number` (`lobject.c`): naively
             // folding every mantissa hex digit into `n` (as a plain
@@ -463,14 +463,14 @@ impl Scanner<'_> {
             for b in mantissa.bytes() {
                 if b == b'.' {
                     if hasdot {
-                        return Err(self.error("malformed numeral"));
+                        return Err(self.error("malformed number"));
                     }
                     hasdot = true;
                     continue;
                 }
                 let d = (b as char)
                     .to_digit(16)
-                    .ok_or_else(|| self.error("malformed numeral"))?;
+                    .ok_or_else(|| self.error("malformed number"))?;
                 if significant_digits == 0 && d == 0 {
                     leading_zero_digits += 1;
                 } else {
@@ -486,7 +486,7 @@ impl Scanner<'_> {
                 }
             }
             if significant_digits + leading_zero_digits == 0 {
-                return Err(self.error("malformed numeral"));
+                return Err(self.error("malformed number"));
             }
             let total_exponent =
                 (extra_exponent * 4 + exp as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
@@ -496,7 +496,7 @@ impl Scanner<'_> {
         } else {
             text.parse::<f64>()
                 .map(Token::FloatLit)
-                .map_err(|_| self.error("malformed numeral"))
+                .map_err(|_| self.error("malformed number"))
         }
     }
 

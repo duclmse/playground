@@ -2,8 +2,6 @@
 //! over `ExprKind` covering literals, names, closures, table constructors,
 //! unary/binary operators, calls, indexing, and field access.
 
-use std::rc::Rc;
-
 use crate::ast::{BinaryOp, Expr, ExprKind, TableField, UnaryOp};
 
 use super::compile_calls::is_multi_expr;
@@ -39,7 +37,8 @@ impl Compiler {
             }
             ExprKind::StringLit(value) => {
                 let r = self.stack[level].alloc_reg();
-                let k = self.stack[level].push_const(Const::Str(Rc::new(value.clone())));
+                let interned = self.intern_string_literal(value);
+                let k = self.stack[level].push_const(Const::Str(interned));
                 self.stack[level].emit(Instr::LoadConst(r, k), line);
                 Ok(r)
             }

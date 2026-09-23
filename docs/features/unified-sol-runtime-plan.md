@@ -1248,10 +1248,50 @@ to explain sharing across nested functions. The test's own `sd = "0123456789"
 .. "01234...39"` runtime concatenation of equal content is required to NOT
 share the address (line 233), confirming this is a compile-time/lexer-level
 phenomenon rather than a general same-content-implies-same-object runtime
-invariant. Not yet fixed - would need a chunk-scoped string-anchoring table
-during Sol's own lexing/compilation, distinct from (and additional to) any
-future per-function constant-pool dedup; `literals.lua` stays `pending` for
-that reason.
+invariant.
+
+This is now fixed: `crates/sol/src/lua_bytecode/mod.rs`'s `Compiler` is
+already exactly the right scope for this - one instance per top-level chunk
+compile, shared across every nested function's own `FuncState` the same way
+real Lua's single `LexState` is shared across a chunk's nested `FuncState`s
+- so it gained a `string_literals: HashMap<Vec<u8>, Rc<Vec<u8>>>` and an
+`intern_string_literal` helper, and `compile_expr.rs`'s `ExprKind::StringLit`
+case now interns through it instead of allocating a fresh `Rc` per token.
+Every string-literal token compiled anywhere in one chunk - including inside
+separately-compiled nested closures - now shares one `Rc<Vec<u8>>`, and
+`%p`'s existing `Rc::as_ptr`-based identity for strings past the 40-byte
+short-string cutoff (`LuaValue::identity_address`, `lua_runtime/value.rs`)
+reports the same address for all of them; runtime-computed strings
+(concatenation, `string.format`, etc.) are untouched and still allocate
+their own `Rc`, so `sd`'s address correctly stays distinct. See
+`identical_long_string_literals_share_identity_across_nested_functions` in
+`crates/sol/tests/lua55.rs`.
+
+With that fixed, the file runs on to line 338's `malformednum` helper
+(`local s, msg = load("return " .. n); assert(not s and string.find(msg,
+exp))`), which surfaced a second, independent, now also-fixed bug: Sol's
+malformed-numeral lexer errors said "malformed numeral" where real Lua's
+`llex.c` (`read_numeral`'s `lexerror(ls, "malformed number", TK_FLT)`) says
+"malformed number" - a plain wording fix across all 6 call sites in
+`crates/sol/src/lexer.rs`, unblocking `malformednum("0xep-p", ...)` and
+`malformednum("1print()", ...)`. See
+`lexer_reports_a_malformed_number_not_a_malformed_numeral` in
+`crates/sol/tests/lua55.rs`.
+
+The file's new stopping point is `malformednum("0xe-", "near <eof>")` (line
+341): `load("return 0xe-")` correctly fails to compile (a trailing `-` with
+nothing after it), but the error comes from `parser.rs`'s generic
+expression-error site, not `lexer.rs`, and Sol's parser does not yet append
+the `near '<token>'`/`near <eof>` diagnostic suffix the way `lexer.rs`'s
+`Scanner::error_near` does for lexer-level errors - real Lua's parser gets
+this for free because `luaX_syntaxerror` (used by both the lexer and the
+parser) always routes through the same `lexerror`/`txtToken`. Extending
+near-text to the parser's own error sites is a distinct, broader change (the
+parser doesn't have `lexer.rs`'s byte-position context, and would need a
+`Token`-to-canonical-text mapping akin to `luaX_token2str` covering every
+token kind, not just the handful of escape/digit-validation cases
+`error_near` currently covers) - not yet attempted; `literals.lua` stays
+`pending` for that reason.
 
 `sort.lua`'s previous blocker (`table.create`'s hash-size hint not honored)
 is now fixed: `table.create(sizeseq, sizerest)` preallocates both the array

@@ -56,6 +56,7 @@
 //!   over `ExprKind`.
 //! - `tests` - unit tests.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use sol_core::{PrototypeMetadata, SourceLocation, SourceMap, ValueCount};
@@ -84,6 +85,14 @@ fn value_count(count: i32) -> ValueCount {
 pub struct Compiler {
     stack: Vec<FuncState>,
     optimization_plan: Option<crate::typeck::inference::OptimizationPlan>,
+    /// Anchors every string-literal token compiled anywhere in this chunk -
+    /// including inside nested function bodies, which each get their own
+    /// `FuncState`/constant pool - so byte-identical literals share one
+    /// `Rc<Vec<u8>>`. Mirrors real Lua's `llex.c` `luaX_newstring`/
+    /// `anchorstr`, which anchors string tokens in a table scoped to the
+    /// whole `LexState` (one per compile), not per function; see
+    /// `intern_string_literal`.
+    string_literals: HashMap<Vec<u8>, Rc<Vec<u8>>>,
 }
 
 impl Compiler {
@@ -91,6 +100,7 @@ impl Compiler {
         let mut compiler = Compiler {
             stack: Vec::new(),
             optimization_plan: None,
+            string_literals: HashMap::new(),
         };
         compiler.compile_function(function)
     }
@@ -102,8 +112,26 @@ impl Compiler {
         let mut compiler = Compiler {
             stack: Vec::new(),
             optimization_plan: Some(optimization_plan.clone()),
+            string_literals: HashMap::new(),
         };
         compiler.compile_function(function)
+    }
+
+    /// Returns the chunk-wide shared `Rc<Vec<u8>>` for a string-literal
+    /// token's bytes, allocating one the first time this exact content is
+    /// seen anywhere in the current compile. Real Lua's `%p` reports
+    /// pointer identity for strings past its short-string interning cutoff,
+    /// so without this, two textually-identical literals compiled into
+    /// different functions (nested closures each get their own `FuncState`
+    /// constant pool) would wrongly appear to be different objects.
+    pub(super) fn intern_string_literal(&mut self, bytes: &[u8]) -> Rc<Vec<u8>> {
+        if let Some(existing) = self.string_literals.get(bytes) {
+            return existing.clone();
+        }
+        let interned = Rc::new(bytes.to_vec());
+        self.string_literals
+            .insert(bytes.to_vec(), interned.clone());
+        interned
     }
 
     /// Scans for the `global`-declaration state governing `name`, starting

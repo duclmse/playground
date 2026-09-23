@@ -426,6 +426,75 @@ fn load_does_not_skip_a_shebang_but_file_loading_still_does() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("ran"));
 }
 
+/// Real Lua's lexer (`llex.c`'s `luaX_newstring`/`anchorstr`) anchors every
+/// string-literal token it produces in a table scoped to the whole compile
+/// (`LexState.h`, not per-function), so byte-identical literals share one
+/// `TString` object even across nested function bodies - `%p` reports the
+/// same address for a literal in an enclosing scope and a textually
+/// identical literal compiled inside a separate nested closure. A
+/// runtime-computed string of equal content (concatenation) must NOT share
+/// that address, since the sharing is a compile-time/lexer phenomenon, not
+/// a general same-content-implies-same-object rule. Mirrors
+/// `lua-5.5.1-tests/literals.lua`'s "reuse of long strings" test; the
+/// literal here is kept over Lua's 40-byte short-string cutoff so this
+/// exercises long-string identity, not `LuaValue::String`'s existing
+/// content-hash-based `%p` approximation for short strings.
+#[test]
+fn identical_long_string_literals_share_identity_across_nested_functions() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_string_reuse_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local function getadd(s) return string.format("%p", s) end
+        local s1 = "01234567890123456789012345678901234567890123456789"
+        local s2 = "01234567890123456789012345678901234567890123456789"
+        local function foo() return s1 end
+        local function inner()
+            return "01234567890123456789012345678901234567890123456789"
+        end
+        local a1 = getadd(s1)
+        assert(a1 == getadd(s2), "identical literals in the same scope must share identity")
+        assert(a1 == getadd(foo()), "a literal read through an outer local must share identity")
+        assert(
+            a1 == getadd(inner()),
+            "an identical literal in a separately-compiled nested function must share identity"
+        )
+        local sd = "0123456789" .. "0123456789012345678901234567890123456789"
+        assert(sd == s1 and getadd(sd) ~= a1, "a runtime concat result must not share identity")
+        print("string reuse ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("string reuse ok"));
+}
+
+/// Real Lua's `llex.c` reports a malformed numeral (e.g. a hex float with no
+/// digits after its `p` exponent, or a decimal integer immediately followed
+/// by a letter) as `"malformed number"` (`read_numeral`'s `lexerror(ls,
+/// "malformed number", TK_FLT)`), which `lua-5.5.1-tests/literals.lua`'s
+/// `malformednum` helper matches via `string.find(msg, "malformed number")`.
+#[test]
+fn lexer_reports_a_malformed_number_not_a_malformed_numeral() {
+    for source in ["return 0xep-p", "return 1print()"] {
+        let err = sol::lexer::lex(source).unwrap_err();
+        assert!(
+            err.contains("malformed number"),
+            "source {source:?}: expected \"malformed number\" in {err:?}"
+        );
+    }
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();
