@@ -401,10 +401,11 @@ fn dynamic_lua_runtime_debug_getinfo_builds_activelines_from_the_source_map() {
     // `lua-5.5.1-tests/db.lua` line 43-46: `activelines` is a set (line ->
     // `true`) of lines this prototype's own bytecode maps to. This only
     // checks the set is actually populated from `source_map` and doesn't leak
-    // lines from an unrelated scope; `db.lua`'s own stricter boundary checks
-    // (excluding the declaration/closing lines exactly, and an empty set for
-    // a debug-info-stripped dump) are still blocked by separate, pre-existing
-    // gaps - see `tests/lua55/manifest.toml`'s `db.lua` entry.
+    // lines from an unrelated scope; see
+    // `dynamic_lua_runtime_debug_getinfo_reports_lastlinedefined_as_the_closing_end_line`
+    // for the exact declaration/closing-line boundary checks and
+    // `dynamic_lua_runtime_string_dump_strip_flag_omits_line_info` for the
+    // debug-info-stripped-dump case.
     let parse =
         |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
     let mut runtime = LuaRuntime::with_capabilities(Capabilities {
@@ -515,6 +516,36 @@ fn dynamic_lua_runtime_set_chunk_name_registers_the_top_level_chunks_source() {
             br#"
             local info = debug.getinfo(1)
             return info.source == "@script.lua" and info.short_src == "script.lua"
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_string_dump_strip_flag_omits_line_info() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `lua-5.5.1-tests/db.lua` lines 52-58: `string.dump(f, true)`'s strip
+    // flag must omit debug info (per-instruction line info -> an empty
+    // `activelines`) from the reloaded closure, matching real Lua's
+    // `ldump.c` (which always still writes `linedefined`/`lastlinedefined` -
+    // those aren't considered debug info - but drops line info when
+    // stripped). A non-stripped dump must still carry line info.
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let value = runtime
+        .run(&parse(
+            br#"
+            local stripped = load(string.dump(load("print(10)"), true))
+            local kept = load(string.dump(load("print(10)"), false))
+            local stripped_lines = debug.getinfo(stripped, "L").activelines
+            local kept_lines = debug.getinfo(kept, "L").activelines
+            return #stripped_lines == 0 and #kept_lines > 0
         "#,
         ))
         .unwrap();

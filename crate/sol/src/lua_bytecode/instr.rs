@@ -173,7 +173,7 @@ impl Instr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Proto {
     pub metadata: PrototypeMetadata,
     pub instrs: Vec<Instr>,

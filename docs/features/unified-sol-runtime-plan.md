@@ -1644,12 +1644,26 @@ into `activelines`; fixed in `Compiler::compile_function`
 (`crate/sol/src/lua_bytecode/mod.rs`) by emitting both at `function.end_line`.
 With both fixed, `db.lua`'s full `linedefined`/`lastlinedefined`/
 `activelines` boundary assertions (lines 41-48) now pass exactly against the
-oracle. `db.lua` stays `pending`: it now progresses to line 57's
-`assert(#actl == 0)`, which needs `string.dump(f, true)`'s strip flag to
-actually omit debug info from the dumped/reloaded closure - Sol's
-`string.dump` is an opaque key into a process-local prototype registry, not a
-real bytecode serializer, so the strip flag is currently a no-op. That is a
-separate, pre-existing gap, out of scope for this line-info fix.
+oracle. Past that, line 57's `assert(#actl == 0)` needed `string.dump(f,
+true)`'s strip flag to actually omit debug info from the dumped/reloaded
+closure - Sol's `string.dump` is an opaque key into a process-local prototype
+registry, not a real bytecode serializer, so the strip flag was a no-op.
+That is now fixed too: `Proto` derives `Clone`, and `string.dump` honors
+`strip` by registering a proto clone with an empty `source_map` under its
+own dump-registry key (distinct from the original, still-running closure's
+full-debug-info proto) instead of always dumping the original proto.
+`linedefined`/`lastlinedefined` are untouched by stripping, matching real
+Lua's `ldump.c` (they aren't considered debug info). With that fixed too,
+the file now progresses through file/string chunkname truncation (lines
+61-85) all the way to line 91's `assert(a.name == 'f' and a.namewhat ==
+'local')` on a level-based `debug.getinfo(2)` lookup. `db.lua` stays
+`pending` there: this needs real call-site name/namewhat resolution (real
+Lua's `funcnamefromcode` in `ldebug.c`, which walks the *caller's* bytecode
+at the call instruction to determine how the callee was referenced -
+global/local/upvalue/field/method), a substantially larger feature than the
+line-info fixes above - `natives_debug.rs` already documents this as a
+known, deliberate gap (only a callee's own declared-local-function name is
+resolved today).
 
 ### U7 — Interpreter performance foundation
 

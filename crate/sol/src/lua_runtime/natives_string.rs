@@ -134,10 +134,29 @@ impl LuaRuntime {
                         )));
                     }
                 };
-                let key = Rc::as_ptr(&closure.proto) as usize;
-                self.dumped_protos.insert(key, closure.proto.clone());
+                // `strip` (Lua 5.5's 2nd `string.dump` argument) omits debug
+                // info from the dumped chunk - real Lua's `ldump.c` still
+                // always writes `linedefined`/`lastlinedefined` (they aren't
+                // considered debug info), but drops per-instruction line
+                // info, so a stripped-then-reloaded closure's `activelines`
+                // is empty. Sol's dump is an opaque registry key rather than
+                // a real byte-for-byte serializer, so this is emulated by
+                // registering a proto clone with its `source_map` cleared
+                // under its own key, distinct from the original (still-
+                // running) closure's own full-debug-info proto.
+                let strip = args.get(1).map(|value| value.truthy()).unwrap_or(false);
+                let dumped_proto = if strip {
+                    let mut stripped = (*closure.proto).clone();
+                    stripped.source_map = sol_core::SourceMap::new(Vec::new());
+                    Rc::new(stripped)
+                } else {
+                    closure.proto.clone()
+                };
+                let key = Rc::as_ptr(&dumped_proto) as usize;
+                self.dumped_protos.insert(key, dumped_proto);
                 let mut payload = Vec::new();
-                if let Some(source) = self.chunk_sources.get(&key) {
+                let source_key = Rc::as_ptr(&closure.proto) as usize;
+                if let Some(source) = self.chunk_sources.get(&source_key) {
                     payload.extend_from_slice(source);
                 }
                 append_dump_constants(&closure.proto, &mut payload);
