@@ -1139,11 +1139,16 @@ dynamic bytecode compiler (`lua_bytecode/compile_expr.rs`) compiles as a
 single-value expression. See
 `dynamic_lua_runtime_table_read_of_a_nil_or_unhashable_key_returns_nil_but_a_write_still_errors`/
 `dynamic_lua_runtime_parenthesized_call_truncates_to_one_value` in
-`crates/sol/tests/lua55_dynamic_runtime.rs`. With both fixed, the unmodified
-upstream file now reaches line 244's `checkload` assertion before stopping on
-the same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-
-prefix divergence already noted above for `goto.lua`; `constructs.lua` stays
-`pending` for the same reason.
+`crates/sol/tests/lua55_dynamic_runtime.rs`. With both fixed, line 244's
+`checkload` cluster (const-attribute and `<const>`/`<close>` reassignment
+diagnostics) now passes - this superseded the previously-recorded
+chunkname-prefix blocker there. The unmodified upstream file runs on into its
+short-circuit-optimization stress section (see `tests/lua55/manifest.toml`'s
+entry for the current, still-`pending` blocker: the CLI's default
+1,000,000-instruction embedder budget is exhausted there, addressed for the
+corpus run via an explicit 10,000,000-instruction budget, with the
+unmodified high-workload run still needing pinned-oracle differential
+validation).
 
 `errors.lua`'s manifest note claiming a line-6 `require "debug"` blocker was
 likewise stale. Chasing this file further turned up two more genuine,
@@ -1161,10 +1166,19 @@ which now consume one optional `;` after a `return`/`MultiReturn` statement
 and then require a block terminator (or end of input at top level). See
 `dynamic_lua_runtime_error_with_no_message_or_a_nil_message_becomes_no_error_object`/
 `dynamic_lua_runtime_return_must_be_the_last_statement_in_a_block` in
-`crates/sol/tests/lua55_dynamic_runtime.rs`. With both fixed, the unmodified
-upstream file now reaches line 65's `checksyntax` call before stopping on the
-same pre-existing, out-of-scope `line N:` vs. `chunkname:N:` diagnostic-prefix
-divergence noted above; `errors.lua` stays `pending` for the same reason.
+`crates/sol/tests/lua55_dynamic_runtime.rs`. The lexer's `near '<token>'`/
+`near <eof>` diagnostic suffix (see `literals.lua` below) unblocks this file's
+`checksyntax` helper too, which asserts on both that suffix and `load`'s
+`chunkname:N:` prefix together - the line-65 `checksyntax` call, previously
+this file's stopping point, now passes. The unmodified upstream file runs on
+to line ~277, inside the `do -- named objects` block, where
+`checkmessage("return ~io.stdin", "on a FILE* value")` fails: Sol's
+bitwise-NOT operator reports a generic "number expected" for a `FILE*`
+userdata operand instead of real Lua's "attempt to perform bitwise operation
+on a FILE* value" - a distinct, unrelated, not-yet-fixed bug in
+userdata-operand error messages for bitwise operators; `errors.lua` stays
+`pending` for that reason (the `checksyntax` cluster at lines 686-697 is not
+yet reached/verified).
 
 `literals.lua`'s manifest note claiming a line-8 `require "debug"` blocker was
 likewise stale, but this file also exercises `require"debug".getinfo`/
@@ -1185,12 +1199,30 @@ alongside `is_ascii_whitespace()`. See
 `dynamic_lua_runtime_vertical_tab_and_form_feed_count_as_whitespace_including_inside_a_z_escape`/
 `dynamic_lua_runtime_debug_getinfo_reports_the_calling_frames_current_line` in
 `crates/sol/tests/lua55_dynamic_runtime.rs`. With all three fixed, the
-unmodified upstream file now reaches line 85's `lexerror` helper, which
-expects a `near '<token>'` phrase in lex/parse error messages that Sol's
-diagnostics don't produce at all - the same out-of-scope diagnostic-format
-divergence noted above for `goto.lua`/`constructs.lua`/`errors.lua`, just its
-"near" half rather than its chunkname-prefix half; `literals.lua` stays
-`pending` for the same reason.
+unmodified upstream file reached line 85's `lexerror` helper, which expects a
+`near '<token>'`/`near <eof>` phrase (real Lua's `lexerror`/`txtToken`,
+`llex.c`) that Sol's diagnostics didn't produce at all. That's now
+implemented: `Scanner::error_near` in `crates/sol/src/lexer.rs` derives the
+near-text directly from the lexer's own byte slice (no separate save-buffer
+needed, since a failure's buffer content is always exactly the raw source
+substring from the token's start to the point of failure) - buffer-style
+(`near '...'`) for every escape/digit-validation failure in `quoted`,
+including ones that coincide with end-of-input (mirroring `esccheck`'s
+always-quoted-token behavior), and `<eof>`-style only for the handful of
+structural cases real Lua's own lexer reaches with no partial escape pending:
+a bare unterminated string/long-string, and a trailing backslash with nothing
+after it. See `lexer_errors_report_lua_compatible_near_text` in
+`crates/sol/tests/lua55.rs`. With this fixed, all ~30 of the file's
+`lexerror` calls (lines 78-122) now pass. The unmodified upstream file runs on
+to line 127's "valid characters in variable names" loop
+(`load(s .. "=1", "")` for every byte 0-255) and fails at byte 35 (`#`):
+Sol's lexer treats a leading `#` as a shebang-comment to skip even when
+reached through `load` on an in-memory string (the shebang-skip is meant only
+for `sol run`/`sol build`'s own file loading), so `load("#=1", "")` succeeds
+where real Lua's `load` - which never skips shebangs, only the standalone
+`lua` CLI's file loader does - would reject `#` as an invalid statement
+start. A distinct, unrelated, not-yet-fixed bug; `literals.lua` stays
+`pending` for that reason.
 
 `sort.lua`'s previous blocker (`table.create`'s hash-size hint not honored)
 is now fixed: `table.create(sizeseq, sizerest)` preallocates both the array

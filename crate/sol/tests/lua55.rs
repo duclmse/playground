@@ -340,6 +340,44 @@ fn lexer_and_parser_errors_include_source_columns() {
     assert!(parsed.ends_with("[EPARSE001]"), "{parsed}");
 }
 
+/// Real Lua 5.5's `lexerror`/`txtToken` (`llex.c`) append a `near '<token>'`
+/// or `near <eof>` suffix to every lexical error, and `lua-5.5.1-tests/
+/// literals.lua`'s `lexerror` helper asserts on that suffix (unanchored:
+/// `string.find(msg, "near .-" .. err)`). These cases mirror representative
+/// `literals.lua` call sites across every near-text code path: quoted-buffer
+/// text (including the one extra lookahead byte `esccheck` saves before
+/// erroring) for escape/digit-validation failures - even ones that coincide
+/// with end-of-input - and a literal `<eof>` only for the handful of
+/// structural cases that never save a partial escape (a bare unterminated
+/// string/long-string, and a trailing backslash with nothing after it).
+#[test]
+fn lexer_errors_report_lua_compatible_near_text() {
+    let cases: &[(&str, &str)] = &[
+        (r#""\x"#, r#"near '"\x'"#),
+        (r#""\x."#, r#"near '"\x.'"#),
+        (r#""\xAG"#, r#"near '"\xAG'"#),
+        (r#""\g"#, r#"near '"\g'"#),
+        (r#""\999"#, r#"near '"\999'"#),
+        (r#""xyz\300"#, r#"near '"xyz\300'"#),
+        (r#""abc\u{100000000}"#, r#"near '"abc\u{100000000'"#),
+        (r#""abc\u11r"#, r#"near '"abc\u1'"#),
+        (r#""abc\u"#, r#"near '"abc\u'"#),
+        (r#""abc\u{11r"#, r#"near '"abc\u{11r'"#),
+        (r#""abc\u{r"#, r#"near '"abc\u{r'"#),
+        ("'alo\n", "near ''alo'"),
+        ("[=[alo]", "near <eof>"),
+        ("'alo", "near <eof>"),
+        ("'alo \\z", "near <eof>"),
+    ];
+    for (source, expected_near) in cases {
+        let err = sol::lexer::lex(source).unwrap_err();
+        assert!(
+            err.contains(expected_near),
+            "source {source:?}: expected {expected_near:?} in {err:?}"
+        );
+    }
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();

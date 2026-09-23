@@ -111,6 +111,25 @@ impl Scanner<'_> {
             .to_string()
     }
 
+    /// Like `error`, but appends real Lua's `near '<token>'`/`near <eof>`
+    /// suffix (`lexerror`/`txtToken`, `llex.c`) so `load()`'s diagnostic
+    /// rewriting (`format_chunk_diagnostic`) can surface it. `near_text` is
+    /// the raw source bytes accumulated for the in-progress token (mirroring
+    /// `ls->buff`) up to the point of failure - `None` for the cases where
+    /// real Lua's own error genuinely reaches end-of-input outside any
+    /// escape/digit check (`lexerror(ls, msg, TK_EOS)`), which report
+    /// `near <eof>` instead of a quoted token. An escape/digit check that
+    /// merely runs out of input while validating one character (e.g. `"\x`
+    /// with nothing after the `x`) is NOT this case - real Lua's `esccheck`
+    /// still reports a quoted `near` token there.
+    fn error_near(&self, msg: &str, near_text: Option<&[u8]>) -> String {
+        let base = self.error(msg);
+        match near_text {
+            Some(text) => format!("{base} near '{}'", String::from_utf8_lossy(text)),
+            None => format!("{base} near <eof>"),
+        }
+    }
+
     fn span_at(&self, pos: usize) -> SourceSpan {
         SourceSpan::new(
             pos,
@@ -167,10 +186,14 @@ impl Scanner<'_> {
                 self.pos += 1;
             }
         }
-        Err(self.error("unfinished long string/comment"))
+        Err(self.error_near("unfinished long string/comment", None))
     }
 
     fn quoted(&mut self, quote: u8) -> Result<Vec<u8>, String> {
+        // Where this token started (the opening delimiter) - real Lua's
+        // `ls->buff` starts here too (`read_string`'s first `save_and_next`
+        // keeps the delimiter "for error messages").
+        let token_start = self.pos;
         self.pos += 1;
         let mut out = Vec::new();
         while let Some(b) = self.peek() {
@@ -179,13 +202,28 @@ impl Scanner<'_> {
                 return Ok(out);
             }
             if b == b'\r' || b == b'\n' {
-                return Err(self.error("unfinished string"));
+                // Real Lua doesn't save the newline itself before erroring
+                // (`read_string`'s `case '\n': case '\r':` calls `lexerror`
+                // directly, no `save_and_next`).
+                return Err(self.error_near(
+                    "unfinished string",
+                    Some(&self.bytes[token_start..self.pos - 1]),
+                ));
             }
             if b != b'\\' {
                 out.push(b);
                 continue;
             }
-            let e = self.peek().ok_or_else(|| self.error("unfinished escape"))?;
+            // A backslash with nothing after it at all is the one escape
+            // failure that reaches real Lua's outer EOZ case (`goto
+            // no_save`, then the enclosing `while` re-checks `ls->current`
+            // and hits `case EOZ: lexerror(ls, "unfinished string",
+            // TK_EOS)`) - genuinely `near <eof>`, unlike every other escape
+            // check below (which use `esccheck`, always a quoted token even
+            // when the next character would be EOF).
+            let e = self
+                .peek()
+                .ok_or_else(|| self.error_near("unfinished escape", None))?;
             self.pos += 1;
             match e {
                 b'a' => out.push(7),
@@ -220,12 +258,25 @@ impl Scanner<'_> {
                 b'x' => {
                     let mut n = 0;
                     for _ in 0..2 {
-                        let d = self
-                            .peek()
-                            .and_then(|c| (c as char).to_digit(16))
-                            .ok_or_else(|| self.error("expected two hex digits"))?;
-                        self.pos += 1;
-                        n = n * 16 + d;
+                        let Some(c) = self.peek() else {
+                            return Err(self.error_near(
+                                "expected two hex digits",
+                                Some(&self.bytes[token_start..self.pos]),
+                            ));
+                        };
+                        match (c as char).to_digit(16) {
+                            Some(d) => {
+                                self.pos += 1;
+                                n = n * 16 + d;
+                            }
+                            None => {
+                                let end = self.pos + 1;
+                                return Err(self.error_near(
+                                    "expected two hex digits",
+                                    Some(&self.bytes[token_start..end]),
+                                ));
+                            }
+                        }
                     }
                     out.push(n as u8);
                 }
@@ -240,26 +291,57 @@ impl Scanner<'_> {
                         }
                     }
                     if n > 255 {
-                        return Err(self.error("decimal escape exceeds 255"));
+                        let end = if self.pos < self.bytes.len() {
+                            self.pos + 1
+                        } else {
+                            self.pos
+                        };
+                        return Err(self.error_near(
+                            "decimal escape exceeds 255",
+                            Some(&self.bytes[token_start..end]),
+                        ));
                     }
                     out.push(n as u8);
                 }
                 b'u' => {
                     if self.peek() != Some(b'{') {
-                        return Err(self.error("expected '{' after \\u"));
+                        let end = if self.pos < self.bytes.len() {
+                            self.pos + 1
+                        } else {
+                            self.pos
+                        };
+                        return Err(self.error_near(
+                            "expected '{' after \\u",
+                            Some(&self.bytes[token_start..end]),
+                        ));
                     }
                     self.pos += 1;
                     let start = self.pos;
                     let mut n = 0u32;
                     while let Some(d) = self.peek().and_then(|c| (c as char).to_digit(16)) {
-                        n = n
-                            .checked_mul(16)
-                            .and_then(|n| n.checked_add(d))
-                            .ok_or_else(|| self.error("Unicode escape too large"))?;
+                        n = n.checked_mul(16).and_then(|n| n.checked_add(d)).ok_or_else(|| {
+                            let end = if self.pos < self.bytes.len() {
+                                self.pos + 1
+                            } else {
+                                self.pos
+                            };
+                            self.error_near(
+                                "Unicode escape too large",
+                                Some(&self.bytes[token_start..end]),
+                            )
+                        })?;
                         self.pos += 1;
                     }
                     if self.pos == start || self.peek() != Some(b'}') || n > 0x7fffffff {
-                        return Err(self.error("invalid Unicode escape"));
+                        let end = if self.pos < self.bytes.len() {
+                            self.pos + 1
+                        } else {
+                            self.pos
+                        };
+                        return Err(self.error_near(
+                            "invalid Unicode escape",
+                            Some(&self.bytes[token_start..end]),
+                        ));
                     }
                     self.pos += 1;
                     // Lua permits the extended UTF-8 range, including surrogates.
@@ -286,10 +368,15 @@ impl Scanner<'_> {
                         out.extend(encoded);
                     }
                 }
-                _ => return Err(self.error("invalid escape sequence")),
+                _ => {
+                    return Err(self.error_near(
+                        "invalid escape sequence",
+                        Some(&self.bytes[token_start..self.pos]),
+                    ))
+                }
             }
         }
-        Err(self.error("unfinished string"))
+        Err(self.error_near("unfinished string", None))
     }
 
     fn number(&mut self) -> Result<Token, String> {
