@@ -315,6 +315,28 @@ impl Parser {
             .to_string()
     }
 
+    /// Real Lua's `near '<token>'`/`near <eof>` diagnostic suffix
+    /// (`luaX_syntaxerror`/`txtToken`, `llex.c`), for the parser's own
+    /// "unexpected symbol" fallbacks, using the *not-yet-consumed* current
+    /// token. `Spanned::lexeme` already holds the token's exact source
+    /// bytes, so unlike the lexer's own `error_near` (which reconstructs
+    /// `near` text from raw byte positions), this can use it directly for
+    /// every token kind - keywords, operators, and literals alike - with no
+    /// separate token-to-text table needed.
+    fn near_suffix(&self) -> String {
+        Self::format_near(self.tokens.get(self.pos).map(|token| token.lexeme.as_slice()))
+    }
+
+    /// Like [`Parser::near_suffix`], but for a call site that already
+    /// consumed the failing token (e.g. via `self.advance()`) and so must
+    /// pass its lexeme in explicitly rather than reading `self.pos`.
+    fn format_near(lexeme: Option<&[u8]>) -> String {
+        match lexeme {
+            Some(text) => format!(" near '{}'", String::from_utf8_lossy(text)),
+            None => " near <eof>".to_string(),
+        }
+    }
+
     fn advance(&mut self) -> Option<Token> {
         let t = self.tokens.get(self.pos).map(|s| s.token.clone());
         self.pos += 1;
@@ -1106,8 +1128,10 @@ impl Parser {
             // phrase itself is part of the compatibility contract, not
             // cosmetic.
             other => Err(format!(
-                "line {}: unexpected symbol (unexpected token {:?}) at start of statement",
-                line, other
+                "line {}: unexpected symbol (unexpected token {:?}) at start of statement{}",
+                line,
+                other,
+                self.near_suffix()
             )),
         }
     }
@@ -1514,6 +1538,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let line = self.line();
         let start = self.current_span();
+        let near = self.tokens.get(self.pos).map(|token| token.lexeme.clone());
         match self.advance() {
             Some(Token::Function) => {
                 let (params, param_annotations, vararg, vararg_name) = self.parse_param_list()?;
@@ -1671,7 +1696,8 @@ impl Parser {
             // - real Lua's wording ("unexpected symbol") is itself part of
             // the Lua 5.5 compatibility contract.
             other => Err(format!(
-                "line {line}: unexpected symbol (unexpected token {other:?} in expression)"
+                "line {line}: unexpected symbol (unexpected token {other:?} in expression){}",
+                Self::format_near(near.as_deref())
             )),
         }
     }

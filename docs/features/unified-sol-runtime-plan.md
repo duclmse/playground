@@ -1318,20 +1318,36 @@ malformed-numeral lexer errors said "malformed numeral" where real Lua's
 `lexer_reports_a_malformed_number_not_a_malformed_numeral` in
 `crates/sol/tests/lua55.rs`.
 
-The file's new stopping point is `malformednum("0xe-", "near <eof>")` (line
-341): `load("return 0xe-")` correctly fails to compile (a trailing `-` with
-nothing after it), but the error comes from `parser.rs`'s generic
-expression-error site, not `lexer.rs`, and Sol's parser does not yet append
-the `near '<token>'`/`near <eof>` diagnostic suffix the way `lexer.rs`'s
+The file's former stopping point was `malformednum("0xe-", "near <eof>")`
+(line 341): `load("return 0xe-")` correctly fails to compile (a trailing `-`
+with nothing after it), but the error came from `parser.rs`'s generic
+expression-error site, not `lexer.rs`, and Sol's parser didn't append the
+`near '<token>'`/`near <eof>` diagnostic suffix the way `lexer.rs`'s
 `Scanner::error_near` does for lexer-level errors - real Lua's parser gets
 this for free because `luaX_syntaxerror` (used by both the lexer and the
-parser) always routes through the same `lexerror`/`txtToken`. Extending
-near-text to the parser's own error sites is a distinct, broader change (the
-parser doesn't have `lexer.rs`'s byte-position context, and would need a
-`Token`-to-canonical-text mapping akin to `luaX_token2str` covering every
-token kind, not just the handful of escape/digit-validation cases
-`error_near` currently covers) - not yet attempted; `literals.lua` stays
-`pending` for that reason.
+parser) always routes through the same `lexerror`/`txtToken`. This turned out
+not to need the `Token`-to-canonical-text mapping originally assumed: each
+token's `Spanned` already carries its exact source bytes in a `lexeme` field
+(added for contextual-keyword spelling and formatting elsewhere), so the
+parser's two generic "unexpected symbol" fallbacks (`parse_stmt`,
+`parse_primary`, its only two sites that produce this class of error) just
+read that lexeme directly via a new `Parser::near_suffix`/`Parser::format_near`
+pair - `near '<token>'` when a token follows, `near <eof>` when the failure
+point is genuinely end-of-input. See
+`parser_reports_the_lua_compatible_near_token_or_near_eof_suffix_for_an_unexpected_symbol`
+in `crates/sol/tests/lua55.rs`. With that fixed, the unmodified upstream file
+now runs to completion and prints `OK`, matching the pinned
+`/opt/homebrew/bin/lua5.5` (`Lua 5.5.1`) oracle's own run - `literals.lua`
+moves from `pending` to `diverges` rather than `pass` because two purely
+cosmetic, pre-existing, unrelated differences remain: Sol's `os.setlocale`
+only ever succeeds for `""`/`"C"` (a deliberate design choice documented in
+`natives_os_io.rs`, not something this file's own locale-availability guard
+treats as a failure), so it always takes the file's "pt_BR locale not
+available" skip branch where the pinned oracle happened to have that locale
+installed on this machine; and `sol run`'s CLI harness prints the top-level
+chunk's own return value as a trailing line after every script's output, a
+pre-existing artifact of `sol run` in general (also visible on already-`pass`
+cases like `closure.lua`), not specific to this file.
 
 `sort.lua`'s previous blocker (`table.create`'s hash-size hint not honored)
 is now fixed: `table.create(sizeseq, sizerest)` preallocates both the array

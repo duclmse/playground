@@ -630,6 +630,46 @@ fn error_and_assert_add_a_luals_where_style_position_prefix() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("where prefix ok"));
 }
 
+/// Real Lua's `luaX_syntaxerror` (used by both the lexer and the parser)
+/// always appends a `near '<token>'`/`near <eof>` suffix. The lexer's own
+/// error sites already had this (`lexer.rs`'s `error_near`), but the
+/// parser's two generic "unexpected symbol" fallbacks (an unparseable
+/// statement or expression start) did not - `Spanned::lexeme` already
+/// carries each token's exact source bytes, so the fix reads that directly
+/// rather than needing a separate token-to-text table.
+#[test]
+fn parser_reports_the_lua_compatible_near_token_or_near_eof_suffix_for_an_unexpected_symbol() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_near_suffix_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local s1, msg1 = load("return 0xe-")
+        assert(not s1 and string.find(msg1, "near <eof>"), msg1)
+
+        local s2, msg2 = load("return )")
+        assert(not s2 and string.find(msg2, "near '%)'"), msg2)
+
+        local s3, msg3 = load("end")
+        assert(not s3 and string.find(msg3, "near 'end'"), msg3)
+
+        print("near suffix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("near suffix ok"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();
