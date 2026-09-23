@@ -534,6 +534,44 @@ fn bitwise_not_on_a_non_number_operand_reports_the_operand_type() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("bnot type errors ok"));
 }
 
+/// Real Lua's `luaG_typeerror` always reports an arithmetic type error as
+/// "attempt to perform arithmetic on a {type} value", for any non-number,
+/// non-numeric-string operand - a plain table with no `__name` metafield
+/// included. Sol's binary arithmetic dispatch used to fall back to a
+/// non-standard "attempt to perform arithmetic on incompatible Lua values"
+/// whenever the operand's diagnostic label happened to equal its plain type
+/// name (i.e. whenever it had no `__name` override), which silently
+/// swallowed the type name for the overwhelmingly common case.
+#[test]
+fn arithmetic_on_a_plain_table_or_non_numeric_string_names_the_operand_type() {
+    let path =
+        std::env::temp_dir().join(format!("sol_lua55_arith_type_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local st1, err1 = pcall(function() return {} + 1 end)
+        assert(not st1 and string.find(err1, "on a table value"), err1)
+
+        local st2, err2 = pcall(function() return "abc" + 1 end)
+        assert(not st2 and string.find(err2, "on a string value"), err2)
+
+        print("arithmetic type errors ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("arithmetic type errors ok"));
+}
+
 #[test]
 fn aot_supports_the_lua_string_subset() {
     ensure_staticlib();

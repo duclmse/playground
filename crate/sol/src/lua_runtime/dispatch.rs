@@ -1737,11 +1737,7 @@ impl LuaRuntime {
                             OperandSide::Right => &right,
                         };
                         let label = self.error_type_label(failing_value);
-                        let message = if label != failing_value.type_name() {
-                            format!("attempt to perform arithmetic on a {label} value")
-                        } else {
-                            "attempt to perform arithmetic on incompatible Lua values".to_string()
-                        };
+                        let message = format!("attempt to perform arithmetic on a {label} value");
                         Err(LuaError::new(message).with_operand_hint(failing_side))
                     }
                 }

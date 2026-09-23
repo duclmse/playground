@@ -1187,14 +1187,20 @@ debug info` block: it loads a closure re-dumped with `string.dump(f, true)`'s
 strip flag and expects a runtime error raised inside it to report its
 location as the literal `?:?` real Lua uses for a function with no debug
 info, rather than a real source position. Sol's dumped/reloaded closure does
-still run and does still error on the bad call, but with a different message
-entirely ("attempt to perform arithmetic on incompatible Lua values" with no
-`?:?:`-style location prefix, instead of real Lua's location-prefixed
-"attempt to perform arithmetic on a table value") - a distinct, unrelated,
-larger gap in how errors are attributed/formatted for closures with stripped
-debug info, not yet investigated; `errors.lua` stays `pending` for that
-reason (the `checksyntax` cluster at lines 686-697 is not yet
-reached/verified).
+still run and does still error on the bad call. Along the way, a second,
+separate bug surfaced and is now fixed: the binary arithmetic dispatch's
+type-error message fell back to a non-standard "attempt to perform
+arithmetic on incompatible Lua values" whenever the failing operand's
+diagnostic label equalled its plain type name (i.e. whenever it had no
+`__name` metafield override) - the overwhelmingly common case (a plain
+table, a non-numeric string, and so on) - instead of always using real Lua's
+`luaG_typeerror` wording, "attempt to perform arithmetic on a {type} value".
+See `arithmetic_on_a_plain_table_or_non_numeric_string_names_the_operand_type`
+in `crates/sol/tests/lua55.rs`. Even with the wording fixed, the error still
+has no `?:?:`-style location prefix at all - a distinct, unrelated, larger
+gap in how errors are attributed/formatted for closures with stripped debug
+info, not yet investigated; `errors.lua` stays `pending` for that reason (the
+`checksyntax` cluster at lines 686-697 is not yet reached/verified).
 
 `literals.lua`'s manifest note claiming a line-8 `require "debug"` blocker was
 likewise stale, but this file also exercises `require"debug".getinfo`/
