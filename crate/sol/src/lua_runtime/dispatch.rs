@@ -1083,6 +1083,23 @@ impl LuaRuntime {
                                 Some(label) => error.at(&format!("in metamethod '{label}'")),
                                 None => error,
                             };
+                            // `frame` was popped above (line 845) and never
+                            // pushed back for this arm, unlike the
+                            // `PushClosure` overflow arm above - so unlike
+                            // that arm, it is no longer in `self.frames` for
+                            // `unwind_error_to_marker`'s own `removed =
+                            // self.frames.len() - marker_index` frame count
+                            // to see. Release its own charge here first (the
+                            // same `self.frames.len() > base_depth` gate
+                            // `finish_frame` uses, since a bare base frame
+                            // was charged by `call`'s own bookkeeping, not
+                            // `depth_charged`), or a runtime error caught by
+                            // an ancestor's pcall/xpcall silently leaks one
+                            // `call_depth` unit per occurrence.
+                            if self.frames.len() > base_depth {
+                                self.call_depth -= 1;
+                                *depth_charged -= 1;
+                            }
                             // `frame` was popped above and never pushed back
                             // for this arm, so it's being discarded here -
                             // close its own pending `<close>` values before

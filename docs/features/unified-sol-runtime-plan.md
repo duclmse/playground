@@ -2124,6 +2124,42 @@ return path used by every other, non-matching parser error. See
 `checksyntax_style_errors_report_the_lua_compatible_near_suffix` in
 `crates/sol/tests/lua55.rs`.
 
+Continuing the `errors.lua` bisection past the near-suffix fix (its
+`for i=1,1000 do doit('a = '); doit('a = 4+nil') end` loop, just before the
+"testing syntax limits" section) surfaced a genuine `call_depth` accounting
+leak, isolated through several layers of scratch repros down to a minimal
+case: a `pcall` that catches a plain, directly-raised runtime error (e.g.
+`4 + nil`, with no nested call involved at all) never released that erroring
+frame's own `call_depth`/`depth_charged` charge. `dispatch.rs`'s
+`drive_result` pops the current frame off `self.frames` before its
+`Err(mut error) =>` arm runs and, unlike the sibling `PushClosure`-overflow
+arm (which explicitly re-pushes the frame first specifically so
+`unwind_error_to_marker`'s frame walk counts it), never puts it back before
+calling `unwind_error_to_marker` — whose `removed = self.frames.len() -
+marker_index; self.call_depth -= removed` accounting only ever sees frames
+still physically present in `self.frames`. Each caught plain runtime error
+therefore leaked exactly one `call_depth` unit, cumulatively exhausting the
+default 1000-unit `max_call_depth` budget after enough pcall-wrapped
+runtime-error calls — which is what made `errors_bisect.lua`'s failure
+surface at an ordinary, shallow `testrep` call far from any deep recursion.
+Fixed by releasing the erroring frame's own charge directly in that
+`Err(mut error) =>` arm, gated by the same `self.frames.len() > base_depth`
+condition `finish_frame` already uses for a normal return (a bare base
+frame's charge belongs to the outer `call`'s own bookkeeping, not
+`depth_charged`, and must not be double-released here). See
+`pcall_catching_a_plain_runtime_error_does_not_leak_call_depth_budget` in
+`crates/sol/tests/lua55.rs`.
+
+With that leak fixed, the bisection advanced past the loop and several
+`testrep` calls into a new, unrelated gap: real Lua's parser rejects deeply
+nested constructs via a recursion-depth limit (`LUAI_MAXCCALLS`, enforced by
+`lparser.c`'s `enterlevel`/`leavelevel`), so `load()` on 500 levels of nested
+parentheses or local-variable lists fails to parse with a "too many"/"stack
+overflow"-style message; Sol's parser has no equivalent nesting-depth check
+and currently accepts constructs that deep outright. Not yet investigated —
+see `tests/lua55/manifest.toml`'s `errors.lua` note for the exact stopping
+point (its `testrep` helper's `load(gencode(500))` assertion).
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

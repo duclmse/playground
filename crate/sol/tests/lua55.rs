@@ -2040,3 +2040,45 @@ fn an_uncaught_error_with_no_enclosing_pcall_still_records_every_frames_position
     assert!(stderr.contains(":6:"), "{stderr}");
     assert!(stderr.contains(":8:"), "{stderr}");
 }
+
+#[test]
+fn pcall_catching_a_plain_runtime_error_does_not_leak_call_depth_budget() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_pcall_runtime_error_no_depth_leak_{}.lua",
+        std::process::id()
+    ));
+    // A directly-raised, non-nested-call runtime error (`4 + nil` inside the
+    // frame's own bytecode, no intervening call) that a pcall catches must
+    // release the erroring frame's own call_depth charge exactly like a
+    // normal return does - `maxdepth()` probes the live recursion budget
+    // before and after 200 such catches, and the two must match.
+    std::fs::write(
+        &path,
+        br#"
+        local function maxdepth()
+          local function f(n)
+            local ok, res = pcall(f, n + 1)
+            if ok then return res end
+            return n
+          end
+          return f(0)
+        end
+
+        local before = maxdepth()
+        for i = 1, 200 do
+          pcall(function() return 4 + nil end)
+        end
+        local after = maxdepth()
+        assert(before == after, "call_depth leaked: before=" .. before .. " after=" .. after)
+        print("pcall runtime error depth ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("pcall runtime error depth ok"));
+}
