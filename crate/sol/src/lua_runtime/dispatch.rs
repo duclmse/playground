@@ -876,16 +876,16 @@ impl LuaRuntime {
                             call_chain_hops,
                         }) => {
                             if self.call_depth >= self.max_call_depth {
-                                let call_site = frame.proto.source_map.location(frame.header.pc);
                                 let entry_label = frame.entry_label;
+                                // This frame stays on `self.frames` (unlike
+                                // the `dispatch_step` `Err` arm below), so
+                                // `unwind_error_to_marker`'s own frame walk
+                                // records its position - adding it again
+                                // here would duplicate the entry.
                                 self.frames.push(Frame::Lua(frame));
                                 let error = LuaError::new(
                                     "stack overflow (Lua call-depth budget exhausted)",
                                 );
-                                let error = match call_site {
-                                    Some(location) => error.at(&format!("line {}", location.line)),
-                                    None => error,
-                                };
                                 let error = match entry_label {
                                     Some(label) => error.at(&format!("in metamethod '{label}'")),
                                     None => error,
@@ -935,7 +935,6 @@ impl LuaRuntime {
                             self.frames.push(Frame::Lua(replacement));
                         }
                         Ok(StepResult::CallLeaf { callee, args }) => {
-                            let call_site = frame.proto.source_map.location(frame.header.pc);
                             let call_proto = frame.proto.clone();
                             let call_pc = frame.header.pc as usize;
                             let call_base = match frame.pending {
@@ -985,20 +984,38 @@ impl LuaRuntime {
                                                 format!("{} (metamethod '{label}')", error.message);
                                         }
                                     }
-                                    match self.unwind_error_to_marker(
+                                    // This leaf call resolves through
+                                    // `step_result_for_call`/`CallLeaf` rather
+                                    // than `dispatch_step`'s direct `Err`
+                                    // return, so it never reaches the other
+                                    // `Err(mut error) =>` arm below that
+                                    // otherwise owns this prefixing - apply
+                                    // the same implicit-error convention here
+                                    // (see that arm's comment) so calling a
+                                    // non-callable value gets a position
+                                    // prefix too. Applied last, after the
+                                    // annotators above that pattern-match on
+                                    // the unprefixed message text.
+                                    if error.value.is_none() {
+                                        if let Some(prefix) =
+                                            self.runtime_error_prefix(&call_proto, call_pc as u32)
                                         {
-                                            let error = match call_site {
-                                                Some(location) => {
-                                                    error.at(&format!("line {}", location.line))
-                                                }
-                                                None => error,
-                                            };
-                                            match entry_label {
-                                                Some(label) => {
-                                                    error.at(&format!("in metamethod '{label}'"))
-                                                }
-                                                None => error,
+                                            error.message = format!("{prefix}{}", error.message);
+                                        }
+                                    }
+                                    // The calling frame's own position isn't
+                                    // added here - it stayed on
+                                    // `self.frames` (pushed above), so
+                                    // `unwind_error_to_marker`'s frame walk
+                                    // records it, along with every other
+                                    // call-chain level between here and the
+                                    // enclosing pcall/xpcall marker.
+                                    match self.unwind_error_to_marker(
+                                        match entry_label {
+                                            Some(label) => {
+                                                error.at(&format!("in metamethod '{label}'"))
                                             }
+                                            None => error,
                                         },
                                         base_depth,
                                         depth_charged,
@@ -1057,7 +1074,9 @@ impl LuaRuntime {
                                 }
                             }
                             let error = match frame.proto.source_map.location(frame.header.pc) {
-                                Some(location) => error.at(&format!("line {}", location.line)),
+                                Some(location) => {
+                                    error.at(&self.traceback_frame_label(&frame.proto, location.line))
+                                }
                                 None => error,
                             };
                             let error = match frame.entry_label {
@@ -1469,16 +1488,45 @@ impl LuaRuntime {
             })
         };
         let Some(marker_index) = marker_index else {
+            // No enclosing `pcall`/`xpcall` catches this - it propagates all
+            // the way out through `call_closure`/`resume_coroutine`, whose
+            // own `close_frames_above` discards these same frames
+            // afterward. Real Lua's traceback for an uncaught error still
+            // records every discarded frame's line (the standalone `lua`
+            // CLI wraps the whole script in its own top-level protected
+            // call with a `msghandler` that calls `luaL_traceback`, exactly
+            // like the marker branch below does explicitly), so record each
+            // frame's position here too - but without popping or closing any
+            // of them, since `drive`'s contract promises `self.frames` is
+            // left untouched on this error path and `close_frames_above`
+            // still owns discarding/closing them.
+            let mut error = error;
+            for frame in self.frames[base_depth..].iter().rev() {
+                if let Frame::Lua(frame) = frame {
+                    if let Some(location) = frame.proto.source_map.location(frame.header.pc) {
+                        error = error
+                            .at_outer_frame(&self.traceback_frame_label(&frame.proto, location.line));
+                    }
+                }
+            }
             return Err(error);
         };
         let marker_index = base_depth + marker_index;
         let removed = self.frames.len() - marker_index;
         // Close every discarded Lua frame's pending `<close>` values first,
         // innermost (highest index, popped first) to outermost, threading the
-        // propagating error through each one.
+        // propagating error through each one. Each discarded frame is also
+        // its own call-chain level between the error site and this marker -
+        // real Lua's traceback (`lauxlib.c`'s `luaL_traceback`) walks every
+        // activation record the same way, so record this frame's own paused
+        // line too (its callers above it in `self.frames` get their own
+        // entry on a later iteration of this same loop).
         let mut error = error;
         while self.frames.len() > marker_index + 1 {
             if let Frame::Lua(mut frame) = self.frames.pop().expect("len > marker_index + 1") {
+                if let Some(location) = frame.proto.source_map.location(frame.header.pc) {
+                    error = error.at_outer_frame(&self.traceback_frame_label(&frame.proto, location.line));
+                }
                 error = self.close_frame_tbc_on_error(&mut frame, error);
             }
         }
@@ -1549,7 +1597,7 @@ impl LuaRuntime {
                     Ok(UnaryResolution::Value(LuaValue::Integer(n.wrapping_neg())))
                 }
                 Ok(Number::Float(n)) => Ok(UnaryResolution::Value(LuaValue::Float(-n))),
-                Err(error) => match self.metamethod(&value, b"__unm")? {
+                Err(_) => match self.metamethod(&value, b"__unm")? {
                     Some(method) => Ok(UnaryResolution::Call {
                         method,
                         // Real Lua's `luaT_trybiniTM` calls unary metamethods
@@ -1558,7 +1606,18 @@ impl LuaRuntime {
                         // just once.
                         args: vec![value.clone(), value],
                     }),
-                    None => Err(error),
+                    // Real Lua's `luaV_execute`'s `OP_UNM` falls back to
+                    // `luaT_trybiniTM`'s own `luaG_opinterror(L, p1, p1,
+                    // "perform arithmetic on")` when there's no `__unm`
+                    // metamethod, which reports the operand's type rather
+                    // than the generic "number expected" `coerce_number`
+                    // raises for any non-number - matching the binary
+                    // arithmetic operators' wording (and the analogous
+                    // `BitNot`/`__bnot` fix above).
+                    None => Err(LuaError::new(format!(
+                        "attempt to perform arithmetic on a {} value",
+                        self.error_type_label(&value)
+                    ))),
                 },
             },
             UnaryOp::BitNot => match self.integer(&value) {

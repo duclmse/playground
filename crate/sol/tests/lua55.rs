@@ -332,7 +332,15 @@ fn cli_accepts_non_utf8_lua_source_bytes() {
 #[test]
 fn lexer_and_parser_errors_include_source_columns() {
     let lexical = sol::lexer::lex("\n  @").unwrap_err();
-    assert_eq!(lexical, "line 2, column 3: unexpected character [ELEX001]");
+    // `@` (byte 64) is not a printable token the parser could otherwise
+    // report a name for, so - like every other lexer error - it carries
+    // real Lua's `near '<\N>'` decimal-escaped suffix (see
+    // `lexer_errors_report_lua_compatible_near_text` and the invalid-
+    // character `checksyntax` cases in `errors.lua`) alongside its column.
+    assert_eq!(
+        lexical,
+        "line 2, column 3: unexpected character [ELEX001] near '<\\64>'"
+    );
 
     let tokens = sol::lexer::lex("function main(\n  1\nend").unwrap();
     let parsed = sol::parser::parse(tokens).unwrap_err();
@@ -672,6 +680,419 @@ fn implicit_runtime_errors_get_an_automatic_position_prefix() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("runtime error prefix ok"));
 }
 
+/// The automatic implicit-runtime-error position prefix above
+/// (`implicit_runtime_errors_get_an_automatic_position_prefix`) only covers
+/// errors `dispatch_step` raises directly and returns through its own `Err`
+/// path. Calling a non-callable value - an ordinary `f()`, a metamethod
+/// dispatch, or generic-`for`'s dedicated `TForCall` iterator invocation -
+/// instead resolves through the separate `step_result_for_call`/`CallLeaf`
+/// bridge (`dispatch.rs`), which never reached the prefixing catch site at
+/// all: `local f = nil; f()` reported the bare "attempt to call a nil value"
+/// with no `chunk:line:` prefix, for every callable value in the runtime, not
+/// just `TForCall`. Surfaced by `lua-5.5.1-tests/errors.lua`'s `lineerror`
+/// helper (`for k,v in 3 do ... end`, expecting the error's line to match the
+/// `for`'s own line). Fixed by applying the same `runtime_error_prefix`
+/// convention (only for an internally-synthesized error, i.e.
+/// `error.value.is_none()`) in the `CallLeaf` arm's own `Err` handling,
+/// applied last - after `annotate_call_error`/`annotate_bad_argument_error`
+/// and the `(metamethod '...')` label, both of which pattern-match on the
+/// unprefixed message text, so they still fire correctly.
+#[test]
+fn calling_a_non_callable_value_gets_the_same_automatic_position_prefix() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_call_error_prefix_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok1, msg1 = pcall(function() local f = nil; f() end)
+        assert(not ok1 and string.find(msg1, ":%d+: attempt to call a nil value"), msg1)
+
+        -- the position prefix must not interfere with the existing
+        -- call-site naming annotation.
+        local ok2, msg2 = pcall(function()
+            aaa=1; bbbb=2; aaa=math.sin(3)+bbbb(3)
+        end)
+        assert(not ok2 and string.find(msg2, "attempt to call a number value"), msg2)
+        assert(string.find(msg2, "global 'bbbb'", 1, true), msg2)
+
+        print("call error prefix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("call error prefix ok"));
+}
+
+/// Real Lua's `lparser.c` line-attributes a call expression to its opening
+/// `(`'s own line (`funcargs`), not the callee's line - so `a\n(23)`, a call
+/// spanning two source lines, reports its "attempt to call" error on the
+/// `(`'s line. Sol's `parser.rs` has two call-parsing sites: the general
+/// postfix-chain loop (`parse_postfix`), which already captured a fresh
+/// `line` per iteration before checking for `(`, and a duplicate inline fast
+/// path inside `parse_primary`'s `Ident` arm (added for Sol's qualified/
+/// struct-constructor name handling) that instead reused the callee name's
+/// own `line`, captured once at the top of `parse_primary` before any of the
+/// name's own dots or the following `(` were even consumed. Since a bare
+/// identifier's call syntax is resolved by that inline fast path rather than
+/// ever reaching `parse_postfix`'s loop, every `name(args)` call taken this
+/// route misattributed a multi-line call to the callee's line instead of the
+/// `(`'s line. Fixed by capturing a fresh `line` right at the `(` check in
+/// `parse_primary`, matching `parse_postfix`'s existing convention.
+#[test]
+fn a_call_expressions_line_is_the_open_parens_line_not_the_callees_line() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_call_expr_line_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        b"
+        local ok, msg = pcall(function()\n\
+        a\n\
+        (\n\
+        23)\n\
+        end)\n\
+        assert(not ok and string.find(msg, \":4: attempt to call\"), msg)\n\
+        print(\"call expr line ok\")\n\
+        ",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("call expr line ok"));
+}
+
+/// Real Lua's `luaV_execute`'s `OP_UNM` falls back to `luaT_trybiniTM`'s own
+/// `luaG_opinterror(L, p1, p1, "perform arithmetic on")` when unary `-` has no
+/// number operand and no `__unm` metamethod, reporting the operand's type
+/// ("attempt to perform arithmetic on a {type} value"), the same wording as
+/// the binary arithmetic operators and the already-fixed `__bnot`/`BitNot`
+/// case. Sol's `unary_resolve`'s `UnaryOp::Neg` arm instead propagated
+/// `coerce_number`'s raw, generic "number expected" error verbatim. Fixing
+/// the wording broke a second, unrelated thing silently: `dispatch/
+/// bytecode.rs`'s `Instr::Neg` naming annotation (the `(local 'x')`/
+/// `(global 'x')` suffix) decided whether to fire by exact-matching the OLD
+/// message text (`error.message == "number expected"`), so it stopped firing
+/// once the wording changed - fixed by matching the new message's prefix
+/// instead, the same pattern the adjacent `Instr::Binary` arm already uses.
+#[test]
+fn unary_minus_on_a_non_number_reports_arithmetic_wording_and_keeps_its_name_annotation() {
+    let path = std::env::temp_dir().join(format!("sol_lua55_unm_wording_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = pcall(function() aaa = {}; return -aaa end)
+        assert(not ok and string.find(msg, "attempt to perform arithmetic on a table value", 1, true), msg)
+        assert(string.find(msg, "global 'aaa'", 1, true), msg)
+        print("unary minus wording ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unary minus wording ok"));
+}
+
+/// Real Lua's `lparser.c` line-attributes a binary operator's instruction to
+/// the operator token's own line (`luaK_posfix`, using `ls->linenumber` after
+/// the operator is consumed), not the left operand's line - so a multi-line
+/// expression like `a\n+\n{}` reports its arithmetic error on the `+`'s own
+/// line. Sol's `parser.rs`'s `parse_precedence` captured `line` once at the
+/// very top of the function, before the left operand (or any left-recursion)
+/// was even parsed, and reused that stale line for the resulting `Binary`
+/// node. Fixed by capturing a fresh `line` right after the operator token is
+/// peeked, immediately before it's consumed.
+#[test]
+fn a_binary_operators_line_is_the_operators_own_line_not_the_left_operands_line() {
+    let path = std::env::temp_dir().join(format!("sol_lua55_binop_line_{}.lua", std::process::id()));
+    std::fs::write(
+        &path,
+        b"
+        local ok, msg = pcall(function()\n\
+        return\n\
+        a\n\
+        +\n\
+        {}\n\
+        end)\n\
+        assert(not ok and string.find(msg, \":5: attempt to perform arithmetic\"), msg)\n\
+        print(\"binop line ok\")\n\
+        ",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("binop line ok"));
+}
+
+/// Real Lua's `funcstat` (`lparser.c`) resolves a `function NAME...()`
+/// declaration's assignment target - a plain name, or a `.`/`:`-chained
+/// prefix for `function a.b.c()`/`function a:m()` - *before* parsing the
+/// closure body, then explicitly re-tags the resulting store instruction
+/// back to the declaration's own starting line via `luaK_fixline` ("the
+/// definition happens in the first line"), even though the closure's own
+/// `OP_CLOSURE` instruction is (correctly) tagged with the closing `end`'s
+/// line. Sol's `compile_stmt.rs`'s `Stmt::GlobalFunction` arm tagged the
+/// name-assignment store (`compile_function_name_assign`) with
+/// `function.end_line` instead of `function.line`, so replacing `_ENV` with
+/// a non-table value before a `global function foo() ... end` declaration
+/// reported the resulting index error on the closing `end`'s line instead of
+/// the declaration's own line. The same stale `end_line` also affected the
+/// declaration's own Sol-specific "already defined" duplicate-global guard
+/// (`emit_check_global_undefined`), fixed alongside it for consistency.
+#[test]
+fn a_global_function_declarations_assignment_is_line_attributed_to_its_own_declaration_not_the_closing_end(
+) {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_globalfunc_line_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = pcall(load([[
+        _ENV = 1
+        global function foo ()
+          local a = 10
+          return a
+        end
+        ]]))
+        assert(not ok and string.find(msg, ":2: attempt to index a number value", 1, true), msg)
+        print("global function line ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("global function line ok"));
+}
+
+/// A compile-time "label already defined" error (`func_state.rs`'s
+/// `record_label`) had no `chunk:line:` position prefix at all - unlike
+/// every other compile-time diagnostic in `lua_bytecode/`, which uses the
+/// `"line {line}: ..."` convention `natives_load.rs`'s
+/// `format_chunk_diagnostic` recognizes and rewrites into the usual
+/// `chunk:line:` form. Fixed by prefixing with the *new* (duplicate) label's
+/// own line, matching real Lua's `checkrepeated`/`luaX_syntaxerror`, which
+/// positions the error at the second occurrence. The message's own "already
+/// defined on line N" text still names the first label's declared line,
+/// which can differ from real Lua's in the presence of blank lines/comments
+/// between the two labels (real Lua's stored label line is `ls->linenumber`
+/// read only after the parser's one-token lookahead has already advanced
+/// past them) - that narrower quirk is not reproduced here.
+#[test]
+fn a_duplicate_label_error_has_a_position_prefix_at_the_duplicates_own_line() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_dup_label_prefix_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = load("::L1::\n::L1::\n")
+        assert(not ok and string.find(msg, ":2: label 'L1' already defined", 1, true), msg)
+        print("duplicate label prefix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("duplicate label prefix ok"));
+}
+
+/// Real Lua's `new_localvar` (`lparser.c`) rejects a second `<close>`
+/// variable in the same `local` statement ("multiple to-be-closed variables
+/// in local list") - only one to-be-closed slot is tracked per declaration.
+/// Sol's `parser.rs` parsed each name's `<const>`/`<close>` attribute (either
+/// per-name, or via a shared leading `local <attrib> a, b, ...` form) without
+/// ever checking for more than one `<close>` among the names, silently
+/// accepting `local <close> a, b` (or `local a <close>, b <close>`) instead
+/// of rejecting it.
+#[test]
+fn a_local_statement_with_more_than_one_close_attribute_is_rejected() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_multi_close_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = load("local <close> a, b\n")
+        assert(not ok and string.find(msg, "multiple to-be-closed", 1, true), msg)
+        print("multiple close rejected ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("multiple close rejected ok"));
+}
+
+/// `lua-5.5.1-tests/errors.lua`'s "error lines in stack overflow" test:
+/// `xpcall(g, debug.traceback, 1)` (where `g` calls a recursive `auxy` that
+/// overflows the call-depth budget) must produce a `debug.traceback` string
+/// with one `"source:line:"`-shaped entry per discarded call-chain level -
+/// real Lua's `luaL_traceback` walks every activation record between the
+/// error site and the `xpcall` marker, printing innermost first. Sol's
+/// stack-overflow error previously carried only a single, bare `"line {N}"`
+/// entry (`dispatch.rs`'s `PushClosure` overflow arm), with no chunk-name/
+/// colon-delimited shape at all, so the corpus's own `string.match(line,
+/// ":(%d+):")` parser (which expects real Lua's format) never matched
+/// anything. Fixed two ways: `LuaError::at`'s call sites now format each
+/// frame as `{short_src}:{line}:` (via the new `traceback_frame_label`
+/// helper, reusing `runtime_error_prefix`'s `chunk_sources` lookup) instead
+/// of a bare `"line {N}"`, and `unwind_error_to_marker`'s frame-discarding
+/// walk now records *every* discarded Lua frame's own paused line (via the
+/// new `LuaError::at_outer_frame`, which prepends rather than appends so the
+/// existing innermost-frame entry still prints first after the shared
+/// `.rev()`), not just the single innermost raise site.
+#[test]
+fn a_stack_overflows_traceback_has_one_source_line_entry_per_discarded_call_frame() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_stack_overflow_traceback_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local l = debug.getinfo(1, "l").currentline + 1
+        local function auxy() auxy() end
+        local l1
+        local function g(x)
+          l1 = debug.getinfo(x, "l").currentline + 2
+          collectgarbage("stop")
+          auxy()
+          collectgarbage("restart")
+        end
+        local _, stackmsg = xpcall(g, debug.traceback, 1)
+        local stack = {}
+        for line in string.gmatch(stackmsg, "[^\n]*") do
+          local curr = string.match(line, ":(%d+):")
+          if curr then table.insert(stack, tonumber(curr)) end
+        end
+        local i = 1
+        while stack[i] ~= l1 do
+          assert(stack[i] == l, "unexpected line at position " .. i)
+          i = i + 1
+        end
+        assert(i > 15, "too few stack traceback entries: " .. i)
+        print("stack overflow traceback lines ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("stack overflow traceback lines ok"));
+}
+
+/// `os.exit` must flush whatever `print`/`io.write` output was already
+/// buffered before terminating the process - real Lua writes each call
+/// straight to stdout as it happens, so anything printed before `os.exit`
+/// has already reached the terminal by the time the process dies. Sol
+/// instead buffers a whole run's `print`/`io.write` output in memory
+/// (`LuaRuntime::output`) and only flushes it to real stdout once the
+/// dynamic-tier call returns normally (`write_lua_run`) or errors
+/// (`report_lua_error`) in `main.rs`. `NativeFunction::OsExit` previously
+/// called `std::process::exit` directly, bypassing both of those flush
+/// points and silently discarding every buffered `print` - a script's
+/// entire output would vanish the moment it called `os.exit`, even
+/// `os.exit(0)` after ordinary `print` calls with no error involved.
+#[test]
+fn os_exit_flushes_buffered_output_before_terminating() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_os_exit_flush_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        print("before exit")
+        os.exit(0)
+        print("never reached")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("before exit"), "{stdout}");
+    assert!(!stdout.contains("never reached"), "{stdout}");
+}
+
 /// Real Lua's `liolib.c` installs the same `f_gc` C function under both
 /// `__gc` and `__close` on the file-handle metatable (`LUA_FILEHANDLE`) - an
 /// ordinary, directly Lua-callable function that argument-checks its
@@ -780,6 +1201,70 @@ fn bad_argument_errors_on_a_method_calls_self_argument_use_reals_calling_on_bad_
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("bad self argcheck ok"));
+}
+
+/// Real Lua's `luaO_chunkid` (`lobject.c`) is the single function that
+/// formats a chunk name for display, shared by `debug.getinfo`'s `short_src`
+/// and `lua_load`'s syntax-error position prefix. It reserves
+/// `LUA_IDSIZE = 60` bytes (one held back for the C string's `'\0'`) and
+/// truncates each of the three chunk-name forms differently: `=name` keeps
+/// the first 59 bytes verbatim with no ellipsis; `@path` keeps the last 56
+/// bytes behind a `"..."` prefix so a long path's distinguishing tail stays
+/// visible; a literal source chunk (e.g. from `load`) is wrapped as
+/// `[string "..."]`, keeping the first line verbatim only if it (with no
+/// embedded newline) is under a 45-byte budget, else truncating to that
+/// budget and appending `"..."`. Sol previously had two independent,
+/// diverging implementations of this - `LuaRuntime::short_src`
+/// (`natives_debug.rs`) and `display_chunk_name` (`natives_load.rs`) - each
+/// with its own off-by-one/wrong-threshold bugs. Fixed by rewriting
+/// `short_src` to match `luaO_chunkid`'s exact truncation arithmetic and
+/// making `display_chunk_name` delegate to it, so both call sites agree.
+/// Surfaced by `lua-5.5.1-tests/errors.lua`'s `checksize` loop.
+#[test]
+fn chunk_name_truncation_matches_reals_luao_chunkid_for_equals_at_and_string_sources() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_chunk_name_truncation_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local f1 = load("return 1", "=" .. string.rep("x", 59))
+        assert(debug.getinfo(f1, "S").short_src == string.rep("x", 59))
+        local f2 = load("return 1", "=" .. string.rep("x", 65))
+        assert(debug.getinfo(f2, "S").short_src == string.rep("x", 59))
+
+        local f3 = load("return 1", "@" .. string.rep("y", 59))
+        assert(debug.getinfo(f3, "S").short_src == string.rep("y", 59))
+        local long_path = "/a/" .. string.rep("y", 65)
+        local f4 = load("return 1", "@" .. long_path)
+        local expect4 = "..." .. string.sub(long_path, -56)
+        assert(debug.getinfo(f4, "S").short_src == expect4, debug.getinfo(f4, "S").short_src)
+
+        local short_line = string.rep("z", 40)
+        local _, msg1 = load(short_line)
+        assert(string.find(msg1, '[string "' .. short_line .. '"]', 1, true), msg1)
+
+        local long_line = string.rep("z", 80)
+        local _, msg2 = load(long_line)
+        local expect_prefix = '[string "' .. string.rep("z", 45) .. '..."]'
+        assert(string.find(msg2, expect_prefix, 1, true), msg2)
+
+        print("chunk name truncation ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("chunk name truncation ok"));
 }
 
 /// Real Lua's `luaX_syntaxerror` (used by both the lexer and the parser)
@@ -1423,4 +1908,135 @@ A = 3
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("sethook lastline ok"));
+}
+
+/// Real Lua's `luaG_errormsg` converts a thrown `nil` error object to the
+/// literal string `"<no error object>"`. This applies not only to a bare
+/// `error(nil)` (`NativeFunction::Error`'s own `LuaValue::Nil` arm) but also
+/// to `assert(condition, nil)`, whose message is *explicitly* `nil` - as
+/// opposed to omitted, which gets the different default `"assertion
+/// failed!"` message. `NativeFunction::Assert` previously let the generic
+/// `Some(message)` arm re-raise an explicit `nil` verbatim instead of
+/// applying this conversion.
+#[test]
+fn assert_with_an_explicit_nil_message_reports_no_error_object() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_assert_nil_message_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg, kind = pcall(assert, nil, nil)
+        assert(not ok and msg == "<no error object>" and kind == nil)
+        print("assert nil message ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("assert nil message ok"));
+}
+
+/// `lua-5.5.1-tests/errors.lua`'s `checksyntax` helper asserts every
+/// `load()` syntax error ends in real Lua's `near '<token>'`/`near <eof>`
+/// suffix (`luaX_syntaxerror`/`txtToken`, `llex.c`). Two of the parser's own
+/// primitives, `expect`/`expect_ident`, previously built their error
+/// messages with no such suffix at all (unlike the parser's "unexpected
+/// symbol" fallback, which already had one), and the lexer's invalid-byte
+/// error omitted it too. These cases mirror `errors.lua`'s own
+/// `checksyntax` call sites for each of those three gaps.
+#[test]
+fn checksyntax_style_errors_report_the_lua_compatible_near_suffix() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_checksyntax_near_suffix_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local function doit(s)
+          local f, msg = load(s)
+          if not f then return msg end
+          local cond, msg = pcall(f)
+          return (not cond) and msg
+        end
+
+        -- `expect(&Token::Eq)` in a `for` numeric-loop header.
+        assert(string.find(doit("for >> do end"), "near '>>'$"))
+        -- `expect_ident` after a struct-like assignment target.
+        assert(string.find(doit("syntax error"), "near 'error'$"))
+        -- The lexer's own invalid-byte error, decimal-escaped like real
+        -- Lua's `txtToken` renders any non-printable single-byte token.
+        assert(string.find(doit("a\1a = 1"), "near '<\\1>'$"))
+        assert(string.find(doit("\255a = 1"), "near '<\\255>'$"))
+
+        print("checksyntax near suffix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("checksyntax near suffix ok"));
+}
+
+/// An uncaught error with no enclosing `pcall`/`xpcall` anywhere on the call
+/// stack must still carry every discarded frame's position in its
+/// traceback, exactly like one caught by `xpcall(f, debug.traceback)` does -
+/// real Lua's own `lua` CLI wraps the whole script in its own top-level
+/// protected call with a `msghandler` that calls `luaL_traceback`, so a
+/// plain uncaught script error shows the full call chain too.
+/// `unwind_error_to_marker` previously only recorded a discarded frame's
+/// position while walking *toward a found* `pcall`/`xpcall` marker; when no
+/// marker exists anywhere on the stack, it returned immediately without
+/// visiting any frame, silently losing every position entry except the one
+/// the innermost erroring frame's own `dispatch_step` `Err` arm added
+/// (`interp::tests::specialized_bytecode_calls_dynamic_lua_through_the_semantic_slot`
+/// caught this same gap from the specialized-bytecode adapter's own call
+/// path).
+#[test]
+fn an_uncaught_error_with_no_enclosing_pcall_still_records_every_frames_position() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_uncaught_traceback_no_marker_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        function inner()
+          error("boom")
+        end
+        function outer()
+          inner()
+        end
+        outer()
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(":3:"), "{stderr}");
+    assert!(stderr.contains(":6:"), "{stderr}");
+    assert!(stderr.contains(":8:"), "{stderr}");
 }

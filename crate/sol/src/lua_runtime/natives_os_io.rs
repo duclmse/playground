@@ -180,6 +180,23 @@ impl LuaRuntime {
                     Some(LuaValue::Bool(false)) => 1,
                     Some(value) => self.integer(value)? as i32,
                 };
+                // `self.output` only ever reaches the real process stdout
+                // through the caller-visible `LuaRun`/`LuaError::output`
+                // paths (`take_output`, read by `write_lua_run`/
+                // `report_lua_error` in `main.rs`) - this call terminates
+                // the process before either of those can run, which would
+                // otherwise silently discard everything `print`/`io.write`
+                // had already buffered. `process` capability is
+                // SANDBOX-disabled by default (only a trusted embedder like
+                // the `sol` CLI, which already writes this same buffer
+                // straight to its own real stdout, can reach this arm at
+                // all), so flushing here first matches real Lua's
+                // straight-to-stdout writes surviving its own `exit(3)`.
+                let output = self.take_output();
+                if !output.is_empty() {
+                    use std::io::Write;
+                    let _ = std::io::stdout().lock().write_all(&output);
+                }
                 std::process::exit(code);
             }
             NativeFunction::IoWrite => {

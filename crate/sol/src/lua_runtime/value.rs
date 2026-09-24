@@ -797,6 +797,20 @@ impl LuaError {
         self
     }
 
+    /// Like `at`, but for a caller that discovers *outer* call-chain levels
+    /// after the innermost one has already been recorded (`unwind_error_to_marker`'s
+    /// frame walk, innermost-frame-first): `at` always appends, so pushing
+    /// outer frames the same way would print them (after `Display`'s/
+    /// `debug.traceback`'s shared `.rev()`) before the innermost frame
+    /// instead of after it. Inserting at the front instead keeps every
+    /// caller's own already-recorded entries in their original relative
+    /// order while still placing this new, more-outer frame beyond them
+    /// once reversed.
+    pub(super) fn at_outer_frame(mut self, function: &str) -> Self {
+        self.stack.insert(0, function.into());
+        self
+    }
+
     /// The value `pcall`/`xpcall`/`coroutine.resume` should hand back for
     /// this error: the original raised value if known, otherwise the error
     /// message as a plain Lua string (matching real Lua's behavior for

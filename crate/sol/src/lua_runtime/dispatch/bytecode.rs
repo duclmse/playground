@@ -385,7 +385,9 @@ impl LuaRuntime {
                     let value = reg_get(&frame.regs, &frame.cells, *src as usize);
                     match self.unary_resolve(UnaryOp::Neg, value) {
                         Err(mut error) => {
-                            if error.message == "number expected" {
+                            if error.message.starts_with("attempt to perform arithmetic")
+                                && !error.message.contains('(')
+                            {
                                 if let Some((kind, name)) = describe_register(&proto, pc, *src) {
                                     error.message = format!("{} ({kind} '{name}')", error.message);
                                 }

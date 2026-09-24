@@ -630,12 +630,38 @@ impl Scanner<'_> {
                         b'|' => Token::Pipe,
                         b'~' => Token::Tilde,
                         _ => {
-                            return Err(Diagnostic::error(
-                                SourceSpan::new(start, self.pos, line, column),
-                                "unexpected character",
-                            )
-                            .with_code("ELEX001")
-                            .to_string())
+                            // Real Lua's lexer never rejects an unrecognized
+                            // byte outright - it returns the raw byte value
+                            // as a single-character token, which the parser
+                            // then fails on as an unexpected token, and
+                            // `txtToken` (`llex.c`) renders any
+                            // non-printable single-byte token as `<\%d>`
+                            // (decimal-escaped) rather than the literal
+                            // control/high byte. Sol instead raises eagerly
+                            // here at lex time rather than threading a
+                            // raw-byte token through the parser, but still
+                            // owes the same `<\N>`-shaped `near` text real
+                            // Lua's own diagnostics use for this case (see
+                            // `errors.lua`'s `checksyntax` calls for
+                            // `a\1a = 1`/`\255a = 1`). Built from the
+                            // `start`/`line`/`column` captured before the
+                            // offending byte was consumed (`self.pos += 1`
+                            // above already moved past it) rather than via
+                            // `error_near` (which would report the position
+                            // *after* the byte, off by one) - the `near`
+                            // text is appended manually afterward, keeping
+                            // the `[ELEX001]` code suffix in the same
+                            // position (before `near`, not after it) as
+                            // every other lexer error.
+                            let escaped = format!("<\\{b}>");
+                            return Err(format!(
+                                "{} near '{escaped}'",
+                                Diagnostic::error(
+                                    SourceSpan::new(start, self.pos, line, column),
+                                    "unexpected character",
+                                )
+                                .with_code("ELEX001")
+                            ));
                         }
                     }
                 }

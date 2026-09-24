@@ -699,38 +699,53 @@ impl LuaRuntime {
         set(b"short_src", LuaValue::String(Rc::new(b"[C]".to_vec())));
     }
 
-    /// A simplified `luaO_chunkid`: `=name` sources report `name` verbatim
-    /// (truncated), `@path` sources report `path` (truncated, keeping the
-    /// tail), and anything else (a literal chunk of source text, e.g. from
-    /// `load`) reports `[string "first line..."]`.
+    /// `luaO_chunkid`: `=name` sources report `name` verbatim (truncated to
+    /// `LUA_IDSIZE - 1` bytes, one held back for the C string's `'\0'`),
+    /// `@path` sources report `path` (truncated the same way, but keeping the
+    /// tail behind a `...` prefix so a long path's distinguishing suffix
+    /// stays visible), and anything else (a literal chunk of source text,
+    /// e.g. from `load`) reports `[string "line one..."]`, truncated to
+    /// whatever fits alongside that fixed decoration. `load`'s own
+    /// syntax-error prefix (`natives_load.rs`'s `format_chunk_diagnostic`)
+    /// routes through this same function rather than a separate formatter,
+    /// matching real Lua's single `luaO_chunkid` used by both
+    /// `debug.getinfo` and `lua_load`'s error path.
     pub(super) fn short_src(source: &[u8]) -> Vec<u8> {
-        const MAX: usize = 60;
+        const IDSIZE: usize = 60;
+        const MAXLEN: usize = IDSIZE - 1;
         if let Some(rest) = source.strip_prefix(b"=") {
             let mut short = rest.to_vec();
-            short.truncate(MAX);
+            short.truncate(MAXLEN);
             short
         } else if let Some(rest) = source.strip_prefix(b"@") {
-            if rest.len() <= MAX {
+            if rest.len() <= MAXLEN {
                 rest.to_vec()
             } else {
                 let mut short = b"...".to_vec();
-                short.extend_from_slice(&rest[rest.len() - (MAX - 3)..]);
+                short.extend_from_slice(&rest[rest.len() - (MAXLEN - 3)..]);
                 short
             }
         } else {
+            const PRE: &[u8] = b"[string \"";
+            const POS: &[u8] = b"\"]";
+            const RETS: &[u8] = b"...";
+            // Real Lua reserves space for PRE/RETS/POS and a trailing '\0'
+            // up front, then only appends RETS when the content itself
+            // doesn't fit within what's left - so the untruncated case gets
+            // one more byte of headroom than the truncated one.
+            let content_budget = IDSIZE - PRE.len() - RETS.len() - POS.len() - 1;
             let first_line_end = source.iter().position(|&b| b == b'\n');
-            let mut snippet = source[..first_line_end.unwrap_or(source.len())].to_vec();
-            let mut truncated = first_line_end.is_some();
-            if snippet.len() > MAX - 15 {
-                snippet.truncate(MAX - 15);
-                truncated = true;
+            let has_newline = first_line_end.is_some();
+            let line = &source[..first_line_end.unwrap_or(source.len())];
+            let mut short = PRE.to_vec();
+            if line.len() < content_budget && !has_newline {
+                short.extend_from_slice(line);
+            } else {
+                let take = line.len().min(content_budget);
+                short.extend_from_slice(&line[..take]);
+                short.extend_from_slice(RETS);
             }
-            let mut short = b"[string \"".to_vec();
-            short.extend_from_slice(&snippet);
-            if truncated {
-                short.extend_from_slice(b"...");
-            }
-            short.extend_from_slice(b"\"]");
+            short.extend_from_slice(POS);
             short
         }
     }

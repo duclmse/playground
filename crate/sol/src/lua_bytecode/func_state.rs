@@ -576,8 +576,21 @@ impl FuncState {
         line: u32,
     ) -> Result<(), String> {
         if let Some(earlier_line) = self.find_open_label_line(name) {
+            // Real Lua's `checkrepeated` (`lparser.c`) raises this through
+            // `luaK_semerror`/`luaX_syntaxerror`, which prefixes it with the
+            // position of the *new* (duplicate) label - `line` here, not
+            // `earlier_line` - matching every other "line {line}: ..."
+            // compile error in this module (`format_chunk_diagnostic`
+            // recognizes that prefix and turns it into the usual
+            // `chunk:line:` form). Real Lua's own `earlier_line` equivalent
+            // is itself an off-by-however-many-lines quirk (a label's stored
+            // line is `ls->linenumber` read only after the parser's
+            // one-token lookahead has already skipped ahead to whatever
+            // comes next, so blank lines/comments between the two labels
+            // shift it forward) that isn't reproduced here - only the
+            // outer position prefix is.
             return Err(format!(
-                "label '{name}' already defined on line {earlier_line}"
+                "line {line}: label '{name}' already defined on line {earlier_line}"
             ));
         }
         let scope = self.scopes.last().expect("label outside any scope");

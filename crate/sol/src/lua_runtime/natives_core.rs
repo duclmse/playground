@@ -62,6 +62,20 @@ impl LuaRuntime {
                                 message,
                             )
                         }
+                        // An explicit `nil` message (as opposed to an
+                        // omitted one, handled by the `None` arm below)
+                        // still reaches `luaB_error` in real Lua, whose
+                        // `luaG_errormsg` turns a nil error object into the
+                        // literal string "<no error object>" - see
+                        // `NativeFunction::Error`'s identical `LuaValue::Nil`
+                        // arm just above this match.
+                        Some(LuaValue::Nil) => {
+                            let text: &[u8] = b"<no error object>";
+                            LuaError::raised(
+                                LuaValue::String(Rc::new(text.to_vec())),
+                                "<no error object>",
+                            )
+                        }
                         Some(message) => {
                             let display =
                                 String::from_utf8_lossy(&message.display_bytes()).into_owned();
@@ -521,6 +535,25 @@ impl LuaRuntime {
         let source = self.chunk_sources.get(&(Rc::as_ptr(proto) as usize))?;
         let short_src = Self::short_src(source);
         Some(format!("{}:{line}: ", String::from_utf8_lossy(&short_src)))
+    }
+
+    /// One `debug.traceback` frame entry's position, in real Lua's own
+    /// `source:line:` shape (`lauxlib.c`'s `lastlevel`/`luaL_traceback`,
+    /// which formats each frame as `"%s:%d:"` before appending an
+    /// `" in ..."` descriptor) - reusing `runtime_error_prefix`'s
+    /// `chunk_sources` lookup so scripts that parse a traceback with a
+    /// `":(%d+):"`-style pattern (as real Lua's own manual examples do)
+    /// find the same colon-delimited shape here. Falls back to a bare
+    /// `"line {line}"` (no colons) when the source can't be resolved,
+    /// matching this call's prior behavior for that case.
+    pub(super) fn traceback_frame_label(&self, proto: &Rc<Proto>, line: u32) -> String {
+        match self.chunk_sources.get(&(Rc::as_ptr(proto) as usize)) {
+            Some(source) => {
+                let short_src = Self::short_src(source);
+                format!("{}:{line}:", String::from_utf8_lossy(&short_src))
+            }
+            None => format!("line {line}"),
+        }
     }
 
     /// Real Lua's `funcnamefromcode` (`ldebug.c`): how the frame at `level`

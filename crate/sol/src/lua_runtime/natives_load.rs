@@ -754,6 +754,14 @@ fn format_chunk_diagnostic(chunkname: &[u8], source: &[u8], diagnostic: &str) ->
 }
 
 fn is_eof_table_diagnostic(message: &str) -> bool {
+    // `expect(&Token::RBrace)`'s own end-of-input arm now appends the same
+    // `near <eof>` suffix every other Lua-mode parser error carries (see
+    // `Parser::lua_near_suffix`), so it must be stripped here too before
+    // matching against the exact wording this special case rewrites -
+    // `self.error(...)`'s own "unexpected end of input inside table
+    // constructor" site never carries that suffix, so stripping it is a
+    // no-op for that variant.
+    let message = message.strip_suffix(" near <eof>").unwrap_or(message);
     matches!(
         message.strip_suffix(" [EPARSE001]"),
         Some("expected RBrace, found end of input" | "unexpected end of input inside table constructor")
@@ -765,10 +773,22 @@ fn is_eof_table_diagnostic(message: &str) -> bool {
 /// EOF table-constructor form here because only the chunk boundary still has
 /// the complete source needed to identify the EOF line and the opening brace.
 fn lua_syntax_message<'a>(source: &[u8], message: &'a str) -> std::borrow::Cow<'a, str> {
+    // See `is_eof_table_diagnostic`'s comment - `expect(&Token::RBrace)`'s
+    // end-of-input arm now appends its own `near <eof>` suffix, which must
+    // be peeled off (along with the diagnostic code) before matching the
+    // exact wording this rewrites into Lua's own "'}' expected ... near
+    // <eof>" phrasing. Stripped only into a local `stripped` copy used for
+    // the match, not into `message` itself - every other Lua-mode parser
+    // error also legitimately ends in a `near '...'`/`near <eof>` suffix of
+    // its own (see `Parser::lua_near_suffix`), which must survive unchanged
+    // on the early `Cow::Borrowed(message)` return below for every message
+    // that isn't one of these two exact, pre-suffix-stripping strings.
+    const NEAR_EOF_SUFFIX: &str = " near <eof>";
     const PARSER_SUFFIX: &str = " [EPARSE001]";
-    let message = message.strip_suffix(PARSER_SUFFIX).unwrap_or(message);
+    let stripped = message.strip_suffix(NEAR_EOF_SUFFIX).unwrap_or(message);
+    let stripped = stripped.strip_suffix(PARSER_SUFFIX).unwrap_or(stripped);
     if !matches!(
-        message,
+        stripped,
         "expected RBrace, found end of input" | "unexpected end of input inside table constructor"
     ) {
         return std::borrow::Cow::Borrowed(message);
@@ -790,21 +810,5 @@ fn lua_syntax_message<'a>(source: &[u8], message: &'a str) -> std::borrow::Cow<'
 }
 
 fn display_chunk_name(chunkname: &[u8]) -> String {
-    match chunkname.first() {
-        Some(b'@' | b'=') => String::from_utf8_lossy(&chunkname[1..]).into_owned(),
-        _ => {
-            const MAX_SOURCE_BYTES: usize = 40;
-            let line = chunkname
-                .split(|byte| *byte == b'\n' || *byte == b'\r')
-                .next()
-                .unwrap_or_default();
-            let shown = &line[..line.len().min(MAX_SOURCE_BYTES)];
-            let suffix = if line.len() > MAX_SOURCE_BYTES || line.len() < chunkname.len() {
-                "..."
-            } else {
-                ""
-            };
-            format!("[string \"{}{suffix}\"]", String::from_utf8_lossy(shown))
-        }
-    }
+    String::from_utf8_lossy(&LuaRuntime::short_src(chunkname)).into_owned()
 }

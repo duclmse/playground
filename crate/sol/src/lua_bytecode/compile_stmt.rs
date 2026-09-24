@@ -692,9 +692,27 @@ impl Compiler {
                     // declaration's initializer, so (unlike a bare `global
                     // NAME`) this form always runs the "already defined"
                     // guard, right before the closure is actually stored.
-                    self.emit_check_global_undefined(level, &function.name, function.end_line);
+                    // This guard is a Sol-only extension with no real-Lua
+                    // equivalent to match, but it conceptually belongs to
+                    // declaring the name (like the store below), not to
+                    // creating the closure value - so it shares the same
+                    // `function.line` tag, not `end_line`, for the same
+                    // reason (and so a non-table environment surfaces on the
+                    // declaration's own line, like the store would).
+                    self.emit_check_global_undefined(level, &function.name, function.line);
                 }
-                self.compile_function_name_assign(&function.name, dst, function.end_line)?;
+                // Real Lua's `funcstat` resolves the assignment target
+                // (`funcname` - a plain name, or a `.`/`:`-chained prefix for
+                // `function a.b.c()`/`function a:m()`) *before* parsing the
+                // closure body, then explicitly re-tags the final store
+                // instruction back to that start line via
+                // `luaK_fixline(ls->fs, line)` ("definition happens in the
+                // first line") - so both the dotted-name prefix lookups and
+                // the store into the target land on `function.line`, the
+                // `function`/`global` keyword's own line, not `end_line`
+                // (unlike the closure creation above, which real Lua's
+                // `codeclosure` does tag with the closing `end`'s line).
+                self.compile_function_name_assign(&function.name, dst, function.line)?;
                 Ok(())
             }
             Stmt::LocalFunction(function) => {

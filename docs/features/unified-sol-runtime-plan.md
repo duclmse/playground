@@ -2054,6 +2054,76 @@ for that one cosmetic reason; its ~three-minute run time under Sol's
 interpreter tier versus the oracle's ~0.2s is a real, separately-tracked
 performance gap, not a correctness one.
 
+Continuing to bisect `errors.lua` past its `checksyntax` cluster surfaced a
+significant, previously-undetected regression, independent of that file's own
+stopping point: `dispatch.rs`'s `unwind_error_to_marker`, which walks
+`self.frames` recording each discarded frame's position while searching for
+an enclosing `pcall`/`xpcall` marker, returned immediately with no marker
+found *without visiting any frame* whenever no such marker exists anywhere on
+the stack — silently dropping every frame's line number from an uncaught
+top-level error's traceback except the innermost one. Real Lua's standalone
+`lua` CLI always shows the full call chain for an uncaught error too, because
+it wraps the whole script in its own top-level protected call with a
+`msghandler` that calls `luaL_traceback` — the no-marker case is not actually
+exempt from needing this bookkeeping. Fixed by having the no-marker branch
+walk `self.frames[base_depth..]` the same way, appending each `Frame::Lua`'s
+position via a new `LuaError::at_outer_frame` (`value.rs`) — inserting at the
+front of the error's recorded stack rather than `at`'s append, since these
+outer levels are discovered after the innermost one is already recorded, and
+`Display`'s shared `.rev()` needs them to end up in call order — without
+popping or closing any frame, preserving `drive`'s contract that
+`self.frames` is left untouched on this path for `close_frames_above` to
+handle afterward. A new `LuaRuntime::traceback_frame_label` helper
+(`natives_core.rs`) formats each frame's `source:line:` the same way
+`debug.traceback` does. This is what
+`interp::tests::specialized_bytecode_calls_dynamic_lua_through_the_semantic_slot`
+had actually been catching. See
+`an_uncaught_error_with_no_enclosing_pcall_still_records_every_frames_position`
+in `crates/sol/tests/lua55.rs`.
+
+Two more, smaller gaps came out of the same `errors.lua` pass. First,
+`assert(condition, nil)` — an *explicit* `nil` message, as opposed to an
+omitted one (which gets the different default `"assertion failed!"`) — fell
+through `NativeFunction::Assert`'s generic `Some(message)` arm and re-raised
+the raw `nil` verbatim, instead of going through the same
+`"<no error object>"` conversion `error(nil)` already applied
+(`luaG_errormsg`, applied to any nil error object at the moment it's raised).
+Fixed by adding a `Some(LuaValue::Nil)` arm to `Assert` mirroring `Error`'s
+existing one. Second, `os.exit(code)` discarded any output `print`/
+`io.write` had already buffered: `self.output` only ever reaches the real
+process stdout through `take_output`, read by the CLI's success/error-report
+paths in `main.rs`, and `std::process::exit` bypasses both. Fixed by flushing
+`self.take_output()` straight to `std::io::stdout()` before exiting, matching
+real Lua's own write-immediately semantics (`process` is a
+sandbox-disabled-by-default capability, so only a trusted embedder like the
+`sol` CLI itself, which already owns that buffer, can reach this call).
+
+Separately, extending the `checksyntax`-style `near '<token>'`/`near <eof>`
+diagnostic suffix (already present on the parser's two generic
+"unexpected symbol" fallback sites, see `literals.lua` above) to the parser's
+`expect`/`expect_ident` primitives — used for a missing expected token like
+`for >> do end` or a missing identifier like `syntax error` — surfaced that
+those two functions are shared by both Sol's own syntax and Lua-compatibility
+parsing (`Parser::config.sol_extensions`), so applying the suffix
+unconditionally broke `frontend_conformance.rs`'s expectation that Sol's own
+annotation-syntax errors end in a bare `[EPARSE001]` with no such suffix (a
+Lua-diagnostic convention with nothing to match on the Sol side). Fixed by
+gating it behind a new `Parser::lua_near_suffix` helper, which is a no-op
+under `sol_extensions` and otherwise delegates to the existing
+`format_near`. The lexer's own invalid-byte error gained the same suffix
+(decimal-escaped as `<\N>`, matching `txtToken`'s convention for a
+non-printable single-byte token), which needed building the diagnostic from
+the position captured *before* the offending byte was consumed rather than
+via `error_near` (which would report the position one byte too late). Both
+additions also had to be threaded through `natives_load.rs`'s
+`is_eof_table_diagnostic`/`lua_syntax_message`, whose exact-string-match
+special-casing for `load()`'s end-of-input-inside-table-constructor rewrite
+now has to strip the new `near <eof>` suffix (alongside the pre-existing
+`[EPARSE001]` one) before comparing, without stripping it from the fallback
+return path used by every other, non-matching parser error. See
+`checksyntax_style_errors_report_the_lua_compatible_near_suffix` in
+`crates/sol/tests/lua55.rs`.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

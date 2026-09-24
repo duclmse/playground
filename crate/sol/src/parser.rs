@@ -337,6 +337,19 @@ impl Parser {
         }
     }
 
+    /// Like [`Parser::format_near`], but suppressed outside Lua-compatibility
+    /// parsing (`sol_extensions`) - the "near" convention exists to match
+    /// real Lua's own diagnostics, so Sol's own syntax (type annotations,
+    /// struct/typed-map literals, etc.) shouldn't grow it just because
+    /// `expect`/`expect_ident` are shared by both dialects.
+    fn lua_near_suffix(&self, lexeme: Option<&[u8]>) -> String {
+        if self.config.sol_extensions {
+            String::new()
+        } else {
+            Self::format_near(lexeme)
+        }
+    }
+
     fn advance(&mut self) -> Option<Token> {
         let t = self.tokens.get(self.pos).map(|s| s.token.clone());
         self.pos += 1;
@@ -345,29 +358,54 @@ impl Parser {
 
     fn expect(&mut self, expected: &Token) -> Result<(), String> {
         let span = self.tokens.get(self.pos).map(|token| token.span);
+        let lexeme = self.tokens.get(self.pos).map(|token| token.lexeme.clone());
         match self.advance() {
             Some(ref t) if t == expected => Ok(()),
-            Some(t) => Err(Diagnostic::error(
-                span.expect("advanced token must have a span"),
-                format!("expected {:?}, found {:?}", expected, t),
-            )
-            .with_code("EPARSE001")
-            .to_string()),
-            None => Err(self.error(format!("expected {:?}, found end of input", expected))),
+            // The `near` suffix is appended *after* `.with_code()`'s
+            // `[EPARSE001]` marker, matching the lexer's `error_near`
+            // convention (code before `near`, not after it) so the message
+            // still ends in the `near '<token>'`/`near <eof>` text real
+            // Lua's own diagnostics do, regardless of which diagnostic code
+            // happens to be attached. Suppressed in Sol mode (see
+            // `lua_near_suffix`).
+            Some(t) => Err(format!(
+                "{}{}",
+                Diagnostic::error(
+                    span.expect("advanced token must have a span"),
+                    format!("expected {:?}, found {:?}", expected, t),
+                )
+                .with_code("EPARSE001")
+                .to_string(),
+                self.lua_near_suffix(lexeme.as_deref())
+            )),
+            None => Err(format!(
+                "{}{}",
+                self.error(format!("expected {:?}, found end of input", expected)),
+                self.lua_near_suffix(None)
+            )),
         }
     }
 
     fn expect_ident(&mut self) -> Result<String, String> {
         let span = self.tokens.get(self.pos).map(|token| token.span);
+        let lexeme = self.tokens.get(self.pos).map(|token| token.lexeme.clone());
         match self.advance() {
             Some(Token::Ident(name)) => Ok(name),
-            Some(t) => Err(Diagnostic::error(
-                span.expect("advanced token must have a span"),
-                format!("expected identifier, found {:?}", t),
-            )
-            .with_code("EPARSE001")
-            .to_string()),
-            None => Err(self.error("expected identifier, found end of input")),
+            Some(t) => Err(format!(
+                "{}{}",
+                Diagnostic::error(
+                    span.expect("advanced token must have a span"),
+                    format!("expected identifier, found {:?}", t),
+                )
+                .with_code("EPARSE001")
+                .to_string(),
+                self.lua_near_suffix(lexeme.as_deref())
+            )),
+            None => Err(format!(
+                "{}{}",
+                self.error("expected identifier, found end of input"),
+                self.lua_near_suffix(None)
+            )),
         }
     }
 
@@ -1005,6 +1043,14 @@ impl Parser {
                         break;
                     }
                 }
+                // Real Lua's `new_localvar` (`lparser.c`) rejects a second
+                // `<close>` variable in the same `local` statement - only one
+                // to-be-closed slot can be tracked per declaration.
+                if names.iter().filter(|(_, _, _, close)| *close).count() > 1 {
+                    return Err(format!(
+                        "line {line}: multiple to-be-closed variables in local list"
+                    ));
+                }
                 let values = if self.eat(&Token::Eq) {
                     self.parse_values()?
                 } else {
@@ -1406,6 +1452,13 @@ impl Parser {
             if prec < min {
                 break;
             }
+            // Real Lua's `lparser.c` emits a binary operator's instruction
+            // line-attributed to the operator token itself (`ls->linenumber`
+            // at the point `luaK_posfix` runs, after the operator is
+            // consumed), not the left operand's line - so a multi-line
+            // expression like `a\n+\nb` reports an arithmetic error on the
+            // `+`'s own line, not `a`'s.
+            let op_line = self.line();
             self.advance();
             let right =
                 self.parse_precedence(if matches!(op, BinaryOp::Pow | BinaryOp::Concat) {
@@ -1415,7 +1468,7 @@ impl Parser {
                 })?;
             left = Expr {
                 kind: ExprKind::Binary(op, Box::new(left), Box::new(right)),
-                line,
+                line: op_line,
             };
         }
         Ok(left)
@@ -1650,7 +1703,15 @@ impl Parser {
                     self.pos = saved;
                     qualified = name.clone();
                 }
-                if self.eat(&Token::LParen) {
+                if self.check(&Token::LParen) {
+                    // Real Lua line-attributes a call to the `(` token's own
+                    // line (`lparser.c`'s `funcargs`/`luaK_fixline`), not the
+                    // callee name's line, so `a\n(23)` reports its call error
+                    // on the `(`'s line - matching `parse_postfix`'s own
+                    // per-iteration `line` capture for the general postfix
+                    // call case this inline fast path duplicates.
+                    let call_line = self.line();
+                    self.advance();
                     let mut args = Vec::new();
                     if !self.check(&Token::RParen) {
                         loop {
@@ -1663,7 +1724,7 @@ impl Parser {
                     self.expect(&Token::RParen)?;
                     Ok(Expr {
                         kind: ExprKind::Call(qualified, args),
-                        line,
+                        line: call_line,
                     })
                 } else if struct_constructor && self.check(&Token::LBrace) && self.line() == line {
                     self.advance();
