@@ -324,6 +324,27 @@ impl FuncState {
             .sum()
     }
 
+    /// Real Lua caps a function's live local-variable count at `MAXVARS`
+    /// (200, `lparser.c`), checked once per variable as it enters scope
+    /// (`adjustlocalvars`'s `luaY_checklimit`) - so a single `local
+    /// a,a,a,...` statement past that count fails to compile at all rather
+    /// than silently succeeding. Call this immediately after each new local
+    /// is pushed onto the innermost scope's `locals` (or `global_decls`),
+    /// matching that same per-variable timing; real Lua's exact wording also
+    /// names whether this is the main chunk or a nested function, which
+    /// isn't reproduced here since callers only need the `"too many"`
+    /// substring `errors.lua`'s `checkerr`-style helpers match on.
+    pub(super) fn check_local_variable_limit(&self, line: u32) -> Result<(), String> {
+        const MAXVARS: usize = 200;
+        if self.active_local_count() > MAXVARS {
+            Err(format!(
+                "line {line}: too many local variables (limit is {MAXVARS})"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Finds the name of the local at live index `index` (0-based, counting
     /// from the outermost currently-open scope inward) - the flattened
     /// equivalent of real Lua's `luaF_getlocalname`, evaluated against the
@@ -535,6 +556,22 @@ impl FuncState {
             .locals
             .push((name.to_string(), reg, constant));
         reg
+    }
+
+    /// `declare_local`, but callable from a `Result<_, String>` context that
+    /// wants the `MAXVARS` check applied - see `check_local_variable_limit`.
+    /// Only used for parameter/vararg binding (`mod.rs::compile_function`),
+    /// which has no natural "innermost scope's own line" the way an ordinary
+    /// statement does, so the defining line is passed in explicitly.
+    pub(super) fn declare_local_checked(
+        &mut self,
+        name: &str,
+        constant: bool,
+        line: u32,
+    ) -> Result<Reg, String> {
+        let reg = self.declare_local(name, constant);
+        self.check_local_variable_limit(line)?;
+        Ok(reg)
     }
 
     pub(super) fn find_upval(&self, name: &str) -> Option<(u16, bool)> {

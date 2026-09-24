@@ -2150,15 +2150,42 @@ frame's charge belongs to the outer `call`'s own bookkeeping, not
 `pcall_catching_a_plain_runtime_error_does_not_leak_call_depth_budget` in
 `crates/sol/tests/lua55.rs`.
 
-With that leak fixed, the bisection advanced past the loop and several
-`testrep` calls into a new, unrelated gap: real Lua's parser rejects deeply
-nested constructs via a recursion-depth limit (`LUAI_MAXCCALLS`, enforced by
-`lparser.c`'s `enterlevel`/`leavelevel`), so `load()` on 500 levels of nested
-parentheses or local-variable lists fails to parse with a "too many"/"stack
-overflow"-style message; Sol's parser has no equivalent nesting-depth check
-and currently accepts constructs that deep outright. Not yet investigated —
-see `tests/lua55/manifest.toml`'s `errors.lua` note for the exact stopping
-point (its `testrep` helper's `load(gencode(500))` assertion).
+With that leak fixed, the bisection advanced past the loop into a cluster of
+`testrep` calls testing real Lua's compile-time resource limits at 500
+repetitions each. Reading the pinned Lua 5.5.0 C source directly
+(`lparser.c`/`lcode.c`, via the `lua-src` crate's vendored copy) showed the
+first three of these (`local` declaration-list forms) fail for a narrower,
+distinct reason than parser recursion depth: `MAXVARS` (200), a flat cap on a
+function's live local-variable count checked once per variable as it enters
+scope (`adjustlocalvars`'s `luaY_checklimit`), independent of nesting depth.
+Implemented the equivalent in Sol's `.lua`-compatibility bytecode compiler —
+`FuncState::check_local_variable_limit`/`declare_local_checked`
+(`crate/sol/src/lua_bytecode/func_state.rs`), wired into every site that
+pushes a new local onto a scope (`Stmt::Local`/`MultiLocal`/`NumericFor`/
+`GenericFor`/`LocalFunction` in `compile_stmt.rs`, plus parameter/vararg
+binding in `mod.rs`'s `compile_function`) — deliberately only the flat
+200-variable count, not real Lua's separate `MAX_FSTACK` (255) "too many
+registers" register-pressure check or its C-stack parser-recursion-depth
+limit, both of which remain unimplemented (see below). See
+`a_function_with_too_many_local_variables_fails_to_compile` in
+`crates/sol/tests/lua55.rs`.
+
+Past those three cases, the remaining `testrep` variants (a plain multiple
+assignment to 500 repeated targets, table constructors, parentheses, nested
+calls, `do`/`while`/`if` blocks, function declarations, string concatenation,
+exponentiation) were verified against the pinned oracle to genuinely fall
+under the originally-suspected `LUAI_MAXCCALLS`-style C-stack
+recursion-depth-during-parsing limit (`lparser.c`'s `enterlevel`/`leavelevel`)
+rather than a variable/register-count check — each reports plain "C stack
+overflow" from the oracle, unrelated to `MAXVARS`. Sol's parser has no
+equivalent nesting-depth check and accepts these constructs outright; it does
+not crash or hang on them, it simply fails to reject them where real Lua
+does. Not fixed — a parser nesting-depth limit is architecturally harder to
+add correctly given Sol's AST-first (not recursive-descent-with-C-stack)
+parsing model, and real Lua's own limit is inherently platform/build-
+dependent — see `tests/lua55/manifest.toml`'s `errors.lua` note for the exact
+stopping point (`testrep("local a; a", ",a", "= 1", ",1")`'s
+`load(gencode(500))` assertion).
 
 ### U7 — Interpreter performance foundation
 

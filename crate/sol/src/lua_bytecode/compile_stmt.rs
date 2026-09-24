@@ -139,6 +139,7 @@ impl Compiler {
                     // Lua's to-be-closed locals are immutable after their
                     // initializer, even without an explicit `<const>`.
                     .push((name.clone(), dst, *constant || *close));
+                self.stack[level].check_local_variable_limit(*line)?;
                 if *close {
                     let name_const = self.stack[level].push_name_const(name);
                     self.stack[level].emit(Instr::MarkClose(dst, name_const), *line);
@@ -166,6 +167,7 @@ impl Compiler {
                         // Lua's to-be-closed locals are immutable after their
                         // initializer, even without an explicit `<const>`.
                         .push((name.clone(), dst, *constant || *close));
+                    self.stack[level].check_local_variable_limit(*line)?;
                     if *close {
                         let name_const = self.stack[level].push_name_const(name);
                         self.stack[level].emit(Instr::MarkClose(dst, name_const), *line);
@@ -425,6 +427,7 @@ impl Compiler {
                     var_reg,
                     true,
                 ));
+                self.stack[level].check_local_variable_limit(*line)?;
                 self.stack[level].loops.push(LoopCtx {
                     break_patches: Vec::new(),
                     scope_depth,
@@ -511,6 +514,7 @@ impl Compiler {
                         *reg,
                         index == 0,
                     ));
+                    self.stack[level].check_local_variable_limit(*line)?;
                 }
                 debug_assert_eq!(var_regs.first().copied(), Some(base + 3));
                 let result = self.compile_statements(body, true);
@@ -733,6 +737,7 @@ impl Compiler {
                     slot,
                     false,
                 ));
+                self.stack[level].check_local_variable_limit(function.end_line)?;
                 let proto = self.compile_function(function)?;
                 let level = self.level();
                 let idx = self.stack[level].nested.len() as u16;

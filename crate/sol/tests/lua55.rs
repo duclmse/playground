@@ -2082,3 +2082,34 @@ fn pcall_catching_a_plain_runtime_error_does_not_leak_call_depth_budget() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("pcall runtime error depth ok"));
 }
+
+#[test]
+fn a_function_with_too_many_local_variables_fails_to_compile() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_too_many_locals_{}.lua",
+        std::process::id()
+    ));
+    // Real Lua caps a function's live local-variable count at MAXVARS (200,
+    // `lparser.c`), checked once per variable as it enters scope. A single
+    // `local a,a,...` declaration list past that count must fail to compile
+    // rather than silently succeed, matching `errors.lua`'s bisection, whose
+    // `checkerr`-style helpers only require the message to contain "too many".
+    std::fs::write(
+        &path,
+        format!(
+            "local ok, err = load(\"local a{} = 1\")\n\
+             assert(not ok, \"expected 201 local variables to fail to compile\")\n\
+             assert(string.find(err, \"too many\"), \"unexpected message: \" .. tostring(err))\n\
+             print(\"too many locals rejected\")\n",
+            ",a".repeat(200)
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("too many locals rejected"));
+}

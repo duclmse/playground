@@ -198,10 +198,11 @@ impl Compiler {
         state.is_vararg = function.vararg;
         state.push_scope();
         for (name, _) in &function.params {
-            state.declare_local(name, false);
+            state.declare_local_checked(name, false, function.line)?;
         }
         if let Some(vararg_name) = &function.vararg_name {
-            state.vararg_name = Some(state.declare_local(vararg_name, true));
+            state.vararg_name =
+                Some(state.declare_local_checked(vararg_name, true, function.line)?);
         }
         self.stack.push(state);
         if let Err(error) = self.compile_block(&function.body) {
