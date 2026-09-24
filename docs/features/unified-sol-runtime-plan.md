@@ -1886,7 +1886,16 @@ at the call instruction to determine how the callee was referenced -
 global/local/upvalue/field/method), a substantially larger feature than the
 line-info fixes above - `natives_debug.rs` already documents this as a
 known, deliberate gap (only a callee's own declared-local-function name is
-resolved today).
+resolved today). `docs/features/call-site-name-resolution.md` is a new design
+document scoping exactly this gap: it shows the caller's `LuaFrame::pending`
+(`Pending::Call { base, .. }`) already carries the inputs `dispatch.rs`'s
+existing `describe_register` (Sol's own scaled-down `getobjname`, currently
+used only to annotate "attempt to call/index" error messages) needs to
+resolve a level's call-site name, proposes a small refactor to share that
+resolution between the error-annotation paths and `debug.getinfo`, and
+explicitly scopes out `errors.lua`'s separate line-331 divergence (a
+real-Lua-RK-instruction-encoding artifact with no equivalent in Sol's
+bytecode format, not a missing feature). Not yet implemented.
 
 `verybig.lua`'s case is re-verified end to end under its own elevated
 `budget`/`alloc_budget` manifest overrides (see `tests/lua55/manifest.toml`,
