@@ -2113,3 +2113,36 @@ fn a_function_with_too_many_local_variables_fails_to_compile() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("too many locals rejected"));
 }
+
+#[test]
+fn a_function_using_too_many_registers_fails_to_compile() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_too_many_registers_{}.lua",
+        std::process::id()
+    ));
+    // Real Lua caps a function's register-stack window at MAX_FSTACK (255,
+    // `lcode.c`'s `luaK_checkstack`). A call with enough arguments to need
+    // more than 255 live registers (each argument expression needs its own
+    // register slot leading into the call) must fail to compile rather than
+    // silently succeed, matching `errors.lua`'s bisection: `checkmessage`
+    // there asserts on the literal substring "too many registers" for
+    // `f(x,x,...,x)` with 261 arguments.
+    std::fs::write(
+        &path,
+        format!(
+            "local ok, err = load(\"local function f(...) end; f(x{})\")\n\
+             assert(not ok, \"expected 261 call arguments to fail to compile\")\n\
+             assert(string.find(err, \"too many registers\"), \"unexpected message: \" .. tostring(err))\n\
+             print(\"too many registers rejected\")\n",
+            ",x".repeat(260)
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("too many registers rejected"));
+}

@@ -2187,6 +2187,50 @@ dependent — see `tests/lua55/manifest.toml`'s `errors.lua` note for the exact
 stopping point (`testrep("local a; a", ",a", "= 1", ",1")`'s
 `load(gencode(500))` assertion).
 
+Continuing past that cluster (neutralized only in the scratch bisection copy)
+surfaced three further, distinct resource-limit gaps, one now fixed and two
+deferred. Fixed: real Lua also caps a function's register-stack window at
+`MAX_FSTACK` (255, `lcode.c`'s `luaK_checkstack`) — a call needing more than
+255 live registers (261 arguments, each needing its own register slot) failed
+to trip anything in Sol (`Reg` is a `u16` with far more headroom) and compiled
+and ran instead. `FuncState` already tracked `max_reg`, the peak
+register-stack depth ever reserved — the exact equivalent of real Lua's own
+peak-usage `maxstacksize` — so `Compiler::compile_function` now rejects a
+function whose final `max_reg` exceeds 255, checked once after the body
+finishes compiling rather than incrementally per-allocation like
+`luaK_checkstack`, which has the same net effect for a `load()`-time failure
+and avoids threading a `Result` through `alloc_reg`'s roughly fifty call sites
+across the compiler. See `a_function_using_too_many_registers_fails_to_compile`
+in `crates/sol/tests/lua55.rs`. Deferred: real Lua similarly caps a function's
+upvalue count at `MAXUPVAL` (255, `lparser.c`'s `newupvalue`); Sol's
+equivalent (`FuncState::add_upval`, called only from `Compiler::resolve`) is
+infallible, and making it fallible is a much larger lift than the two fixes
+above, since `resolve(level, "_ENV")` is also called from the `()`-returning
+`emit_environment_get`/`emit_environment_set`, used by every plain global
+variable read/write in the compiler. A stress test exercising this
+(`errors.lua`, nested functions capturing 258 total upvalues) also revealed a
+separate, likely-independently-valuable gap while investigating: Sol's
+expression compiler allocates a fresh register per intermediate result in a
+binary-operator chain without freeing the previous one, unlike real Lua's
+`freeexp`-based reuse, so a long addition chain now hits the just-added
+255-register cap before any upvalue-count concern would ever apply — neither
+piece attempted here. Also deferred: a related stress case (a function
+missing its closing `end`, expecting a `MAXVARS` violation message despite
+the incomplete body) exposed a more fundamental architectural fact — Sol's
+`.lua` front end fully parses a function into a complete, syntactically-valid
+AST before the separate compilation pass (where the `MAXVARS`/`MAX_FSTACK`
+fixes live) ever runs, so an incomplete function body always surfaces its own
+syntax error first, unlike real Lua's single-pass parser, which can report a
+resource-limit violation mid-parse before ever needing a matching `end`. This
+is a general consequence of Sol's two-phase pipeline (the same underlying
+reason the parser recursion-depth limit above is awkward to add), not
+specific to `MAXVARS`, and doesn't affect the `MAXVARS` fix for any
+syntactically-complete input. With all four gaps neutralized only in
+`crate/sol/scratch/errors_bisect.lua` (each with its own explanatory comment),
+`errors.lua` now runs to completion and prints `OK`, matching the pinned
+oracle's final line; the real corpus file still fails at the earliest
+remaining deferred item and stays `pending` in the manifest.
+
 ### U7 — Interpreter performance foundation
 
 **Purpose:** make the semantic engine efficient before adding native tiers.

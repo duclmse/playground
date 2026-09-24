@@ -228,6 +228,19 @@ impl Compiler {
             ));
         }
         let num_registers = state.max_reg as usize;
+        // Real Lua caps a function's register-stack window at `MAX_FSTACK`
+        // (255, `lparser.c`/`lcode.c`'s `luaK_checkstack`), checked as
+        // registers are reserved. Sol's `Reg` is a `u16` with far more
+        // headroom, so without this a function using more than 255 live
+        // registers (e.g. a call with hundreds of arguments) would compile
+        // and run instead of failing like real Lua does.
+        const MAX_REGISTERS: usize = 255;
+        if num_registers > MAX_REGISTERS {
+            return Err(format!(
+                "line {}: too many registers (limit is {MAX_REGISTERS}) in function '{}'",
+                function.line, function.name
+            ));
+        }
         let mut captured_registers = vec![false; num_registers];
         for &reg in &state.captured {
             captured_registers[reg as usize] = true;
