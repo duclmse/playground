@@ -250,6 +250,11 @@ impl Compiler {
             consts: std::mem::take(&mut state.consts),
             upvals: std::mem::take(&mut state.upvals),
             upval_names: std::mem::take(&mut state.upval_names),
+            param_names: function
+                .params
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
             vararg_name: state.vararg_name,
             captured_registers,
             captured_cell_count,

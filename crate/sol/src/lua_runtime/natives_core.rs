@@ -3,10 +3,11 @@
 //! Split out of natives.rs, which holds the shared `call_native` dispatch
 //! table and its small cross-cutting coercion helpers.
 
-use super::frame::Frame;
+use super::dispatch::describe_register;
+use super::frame::{Frame, Pending};
 use super::util::*;
 use super::*;
-use crate::lua_bytecode::Proto;
+use crate::lua_bytecode::{Proto, Reg};
 
 impl LuaRuntime {
     pub(super) fn call_native_core(
@@ -55,8 +56,7 @@ impl LuaRuntime {
                     let prefix = self.where_prefix(1).unwrap_or_default();
                     Err(match args.get(1) {
                         Some(LuaValue::String(bytes)) => {
-                            let message =
-                                format!("{prefix}{}", String::from_utf8_lossy(bytes));
+                            let message = format!("{prefix}{}", String::from_utf8_lossy(bytes));
                             LuaError::raised(
                                 LuaValue::String(Rc::new(message.clone().into_bytes())),
                                 message,
@@ -518,10 +518,42 @@ impl LuaRuntime {
         if line <= 0 {
             return None;
         }
-        let source = self
-            .chunk_sources
-            .get(&(Rc::as_ptr(proto) as usize))?;
+        let source = self.chunk_sources.get(&(Rc::as_ptr(proto) as usize))?;
         let short_src = Self::short_src(source);
         Some(format!("{}:{line}: ", String::from_utf8_lossy(&short_src)))
+    }
+
+    /// Real Lua's `funcnamefromcode` (`ldebug.c`): how the frame at `level`
+    /// was *referred to by its caller* at the call site - resolved from the
+    /// caller's own bytecode via `describe_register`, not from the callee's
+    /// declared name. `level` uses the same 1-based, `DebugGetinfo`-
+    /// matching convention as `where_prefix` (level 1 is the topmost
+    /// frame). Returns `None` when there is no caller frame (the outermost
+    /// frame on the stack), the caller is a native frame, or the caller
+    /// isn't paused on an ordinary call (`Pending::Call` - a tail call
+    /// reuses the caller's own frame instead of leaving one behind to
+    /// inspect, so it has no call-site register to resolve from) - matching
+    /// real Lua's own `nil`/`""` fallback whenever it can't determine a
+    /// name.
+    pub(super) fn call_site_name(&self, level: i64) -> Option<(&'static str, String)> {
+        if level <= 0 {
+            return None;
+        }
+        let mut remaining = level + 1;
+        let mut found = None;
+        for frame in self.frames.iter().rev() {
+            remaining -= 1;
+            if remaining == 0 {
+                found = Some(frame);
+                break;
+            }
+        }
+        let Frame::Lua(caller) = found? else {
+            return None;
+        };
+        let Pending::Call { base, .. } = caller.pending else {
+            return None;
+        };
+        describe_register(&caller.proto, caller.header.pc as usize, base as Reg)
     }
 }

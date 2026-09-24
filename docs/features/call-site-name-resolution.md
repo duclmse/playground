@@ -1,8 +1,10 @@
 # Call-site name resolution
 
-> Status: design only - not yet implemented. Written to unblock two U6 Lua
-> 5.5 corpus files (`errors.lua`, `db.lua`); no code in this document has
-> landed.
+> Status: implemented (see the "Implementation plan" checklist below for
+> per-item notes). Written to unblock two U6 Lua 5.5 corpus files
+> (`errors.lua`, `db.lua`); `errors.lua`'s RK-limit divergence (gap 2) stays
+> permanently out of scope, and `db.lua` advanced past this design's target
+> assertions to a new, unrelated `debug.sethook` line-trace blocker.
 
 **Purpose**: real Lua's error messages and `debug.getinfo` both answer the
 same question - "how did the caller refer to this value?" - by walking the
@@ -166,12 +168,16 @@ further.
 
 ## Implementation plan
 
-- [ ] Change `describe_register`'s return type from `Option<String>` to a
+- [x] Change `describe_register`'s return type from `Option<String>` to a
       structured `Option<(&'static str, String)>` (`namewhat`, `name`), or
       an equivalent small enum/struct. Update `annotate_index_error`/
       `annotate_call_error` to format `"{kind} '{name}'"` themselves from
       the structured result - no behavior change at those two call sites.
-- [ ] Add a helper (e.g. `LuaRuntime::call_site_name(&self, frame_index:
+      Implementation note: `dispatch/bytecode.rs`'s arithmetic/unary
+      error-annotation code (4 more call sites, not listed above) needed the
+      same update; the design's "no behavior change" goal now covers all 6
+      actual call sites, not just the 2 originally named.
+- [x] Add a helper (e.g. `LuaRuntime::call_site_name(&self, frame_index:
       usize) -> Option<(&'static str, String)>`) that, given the index of a
       frame in `self.frames`, looks at `self.frames[frame_index - 1]`,
       matches `Frame::Lua` with `pending: Pending::Call { base, .. }`, and
@@ -181,22 +187,53 @@ further.
       metamethod dispatch mid-instruction - real Lua reports `nil` there
       too via its own `"metamethod"`/unresolved fallback path, which this
       first pass does not need to distinguish).
-- [ ] Wire that helper into `natives_debug.rs`'s `DebugGetinfo` level-based
+      Implementation note: landed as `LuaRuntime::call_site_name(&self,
+      level: i64)`, keyed on the same 1-based `level` convention
+      `where_prefix`/`DebugGetinfo` already use, rather than a raw
+      `frame_index`.
+- [x] Wire that helper into `natives_debug.rs`'s `DebugGetinfo` level-based
       branch (currently lines 325-359): prefer the call-site result over
       `declared_lua_name`'s fallback when present, keep the existing
       `declared_lua_name` fallback for frames with no resolvable caller
       (e.g. level equals the frame count, or a coroutine's base frame).
-- [ ] Regression coverage in `crate/sol/tests/lua55.rs`: a focused test
+- [x] Regression coverage in `crate/sol/tests/lua55.rs`: a focused test
       exercising `debug.getinfo(2).name`/`namewhat` for a local-variable-
       held anonymous closure and for a field-held one (mirroring
       `db.lua`'s two assertions at lines 88 and 91), independent of the
       full corpus file.
-- [ ] Update `tests/lua55/manifest.toml`'s `db.lua` entry and
+      Implementation note: landed as
+      `debug_getinfo_resolves_the_callers_call_site_name`, using
+      `debug.getinfo(1)` (read from inside the running function itself,
+      mirroring `db.lua`'s `function f (x, name)` case at line 101) rather
+      than `debug.getinfo(2)`, plus a third case for a call through a bare
+      function parameter register (`db.lua` line 120) - this is the case
+      that surfaced the `param_names` gap below.
+- [x] Update `tests/lua55/manifest.toml`'s `db.lua` entry and
       `docs/features/unified-sol-runtime-plan.md`'s U6 narrative together
       once the file's actual stopping point (promoted or newly pending
       elsewhere) is confirmed by rerunning it against the pinned oracle -
       `db.lua` is a large file and line 91 is very unlikely to be its only
       remaining blocker.
+      Outcome: `db.lua` now advances past lines 91, 92, and 104 to line 124
+      - its first `debug.sethook(f, "l")` line-trace test - which fails on a
+      distinct, pre-existing `wrong trace!!` gap in the line-hook
+      implementation itself, unrelated to call-site name resolution.
+      `db.lua` stays `pending` on that new blocker.
+
+**Gap found during implementation, not anticipated by this plan**:
+`describe_register` resolves a register's name only by scanning backward for
+a write instruction, but Sol's bytecode compiler never emits a write for a
+function *parameter* - its register is pre-populated by the calling
+convention at function entry, with no `Instr::NewLocal`. A call made through
+a bare parameter (`db.lua` line 120's `(x('a', 'x'))`, where `x` is `g`'s
+parameter) therefore fell back incorrectly to the callee's own declared name.
+Fixed by adding `Proto::param_names: Vec<String>` (populated in
+`compile_function` from `function.params`, mirroring the existing
+`upval_names`) and a terminal fallback in `describe_register`'s scan loop
+consulting it when no write is found for the target register. Sound because a
+parameter's register lives in the function's outermost scope for the entire
+function body (that scope is popped only at function exit), so it is never
+freed/reused for an unrelated temporary mid-function.
 
 **Explicitly out of scope**: the RK-limit method/field degradation
 (gap 2 above, permanent divergence); real Lua's `"metamethod"`/`upvalue`-

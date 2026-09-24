@@ -70,18 +70,25 @@ fn instr_writes(instr: &Instr, reg: Reg) -> bool {
 
 /// Real Lua's `getobjname` (`ldebug.c`), scaled down to the handful of
 /// sources worth annotating an "attempt to index/call a nil value" error
-/// with: scans backward from just before `pc` for the most recent write to
-/// `reg`, chasing through `Move` the way real Lua's bytecode scan does, and
-/// gives up (returning `None`, so the error stays unannotated) at the first
-/// write it can't name - matching real Lua's own conservative fallback
-/// rather than guessing.
-fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
+/// with (and, via `LuaRuntime::call_site_name`, `debug.getinfo`'s
+/// `name`/`namewhat`): scans backward from just before `pc` for the most
+/// recent write to `reg`, chasing through `Move` the way real Lua's
+/// bytecode scan does, and gives up (returning `None`) at the first write
+/// it can't name - matching real Lua's own conservative fallback rather
+/// than guessing. Returns `(namewhat, name)`, mirroring real Lua's own
+/// `getobjname` output pair - `namewhat` is always one of `"local"`,
+/// `"upvalue"`, `"global"`, `"field"`, `"method"`.
+pub(super) fn describe_register(
+    proto: &Proto,
+    pc: usize,
+    reg: Reg,
+) -> Option<(&'static str, String)> {
     let mut target = reg;
     // When a dotted name is lowered through a self-overwriting register,
     // retain its final field while chasing the root.  A local root retains
     // Lua's `field 'x'` wording; a global root takes precedence as
     // `global 'x'` (see the branch below).
-    let mut dotted_field = None;
+    let mut dotted_field: Option<String> = None;
     for (index, instr) in proto.instrs[..pc].iter().enumerate().rev() {
         match instr {
             // `compile_expr` emits this self-move only after an `and`/`or`
@@ -91,20 +98,20 @@ fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
             Instr::Move(dst, src) if *dst == target => target = *src,
             Instr::NewLocal(dst, _, name_idx) if *dst == target => {
                 if let Some(field) = dotted_field {
-                    return Some(format!("field '{field}'"));
+                    return Some(("field", field));
                 }
                 let name = String::from_utf8_lossy(&name_const(proto, *name_idx)).into_owned();
-                return Some(format!("local '{name}'"));
+                return Some(("local", name));
             }
             Instr::GetUpval(dst, index) if *dst == target => {
                 if let Some(field) = dotted_field {
-                    return Some(format!("field '{field}'"));
+                    return Some(("field", field));
                 }
                 let name = proto.upval_names.get(*index as usize)?;
-                return Some(format!("upvalue '{name}'"));
+                return Some(("upvalue", name.clone()));
             }
             Instr::GetGlobal(dst, name) if *dst == target => {
-                return Some(format!("global '{name}'"));
+                return Some(("global", name.to_string()));
             }
             Instr::GetField(dst, receiver, name_idx) if *dst == target => {
                 let name = String::from_utf8_lossy(&name_const(proto, *name_idx)).into_owned();
@@ -126,11 +133,12 @@ fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
                 // lexically rebound `_ENV` lowers to a field load.  Keep
                 // Lua's observable global wording for that special
                 // receiver rather than calling it a field of `_ENV`.
-                if matches!(
-                    describe_register(proto, index, *receiver).as_deref(),
-                    Some("local '_ENV'") | Some("upvalue '_ENV'")
-                ) {
-                    return Some(format!("global '{name}'"));
+                if let Some((receiver_kind, receiver_name)) =
+                    describe_register(proto, index, *receiver)
+                {
+                    if matches!(receiver_kind, "local" | "upvalue") && receiver_name == "_ENV" {
+                        return Some(("global", name));
+                    }
                 }
                 // `compile_method_base` emits `GetField(base, receiver,
                 // name)` immediately followed by `Move(base + 1, receiver)`
@@ -143,13 +151,24 @@ fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
                         if *self_reg == target + 1 && *source == *receiver
                 );
                 let kind = if is_method { "method" } else { "field" };
-                return Some(format!("{kind} '{name}'"));
+                return Some((kind, name));
             }
             other if instr_writes(other, target) => return None,
             _ => {}
         }
     }
-    None
+    // No instruction in `[0, pc)` ever wrote `target` - real Lua's
+    // `getobjname` would still resolve it via `getlocalname`'s static
+    // `locvars` lookup rather than giving up, and the only Sol register
+    // that shape describes is a function parameter: it arrives already
+    // populated by the calling convention, with no `Instr::NewLocal` (or
+    // any other write) to chase. `param_names` is exactly that minimal,
+    // `upval_names`-style debug metadata for this one case.
+    if let Some(field) = dotted_field {
+        return Some(("field", field));
+    }
+    let name = proto.param_names.get(target as usize)?;
+    Some(("local", name.clone()))
 }
 
 /// Appends real Lua's "(global 'x')"/"(field 'x')" suffix to a fresh
@@ -158,8 +177,8 @@ fn describe_register(proto: &Proto, pc: usize, reg: Reg) -> Option<String> {
 /// the metatable-chain-too-long error also raised from this path).
 fn annotate_index_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg) {
     if err.message.starts_with("attempt to index a ") && err.message.ends_with(" value") {
-        if let Some(description) = describe_register(proto, pc, base) {
-            err.message = format!("{} ({description})", err.message);
+        if let Some((kind, name)) = describe_register(proto, pc, base) {
+            err.message = format!("{} ({kind} '{name}')", err.message);
         }
     }
 }
@@ -169,8 +188,8 @@ fn annotate_index_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg)
 /// call retains its useful source name even when the callee is a non-function.
 fn annotate_call_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg) {
     if err.message.starts_with("attempt to call a ") && err.message.ends_with(" value") {
-        if let Some(description) = describe_register(proto, pc, base) {
-            err.message = format!("{} ({description})", err.message);
+        if let Some((kind, name)) = describe_register(proto, pc, base) {
+            err.message = format!("{} ({kind} '{name}')", err.message);
         }
     }
 }

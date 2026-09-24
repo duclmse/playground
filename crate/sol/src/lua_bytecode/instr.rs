@@ -183,6 +183,15 @@ pub struct Proto {
     /// Source names for `upvals`, kept alongside the capture descriptors so
     /// runtime diagnostics can preserve Lua's `upvalue 'name'` wording.
     pub upval_names: Vec<String>,
+    /// Declared parameter names, in register order (`param_names[i]` is
+    /// register `i`'s name). Unlike an ordinary `local x = ...`, a
+    /// parameter's register is populated by the calling convention itself
+    /// with no `Instr::NewLocal` to carry its name, so `describe_register`
+    /// (`lua_runtime/dispatch.rs`) cannot recover it by scanning for a
+    /// write - this is the minimal, `upval_names`-style debug metadata that
+    /// lets it do so anyway, mirroring real Lua's `locvars` (scaled down to
+    /// just the one case Sol's bytecode can't otherwise reconstruct).
+    pub param_names: Vec<String>,
     pub vararg_name: Option<Reg>,
     pub nested: Vec<Rc<Proto>>,
     /// `captured_registers[i]` is true iff register `i` is ever captured as

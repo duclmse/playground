@@ -386,8 +386,8 @@ impl LuaRuntime {
                     match self.unary_resolve(UnaryOp::Neg, value) {
                         Err(mut error) => {
                             if error.message == "number expected" {
-                                if let Some(description) = describe_register(&proto, pc, *src) {
-                                    error.message = format!("{} ({description})", error.message);
+                                if let Some((kind, name)) = describe_register(&proto, pc, *src) {
+                                    error.message = format!("{} ({kind} '{name}')", error.message);
                                 }
                             }
                             return Err(error);
@@ -454,16 +454,17 @@ impl LuaRuntime {
                                     OperandSide::Left => left_reg,
                                     OperandSide::Right => right_reg,
                                 };
-                                if let Some(description) = describe_register(&proto, pc, reg as Reg)
+                                if let Some((kind, name)) =
+                                    describe_register(&proto, pc, reg as Reg)
                                 {
                                     // Lua's integer-representation errors
                                     // spell a local source without the
                                     // quotes used by call/index diagnostics.
-                                    let description = description
-                                        .strip_prefix("local '")
-                                        .and_then(|name| name.strip_suffix('\''))
-                                        .map(|name| format!("local {name}"))
-                                        .unwrap_or(description);
+                                    let description = if kind == "local" {
+                                        format!("local {name}")
+                                    } else {
+                                        format!("{kind} '{name}'")
+                                    };
                                     error.message = error.message.replacen(
                                         "number has",
                                         &format!("number ({description}) has"),
@@ -487,7 +488,7 @@ impl LuaRuntime {
                                     Some(OperandSide::Right) => right_reg,
                                     None => left_reg,
                                 };
-                                if let Some(description) =
+                                if let Some((kind, name)) =
                                     describe_register(&proto, pc, described_register as Reg)
                                         .or_else(|| {
                                             (hinted_side.is_none())
@@ -497,7 +498,7 @@ impl LuaRuntime {
                                                 .flatten()
                                         })
                                 {
-                                    error.message = format!("{} ({description})", error.message);
+                                    error.message = format!("{} ({kind} '{name}')", error.message);
                                 }
                             }
                             return Err(error);

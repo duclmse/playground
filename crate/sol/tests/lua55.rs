@@ -386,8 +386,7 @@ fn lexer_errors_report_lua_compatible_near_text() {
 /// (a `sol run` script argument) must still skip a shebang line.
 #[test]
 fn load_does_not_skip_a_shebang_but_file_loading_still_does() {
-    let path =
-        std::env::temp_dir().join(format!("sol_lua55_shebang_{}.lua", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sol_lua55_shebang_{}.lua", std::process::id()));
     std::fs::write(
         &path,
         br##"
@@ -503,8 +502,7 @@ fn lexer_reports_a_malformed_number_not_a_malformed_numeral() {
 /// report the more specific "number has no integer representation" instead.
 #[test]
 fn bitwise_not_on_a_non_number_operand_reports_the_operand_type() {
-    let path =
-        std::env::temp_dir().join(format!("sol_lua55_bnot_type_{}.lua", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sol_lua55_bnot_type_{}.lua", std::process::id()));
     std::fs::write(
         &path,
         br#"
@@ -1167,4 +1165,58 @@ fn cli_run_reaches_os_io_and_load_through_the_dynamic_runtime_fallback() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("hello io"), "{stdout}");
     assert!(stdout.contains("number\t3"), "{stdout}");
+}
+
+/// `debug.getinfo(1).name`/`.namewhat`, read from inside the running function
+/// itself, must reflect how the *caller* referred to it at the call site
+/// (real Lua's `funcnamefromcode` in `ldebug.c`), not the callee's own
+/// declared name - the same closure called through a local variable, a table
+/// field, and a bare parameter register must report different `name`/
+/// `namewhat` pairs each time, mirroring `lua-5.5.1-tests/db.lua` lines
+/// 96-104.
+#[test]
+fn debug_getinfo_resolves_the_callers_call_site_name() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_call_site_name_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local function f()
+            return debug.getinfo(1)
+        end
+
+        -- called through a local variable
+        local a = f()
+        assert(a.name == 'f' and a.namewhat == 'local', a.namewhat .. " " .. tostring(a.name))
+
+        -- called through a table field
+        local t = {f = f}
+        local b = t.f()
+        assert(b.name == 'f' and b.namewhat == 'field', b.namewhat .. " " .. tostring(b.name))
+
+        -- called through a bare function parameter (no declared name at all);
+        -- parens around the call disable Lua's tail-call optimization, so the
+        -- caller's frame (and its call-site register) is still live to
+        -- inspect - matching lua-5.5.1-tests/db.lua line 120's `(x('a', 'x'))`
+        local function g(x) return (x()) end
+        local c = g(f)
+        assert(c.name == 'x' and c.namewhat == 'local', c.namewhat .. " " .. tostring(c.name))
+
+        print("call site name ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("call site name ok"));
 }

@@ -1895,7 +1895,35 @@ resolve a level's call-site name, proposes a small refactor to share that
 resolution between the error-annotation paths and `debug.getinfo`, and
 explicitly scopes out `errors.lua`'s separate line-331 divergence (a
 real-Lua-RK-instruction-encoding artifact with no equivalent in Sol's
-bytecode format, not a missing feature). Not yet implemented.
+bytecode format, not a missing feature).
+
+That design is now implemented. `describe_register` returns a structured
+`(namewhat, name)` pair instead of a pre-formatted message, and a new
+`LuaRuntime::call_site_name` helper (`natives_core.rs`) resolves a frame's
+call-site name by reading the *caller's* still-live `Pending::Call { base,
+.. }` and re-running `describe_register` against the caller's own bytecode at
+its paused `pc`, mirroring `funcnamefromcode`. `DebugGetinfo` tries
+`call_site_name` first, falling back to the callee's own declared name only
+when there is no caller frame to inspect (outermost frame, native caller, or
+a tail call, which reuses the caller's frame in place and leaves no call-site
+register to resolve from). Implementing it against the real corpus surfaced
+one gap the design didn't anticipate: Sol's bytecode never emits a write
+instruction for a function *parameter* (its register is pre-populated by the
+calling convention, not by an `Instr::NewLocal`), so `describe_register`'s
+backward write-scan could never resolve a call made through a parameter
+register. Fixed by adding `Proto::param_names` (populated in
+`compile_function`, the same pattern as the existing `upval_names`) and a
+terminal fallback in `describe_register` consulting it when no write is
+found - sound because a parameter's register lives in the function's
+outermost scope for the whole function body and is never freed/reused for an
+unrelated temporary. With both landed, `db.lua` now passes line 91's
+`namewhat`/`name` assertion, line 92's field-namewhat case, the
+parameter-call-site case, and line 104's reassigned-local case, advancing to
+line 124 - the file's first `debug.sethook(f, "l")` line-trace test, which
+fails on `wrong trace!!` inside the hook callback. That is a distinct,
+substantial, pre-existing gap in the `debug.sethook` line-event implementation
+itself, unrelated to call-site name resolution and not investigated here;
+`db.lua` stays `pending` on it.
 
 `verybig.lua`'s case is re-verified end to end under its own elevated
 `budget`/`alloc_budget` manifest overrides (see `tests/lua55/manifest.toml`,

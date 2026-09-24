@@ -131,7 +131,7 @@ impl LuaRuntime {
                                 (usize::try_from(index).ok()
                                     == Some(closure.proto.upvals.len() + 1)
                                     && has_implicit_environment(&closure.proto))
-                                    .then(|| closure.globals.identity_address())
+                                .then(|| closure.globals.identity_address())
                             })
                     }
                     LuaValue::GMatchIterator(state) if index == 1 => {
@@ -238,17 +238,23 @@ impl LuaRuntime {
                 // real Lua's `lua_getstack` walks the full `CallInfo` chain,
                 // C activation records included, not just Lua ones.
                 //
-                // `name`/`namewhat` are not fully resolved: real Lua's
-                // `funcnamefromcode` walks the *caller's* bytecode at the
-                // call site to figure out how the callee was referenced
-                // (global/local/upvalue/field/method), which this runtime
-                // does not yet do. They are always `nil`/`""`, which is also
-                // real Lua's own fallback whenever it can't determine a
-                // name.  A named local-function declaration carries its
-                // declared name in the prototype, which is enough for the
-                // common direct-call case.  Other call-site forms still use
-                // Lua's nil/empty fallback below until the bytecode retains
-                // full call-site name metadata.
+                // `name`/`namewhat` for a level-based lookup prefer real
+                // Lua's `funcnamefromcode`-equivalent (`LuaRuntime::
+                // call_site_name`, `natives_core.rs`): it walks the
+                // *caller's* bytecode at the call site to figure out how
+                // the callee was referenced (global/local/upvalue/field/
+                // method), reusing the same `describe_register` real
+                // Lua-equivalent `getobjname` scan that annotates "attempt
+                // to call/index" error messages (`dispatch.rs`). When that
+                // has no answer - the outermost frame, a native caller, or
+                // a tail call (which reuses the caller's own frame instead
+                // of leaving one behind to resolve from) - fall back to the
+                // callee's own declared local-function name, and finally to
+                // Lua's own `nil`/`""` when neither resolves anything,
+                // matching real Lua's own fallback whenever it can't
+                // determine a name. A direct function-value lookup (the
+                // `LuaValue::Closure` arm above) has no caller frame at all,
+                // so it always uses Lua's fallback.
                 let arg0 = required(0)?;
                 if let Some(option) = args.get(1) {
                     let option = self.string(option).map_err(|_| {
@@ -351,7 +357,14 @@ impl LuaRuntime {
                                     current_line,
                                     lua_frame.call_chain_hops as i64,
                                 );
-                                if let Some(name) = Self::declared_lua_name(&lua_frame.proto) {
+                                if let Some((namewhat, name)) = self.call_site_name(level) {
+                                    set(
+                                        b"namewhat",
+                                        LuaValue::String(Rc::new(namewhat.as_bytes().to_vec())),
+                                    );
+                                    set(b"name", LuaValue::String(Rc::new(name.into_bytes())));
+                                } else if let Some(name) = Self::declared_lua_name(&lua_frame.proto)
+                                {
                                     set(b"namewhat", LuaValue::String(Rc::new(b"local".to_vec())));
                                     set(b"name", LuaValue::String(Rc::new(name.to_vec())));
                                 }
@@ -586,7 +599,10 @@ impl LuaRuntime {
             if let Some(location) = proto.source_map.location(pc) {
                 activelines
                     .borrow_mut()
-                    .set(LuaValue::Integer(location.line as i64), LuaValue::Bool(true))
+                    .set(
+                        LuaValue::Integer(location.line as i64),
+                        LuaValue::Bool(true),
+                    )
                     .unwrap();
             }
         }
