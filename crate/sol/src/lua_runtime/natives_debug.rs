@@ -538,6 +538,37 @@ impl LuaRuntime {
                     .unwrap_or_else(|| self.main_coroutine.clone());
                 if Rc::ptr_eq(&target, &running) {
                     self.active_hook = target.hook.borrow().clone();
+                    // `fire_line_and_count_hooks` only updates
+                    // `hook_last_pc`/`hook_last_line` while a hook is
+                    // actually active (real Lua's own `oldpc` tracking in
+                    // `luaG_traceexec` runs unconditionally, hook or not, so
+                    // by the time a hook is installed it already reflects
+                    // "the line we're currently on"). Sol's per-frame
+                    // tracking instead sits stale (frozen at its `-1`
+                    // sentinel, or wherever it was when a previous hook was
+                    // cleared) the whole time no hook is active. Left
+                    // uncorrected, activating a fresh "l"-mode hook mid-frame
+                    // would compare the frame's *current* line against that
+                    // stale value on the very next instruction and misfire a
+                    // spurious "line" event for a line the frame was already
+                    // on, not a real transition - every live frame on this
+                    // coroutine's stack needs its bookkeeping seeded to its
+                    // own current position first.
+                    if matches!(&self.active_hook, Some(hook) if hook.mask.line) {
+                        for frame in self.frames.iter_mut() {
+                            if let Frame::Lua(lua_frame) = frame {
+                                let pc = lua_frame.header.pc as i64;
+                                let line = lua_frame
+                                    .proto
+                                    .source_map
+                                    .location(lua_frame.header.pc)
+                                    .map(|location| location.line as i64)
+                                    .unwrap_or(-1);
+                                lua_frame.hook_last_pc = pc;
+                                lua_frame.hook_last_line = line;
+                            }
+                        }
+                    }
                 }
                 Ok(vec![])
             }

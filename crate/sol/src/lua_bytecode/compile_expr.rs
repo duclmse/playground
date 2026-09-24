@@ -58,7 +58,12 @@ impl Compiler {
                 let idx = self.stack[level].nested.len() as u16;
                 self.stack[level].nested.push(proto);
                 let dst = self.stack[level].alloc_reg();
-                self.stack[level].emit(Instr::NewClosure(dst, idx), line);
+                // Matches `Stmt::GlobalFunction`/`Stmt::LocalFunction`: real
+                // Lua's `OP_CLOSURE` isn't emitted until the whole function
+                // body has been parsed, tagged with that point's
+                // `lastline` (`function.end_line`), not this expression's
+                // own starting `line`.
+                self.stack[level].emit(Instr::NewClosure(dst, idx), function.end_line);
                 Ok(dst)
             }
             ExprKind::Table(fields) => {

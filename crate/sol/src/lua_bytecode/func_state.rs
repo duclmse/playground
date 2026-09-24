@@ -280,6 +280,23 @@ impl FuncState {
         self.instrs.len() - 1
     }
 
+    /// The line of the most recently emitted instruction, if any. Real
+    /// Lua's line-info generation (`lcode.c`'s `savelineinfo`) tags every
+    /// instruction with `ls->lastline` - the line of the most recent token
+    /// actually consumed by the parser - which for a compiler-synthesized
+    /// structural instruction with no source token of its own (e.g. the
+    /// `OP_JMP` a `test_then_block` emits to skip an `else` branch) ends up
+    /// being the line of whatever real statement was parsed immediately
+    /// before it, not the enclosing compound statement's own opening line.
+    /// This is the equivalent lookup for Sol's already-fully-parsed-AST
+    /// compiler: at the point a structural instruction (a control-flow
+    /// jump, a `CloseSlots`, a loop back-edge) is emitted, the line of the
+    /// last instruction already in `self.instrs` is exactly "the line of
+    /// the last real statement compiled so far" - the same value.
+    pub(super) fn last_line(&self) -> Option<u32> {
+        self.lines.last().copied()
+    }
+
     pub(super) fn push_const(&mut self, value: Const) -> u32 {
         self.consts.push(value);
         (self.consts.len() - 1) as u32

@@ -242,14 +242,20 @@ impl Compiler {
                 line,
             } => {
                 let cond_reg = self.compile_expr(cond)?;
+                let test_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
                 let jump_to_else = self
                     .stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::JumpIfFalse(cond_reg, 0), *line);
+                    .emit(Instr::JumpIfFalse(cond_reg, 0), test_line);
                 self.compile_block(then_block)?;
                 if let Some(else_block) = else_block {
-                    let jump_to_end = self.stack.last_mut().unwrap().emit(Instr::Jump(0), *line);
+                    let skip_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
+                    let jump_to_end = self
+                        .stack
+                        .last_mut()
+                        .unwrap()
+                        .emit(Instr::Jump(0), skip_line);
                     let else_start = self.stack.last_mut().unwrap().here();
                     self.stack
                         .last_mut()
@@ -274,11 +280,12 @@ impl Compiler {
                 let test_start = self.stack[level].here();
                 let cond_before = self.stack[level].next_reg;
                 let cond_reg = self.compile_expr(cond)?;
+                let cond_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
                 let exit_jump = self
                     .stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::JumpIfFalse(cond_reg, 0), *line);
+                    .emit(Instr::JumpIfFalse(cond_reg, 0), cond_line);
                 // If the condition compiled to a genuinely fresh temporary
                 // (register allocation is stack-disciplined, so `cond_reg`
                 // can only alias a pre-existing local/upvalue-as-local if it
@@ -312,7 +319,12 @@ impl Compiler {
                     reg_floor: 0,
                 });
                 self.compile_block(body)?;
-                let back = self.stack.last_mut().unwrap().emit(Instr::Jump(0), *line);
+                let back_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
+                let back = self
+                    .stack
+                    .last_mut()
+                    .unwrap()
+                    .emit(Instr::Jump(0), back_line);
                 self.stack
                     .last_mut()
                     .unwrap()
@@ -346,10 +358,11 @@ impl Compiler {
                 let result = self.compile_statements(body, false).and_then(|_| {
                     let cond_reg = self.compile_expr(cond)?;
                     let cl = self.level();
+                    let cond_line = self.stack[cl].last_line().unwrap_or(*line);
                     let here = self.stack[cl].here();
                     self.stack[cl].emit(
                         Instr::JumpIfFalse(cond_reg, start as i32 - here as i32),
-                        *line,
+                        cond_line,
                     );
                     Ok(())
                 });
@@ -666,24 +679,37 @@ impl Compiler {
                 let idx = self.stack[level].nested.len() as u16;
                 self.stack[level].nested.push(proto);
                 let dst = self.stack[level].alloc_reg();
-                self.stack[level].emit(Instr::NewClosure(dst, idx), function.line);
+                // Real Lua's `codeclosure` emits `OP_CLOSURE` only after the
+                // whole function body has been parsed, tagged with
+                // `ls->lastline` at that point (the closing `end`'s line,
+                // i.e. `function.end_line`) - not the `function` keyword's
+                // own opening line. A line-event hook installed before this
+                // statement runs must not observe anything until the
+                // closure is actually created.
+                self.stack[level].emit(Instr::NewClosure(dst, idx), function.end_line);
                 if function.is_global_decl && !function.name.contains(['.', ':']) {
                     // `globalfunc` always supplies its closure as the
                     // declaration's initializer, so (unlike a bare `global
                     // NAME`) this form always runs the "already defined"
                     // guard, right before the closure is actually stored.
-                    self.emit_check_global_undefined(level, &function.name, function.line);
+                    self.emit_check_global_undefined(level, &function.name, function.end_line);
                 }
-                self.compile_function_name_assign(&function.name, dst, function.line)?;
+                self.compile_function_name_assign(&function.name, dst, function.end_line)?;
                 Ok(())
             }
             Stmt::LocalFunction(function) => {
                 let level = self.level();
                 let nil = self.stack[level].alloc_reg();
-                self.stack[level].emit(Instr::LoadNil(nil), function.line);
+                // No real-Lua equivalent emits any code for pre-declaring
+                // the recursive-reference local itself (`new_localvar`
+                // alone doesn't touch `lastline`), so these two setup
+                // instructions must not be independently line-observable
+                // either - tag them `end_line` too, matching the closure
+                // instructions below.
+                self.stack[level].emit(Instr::LoadNil(nil), function.end_line);
                 let slot = self.stack[level].alloc_reg();
                 let name_const = self.stack[level].push_name_const(&function.name);
-                self.stack[level].emit(Instr::NewLocal(slot, nil, name_const), function.line);
+                self.stack[level].emit(Instr::NewLocal(slot, nil, name_const), function.end_line);
                 self.stack[level].scopes.last_mut().unwrap().locals.push((
                     function.name.clone(),
                     slot,
@@ -694,8 +720,12 @@ impl Compiler {
                 let idx = self.stack[level].nested.len() as u16;
                 self.stack[level].nested.push(proto);
                 let dst = self.stack[level].alloc_reg();
-                self.stack[level].emit(Instr::NewClosure(dst, idx), function.line);
-                self.stack[level].emit(Instr::Move(slot, dst), function.line);
+                // See the matching comment in `Stmt::GlobalFunction`: the
+                // closure isn't observably created until its body is fully
+                // parsed, so this (and the `Move` storing it into `slot`)
+                // must carry `end_line`, not the declaration's own line.
+                self.stack[level].emit(Instr::NewClosure(dst, idx), function.end_line);
+                self.stack[level].emit(Instr::Move(slot, dst), function.end_line);
                 Ok(())
             }
             Stmt::Label { name, line } => {

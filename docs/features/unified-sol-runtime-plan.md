@@ -1925,6 +1925,45 @@ substantial, pre-existing gap in the `debug.sethook` line-event implementation
 itself, unrelated to call-site name resolution and not investigated here;
 `db.lua` stays `pending` on it.
 
+That line-trace gap was three distinct bugs, all now fixed. (1)
+`LuaFrame::hook_last_pc`/`hook_last_line` only updated while a hook was
+already active, so they sat stale while none was installed; a fresh
+`"l"`-mode hook installed mid-frame (`test`'s own
+`debug.sethook(f,"l"); load(s)(); debug.sethook()` idiom) then misfired a
+spurious event comparing the frame's current line against that stale value -
+fixed by seeding every live Lua frame's hook bookkeeping to its own current
+position when a line-mode hook is (re)installed on the running coroutine
+(`natives_debug.rs`). (2) Sol's AST-first compiler tags synthetic
+control-flow instructions with no source token of their own (an `if`/
+`while`'s else-skip or back-edge jump, a `repeat`'s `until` test) with the
+enclosing statement's own start line; real Lua's single-pass `lcode.c`
+always uses `ls->lastline` - the most recently *parsed* token's line - which
+for these is the last real statement/condition already compiled, not the
+construct's opening keyword. Added `FuncState::last_line()` (the emission-
+order equivalent of `lastline` for an already-parsed AST) and wired it into
+`Stmt::If`/`Stmt::While`/`Stmt::Repeat`'s synthetic jumps (`compile_stmt.rs`);
+numeric/generic `for`'s own control instructions were verified against the
+oracle to already match real Lua's (surprising) opening-line tagging, so
+those were left alone. (3) A closure isn't observably created in real Lua
+until its whole body is parsed (`codeclosure` emits `OP_CLOSURE` only then,
+tagged with the closing `end`'s line), but Sol tagged `local function`/
+`function`/function-expression closures with the declaration's own opening
+line; fixed by using `function.end_line` throughout their `NewClosure`
+emission (`compile_stmt.rs`, `compile_expr.rs`). All three are covered by
+`debug_sethook_line_events_match_real_luas_lastline_convention`
+(`crate/sol/tests/lua55.rs`). With all three fixed, `db.lua` advances through
+all ten of the file's simple `test(...)` calls into its "large gaps in
+source" stress loop (lines 193-212), which surfaces a fourth, much narrower
+gap: real Lua's parser only discharges a binary expression's first operand
+when it consumes the following operator token, by which point lookahead has
+already scanned past that operator onto the next line, so the first
+operand's (and the operator's own) instruction end up tagged with whatever
+line that lookahead reached - confirmed via `luac5.5 -l -l`'s bytecode dump.
+Sol's AST-first compiler has no equivalent lazy-discharge sequencing to
+reproduce this from, and it only arises from source that deliberately splits
+an operator from its operand across embedded newlines - out of scope for
+this pass. `db.lua` stays `pending` on that narrower blocker.
+
 `verybig.lua`'s case is re-verified end to end under its own elevated
 `budget`/`alloc_budget` manifest overrides (see `tests/lua55/manifest.toml`,
 same mechanism as `sort.lua`/`nextvar.lua`), now that the `os.tmpname`/

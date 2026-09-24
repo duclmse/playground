@@ -1220,3 +1220,97 @@ fn debug_getinfo_resolves_the_callers_call_site_name() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("call site name ok"));
 }
+
+#[test]
+fn debug_sethook_line_events_match_real_luas_lastline_convention() {
+    // Mirrors `lua-5.5.1-tests/db.lua`'s `test(s, l)` helper: installs a
+    // fresh `"l"`-mode hook *mid-frame* (after `f`'s own locals are already
+    // running), then checks the exact sequence of lines it reports against
+    // real Lua 5.5.1's oracle output for each construct. Regression coverage
+    // for three related bugs found while chasing db.lua's first divergence:
+    // (1) a freshly-installed hook must not fire a spurious event for the
+    // line the frame is already on (stale `hook_last_line` bookkeeping);
+    // (2) a synthetic control-flow instruction (an `if`/`while`/`repeat`'s
+    // jump) must be tagged with the line of the last real statement
+    // compiled so far, not the enclosing statement's own start line
+    // (matches real Lua's `lastline`, since `lcode.c`'s `savelineinfo`
+    // always uses it, never a construct's opening keyword line); (3) a
+    // closure isn't observably created until its whole body has been
+    // parsed, so `local function`/`function`/a function expression must
+    // report the closing `end`'s line, not the declaration's own line.
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_sethook_lastline_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local function test(s, expected)
+            collectgarbage()
+            local function f(event, line)
+                assert(event == 'line')
+                local want = table.remove(expected, 1)
+                assert(want == line, "wrong trace!! got " .. line .. " expected " .. tostring(want))
+            end
+            -- Real Lua's db.lua keeps these three calls on one line, so
+            -- the hook's own installation doesn't itself cross a line
+            -- boundary in the calling frame before `load(s)()` runs.
+            debug.sethook(f, "l"); load(s)(); debug.sethook()
+            assert(#expected == 0)
+        end
+
+        -- if/else: the else-skip jump must carry the then-branch's last
+        -- line (4), not the `if`'s own line (1).
+        test([[if
+math.sin(1)
+then
+  a=1
+else
+  a=2
+end
+]], {2, 4, 7})
+
+        -- while: the back-edge jump must carry the body's last line (3),
+        -- not the `while`'s own line (2).
+        test([[local i = 1
+while i < 3 do
+  i = i + 1
+end
+]], {1, 2, 3, 2, 3, 2, 4})
+
+        -- repeat: the `until` test's jump must carry the condition's own
+        -- line (4), not the `repeat`'s own line (2).
+        test([[local i = 1
+repeat
+  i = i + 1
+until i >= 3
+]], {1, 3, 4, 3, 4})
+
+        -- local function: the closure isn't created until its `end`
+        -- (line 2), so no event fires for line 1 at all.
+        test([[
+local function foo()
+end
+foo()
+A = 1
+A = 2
+A = 3
+]], {2, 3, 2, 4, 5, 6})
+        _G.A = nil
+
+        print("sethook lastline ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("sethook lastline ok"));
+}
