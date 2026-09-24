@@ -362,6 +362,31 @@ impl LuaRuntime {
                     self.error_type_label(value)
                 ))),
             },
+            // Real Lua installs this as the file-handle metatable's `__gc`
+            // (and `__close`) entry (`liolib.c`'s `f_gc`, both aliased to the
+            // same C function) - an ordinary, directly callable Lua function
+            // that argument-checks its receiver like any other file method
+            // (`tolstream`'s `luaL_checkudata`), not something only the
+            // collector can invoke. `lua-5.5.1-tests/errors.lua`'s "tests for
+            // field accesses after RK limit" section calls it explicitly
+            // (`getmetatable(io.stdin).__gc()`) purely to observe that
+            // argument-check error. Sol has no tracing-GC finalizer hook to
+            // wire this into yet (`crates/sol/AGENTS.md`'s `sol-core`
+            // migration; see `gc.lua`'s manifest note), so on a valid FILE*
+            // receiver this only performs the check and otherwise no-ops,
+            // matching real Lua's own no-op outcome for the standard streams
+            // (`f_gc` skips closing whenever `p->closef` is unset, which is
+            // always the case for `stdin`/`stdout`/`stderr`).
+            NativeFunction::FileGc => match args.first() {
+                Some(value) if self.is_file_userdata(value) => Ok(vec![]),
+                Some(value) => Err(LuaError::new(format!(
+                    "bad argument #1 to '__gc' (FILE* expected, got {})",
+                    self.error_type_label(value)
+                ))),
+                None => Err(LuaError::new(
+                    "bad argument #1 to '__gc' (FILE* expected, got no value)",
+                )),
+            },
             _ => unreachable!("call_native_os_io received a non-os_io NativeFunction"),
         }
     }

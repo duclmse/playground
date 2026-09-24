@@ -613,6 +613,32 @@ impl LuaRuntime {
                 sol_core::Value::object(name_value),
             )
             .expect("fresh canonical file metatable accepts __name");
+            // Matches real Lua's `liolib.c` `metameth` table, which installs
+            // the *same* `f_gc` C function under both `__gc` and `__close`
+            // (`__close`'s to-be-closed-variable path and an explicit
+            // `getmetatable(io.stdin).__gc()` call are meant to reach
+            // identical argument-checking behavior - see `FileGc`'s doc
+            // comment in `natives_os_io.rs`). Real Lua's `lua_pushcclosure`
+            // pushes the same function pointer both times, so `mt.__gc ==
+            // mt.__close`; Sol's `CFunction`/`NativeCallable` equality is
+            // object-identity-based (`value.rs`), so this must reuse one
+            // allocated callable object for both keys rather than allocating
+            // twice.
+            let gc_key = heap.alloc_string(b"__gc");
+            let close_key = heap.alloc_string(b"__close");
+            let gc_native = heap.alloc_native_callable(0, NativeFunction::FileGc as u32, Vec::new());
+            heap.table_set(
+                metatable.object_id(),
+                sol_core::Value::object(gc_key),
+                sol_core::Value::object(gc_native),
+            )
+            .expect("fresh canonical file metatable accepts __gc");
+            heap.table_set(
+                metatable.object_id(),
+                sol_core::Value::object(close_key),
+                sol_core::Value::object(gc_native),
+            )
+            .expect("fresh canonical file metatable accepts __close");
             heap.set_metatable(userdata.object_id(), Some(metatable.object_id()))
                 .expect("fresh canonical file userdata accepts a metatable");
         }

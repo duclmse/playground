@@ -194,6 +194,41 @@ fn annotate_call_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg) 
     }
 }
 
+/// Real Lua's `luaL_argerror` (`lauxlib.c`): when the call that raised a
+/// `"bad argument #N to 'NAME'"` error was itself a method call (`t:name(...)`),
+/// argument numbers exclude the implicit `self` (`arg--`), and if the
+/// decremented number reaches 0 - the self argument itself failed - the
+/// message becomes `"calling 'NAME' on bad self (EXTRAMSG)"` instead of
+/// `"bad argument #0 to 'NAME'"` (`lua-5.5.1-tests/errors.lua`'s `aaa:sub()`/
+/// `('a'):sub{}` tests). Mirrors `annotate_call_error`'s pattern: a post-hoc
+/// rewrite driven by the same `describe_register` call-site name resolution,
+/// applied only when the raised message already carries the "bad argument
+/// #N to 'NAME'" shape a native function itself produced (`checked_string`/
+/// `checked_integer` in `natives.rs`, or any of the other native functions
+/// that already format their own argument-check errors this way).
+fn annotate_bad_argument_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg) {
+    let Some(("method", name)) = describe_register(proto, pc, base) else {
+        return;
+    };
+    let Some(rest) = err.message.strip_prefix("bad argument #") else {
+        return;
+    };
+    let Some((number, rest)) = rest.split_once(" to '") else {
+        return;
+    };
+    let Ok(argument) = number.parse::<u32>() else {
+        return;
+    };
+    let Some(rest) = rest.strip_prefix(&format!("{name}' (")) else {
+        return;
+    };
+    err.message = match argument {
+        0 => return,
+        1 => format!("calling '{name}' on bad self ({rest}"),
+        n => format!("bad argument #{} to '{name}' ({rest}", n - 1),
+    };
+}
+
 impl LuaRuntime {
     /// Semantic-ABI entry point used by specialized-tier adapters. The
     /// callable remains a normal value in the dynamic global environment;
@@ -514,6 +549,19 @@ impl LuaRuntime {
         args: Vec<LuaValue>,
     ) -> LuaResult<c_api::CApiOutcome> {
         let callable_id = callable.callable_id();
+        // Provider 0 is `CanonicalAdapter::import_native_function`'s "portable
+        // Lua standard library" registry key (`canonical.rs`) - a
+        // `NativeFunction` that got imported into the canonical heap (for
+        // example, as a file-handle metatable entry: see `FileGc`'s doc
+        // comment in `natives_os_io.rs`) reads back out through ordinary
+        // indexing as this same `CFunction` shape (`canonical_to_lua`), so
+        // calling it must route back to `call_native` instead of the
+        // `c_functions` registry below, which is reserved for the embedder's
+        // own `lua_pushcfunction`-registered callables (provider 1/2).
+        if callable_id.provider == 0 && callable_id.function == NativeFunction::FileGc as u32 {
+            let values = self.call_native(NativeFunction::FileGc, args)?;
+            return Ok(c_api::CApiOutcome::Returned(values));
+        }
         let function = self.c_functions.get(&callable_id).copied().ok_or_else(|| {
             LuaError::new(format!(
                 "C callable provider {} function {} is not registered",
@@ -913,6 +961,12 @@ impl LuaRuntime {
                                 Err(mut error) => {
                                     if let Some(call_base) = call_base {
                                         annotate_call_error(
+                                            &mut error,
+                                            &call_proto,
+                                            call_pc,
+                                            call_base,
+                                        );
+                                        annotate_bad_argument_error(
                                             &mut error,
                                             &call_proto,
                                             call_pc,

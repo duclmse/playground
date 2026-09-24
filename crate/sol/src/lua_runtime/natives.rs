@@ -148,6 +148,7 @@ impl LuaRuntime {
             | NativeFunction::FileWrite
             | NativeFunction::IoOutput
             | NativeFunction::FileClose
+            | NativeFunction::FileGc
             | NativeFunction::OsRemove
             | NativeFunction::OsSetlocale
             | NativeFunction::OsTmpname
@@ -193,6 +194,54 @@ impl LuaRuntime {
 
     pub(super) fn integer(&self, value: &LuaValue) -> LuaResult<i64> {
         coerce_integer(value)
+    }
+
+    /// Real Lua's `luaL_checklstring` (`lauxlib.c`) reports a type-mismatched
+    /// argument as `"bad argument #N to 'FUNCTION' (string expected, got
+    /// TYPE)"`, not the bare `"string expected"` `string()` produces on its
+    /// own - `annotate_bad_argument_error` (`dispatch.rs`) needs this exact
+    /// shape to further rewrite a method call's failing self argument into
+    /// `"calling 'FUNCTION' on bad self (...)"` (`lua-5.5.1-tests/errors.lua`'s
+    /// `aaa:sub()` test).
+    pub(super) fn checked_string<'a>(
+        &self,
+        value: &'a LuaValue,
+        index: usize,
+        function: &str,
+    ) -> LuaResult<&'a [u8]> {
+        self.string(value).map_err(|_| {
+            LuaError::new(format!(
+                "bad argument #{} to '{}' (string expected, got {})",
+                index + 1,
+                function,
+                self.error_type_label(value)
+            ))
+        })
+    }
+
+    /// The `checked_integer` counterpart of `checked_string`, matching real
+    /// Lua's `luaL_checkinteger`. A non-integral float keeps `coerce_integer`'s
+    /// own "number has no integer representation" wording (real Lua reports
+    /// this exact phrase too), rather than the generic "number expected, got
+    /// TYPE" used for every other mismatch.
+    pub(super) fn checked_integer(
+        &self,
+        value: &LuaValue,
+        index: usize,
+        function: &str,
+    ) -> LuaResult<i64> {
+        self.integer(value).map_err(|err| {
+            let extra = if err.message == "number has no integer representation" {
+                err.message
+            } else {
+                format!("number expected, got {}", self.error_type_label(value))
+            };
+            LuaError::new(format!(
+                "bad argument #{} to '{}' ({extra})",
+                index + 1,
+                function
+            ))
+        })
     }
 
     pub(super) fn values_table(&self, values: &[LuaValue]) -> LuaValue {

@@ -1119,6 +1119,82 @@ machinery already deferred for `db.lua`'s `funcnamefromcode` work (see that
 file's own manifest note), not attempted here. The file's manifest entry
 stays `pending`.
 
+Working around only that one line (in `crates/sol/scratch/errors_bisect.lua`,
+never the real corpus file), `errors.lua` advances to line 369's
+`checkmessage("getmetatable(io.stdin).__gc()", "no value")`: Sol's `io.stdin`
+metatable had no `__gc`/`__close` entry at all. Real Lua's `liolib.c` installs
+the same `f_gc` C function under both `__gc` and `__close` on the file-handle
+metatable - an ordinary, directly Lua-callable function that argument-checks
+its receiver like any other file method, not something only the collector/a
+`<close>` scope exit can invoke. Fixed by adding `NativeFunction::FileGc`
+implementing that check (no-op on a valid `FILE*`, matching real Lua's own
+no-op for the standard streams) and installing it under both keys on
+`io.stdin`'s canonical metatable, reusing one allocated native-callable object
+for both keys since Sol's `CFunction`/`NativeCallable` equality is
+object-identity-based while real Lua's `mt.__gc == mt.__close` (the same C
+function pointer pushed twice). This required a small dispatch bridge:
+`CanonicalAdapter::import_native_function` allocates provider-0 native
+callables that `call_c_function_outcome`'s embedder-callable registry never
+covers, so a narrowly-scoped special case routes exactly this one
+`(provider, function)` pair straight to `call_native` rather than building a
+general provider-0-to-`NativeFunction` reverse-conversion mechanism. See
+`file_handle_metatable_exposes_a_callable_gc_and_close_with_a_filestar_argument_check`
+in `crates/sol/tests/lua55.rs`.
+
+With that fixed, `errors.lua` advances to line 381's
+`checkmessage("aaa:sub()", "bad self")` and its siblings
+`string.sub('a', {})`/`('a'):sub{}`: real Lua's `luaL_argerror` renumbers a
+method call's argument index to exclude the implicit `self` and, if the
+decremented index reaches 0, rewords the message to `"calling 'NAME' on bad
+self (...)"` instead of `"bad argument #N to 'NAME'"`; Sol had neither the
+renumbering nor the rewording, and separately `string.sub`'s own checks used
+the generic, contextless `string`/`integer` coercion helpers with no
+`"bad argument #N to 'NAME'"` wrapping at all. Fixed in two parts: new
+`checked_string`/`checked_integer` helpers in `lua_runtime/natives.rs`
+producing that base wording (used by `NativeFunction::StringSub`), and a new
+`annotate_bad_argument_error` post-hoc rewrite in `dispatch.rs`, alongside the
+existing `annotate_call_error`/`annotate_index_error`, reusing
+`describe_register`'s call-site resolution to detect a method call and
+renumber/reword any native function's already-`"bad argument #N to
+'NAME'"`-shaped error - a small, generically reusable mechanism rather than a
+`string.sub`-specific fix. See
+`bad_argument_errors_on_a_method_calls_self_argument_use_reals_calling_on_bad_self_wording`
+in `crates/sol/tests/lua55.rs`.
+
+Past that, `errors.lua` surfaces three further gaps, all deliberately deferred
+rather than attempted in this pass. Lines 385-386's
+`checkmessage("table.sort({1,2,3}, table.sort)", "'table.sort'")` and
+`checkmessage("string.gsub('s', 's', setmetatable)", "'setmetatable'")` name a
+native callback invoked with no Lua bytecode call site at all (a comparator or
+replacement function called directly from Rust-native code); real Lua names
+these via `luaL_argerror`'s `pushglobalfuncname` fallback, a reverse lookup
+through `package.loaded`'s library tables for a value-identity match, which
+Sol's entirely-bytecode-driven `describe_register` has no equivalent for -
+and separately exposed a more basic, still-open gap that many native
+argument-checks besides `string.sub` (e.g. `expect_table`, used by
+`table.sort`/`insert`/`move`) produce a bare, unwrapped message even for an
+ordinary top-level call (`table.sort(5)` reports plain "table expected, got
+number", not "bad argument #1 to 'sort' (...)"), so fixing this correctly
+needs both a naming fallback and much broader argument-check-message
+coverage. Line 405's `assert(string.find(f(), "C stack overflow"))` (`f`
+recursively creating/resuming coroutines) expects real Lua's distinction
+between a value-stack-size overflow ("stack overflow", `luaD_growstack`) and a
+C-call-nesting overflow ("C stack overflow", `luaE_incCstack`/
+`LUAI_MAXCCALLS`, hit by recursive `coroutine.resume`/`pcall`/metamethod
+chains); Sol tracks one unified `call_depth` counter across all four of
+`dispatch.rs`'s call-depth-exhaustion sites and always reports "stack overflow
+(Lua call-depth budget exhausted)" - it does cleanly raise a catchable error
+for this repro already, just with the wrong text, and adding the distinction
+risks changing wording that other already-passing cases depend on. And a
+`checksize` helper further in the file (`assert(msg:len() <= idsize)`,
+`idsize = LUA_IDSIZE - 1 = 59`) expects long chunk-name sources to be
+truncated to Lua's fixed debug-info buffer size the way `luaO_chunkid` does -
+found but not yet investigated, and lines past it are unbisected. All three
+gaps are individually neutralized with an explanatory comment (never silently
+deleted) in `crates/sol/scratch/errors_bisect.lua` so bisection can continue
+past each; the real corpus file and its manifest row (`pending`) are
+unaffected by that scratch-only workaround.
+
 `goto.lua`'s label/goto validation is now implemented in the dynamic bytecode
 compiler: `FuncState` tracks a live active-local count per scope (mirroring
 real Lua's `fs->nactvar`), clamps a bubbled-out pending goto's count to its

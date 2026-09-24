@@ -169,11 +169,11 @@ impl LuaRuntime {
             }
             NativeFunction::StringSub => {
                 let input = required(0)?;
-                let value = self.string(&input)?;
-                let start = self.integer(&required(1)?)?;
+                let value = self.checked_string(&input, 0, function.name())?;
+                let start = self.checked_integer(&required(1)?, 1, function.name())?;
                 let end = args
                     .get(2)
-                    .map(|value| self.integer(value))
+                    .map(|value| self.checked_integer(value, 2, function.name()))
                     .transpose()?
                     .unwrap_or(value.len() as i64);
                 let bytes = byte_range(start, end, value.len())

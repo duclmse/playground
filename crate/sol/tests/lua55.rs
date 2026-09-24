@@ -672,6 +672,116 @@ fn implicit_runtime_errors_get_an_automatic_position_prefix() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("runtime error prefix ok"));
 }
 
+/// Real Lua's `liolib.c` installs the same `f_gc` C function under both
+/// `__gc` and `__close` on the file-handle metatable (`LUA_FILEHANDLE`) - an
+/// ordinary, directly Lua-callable function that argument-checks its
+/// receiver like any other file method (`tolstream`'s `luaL_checkudata`), not
+/// something only the collector/a `<close>` scope exit can invoke. Surfaced
+/// by `lua-5.5.1-tests/errors.lua`'s "tests for field accesses after RK
+/// limit" section (`checkmessage(s.."; local t = {}; t:bbb()", "field
+/// 'bbb'")`'s preceding sibling, `getmetatable(io.stdin).__gc()`, run with no
+/// arguments purely to observe this check). Previously Sol's `io.stdin`
+/// metatable had no `__gc`/`__close` entry at all, so this failed with the
+/// unrelated, generic "attempt to call a nil value (field '__gc')" instead.
+#[test]
+fn file_handle_metatable_exposes_a_callable_gc_and_close_with_a_filestar_argument_check() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_file_gc_argcheck_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local mt = getmetatable(io.stdin)
+        assert(type(mt.__gc) == "function")
+        assert(mt.__close == mt.__gc)
+
+        local ok1, msg1 = pcall(mt.__gc)
+        assert(not ok1 and string.find(msg1, "bad argument #1 to '__gc'", 1, true), msg1)
+        assert(string.find(msg1, "FILE%* expected, got no value"), msg1)
+
+        local ok2, msg2 = pcall(mt.__gc, {})
+        assert(not ok2 and string.find(msg2, "FILE%* expected, got table"), msg2)
+
+        -- a real FILE* receiver passes the check and no-ops (matching real
+        -- Lua's own no-op outcome for the standard streams, whose `closef`
+        -- is unset).
+        assert(mt.__gc(io.stdin) == nil)
+
+        print("file gc argcheck ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("file gc argcheck ok"));
+}
+
+/// Real Lua's `luaL_argerror` (`lauxlib.c`) treats a method call specially:
+/// argument numbers exclude the implicit `self` (`arg--`), and if the
+/// decremented number reaches 0 - the self argument itself failed the check -
+/// the message becomes `"calling 'NAME' on bad self (EXTRAMSG)"` instead of
+/// `"bad argument #N to 'NAME'"`. Surfaced by `lua-5.5.1-tests/errors.lua`'s
+/// `checkmessage("aaa:sub()", "bad self")` and its siblings
+/// `string.sub('a', {})`/`('a'):sub{}`, which check that the non-method forms
+/// keep ordinary, un-renumbered argument counting. Fixed via
+/// `checked_string`/`checked_integer` (`natives.rs`, used by
+/// `NativeFunction::StringSub`) producing the base
+/// `"bad argument #N to 'NAME'"` shape, plus `annotate_bad_argument_error`
+/// (`dispatch.rs`) - a post-hoc rewrite alongside the existing
+/// `annotate_call_error`/`annotate_index_error`, reusing `describe_register`'s
+/// call-site resolution - that renumbers/rewords any such message when the
+/// failing call was a method call.
+#[test]
+fn bad_argument_errors_on_a_method_calls_self_argument_use_reals_calling_on_bad_self_wording() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_bad_self_argcheck_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local aaa = {}
+        setmetatable(aaa, {__index = string})
+
+        local ok1, msg1 = pcall(function() return aaa:sub() end)
+        assert(not ok1, "aaa:sub() should fail")
+        assert(string.find(msg1, "calling 'sub' on bad self", 1, true), msg1)
+        assert(string.find(msg1, "string expected, got table"), msg1)
+
+        local ok2, msg2 = pcall(string.sub, 'a', {})
+        assert(not ok2, "string.sub('a', {}) should fail")
+        assert(string.find(msg2, "bad argument #2 to 'sub'", 1, true), msg2)
+
+        local ok3, msg3 = pcall(function() return ('a'):sub{} end)
+        assert(not ok3, "('a'):sub{} should fail")
+        assert(string.find(msg3, "bad argument #1 to 'sub'", 1, true), msg3)
+
+        print("bad self argcheck ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("bad self argcheck ok"));
+}
+
 /// Real Lua's `luaX_syntaxerror` (used by both the lexer and the parser)
 /// always appends a `near '<token>'`/`near <eof>` suffix. The lexer's own
 /// error sites already had this (`lexer.rs`'s `error_near`), but the
