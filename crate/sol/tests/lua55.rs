@@ -630,6 +630,50 @@ fn error_and_assert_add_a_luals_where_style_position_prefix() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("where prefix ok"));
 }
 
+/// Real Lua's `luaG_runerror`/`luaG_addinfo` give every runtime error the
+/// VM itself synthesizes (not an explicit `error()`/`assert()` call, which
+/// already gets its own prefix - see the test above) a "{short_src}:{line}:
+/// " position prefix automatically, or the literal "?:?: " fallback when
+/// the raising closure's debug info was stripped (`string.dump(f, true)`,
+/// then `load()`ed back) - surfaced by `lua-5.5.1-tests/errors.lua`'s
+/// "errors in functions without debug info" section
+/// (`checkerr("^%?:%?:", f, {})`). Previously these errors carried no
+/// position prefix at all.
+#[test]
+fn implicit_runtime_errors_get_an_automatic_position_prefix() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_runtime_error_prefix_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok1, msg1 = pcall(function() return {} + 1 end)
+        assert(not ok1 and string.find(msg1, ":%d+: attempt to perform arithmetic"), msg1)
+
+        local f = function (a) return a + 1 end
+        f = assert(load(string.dump(f, true)))
+        local ok2, msg2 = pcall(f, {})
+        assert(not ok2 and string.find(msg2, "^%?:%?:"), msg2)
+        assert(string.find(msg2, "table value"), msg2)
+
+        print("runtime error prefix ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("runtime error prefix ok"));
+}
+
 /// Real Lua's `luaX_syntaxerror` (used by both the lexer and the parser)
 /// always appends a `near '<token>'`/`near <eof>` suffix. The lexer's own
 /// error sites already had this (`lexer.rs`'s `error_near`), but the

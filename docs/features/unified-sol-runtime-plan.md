@@ -1091,6 +1091,34 @@ manifest entry moves from `pending` to `diverges` (not `pass`) for those two
 reasons alone, with `budget = 200000000`/`alloc_budget = 268435456`
 overrides.
 
+`errors.lua`'s `checkerr("^%?:%?:", f, {})` (line 309, "errors in functions
+without debug info") turned out to be a symptom of a much broader gap: Sol's
+VM-raised runtime errors (arithmetic on the wrong type, calling a
+non-callable, indexing nil, and so on) never carried a position prefix at
+all, for any closure, stripped or not - only explicit `error()`/`assert()`
+calls got one, via the existing `where_prefix`. Real Lua's
+`luaG_runerror`/`luaG_addinfo` add this automatically at the point any
+VM-internal error is raised, independent of `error()`, using the literal
+`"?:?: "` fallback when the raising closure's debug info was stripped
+(`string.dump(f, true)`, reloaded via `load()`) rather than omitting the
+prefix. Fixed by adding `LuaRuntime::runtime_error_prefix` alongside
+`where_prefix` in `natives_core.rs` (same `"{short_src}:{line}: "` format, or
+`"?:?: "` when the raising frame's proto has an empty `source_map`), wired
+into the single frame-unwind catch site in `dispatch.rs`'s `drive` loop that
+every VM-raised error passes through exactly once, guarded by
+`error.value.is_none()` so explicit `error()`/`assert()` errors (which always
+carry a `value`) are never double-prefixed. See
+`implicit_runtime_errors_get_an_automatic_position_prefix` in
+`crates/sol/tests/lua55.rs`. With it, `errors.lua` advances past both
+`checkerr("^%?:%?:", ...)` calls (lines 309/316) to line 331's
+`checkmessage(s.."; local t = {}; t:bbb()", "field 'bbb'")`: after enough
+assignments to force the RK-limit, real Lua's `getobjname` degrades a
+method-call name resolution to a generic field name, but Sol still reports it
+as a method - a narrow, specific gap in the same call-site name-resolution
+machinery already deferred for `db.lua`'s `funcnamefromcode` work (see that
+file's own manifest note), not attempted here. The file's manifest entry
+stays `pending`.
+
 `goto.lua`'s label/goto validation is now implemented in the dynamic bytecode
 compiler: `FuncState` tracks a live active-local count per scope (mirroring
 real Lua's `fs->nactvar`), clamps a bubbled-out pending goto's count to its

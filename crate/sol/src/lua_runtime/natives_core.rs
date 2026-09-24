@@ -6,6 +6,7 @@
 use super::frame::Frame;
 use super::util::*;
 use super::*;
+use crate::lua_bytecode::Proto;
 
 impl LuaRuntime {
     pub(super) fn call_native_core(
@@ -492,6 +493,34 @@ impl LuaRuntime {
         let source = self
             .chunk_sources
             .get(&(Rc::as_ptr(&lua_frame.proto) as usize))?;
+        let short_src = Self::short_src(source);
+        Some(format!("{}:{line}: ", String::from_utf8_lossy(&short_src)))
+    }
+
+    /// Real Lua's `luaG_addinfo`/`luaG_runerror`: the "{short_src}:{line}: "
+    /// position prefix a runtime error the VM itself synthesizes (arithmetic
+    /// on the wrong type, calling a non-callable, indexing nil, and so on)
+    /// picks up automatically at the innermost Lua frame it's raised from -
+    /// distinct from `where_prefix`, which only covers explicit `error()`/
+    /// `assert()` calls (both always carry `LuaError::value`, so the
+    /// dispatch-loop unwind site that calls this only does so when `value`
+    /// is `None`, i.e. never for those). A frame whose proto has no source
+    /// map at all (`string.dump(f, true)`'s stripped debug info, or
+    /// `load(string.dump(...))`'s reload of it) has no line to report, so
+    /// real Lua substitutes the literal two-character "?:?: " for both the
+    /// source and line fields (`ldebug.c`'s "no source available" fallback)
+    /// rather than omitting the prefix.
+    pub(super) fn runtime_error_prefix(&self, proto: &Rc<Proto>, pc: u32) -> Option<String> {
+        if proto.source_map.is_empty() {
+            return Some("?:?: ".to_string());
+        }
+        let line = proto.source_map.location(pc)?.line as i64;
+        if line <= 0 {
+            return None;
+        }
+        let source = self
+            .chunk_sources
+            .get(&(Rc::as_ptr(proto) as usize))?;
         let short_src = Self::short_src(source);
         Some(format!("{}:{line}: ", String::from_utf8_lossy(&short_src)))
     }

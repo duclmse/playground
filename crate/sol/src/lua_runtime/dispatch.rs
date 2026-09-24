@@ -963,7 +963,26 @@ impl LuaRuntime {
                             self.frames.push(Frame::Lua(frame));
                             return Ok(DriveOutcome::Yielded(values));
                         }
-                        Err(error) => {
+                        Err(mut error) => {
+                            // Only errors the VM itself synthesizes (no
+                            // `LuaError::value`) get an automatic position
+                            // prefix here - explicit `error()`/`assert()`
+                            // calls always carry a `value` and already added
+                            // their own prefix via `where_prefix` before
+                            // reaching this unwind site, matching real Lua's
+                            // `luaG_runerror` (implicit) vs `luaB_error`
+                            // (explicit) split. This fires exactly once per
+                            // error, at the innermost frame `dispatch_step`
+                            // raised it from - `unwind_error_to_marker` only
+                            // pops outer frames to close `<close>` values, it
+                            // never re-drives them through this arm.
+                            if error.value.is_none() {
+                                if let Some(prefix) =
+                                    self.runtime_error_prefix(&frame.proto, frame.header.pc)
+                                {
+                                    error.message = format!("{prefix}{}", error.message);
+                                }
+                            }
                             let error = match frame.proto.source_map.location(frame.header.pc) {
                                 Some(location) => error.at(&format!("line {}", location.line)),
                                 None => error,
