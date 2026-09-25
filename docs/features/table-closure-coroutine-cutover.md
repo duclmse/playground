@@ -244,18 +244,24 @@ Two ways forward, in order of preference:
    new representation, and can be shipped as a scoped, called-out gap rather
    than blocking the rest of the cutover on it.
 
-This document recommends starting the coroutine slice with (2) so table/closure
-migration isn't blocked on a new tracing-collector feature, and filing (1) as
-its own `sol-core` design task to close the cycle gap afterward — but this is
-a real trade-off, not a mechanical decision, and is called out here
-specifically so it can be revisited rather than silently locked in.
+**Decided: (2), the interim fallback**, so table/closure migration isn't
+blocked on a new tracing-collector feature. `canonical.rs`'s `CoroutineRegistry`
+already implements this: every entry it holds is fed back as an unconditional
+root on each collection while present, and its doc comment states the gap this
+leaves open. Closing that gap via (1) — a conditional/deferred-root `sol-core`
+hook mirroring `mark_ephemerons`'s fixed-point approach — is filed as its own
+follow-up design task, scoped and tested independently of the rest of this
+cutover, not a blocker for task #11's flip.
 
-Whichever option lands, `LuaValue::Thread(ThreadRef)` addresses a lightweight
-`ThreadObject` whose payload is a registry slot index into a `LuaRuntime`-owned
-side table of `LuaCoroutine`s (replacing `Rc<LuaCoroutine>` as the ownership
-mechanism); sweeping a `Thread` object whose slot's coroutine is confirmed
-unreachable removes that slot's entry, dropping its `frames`, `hook`, and
-`dead_error` state.
+`LuaValue::Thread(ThreadRef)` addresses a lightweight `ThreadObject`; its
+`LuaCoroutine` (executable frames, hook, `dead_error`) is owned by the
+`LuaRuntime`-level `CoroutineRegistry`, keyed by the `ThreadObject`'s own
+`ObjectId` (already unique and generation-checked, so no separate slot-index
+field on `ThreadObject` is needed) rather than by an `Rc` refcount. Sweeping a
+`Thread` object whose id has no live `CoroutineRegistry` entry removes nothing
+further; sweeping one whose entry is confirmed unreachable (once (1) exists —
+under (2), only once its owning `LuaRuntime` explicitly removes the entry)
+drops that entry's `frames`, `hook`, and `dead_error` state.
 
 ## 7. What gets deleted
 
@@ -270,11 +276,14 @@ collector to `Heap::collect_minor`/`collect_major` plus whatever byte-count API
 
 ## 8. Sequencing
 
-The exit criterion is combined (§1), but the engineering doesn't need to be a
-single patch — `LuaValue`/`LuaKey` already carry legacy and canonical variants
-side by side for strings and for the embedding-only `CanonicalTable`, so the
-same call-site-by-call-site flip that shipped the string migration applies
-here per object kind:
+The exit criterion is combined (§1), but not every step needs to be a single
+patch. `LuaValue`/`LuaKey` already carry legacy and canonical variants side by
+side for strings and for the embedding-only `CanonicalTable`, and that same
+incremental pattern applies to steps 1–3 below: prerequisites, ref-type
+plumbing, and the coroutine rooting decision can each land as their own
+reviewable, always-green change. Only step 4 — the actual `LuaValue`/`LuaKey`
+storage flip — cannot be split per object kind (§1's mutual-recursion
+constraint), unlike the string migration, which had no such constraint:
 
 1. **`sol-core` prerequisites**: `TableObject` border cache; `Heap` byte-count
    API; confirm `alloc_upvalue`/`alloc_thread`/`alloc_closure` cover every
@@ -286,11 +295,12 @@ here per object kind:
    coroutine side-table registry per §6. This is tested directly against
    `sol_core::Heap` (synthetic values), not through the live `LuaValue` enum,
    so it carries no storage-layer risk and can land incrementally with its own
-   coverage, same as the string migration's helpers did.
+   coverage, same as the string migration's helpers did. *(Done.)*
 3. **Coroutine conditional-root decision (§6)**: decide interim fallback vs.
    the conditional-root `sol-core` extension *before* the flip, since
    frame-rooting has to work correctly from the moment real coroutine frames
-   go canonical, not be retrofitted after.
+   go canonical, not be retrofitted after. *(Done — interim fallback (2); see
+   §6.)*
 4. **The coordinated flip**: because `TableObject`/`UpvalueObject`/
    `ThreadObject` storage is mutually recursive (§1), `LuaValue`/`LuaKey`'s
    `Table`, `Closure`, and `Thread` variants move to their canonical payloads
