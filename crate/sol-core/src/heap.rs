@@ -61,6 +61,15 @@ pub struct TableObject {
     pub weak_keys: bool,
     pub weak_values: bool,
     pub version: u64,
+    /// Length of the longest confirmed non-`Value::NIL` prefix of `array`: a
+    /// "border" per the Lua manual's `#` operator (any `n` with `t[n] != nil`
+    /// and `t[n+1] == nil`; undefined when the array part has holes).
+    /// Maintained incrementally by `Heap::table_set` so `t[#t + 1] = v` in a
+    /// loop stays O(1) amortized rather than O(n^2) - see
+    /// `sol::lua_runtime::value::LuaTable::array_border`'s identical
+    /// rationale. `Heap::table_len` recomputes from scratch for the rare
+    /// paths that mutate `array` directly instead of through `table_set`.
+    pub array_border: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +665,27 @@ impl Heap {
         Ok(table.hash.get(&key).copied().unwrap_or(Value::NIL))
     }
 
+    /// The `#` operator: the table's cached array border (see
+    /// `TableObject::array_border`), O(1) amortized as long as every mutation
+    /// went through `table_set`.
+    pub fn table_len(&self, table: ObjectId) -> Result<usize, HeapError> {
+        Ok(self.table(table)?.array_border)
+    }
+
+    /// Recomputes `array_border` from scratch by scanning for the longest
+    /// non-nil prefix. Only needed after code that mutates a table's `array`
+    /// directly instead of through `table_set` (e.g. weak-table sweep pruning
+    /// stale array slots to `Value::NIL` in place).
+    pub fn recompute_table_len(&mut self, table: ObjectId) -> Result<(), HeapError> {
+        let object = self.table_mut(table)?;
+        object.array_border = object
+            .array
+            .iter()
+            .take_while(|value| **value != Value::NIL)
+            .count();
+        Ok(())
+    }
+
     /// Snapshot of live table entries in the runtime's iteration order.
     /// Used by the embedding API's `lua_next`; callers must not assume a
     /// stable order across structural mutations.
@@ -705,6 +735,25 @@ impl Heap {
                 object.array.resize(index + 1, Value::NIL);
             }
             object.array[index] = value;
+            if value != Value::NIL {
+                // Filling exactly the slot right past the confirmed non-nil
+                // prefix extends it - the common `t[#t + 1] = v` append idiom
+                // hits this every time, keeping the border O(1) amortized. A
+                // `while` (not `if`) because a prior out-of-order write past
+                // the border may already have left later slots non-nil too.
+                if index == object.array_border {
+                    object.array_border += 1;
+                    while object.array_border < object.array.len()
+                        && object.array[object.array_border] != Value::NIL
+                    {
+                        object.array_border += 1;
+                    }
+                }
+            } else if index < object.array_border {
+                // The confirmed prefix can no longer include `index`, but
+                // everything strictly before it is still confirmed.
+                object.array_border = index;
+            }
         } else {
             // Always `insert`, even for `nil` (a tombstone, not a removal):
             // `IndexMap::remove`/`shift_remove` would either reorder or
@@ -742,6 +791,61 @@ impl Heap {
     /// minor tracing without changing object semantics.
     pub fn collect_minor(&mut self) -> Collection {
         self.collect(CollectionKind::Minor, &[])
+    }
+
+    /// Approximates the currently live, heap-managed byte footprint (for
+    /// Lua's `collectgarbage("count")`) by summing every live object's fixed
+    /// header plus the allocated capacity of its variable-length storage.
+    /// This is a live snapshot recomputed from the current slots on every
+    /// call, not a cumulative allocation counter - a temporary object
+    /// already reclaimed by a prior collection contributes nothing, matching
+    /// real Lua's `count` reporting the collector's current retained set
+    /// rather than total bytes ever allocated.
+    pub fn live_bytes(&self) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .map(|entry| Self::object_byte_footprint(&entry.object))
+            .sum()
+    }
+
+    fn object_byte_footprint(object: &HeapObject) -> usize {
+        match object {
+            HeapObject::String(bytes) => std::mem::size_of::<HeapObject>() + bytes.capacity(),
+            HeapObject::Table(table) => {
+                std::mem::size_of::<TableObject>()
+                    + table.array.capacity() * std::mem::size_of::<Value>()
+                    + table.hash.capacity()
+                        * (std::mem::size_of::<TableKey>() + std::mem::size_of::<Value>())
+            }
+            HeapObject::Closure(closure) => {
+                std::mem::size_of::<ClosureObject>()
+                    + closure.upvalues.capacity() * std::mem::size_of::<ObjectId>()
+            }
+            HeapObject::NativeCallable(callable) => {
+                std::mem::size_of::<NativeCallableObject>()
+                    + callable.captures.capacity() * std::mem::size_of::<Value>()
+            }
+            HeapObject::Upvalue(_) => std::mem::size_of::<UpvalueObject>(),
+            HeapObject::Thread(thread) => {
+                std::mem::size_of::<ThreadObject>()
+                    + thread.stack.capacity() * std::mem::size_of::<Value>()
+                    + thread.yielded.capacity() * std::mem::size_of::<Value>()
+            }
+            HeapObject::Userdata(userdata) => {
+                std::mem::size_of::<UserdataObject>()
+                    + userdata.bytes.capacity()
+                    + userdata.user_values.capacity() * std::mem::size_of::<Value>()
+            }
+            HeapObject::Error(error) => {
+                std::mem::size_of::<ErrorObject>()
+                    + error
+                        .traceback
+                        .iter()
+                        .map(|line| line.capacity())
+                        .sum::<usize>()
+            }
+        }
     }
 
     fn alloc(&mut self, object: HeapObject) -> ObjectId {
@@ -1050,10 +1154,22 @@ impl Heap {
                 continue;
             };
             if table.weak_values {
-                for value in &mut table.array {
+                let mut nilled_within_border = false;
+                for (index, value) in table.array.iter_mut().enumerate() {
                     if value.as_object().is_some_and(|id| !marked.contains(&id)) {
                         *value = Value::NIL;
+                        nilled_within_border |= index < table.array_border;
                     }
+                }
+                // Niling a weak-value array slot directly (not through
+                // `table_set`) can invalidate the confirmed non-nil prefix;
+                // rescan rather than trying to track this incrementally here.
+                if nilled_within_border {
+                    table.array_border = table
+                        .array
+                        .iter()
+                        .take_while(|value| **value != Value::NIL)
+                        .count();
                 }
             }
             table.hash.retain(|key, value| {
@@ -1213,6 +1329,101 @@ mod tests {
             .map(|(_, value)| value.as_integer().unwrap())
             .collect();
         assert_eq!(values, vec![20, 3]);
+    }
+
+    #[test]
+    fn table_array_border_stays_amortized_o1_under_append_and_retraction() {
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        assert_eq!(heap.table_len(table).unwrap(), 0);
+
+        // The common `t[#t + 1] = v` append idiom extends the border by one
+        // on every call.
+        for index in 1..=5 {
+            heap.table_set(table, Value::integer(index), Value::integer(index * 10))
+                .unwrap();
+            assert_eq!(heap.table_len(table).unwrap(), index as usize);
+        }
+
+        // An out-of-order write past the current border doesn't move it yet...
+        heap.table_set(table, Value::integer(10), Value::integer(100))
+            .unwrap();
+        assert_eq!(heap.table_len(table).unwrap(), 5);
+
+        // ...but filling the gap all the way up walks the border forward
+        // past the pre-existing out-of-order write in one `table_set` call.
+        for index in 6..=9 {
+            heap.table_set(table, Value::integer(index), Value::integer(index * 10))
+                .unwrap();
+        }
+        assert_eq!(heap.table_len(table).unwrap(), 10);
+
+        // Nil-ing a slot inside the confirmed prefix retracts the border to
+        // just before it, even though later slots are still non-nil.
+        heap.table_set(table, Value::integer(3), Value::NIL)
+            .unwrap();
+        assert_eq!(heap.table_len(table).unwrap(), 2);
+    }
+
+    #[test]
+    fn table_array_border_rescans_after_weak_value_sweep_nils_inside_it() {
+        // `sweep_weak_tables` nils dead weak-value array slots directly,
+        // bypassing `table_set`'s incremental border maintenance - the
+        // border must still reflect the truth afterward.
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        heap.set_table_weak_mode(table, false, true).unwrap();
+        let garbage = heap.alloc_table();
+        heap.table_set(table, Value::integer(1), Value::integer(1))
+            .unwrap();
+        heap.table_set(table, Value::integer(2), Value::object(garbage))
+            .unwrap();
+        heap.table_set(table, Value::integer(3), Value::integer(3))
+            .unwrap();
+        assert_eq!(heap.table_len(table).unwrap(), 3);
+
+        // Nothing roots `garbage` or the outer table itself; a major
+        // collection sweeps the weak-value reference at index 2, which must
+        // retract the border to 1 rather than leaving it stale at 3.
+        let root = heap.add_root(Value::object(table));
+        heap.collect_major();
+        assert_eq!(heap.table_len(table).unwrap(), 1);
+        heap.remove_root(root);
+    }
+
+    #[test]
+    fn live_bytes_tracks_current_retained_set_not_cumulative_allocation() {
+        let mut heap = Heap::default();
+        let baseline = heap.live_bytes();
+
+        let table = heap.alloc_table();
+        let root = heap.add_root(Value::object(table));
+        heap.table_set(table, Value::integer(1), Value::integer(1))
+            .unwrap();
+        let with_table = heap.live_bytes();
+        assert!(
+            with_table > baseline,
+            "a live table must contribute to the byte count"
+        );
+
+        // An unrooted, unreachable table must not be counted even though it
+        // was allocated - `live_bytes` reports the retained set, not
+        // cumulative allocation.
+        heap.alloc_table();
+        heap.collect_major();
+        let after_garbage_collected = heap.live_bytes();
+        assert_eq!(
+            after_garbage_collected, with_table,
+            "a swept, unreachable table must not inflate the live count"
+        );
+
+        heap.remove_root(root);
+        heap.collect_major();
+        assert_eq!(
+            heap.live_bytes(),
+            baseline,
+            "dropping the last root and collecting must return to baseline"
+        );
     }
 
     #[test]

@@ -664,12 +664,13 @@ independently, ahead of the rest. The genuinely remaining work is tables
 (including metatables; the production global environment is just a table and
 needs no separate step), closures, and coroutine frames — each still
 `Rc`-owned (`lua_runtime::value::LuaTable`/`LuaClosure`,
-`lua_runtime::coroutine::LuaCoroutine`). Unlike strings, these three cannot
-migrate one at a time: closures capture table-holding values and coroutine
-frames hold both, so they must land together in one combined cutover rather
-than in dependency order — there is no intermediate state where only one of
-the three is canonical while the others still hold `Rc` references into it.
-See [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
+`lua_runtime::coroutine::LuaCoroutine`). Unlike strings, these three cannot be
+verified one at a time under realistic programs: closures capture
+table-holding values and coroutine frames hold both, so the useful unit of
+"done" is when all three are canonical, not a single monolithic patch — see
+[table-closure-coroutine-cutover.md](table-closure-coroutine-cutover.md) for
+the target representation, root/safepoint discipline, and sequencing this
+converges on. See also [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
 ### U3 — Unified bytecode, frames, and semantic call ABI — **completed 2026-09-16**
 

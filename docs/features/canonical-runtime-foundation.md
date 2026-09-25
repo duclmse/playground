@@ -122,12 +122,18 @@ dynamically loaded chunk source/name).
 
 U2 is complete only after production code also uses canonical handles for
 tables (including metatables and the root `_ENV` table, which is just a
-table), closures, and coroutine frames. Unlike strings, these three must land
-together in one combined cutover rather than in dependency order: closures
-capture `LuaValue`s that may be tables, and coroutine frames
-(`regs`/`upvals`/`cells`) hold both, so there is no intermediate state where
-only one of the three is canonical without the others still holding `Rc`
-references into it. `sol_core::TableObject::hash` moved from `HashMap` to an
+table), closures, and coroutine frames. Unlike strings, these three cannot be
+verified in isolation under realistic programs: closures capture `LuaValue`s
+that may be tables, and coroutine frames (`regs`/`upvals`/`cells`) hold both.
+The target design for this slice — a cheap `Copy` `ObjectId`-based value tier
+for the hot path (distinct from the existing `Rc<CanonicalObjectRoot>`-rooted
+`CanonicalTable`/`CanonicalString` handles, which stay reserved for long-lived
+anchors), frame-walk-based rooting at defined GC safepoints, and the still-open
+question of how a coroutine's frames become conditional GC roots without
+leaking the coroutine-cycle case `lua_runtime::coroutine::LuaCoroutine` already
+documents as a known gap — is written up in
+[table-closure-coroutine-cutover.md](table-closure-coroutine-cutover.md).
+`sol_core::TableObject::hash` moved from `HashMap` to an
 order-preserving `IndexMap` (matching `LuaTable::hash`'s existing rationale) as
 a prerequisite, since production tables cannot move onto it correctly
 otherwise. The existing `Rc` trial-deletion collector and typed arena must then
