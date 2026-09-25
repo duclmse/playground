@@ -92,6 +92,71 @@ embedder holds via `lua_ref`/a persistent C handle. Everything reachable from
 Lua-visible registers, table contents, upvalues, and coroutine frames uses the
 cheap `*Ref` tier instead.
 
+### Values with no `sol_core::Value` representation today
+
+`TableObject::array`/`hash` and `UpvalueObject::value` are typed
+`sol_core::Value`, so once `LuaValue::Table` is `TableRef`-backed, **every**
+value a Lua program stores in a table or captures in an upvalue must be
+`sol_core::Value`-representable — not just `Table`/`Closure`/`Thread`
+themselves. Four more `LuaValue` variants were checked against this
+requirement by direct inspection:
+
+- **`Native(Rc<NativeBridge>)` — not a gap.** `init.rs` always converts this to
+  `RegisteredNative(NativeCallableId)` (already canonical, via
+  `alloc_native_callable`) before the value is ever installed into a table or
+  global; a raw `Native` value never reaches table/upvalue storage.
+- **`NativeFunction` (`#[repr(u32)] enum`, ~120 builtin discriminants,
+  installed into the globals table by `init.rs`) and `LightUserdata(usize)`
+  (produced by `debug.upvalueid`, and independently by the C API's
+  `lua_pushlightuserdata`/`lua_rawgetp`/`lua_rawsetp` wrapping an arbitrary
+  host pointer with no backing heap object at all) and `GMatchIterator`
+  (`Rc<RefCell<GMatchState>>`: `source`/`pattern` byte strings plus mutable
+  `position`/`last_end`) all resolve the same way: as a `NativeCallableObject
+  { provider, function, captures }`, using the `provider` field purely as a
+  disambiguating namespace rather than a real bridge identity —
+  `LuaRuntime` reserves one fixed provider id per kind
+  (`Heap::reserve_native_provider`, the same call already used per imported
+  native bridge) at construction:
+  - `NativeFunction`: `function` holds the discriminant; `captures` is empty.
+    Because `alloc_native_callable` mints a fresh `ObjectId` on every call (no
+    dedup), a small caller-side registry (`HashMap<u32, ObjectId>`, populated
+    lazily, one entry per discriminant ever referenced) is required so two
+    references to the same builtin — e.g. `t[print] = 1; print(t[print])` —
+    resolve to the same object. `NativeFunction` also needs a `from_u32`
+    reverse mapping alongside its existing `.name()` method.
+  - `LightUserdata`: `function` is unused (`0`); `captures` holds a single
+    `Value::integer(bits as i64)` — the full 64-bit pointer value bit-cast
+    into an `i64`, not truncated through `function: u32`. This is *not* the
+    same as encoding a light userdata directly as `Value::integer`: two
+    values with the same `ValueTag::Integer` payload would then be
+    indistinguishable from a real Lua integer once read back out of a table
+    cell, which is a real information-loss bug, not just a style choice. A
+    distinct `provider` id keeps `Object`-tagged light userdata unambiguous
+    against both real integers and real (`lua_newuserdata`) host userdata,
+    which is also `Object`-tagged but through `HeapObject::Userdata`, a
+    different heap-object kind entirely. Real Lua light userdata compares
+    equal by pointer *value*, not by identity, so this must be memoized the
+    same way as `NativeFunction` — a `HashMap<usize, ObjectId>` keyed by the
+    raw pointer bits, so two light userdata values with equal bits always
+    resolve to the same `ObjectId`.
+  - `GMatchIterator`: `function` is unused; `captures` holds
+    `[Value::object(source_string_id), Value::object(pattern_string_id),
+    Value::integer(position as i64), Value::integer(last_end.map_or(-1, |v| v
+    as i64))]` (source/pattern interned via `Heap::alloc_string_fresh`, like
+    every other runtime-computed string). Unlike the other two, this is
+    *never* memoized — each `string.gmatch(...)` call must produce a distinct,
+    independently mutable iterator even over identical subject/pattern text,
+    matching real Lua. Advancing the iterator calls
+    `Heap::set_native_callable_captures` to rewrite `position`/`last_end` in
+    place rather than allocating a new object per step.
+
+  Decoding a `Value::Object(id)` back into a `LuaValue` therefore requires
+  checking `provider` against the three reserved ids (and the dynamic native-
+  bridge/`CFunction` providers already in use) before matching on
+  `HeapObject::NativeCallable` vs `HeapObject::Userdata` vs the rest — the
+  `provider` field is the only disambiguator once several unrelated `LuaValue`
+  kinds share the same underlying `HeapObject` variant.
+
 ## 3. Root and safepoint discipline
 
 The cheap tier's safety rests entirely on `sol_core::Heap::collect_major_with_roots(&mut self, frame_roots: &[Value])`
