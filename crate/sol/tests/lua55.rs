@@ -2231,3 +2231,134 @@ fn a_binary_operations_error_names_its_last_field_not_its_reused_register_root()
     assert!(String::from_utf8_lossy(&output.stdout)
         .contains("reused-register error naming stayed correct"));
 }
+
+#[test]
+fn a_multi_name_local_declaration_uses_one_register_per_local_not_two() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_multilocal_registers_{}.lua",
+        std::process::id()
+    ));
+    // Regression test for `Stmt::MultiLocal`: it used to compute every
+    // initializer/nil-pad value into its own freshly-allocated register via
+    // `compile_expr_list`, then allocate a *second*, separate register per
+    // declared name for `Instr::NewLocal`'s destination - doubling a
+    // function's register cost per plain `local a, b, c, ...` declaration
+    // relative to real Lua's single-register-per-local `luaK_exp2nextreg`
+    // scheme (`lparser.c`'s `localstat`). A single statement declaring 129
+    // plain locals (well under MAXVARS=200, and needing only 129 registers
+    // with one register per local) used to need 258 registers under the old
+    // scheme, crossing MAX_FSTACK=255 and failing to compile at all -
+    // matching `errors.lua`'s bisection, where this exact shape (127
+    // `a`-locals plus `b`, `c`) was found to trip MAX_FSTACK purely from this
+    // bug, independent of the separate upvalue-count case built on top of it.
+    let mut names = String::from("a1");
+    for i in 2..=127 {
+        names.push_str(&format!(", a{i}"));
+    }
+    names.push_str(", b, c");
+    std::fs::write(
+        &path,
+        format!(
+            "local ok, err = load(\"local function f() local {names} = 1; return a1, a127, b, c end; return f()\")\n\
+             assert(ok, \"expected 129 plain locals in one statement to compile: \" .. tostring(err))\n\
+             local a1, a127, b, c = ok()\n\
+             assert(a1 == 1, \"unexpected a1: \" .. tostring(a1))\n\
+             assert(a127 == nil, \"unexpected a127: \" .. tostring(a127))\n\
+             assert(b == nil and c == nil, \"unexpected b/c: \" .. tostring(b) .. \" \" .. tostring(c))\n\
+             print(\"multi-name local declaration used one register per local\")\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("multi-name local declaration used one register per local"));
+}
+
+#[test]
+fn a_multi_name_local_declaration_evaluates_aliasing_initializers_correctly() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_multilocal_aliasing_{}.lua",
+        std::process::id()
+    ));
+    // Regression test for the same `Stmt::MultiLocal` fix above, covering
+    // value correctness (not just register count): each initializer now
+    // compiles directly into its own final, pre-reserved slot register via
+    // `compile_into` instead of a separately-allocated temporary, so an
+    // initializer that reads an *outer* variable sharing a name with one of
+    // the new locals (`local a, b = b, a`, a swap) must still read the old
+    // outer values, not a partially-updated new one.
+    std::fs::write(
+        &path,
+        "local a, b = 10, 20\n\
+         local a, b = b, a\n\
+         assert(a == 20 and b == 10, \"unexpected swap result: \" .. a .. \" \" .. b)\n\
+         local function multi() return 10, 20, 30 end\n\
+         local g = 1, multi()\n\
+         assert(g == 1, \"unexpected trailing-multi-value result: \" .. tostring(g))\n\
+         print(\"multi-name local aliasing stayed correct\")\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("multi-name local aliasing stayed correct"));
+}
+
+#[test]
+fn a_function_with_too_many_upvalues_fails_to_compile() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_too_many_upvalues_{}.lua",
+        std::process::id()
+    ));
+    // Real Lua caps a function's upvalue count at MAXUPVAL (255, `lparser.c`'s
+    // `newupvalue`/`luaY_checklimit`). This mirrors `errors.lua`'s bisected
+    // upvalue-limit case: `fooC`, nested two levels inside `fooA`/`fooB`,
+    // ends up needing 256 upvalues (one chained upvalue each for `fooA`'s
+    // `a1..a127` and `c`, plus one direct upvalue each for `fooB`'s own
+    // `b1..b127` and `b`) - one past the limit - and must fail to compile
+    // rather than silently succeed.
+    let lim = 127;
+    let mut s = String::from("local function fooA ()\n  local ");
+    for j in 1..=lim {
+        s.push_str(&format!("a{j}, "));
+    }
+    s.push_str("b,c\n");
+    s.push_str("local function fooB ()\n  local ");
+    for j in 1..=lim {
+        s.push_str(&format!("b{j}, "));
+    }
+    s.push_str("b\n");
+    s.push_str("function fooC () return b+c");
+    for j in 1..=lim {
+        s.push_str(&format!("+a{j}+b{j}"));
+    }
+    s.push_str("\nend  end end");
+    std::fs::write(
+        &path,
+        format!(
+            "local ok, err = load({:?})\n\
+             assert(not ok, \"expected 256 upvalues to fail to compile\")\n\
+             assert(string.find(err, \"too many upvalues\"), \"unexpected message: \" .. tostring(err))\n\
+             assert(string.find(err, \"line 5\"), \"unexpected message: \" .. tostring(err))\n\
+             print(\"too many upvalues rejected\")\n",
+            s
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("too many upvalues rejected"));
+}

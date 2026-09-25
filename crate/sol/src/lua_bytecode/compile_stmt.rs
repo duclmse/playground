@@ -6,6 +6,7 @@ use sol_core::ValueCount;
 
 use crate::ast::{self, AssignTarget, Stmt};
 
+use super::compile_calls::is_multi_expr;
 use super::func_state::{GlobalScanState, LoopCtx};
 use super::{value_count, Compiler, Const, Instr, Reg, Resolved};
 
@@ -152,11 +153,69 @@ impl Compiler {
                 values,
                 line,
             } => {
-                let regs = self.compile_expr_list(values, names.len())?;
+                // Real Lua's `localstat` (`lparser.c`) compiles each
+                // initializer directly into the new local's own eventual
+                // register via `luaK_exp2nextreg`, one register per declared
+                // name. This used to instead compute every initializer (or
+                // nil pad) into its own fresh register via
+                // `compile_expr_list`, then allocate a *second*, separate
+                // register per name for `Instr::NewLocal`'s destination -
+                // permanently doubling a `local a, b, ...` statement's
+                // register cost (confirmed to trip `MAX_FSTACK` on a plain
+                // ~127-local declaration with no closures at all; see
+                // `docs/features/unified-sol-runtime-plan.md`'s U6 section
+                // and `tests/lua55/manifest.toml`'s `errors.lua` entry).
+                //
+                // `base..base + names.len()` are reserved up front as the
+                // locals' own registers. Each initializer compiles directly
+                // into its slot via `compile_into`, whose own
+                // `reserve_through` keeps its internal temporaries above
+                // every slot - so an initializer that aliases an outer
+                // variable's own register (e.g. `local a, b = outerA,
+                // outerA + 1`) still only ever *copies* that value in via a
+                // `Move`; the new locals aren't pushed into `scopes.locals`
+                // until every initializer above has already compiled, so
+                // `resolve` can't see them early either way.
+                // `NewLocal(dst, dst, name)` then "freshens" each slot's
+                // cell identity in place - safe because `reg_set_fresh`
+                // reads a register's current value before replacing its
+                // cell, so a self-referential `dst == src` is an ordinary
+                // in-place update.
+                let base = self.stack[level].next_reg;
+                let count = names.len();
+                let mut filled: usize = 0;
+                for (index, value) in values.iter().enumerate() {
+                    let is_last = index + 1 == values.len();
+                    if is_last && is_multi_expr(value) {
+                        let want = (count as i32 - filled as i32).max(0);
+                        let dst = base + filled as u16;
+                        self.stack[level].reset_to(dst);
+                        let result_base = self.compile_expr_multi_n(value, want)?;
+                        debug_assert_eq!(result_base, dst);
+                        filled = count;
+                        break;
+                    }
+                    if filled < count {
+                        let dst = base + filled as u16;
+                        self.compile_into(value, dst)?;
+                        filled += 1;
+                    } else {
+                        // More initializers than names: still evaluate for
+                        // side effects (`local a = f(), g()`), but the
+                        // result doesn't need a home.
+                        self.compile_expr(value)?;
+                    }
+                }
+                while filled < count {
+                    let dst = base + filled as u16;
+                    self.stack[level].reserve_through(dst);
+                    self.stack[level].emit(Instr::LoadNil(dst), *line);
+                    filled += 1;
+                }
                 for (index, (name, _, constant, close)) in names.iter().enumerate() {
-                    let dst = self.stack.last_mut().unwrap().alloc_reg();
+                    let dst = base + index as u16;
                     let name_const = self.stack[level].push_name_const(name);
-                    self.stack[level].emit(Instr::NewLocal(dst, regs[index], name_const), *line);
+                    self.stack[level].emit(Instr::NewLocal(dst, dst, name_const), *line);
                     self.stack
                         .last_mut()
                         .unwrap()

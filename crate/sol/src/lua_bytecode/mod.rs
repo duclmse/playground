@@ -241,6 +241,33 @@ impl Compiler {
                 function.line, function.name
             ));
         }
+        // Real Lua caps a function's upvalue count at `MAXUPVAL` (255,
+        // `lparser.c`'s `newupvalue`/`luaY_checklimit`), checked as each new
+        // upvalue is created while resolving a name mid-parse. Sol's
+        // equivalent (`FuncState::add_upval`, called from `resolve` above) is
+        // infallible, since `resolve` is also reached - via
+        // `resolve(level, "_ENV")` - from `emit_environment_get`/
+        // `emit_environment_set`, which are `()`-returning and used by every
+        // plain global variable read/write; threading a `Result` through
+        // those just to cover this one narrow case isn't worth it. Instead,
+        // check the finished count here, exactly like `MAX_REGISTERS` above:
+        // `add_upval` never fails, but a function that ends up with more than
+        // 255 entries in `state.upvals` is rejected post-hoc, the same way an
+        // over-budget register file is. Real Lua's own wording separately
+        // reports the current parse position and the function's own
+        // definition line ("in function at line N"); Sol only tracks the
+        // latter here, so both roles are filled by `function.line` - this
+        // still satisfies `errors.lua`'s own compound assertion
+        // (`string.find(b, "too many upvalues") and string.find(b, "line
+        // 5")`), which checks for that literal "line N" substring alongside
+        // "too many upvalues", not real Lua's exact phrasing.
+        const MAX_UPVALUES: usize = 255;
+        if state.upvals.len() > MAX_UPVALUES {
+            return Err(format!(
+                "line {}: too many upvalues (limit is {MAX_UPVALUES}) in function at line {} '{}'",
+                function.line, function.line, function.name
+            ));
+        }
         let mut captured_registers = vec![false; num_registers];
         for &reg in &state.captured {
             captured_registers[reg as usize] = true;

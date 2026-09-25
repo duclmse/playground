@@ -2201,14 +2201,16 @@ finishes compiling rather than incrementally per-allocation like
 `luaK_checkstack`, which has the same net effect for a `load()`-time failure
 and avoids threading a `Result` through `alloc_reg`'s roughly fifty call sites
 across the compiler. See `a_function_using_too_many_registers_fails_to_compile`
-in `crates/sol/tests/lua55.rs`. Deferred: real Lua similarly caps a function's
+in `crates/sol/tests/lua55.rs`. Real Lua similarly caps a function's
 upvalue count at `MAXUPVAL` (255, `lparser.c`'s `newupvalue`); Sol's
 equivalent (`FuncState::add_upval`, called only from `Compiler::resolve`) is
-infallible, and making it fallible is a much larger lift than the two fixes
-above, since `resolve(level, "_ENV")` is also called from the `()`-returning
-`emit_environment_get`/`emit_environment_set`, used by every plain global
-variable read/write in the compiler. A stress test exercising this
-(`errors.lua`, nested functions capturing 258 total upvalues) also revealed a
+infallible, and making it fallible would be a much larger lift than the two
+fixes above, since `resolve(level, "_ENV")` is also called from the
+`()`-returning `emit_environment_get`/`emit_environment_set`, used by every
+plain global variable read/write in the compiler — see below for how this was
+fixed anyway, without threading a `Result` through either of those. A stress
+test exercising this (`errors.lua`, nested functions capturing 256 total
+upvalues) also revealed a
 separate, likely-independently-valuable gap while investigating: Sol's
 expression compiler allocates a fresh register per intermediate result in a
 binary-operator chain without freeing the previous one, unlike real Lua's
@@ -2231,28 +2233,58 @@ in `crates/sol/tests/lua55.rs` (a 399-term addition chain that used to trip
 `MAX_FSTACK` and now compiles and runs correctly).
 
 This didn't get `errors.lua`'s upvalue stress test any closer to matching the
-oracle, though — with the addition chain's own register growth gone, the
-stress test's innermost closure no longer trips `MAX_FSTACK`, but its
-*enclosing* function now does, at a far lower local-variable count (127) than
+oracle at first, though — with the addition chain's own register growth gone,
+the stress test's innermost closure no longer trips `MAX_FSTACK`, but its
+*enclosing* function now did, at a far lower local-variable count (127) than
 either `MAXVARS` or `MAX_FSTACK` should allow. Root-caused to a distinct,
-unrelated bug: `Stmt::MultiLocal` (`compile_stmt.rs`) allocates *two*
+unrelated bug: `Stmt::MultiLocal` (`compile_stmt.rs`) was allocating *two*
 registers per declared local instead of one — an initializer/nil-pad
 register from `compile_expr_list`, plus a second, separate destination
 register for `Instr::NewLocal` — permanently doubling a function's register
 cost per plain `local` declaration relative to real Lua's single-register
 `luaK_exp2nextreg` scheme (confirmed with a minimal repro: a function
-declaring ~127 plain locals and nothing else already crosses `MAX_FSTACK`;
+declaring ~127 plain locals and nothing else already crossed `MAX_FSTACK`;
 confirmed pre-existing, unrelated to and unmasked only by this session's
-register-reuse fix). Not fixed here: eliminating the second register isn't
-safe in general, since an initializer's `compile_expr_list` register can
-alias a *pre-existing* outer variable's own register rather than a fresh
-temporary (e.g. `local a, b = outerA, outerA + 1`), and folding a later
-initializer directly into an earlier new local's destination register before
-every initializer is read would risk the same kind of aliasing corruption the
-existing `MultiAssign` codegen's snapshot-into-fresh-registers comment
-already documents. A correct fix needs to first distinguish a genuinely fresh
-temporary from an aliased outer register before it can safely reuse it —
-deferred as its own separately-scoped item.
+register-reuse fix).
+
+Now fixed: each initializer compiles directly into its own final,
+pre-reserved slot register via `compile_into` — the same fixed-destination
+pattern `compile_call_args` already used for call arguments — instead of a
+separate temporary, and `Instr::NewLocal(dst, dst, name)` reuses that same
+register in place rather than allocating a second one. This is safe for the
+aliasing case that made the naive fix risky: `compile_into` reserves through
+the target register before compiling the initializer, and the target
+register is always chosen strictly above every currently-live register, so an
+initializer that reads a *pre-existing* outer variable's own register (e.g.
+`local a, b = outerA, outerA + 1`) can never numerically collide with it —
+`compile_expr`'s no-alloc fast path for a bare name just returns that outer
+register directly, and `compile_into` copies it with an ordinary `Move`. A
+trailing multi-value initializer is handled the same way `compile_call_args`
+handles one, via `reset_to` plus `compile_expr_multi_n`. Verified correct
+(not just smaller) for outer-variable aliasing, swaps (`local a, b = b, a`),
+self-shadowing (`local a = a`), excess/deficient initializer counts, and a
+trailing multi-value expression with nothing left to fill. See
+`a_multi_name_local_declaration_uses_one_register_per_local_not_two` and
+`a_multi_name_local_declaration_evaluates_aliasing_initializers_correctly` in
+`crates/sol/tests/lua55.rs`.
+
+With both of those genuinely fixed, the stress test now reaches — and
+correctly rejects — the actual `MAXUPVAL` condition it was written to
+exercise: the innermost closure needs 256 upvalues, one past the 255 limit.
+Rather than making `FuncState::add_upval`/`resolve` fallible (the "much
+larger lift" noted above), this is enforced with a post-hoc check on the
+finished upvalue count in `Compiler::compile_function` (`mod.rs`), right next
+to the pre-existing `MAX_FSTACK` check — `add_upval` still never fails, but a
+function that ends up with more than 255 entries in its upvalue list is
+rejected once compilation finishes, the same way an over-budget register file
+already was. Real Lua's own wording separately reports the current parse
+position and the function's own definition line ("in function at line N");
+Sol only tracks the latter here, so both roles are filled by the same line
+number — this still satisfies `errors.lua`'s own compound assertion
+(`string.find(b, "too many upvalues") and string.find(b, "line 5")`), which
+checks for that literal "line N" substring alongside "too many upvalues", not
+real Lua's exact phrasing. See `a_function_with_too_many_upvalues_fails_to_compile`
+in `crates/sol/tests/lua55.rs`.
 
 The register-reuse fix above also introduced (and required fixing) a real
 naming regression, caught before committing: once an operand register is
