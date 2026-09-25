@@ -122,7 +122,9 @@ impl Compiler {
                 Ok(dst)
             }
             ExprKind::Unary(op, value) => {
+                let entry = self.stack[level].next_reg;
                 let value_reg = self.compile_expr(value)?;
+                self.stack.last_mut().unwrap().free_reg(value_reg, entry);
                 let dst = self.stack.last_mut().unwrap().alloc_reg();
                 let instr = match op {
                     UnaryOp::Not => Instr::Not(dst, value_reg),
@@ -133,7 +135,9 @@ impl Compiler {
                 Ok(dst)
             }
             ExprKind::Len(value) => {
+                let entry = self.stack[level].next_reg;
                 let value_reg = self.compile_expr(value)?;
+                self.stack.last_mut().unwrap().free_reg(value_reg, entry);
                 let dst = self.stack.last_mut().unwrap().alloc_reg();
                 self.stack
                     .last_mut()
@@ -143,7 +147,9 @@ impl Compiler {
             }
             ExprKind::Binary(op, left, right) => {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let entry = self.stack[level].next_reg;
                     let left_reg = self.compile_expr(left)?;
+                    self.stack.last_mut().unwrap().free_reg(left_reg, entry);
                     let dst = self.stack.last_mut().unwrap().alloc_reg();
                     if dst != left_reg {
                         self.stack
@@ -179,8 +185,11 @@ impl Compiler {
                     self.stack.last_mut().unwrap().patch_jump(jump, end as i32);
                     return Ok(dst);
                 }
+                let entry = self.stack[level].next_reg;
                 let left_reg = self.compile_expr(left)?;
                 let right_reg = self.compile_expr(right)?;
+                self.stack.last_mut().unwrap().free_reg(right_reg, entry);
+                self.stack.last_mut().unwrap().free_reg(left_reg, entry);
                 let dst = self.stack.last_mut().unwrap().alloc_reg();
                 let specialized = self.optimization_plan.as_ref().is_some_and(|plan| {
                     plan.proves_integer_binary(&self.stack[self.level()].name, line, *op)
@@ -201,8 +210,11 @@ impl Compiler {
             | ExprKind::Vararg => self.compile_expr_multi_n(expr, 1),
             ExprKind::Paren(inner) => self.compile_expr(inner),
             ExprKind::Index(base, index) => {
+                let entry = self.stack[level].next_reg;
                 let base_reg = self.compile_expr(base)?;
                 let index_reg = self.compile_expr(index)?;
+                self.stack.last_mut().unwrap().free_reg(index_reg, entry);
+                self.stack.last_mut().unwrap().free_reg(base_reg, entry);
                 let dst = self.stack.last_mut().unwrap().alloc_reg();
                 self.stack
                     .last_mut()
@@ -211,7 +223,9 @@ impl Compiler {
                 Ok(dst)
             }
             ExprKind::Field(base, field) => {
+                let entry = self.stack[level].next_reg;
                 let base_reg = self.compile_expr(base)?;
+                self.stack.last_mut().unwrap().free_reg(base_reg, entry);
                 let dst = self.stack.last_mut().unwrap().alloc_reg();
                 let n = self
                     .stack

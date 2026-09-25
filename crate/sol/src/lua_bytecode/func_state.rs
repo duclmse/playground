@@ -274,6 +274,28 @@ impl FuncState {
         self.next_reg = dst.max(self.retired_floor);
     }
 
+    /// Reclaims `reg` back into the temp-register pool if it is both a
+    /// genuine temporary this expression itself allocated (`reg >= floor` -
+    /// callers pass the `next_reg` value captured before the operand that
+    /// produced `reg` was compiled, so a bare local variable's own register,
+    /// which is always below that snapshot, is never reclaimed) and the
+    /// topmost currently-allocated register (`reg + 1 == next_reg`).
+    /// Mirrors real Lua's `freeexp`/`freereg` (`lcode.c`), whose own
+    /// `lua_assert(reg == fs->freereg)` encodes the same LIFO-only
+    /// constraint: only ever call this for the most recently allocated
+    /// register(s), most-recent first, exactly as `compile_expr`'s binary/
+    /// unary/index/field cases free their operand registers (right-to-left)
+    /// right before allocating the result register. Without this, a
+    /// left-associative chain (`a+b+c+...`) allocates one permanent new
+    /// register per operator instead of reusing a small constant number,
+    /// growing `max_reg` linearly with the chain length until it can spill
+    /// past `MAX_FSTACK` on an otherwise perfectly ordinary expression.
+    pub(super) fn free_reg(&mut self, reg: Reg, floor: Reg) {
+        if reg >= floor && reg + 1 == self.next_reg {
+            self.next_reg = reg;
+        }
+    }
+
     pub(super) fn emit(&mut self, instr: Instr, line: u32) -> usize {
         self.instrs.push(instr);
         self.lines.push(line);

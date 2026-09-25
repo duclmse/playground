@@ -2146,3 +2146,88 @@ fn a_function_using_too_many_registers_fails_to_compile() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("too many registers rejected"));
 }
+
+#[test]
+fn a_long_left_associative_expression_chain_reuses_registers_instead_of_growing_without_bound() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_long_expr_chain_{}.lua",
+        std::process::id()
+    ));
+    // Real Lua's code generator frees a binary operation's operand
+    // registers as soon as they're folded into its result (`lcode.c`'s
+    // `freeexp`/`freereg`), so a long left-associative chain like
+    // `1 + 2 + 3 + ... + N` only ever needs a couple of live registers at a
+    // time, no matter how many terms it has. Sol's expression compiler used
+    // to allocate one permanent new register per intermediate result
+    // instead, so a chain with enough terms (well under any real limit -
+    // 399 here, summing to 79800) would eventually cross the MAX_FSTACK=255
+    // register-stack cap added for `errors.lua`'s "too many registers" case
+    // and fail to compile a perfectly ordinary expression. Also exercises
+    // the same reuse for `and`/`or`, unary, indexing, and field-access
+    // chains via the nested nil-coalescing/field-access expression below.
+    let mut chain = String::from("1");
+    for term in 2..=399 {
+        chain.push_str(&format!(" + {term}"));
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "local sum = {chain}\n\
+             assert(sum == 79800, \"unexpected sum: \" .. tostring(sum))\n\
+             local t = {{a = {{b = {{c = 5}}}}}}\n\
+             local deep = t.a.b.c or 0\n\
+             assert(deep == 5, \"unexpected deep field access: \" .. tostring(deep))\n\
+             print(\"long expression chain reused registers\")\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("long expression chain reused registers"));
+}
+
+#[test]
+fn a_binary_operations_error_names_its_last_field_not_its_reused_register_root() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_reused_register_error_name_{}.lua",
+        std::process::id()
+    ));
+    // Regression test for `describe_register`'s interaction with the
+    // register-reuse fix above: once a chain's operand registers are freed
+    // and reallocated, a binary operation's destination register can
+    // numerically coincide with its own operand register (e.g. `a._ENV.x`
+    // compiles to `GetField(r0, r0, "_ENV"); GetField(r0, r0, "x")`, both
+    // self-overwriting `r0` - exactly real Lua's own `GETFIELD` codegen
+    // shape, confirmed via `luac5.5 -l`). `describe_register` used to chase
+    // through that self-overwrite back to the chain's root and misreport
+    // "global 'a'"; real Lua's `getobjname` never does that (confirmed
+    // against the pinned `lua5.5` oracle for this exact script) - it always
+    // names the most recent field, "field 'x'".
+    std::fs::write(
+        &path,
+        "local function doit(s)\n\
+           local f, msg = load(s)\n\
+           if not f then return msg end\n\
+           local cond, msg = pcall(f)\n\
+           return (not cond) and msg\n\
+         end\n\
+         local err = doit(\"a = {_ENV = {}}; print(a._ENV.x + 1)\")\n\
+         assert(tostring(err):find(\"field 'x'\", 1, true), \"unexpected message: \" .. tostring(err))\n\
+         assert(not tostring(err):find(\"global 'a'\", 1, true), \"unexpected message: \" .. tostring(err))\n\
+         print(\"reused-register error naming stayed correct\")\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("reused-register error naming stayed correct"));
+}

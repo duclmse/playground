@@ -84,11 +84,6 @@ pub(super) fn describe_register(
     reg: Reg,
 ) -> Option<(&'static str, String)> {
     let mut target = reg;
-    // When a dotted name is lowered through a self-overwriting register,
-    // retain its final field while chasing the root.  A local root retains
-    // Lua's `field 'x'` wording; a global root takes precedence as
-    // `global 'x'` (see the branch below).
-    let mut dotted_field: Option<String> = None;
     for (index, instr) in proto.instrs[..pc].iter().enumerate().rev() {
         match instr {
             // `compile_expr` emits this self-move only after an `and`/`or`
@@ -97,16 +92,10 @@ pub(super) fn describe_register(
             Instr::Move(dst, src) if *dst == target && *src == target => return None,
             Instr::Move(dst, src) if *dst == target => target = *src,
             Instr::NewLocal(dst, _, name_idx) if *dst == target => {
-                if let Some(field) = dotted_field {
-                    return Some(("field", field));
-                }
                 let name = String::from_utf8_lossy(&name_const(proto, *name_idx)).into_owned();
                 return Some(("local", name));
             }
             Instr::GetUpval(dst, index) if *dst == target => {
-                if let Some(field) = dotted_field {
-                    return Some(("field", field));
-                }
                 let name = proto.upval_names.get(*index as usize)?;
                 return Some(("upvalue", name.clone()));
             }
@@ -115,24 +104,24 @@ pub(super) fn describe_register(
             }
             Instr::GetField(dst, receiver, name_idx) if *dst == target => {
                 let name = String::from_utf8_lossy(&name_const(proto, *name_idx)).into_owned();
-                // A dotted name (`aaa.bbb.cc`) is compiled by
-                // `compile_name_into` as a succession of self-overwriting
-                // field loads.  It is still the original global/local that
-                // Lua identifies when a later index fails (for example,
-                // `aaa.bbb:ddd()` reports `global 'aaa'` when `aaa` is
-                // nil).  Keep walking through that special shape instead
-                // of stopping at its last field.  Ordinary field
-                // expressions use a separate destination register and keep
-                // their useful `field 'name'` description below.
-                if *receiver == target {
-                    dotted_field = Some(name);
-                    continue;
-                }
-                // Ordinary global access is `_ENV.name`.  The default
-                // environment has its own `GetGlobal` instruction, but a
-                // lexically rebound `_ENV` lowers to a field load.  Keep
-                // Lua's observable global wording for that special
-                // receiver rather than calling it a field of `_ENV`.
+                // Confirmed against the pinned `lua5.5` oracle
+                // (`aaa = {bbb = {}}; aaa.bbb.ccc:ddd()`,
+                // `foo = {bar = {}}; foo.bar.baz.qux()`): real Lua's own
+                // `getobjname` never chases *through* a `GETFIELD` to
+                // describe some earlier receiver, even when the field load
+                // reuses its receiver's own register (the ordinary,
+                // register-reuse-optimized shape for a dotted chain like
+                // `a.b.c` - table-base register freed and immediately
+                // reallocated as the field's own destination). It always
+                // reports the most recent field name only - `foo.bar.baz`
+                // failing on `.qux` is `(field 'baz')`, never
+                // `(global 'foo')` - so this stops here without recursing
+                // into `receiver` at all.
+                //
+                // The one real exception is a lexically rebound `_ENV`:
+                // `_ENV.name` lowers to a field load of `name` on `_ENV`
+                // rather than a dedicated `GetGlobal`, and Lua's own
+                // wording for that is `global 'name'`, not `field 'name'`.
                 if let Some((receiver_kind, receiver_name)) =
                     describe_register(proto, index, *receiver)
                 {
@@ -164,9 +153,6 @@ pub(super) fn describe_register(
     // populated by the calling convention, with no `Instr::NewLocal` (or
     // any other write) to chase. `param_names` is exactly that minimal,
     // `upval_names`-style debug metadata for this one case.
-    if let Some(field) = dotted_field {
-        return Some(("field", field));
-    }
     let name = proto.param_names.get(target as usize)?;
     Some(("local", name.clone()))
 }

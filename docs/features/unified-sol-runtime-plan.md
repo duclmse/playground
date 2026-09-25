@@ -2213,8 +2213,76 @@ separate, likely-independently-valuable gap while investigating: Sol's
 expression compiler allocates a fresh register per intermediate result in a
 binary-operator chain without freeing the previous one, unlike real Lua's
 `freeexp`-based reuse, so a long addition chain now hits the just-added
-255-register cap before any upvalue-count concern would ever apply — neither
-piece attempted here. Also deferred: a related stress case (a function
+255-register cap before any upvalue-count concern would ever apply.
+
+That register-reuse gap is now fixed: added `FuncState::free_reg(reg, floor)`
+(`crate/sol/src/lua_bytecode/func_state.rs`), which reclaims `reg` back into
+`next_reg` only when it's at or above `floor` (a `next_reg` snapshot taken
+before the operand that produced it was compiled, so an active local's own
+register — always below that snapshot — is never reclaimed) and is the
+topmost currently-allocated register, mirroring real Lua's own
+`freeexp`/`freereg` LIFO invariant (`lua_assert(reg == fs->freereg)`).
+`compile_expr.rs`'s binary (including `and`/`or`), unary, `#`, indexing, and
+field-access cases now free their operand register(s) right before
+allocating their result register, so a long chain reuses a small constant
+number of registers instead of growing linearly with its length. See
+`a_long_left_associative_expression_chain_reuses_registers_instead_of_growing_without_bound`
+in `crates/sol/tests/lua55.rs` (a 399-term addition chain that used to trip
+`MAX_FSTACK` and now compiles and runs correctly).
+
+This didn't get `errors.lua`'s upvalue stress test any closer to matching the
+oracle, though — with the addition chain's own register growth gone, the
+stress test's innermost closure no longer trips `MAX_FSTACK`, but its
+*enclosing* function now does, at a far lower local-variable count (127) than
+either `MAXVARS` or `MAX_FSTACK` should allow. Root-caused to a distinct,
+unrelated bug: `Stmt::MultiLocal` (`compile_stmt.rs`) allocates *two*
+registers per declared local instead of one — an initializer/nil-pad
+register from `compile_expr_list`, plus a second, separate destination
+register for `Instr::NewLocal` — permanently doubling a function's register
+cost per plain `local` declaration relative to real Lua's single-register
+`luaK_exp2nextreg` scheme (confirmed with a minimal repro: a function
+declaring ~127 plain locals and nothing else already crosses `MAX_FSTACK`;
+confirmed pre-existing, unrelated to and unmasked only by this session's
+register-reuse fix). Not fixed here: eliminating the second register isn't
+safe in general, since an initializer's `compile_expr_list` register can
+alias a *pre-existing* outer variable's own register rather than a fresh
+temporary (e.g. `local a, b = outerA, outerA + 1`), and folding a later
+initializer directly into an earlier new local's destination register before
+every initializer is read would risk the same kind of aliasing corruption the
+existing `MultiAssign` codegen's snapshot-into-fresh-registers comment
+already documents. A correct fix needs to first distinguish a genuinely fresh
+temporary from an aliased outer register before it can safely reuse it —
+deferred as its own separately-scoped item.
+
+The register-reuse fix above also introduced (and required fixing) a real
+naming regression, caught before committing: once an operand register is
+freed and reallocated, a binary/field/index operation's result register can
+numerically coincide with its own operand register — e.g. `a._ENV.x` now
+compiles to `GetField(r0, r0, "_ENV"); GetField(r0, r0, "x")`, both
+self-overwriting `r0` (confirmed via `luac5.5 -l` that this is exactly real
+Lua's own `GETFIELD` codegen shape for this expression, not a Sol-only
+artifact). `describe_register`'s (`crate/sol/src/lua_runtime/dispatch.rs`)
+existing "chase through a self-overwriting field chain back to its root"
+special case — added for `compile_name_into`'s dotted-call-name lowering,
+e.g. `foo.bar.baz(...)` — could not distinguish that shape from an ordinary
+nested field-access chain hitting the same bytecode pattern, and started
+misreporting `a._ENV.x + 1`'s nil-field error as `global 'a'` instead of
+`field 'x'`. Checked against the pinned `lua5.5` oracle across several shapes
+(`aaa.bbb:ddd()`, `aaa.bbb.ccc:ddd()`, `foo.bar.baz()`, `foo.bar.baz.qux()`):
+real Lua's own `getobjname` never chases through a `GETFIELD` to name some
+earlier receiver, always naming the most recently written field instead — so
+the chase-to-root special case rested on a mistaken premise even before this
+session's fix (it happened to go untriggered by the one pre-existing test
+covering this wording, `dotted_root.bad_field:bad_method()`, since that
+test's failure is a direct index-of-nil at the very first `GetField`,
+needing no chase either way). Fixed by removing the chase-to-root branch
+entirely, keeping only the unrelated, legitimate `_ENV`-rebinding recursion
+(a lexically rebound `_ENV.name` field load must still report as
+`global 'name'`, matching real Lua). See
+`a_binary_operations_error_names_its_last_field_not_its_reused_register_root`
+in `crates/sol/tests/lua55.rs`.
+
+Also deferred: a related stress case (a function
 missing its closing `end`, expecting a `MAXVARS` violation message despite
 the incomplete body) exposed a more fundamental architectural fact — Sol's
 `.lua` front end fully parses a function into a complete, syntactically-valid
