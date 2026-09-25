@@ -2148,6 +2148,50 @@ fn a_function_using_too_many_registers_fails_to_compile() {
 }
 
 #[test]
+fn a_parser_stops_recursing_before_the_rust_stack_overflows() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_parser_recursion_depth_{}.lua",
+        std::process::id()
+    ));
+    // Real Lua bounds recursive-descent parsing via a shared `nCcalls`
+    // counter (`lstate.h`/`lparser.c`'s `enterlevel`/`leavelevel`,
+    // `LUAI_MAXCCALLS` = 200 by default), rejecting deeply nested input with
+    // a bare "C stack overflow" rather than growing its own C stack without
+    // bound. Sol's parser previously had no equivalent: 100 levels of
+    // nesting worked (matching `errors.lua`'s bisection, whose `testrep`
+    // helper asserts this), but a much deeper adversarial/generated input -
+    // 100000 nested parens, well beyond anything `errors.lua` itself tests -
+    // recursed through Sol's own Rust call stack until the whole process
+    // aborted with a real stack overflow instead of failing gracefully.
+    // Covers both ends: a moderately nested, legitimate expression must
+    // still parse and evaluate correctly, and a very deeply nested one must
+    // fail cleanly (`load` returning `nil, "C stack overflow"`), not crash
+    // the process.
+    std::fs::write(
+        &path,
+        format!(
+            "assert(({}1{}) == 1, \"100-deep nesting should still parse and evaluate\")\n\
+             local ok, err = load(\"return {}1{}\")\n\
+             assert(not ok, \"expected 100000-deep nesting to fail to compile\")\n\
+             assert(string.find(err, \"C stack overflow\"), \"unexpected message: \" .. tostring(err))\n\
+             print(\"parser recursion depth bounded\")\n",
+            "(".repeat(100),
+            ")".repeat(100),
+            "(".repeat(100_000),
+            ")".repeat(100_000),
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("parser recursion depth bounded"));
+}
+
+#[test]
 fn a_long_left_associative_expression_chain_reuses_registers_instead_of_growing_without_bound() {
     let path = std::env::temp_dir().join(format!(
         "sol_lua55_long_expr_chain_{}.lua",

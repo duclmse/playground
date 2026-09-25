@@ -2187,15 +2187,39 @@ exponentiation) were verified against the pinned oracle to genuinely fall
 under the originally-suspected `LUAI_MAXCCALLS`-style C-stack
 recursion-depth-during-parsing limit (`lparser.c`'s `enterlevel`/`leavelevel`)
 rather than a variable/register-count check — each reports plain "C stack
-overflow" from the oracle, unrelated to `MAXVARS`. Sol's parser has no
-equivalent nesting-depth check and accepts these constructs outright; it does
-not crash or hang on them, it simply fails to reject them where real Lua
-does. Not fixed — a parser nesting-depth limit is architecturally harder to
-add correctly given Sol's AST-first (not recursive-descent-with-C-stack)
-parsing model, and real Lua's own limit is inherently platform/build-
-dependent — see `tests/lua55/manifest.toml`'s `errors.lua` note for the exact
-stopping point (`testrep("local a; a", ",a", "= 1", ",1")`'s
-`load(gencode(500))` assertion).
+overflow" from the oracle, unrelated to `MAXVARS`. Sol's parser previously had
+no equivalent nesting-depth check, and — worse than just failing to reject
+these constructs where real Lua does — a sufficiently deep, adversarial or
+generated input (well beyond anything `errors.lua` itself tests, but not hard
+to construct) recursed through Sol's own Rust call stack without bound until
+the whole process aborted with a real stack overflow, since `parse_stmt`
+(reached recursively through nested blocks: `do`/`if`/`while`/`for`/function
+bodies) and `parse_precedence` (reached recursively through parenthesized
+expressions, unary operator chains, and binary operator right-hand sides)
+form Sol's own genuine recursive-descent chain, even though Sol's front end is
+AST-first rather than interleaved parse-and-codegen like real Lua's — the
+previously-recorded reasoning that a depth limit would be "architecturally
+harder to add" given that difference did not hold up once examined directly.
+Fixed: `Parser::enter_level`/`leave_level` (`parser.rs`) add a shared
+recursion-depth counter, mirroring real Lua's `nCcalls`, checked in
+`parse_stmt` and `parse_precedence` and raising the identical bare
+`"C stack overflow"` message (no `chunkname:line:` prefix, matching real
+Lua's own `luaE_incCstack`-reused check, which predates the parser having any
+executing call frame to attribute a position to) once nesting reaches 200
+levels — the same default `LUAI_MAXCCALLS` value, though exact numeric parity
+isn't the compatibility goal here, just failing at a comparable depth with the
+same message. `parse_assign`'s repeated-assignment-target list is parsed with
+a plain loop rather than recursion in Sol, so it carries no analogous
+stack-overflow risk, but is still charged against the same depth budget (once
+per extra target, mirroring `restassign`'s own per-target recursion in
+`lparser.c`) so that case's `load(gencode(500))` rejection is reproduced too;
+`explist`-style plain value lists (return statements, local-declaration
+initializers, assignment values) are not charged, matching real Lua's own
+`explist`, which has no `enterlevel` call of its own. All ten `testrep`
+variants at this stopping point, including the multiple-assignment case, now
+pass. See `a_parser_stops_recursing_before_the_rust_stack_overflows` in
+`crates/sol/tests/lua55.rs` and `tests/lua55/manifest.toml`'s `errors.lua`
+note.
 
 Continuing past that cluster (neutralized only in the scratch bisection copy)
 surfaced three further, distinct resource-limit gaps, one now fixed and two
@@ -2332,14 +2356,15 @@ AST before the separate compilation pass (where the `MAXVARS`/`MAX_FSTACK`
 fixes live) ever runs, so an incomplete function body always surfaces its own
 syntax error first, unlike real Lua's single-pass parser, which can report a
 resource-limit violation mid-parse before ever needing a matching `end`. This
-is a general consequence of Sol's two-phase pipeline (the same underlying
-reason the parser recursion-depth limit above is awkward to add), not
-specific to `MAXVARS`, and doesn't affect the `MAXVARS` fix for any
-syntactically-complete input. With all four gaps neutralized only in
-`crate/sol/scratch/errors_bisect.lua` (each with its own explanatory comment),
+is a general consequence of Sol's two-phase pipeline, not specific to
+`MAXVARS`, and doesn't affect the `MAXVARS` fix for any syntactically-complete
+input; it remains the one still-unattempted gap. With the parser
+recursion-depth limit now fixed (above) alongside the other three originally
+found here, only this last, genuinely architectural gap is neutralized in
+`crate/sol/scratch/errors_bisect.lua` (with its own explanatory comment) —
 `errors.lua` now runs to completion and prints `OK`, matching the pinned
-oracle's final line; the real corpus file still fails at the earliest
-remaining deferred item and stays `pending` in the manifest.
+oracle's final line; the real corpus file still fails at this one remaining
+deferred item and stays `pending` in the manifest.
 
 ### U7 — Interpreter performance foundation
 

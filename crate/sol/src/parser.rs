@@ -80,6 +80,7 @@ pub fn parse_with_config(tokens: Vec<Spanned>, config: LanguageConfig) -> Result
         generated_structs: Vec::new(),
         known_structs: HashSet::new(),
         imported_modules: HashSet::new(),
+        depth: 0,
     }
     .parse_program()
 }
@@ -273,9 +274,46 @@ struct Parser {
     generated_structs: Vec<StructDef>,
     known_structs: HashSet<String>,
     imported_modules: HashSet<String>,
+    /// Nesting depth of recursive-descent parsing, mirroring real Lua's
+    /// shared `nCcalls` counter (`lstate.h`/`lparser.c`'s `enterlevel`/
+    /// `leavelevel`, incremented at the same three call sites: each
+    /// statement, each expression-precedence descent, and each additional
+    /// item in a comma-separated list). Without this, adversarial or
+    /// generated deeply nested input (chained parens, nested `do...end`,
+    /// long comma lists) recurses through Sol's own Rust call stack until
+    /// the process aborts with a real stack overflow, instead of failing
+    /// gracefully with a parse error the way real Lua's `LUAI_MAXCCALLS`
+    /// limit does.
+    depth: u32,
 }
 
+/// Real Lua's default `LUAI_MAXCCALLS` (`luaconf.h`). The exact number is
+/// platform/build-tunable in real Lua and not part of its observable
+/// semantics beyond "some input this deep is rejected", so exact numeric
+/// parity isn't required - matching the failure at a comparable depth with
+/// the same message is what the compatibility corpus actually checks for.
+const MAX_PARSE_DEPTH: u32 = 200;
+
 impl Parser {
+    /// Real Lua's `enterlevel` (`lparser.c`), which reuses the VM's own
+    /// `luaE_incCstack` C-call-depth guard - raising a bare `"C stack
+    /// overflow"` with no `chunkname:line:` position prefix, unlike every
+    /// other parse error (`luaG_runerror`'s `luaG_addinfo` only adds one
+    /// when an executing Lua call frame exists, which there isn't yet
+    /// during parsing).
+    fn enter_level(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err("C stack overflow".to_string());
+        }
+        Ok(())
+    }
+
+    /// Real Lua's `leavelevel` (`lparser.c`).
+    fn leave_level(&mut self) {
+        self.depth -= 1;
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos).map(|s| &s.token)
     }
@@ -977,6 +1015,13 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
+        self.enter_level()?;
+        let result = self.parse_stmt_inner();
+        self.leave_level();
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, String> {
         let line = self.line();
         match self.peek() {
             Some(Token::Semi) => {
@@ -1338,11 +1383,25 @@ impl Parser {
             }
         }
         let mut targets = vec![target(target_expr, line)?];
+        // Real Lua's `restassign` (`lparser.c`) recurses once per additional
+        // assignment target, consuming the same shared `nCcalls` budget as
+        // nested statements/expressions - a long enough repeated-target list
+        // fails with "C stack overflow" on its own, with no other nesting
+        // involved. Sol parses this list with a plain loop rather than
+        // recursion, so it carries no analogous stack risk, but the same
+        // depth budget is still charged here (and released once the whole
+        // assignment finishes) to reproduce that observable limit.
+        let mut extra_targets = 0u32;
         while self.eat(&Token::Comma) {
+            self.enter_level()?;
+            extra_targets += 1;
             targets.push(target(self.parse_postfix()?, line)?);
         }
         self.expect(&Token::Eq)?;
         let mut values = self.parse_values()?;
+        for _ in 0..extra_targets {
+            self.leave_level();
+        }
         if targets.len() == 1 && values.len() == 1 {
             Ok(Stmt::Assign {
                 target: targets.remove(0),
@@ -1359,6 +1418,11 @@ impl Parser {
     }
 
     fn parse_values(&mut self) -> Result<Vec<Expr>, String> {
+        // Unlike `parse_assign`'s target list, real Lua's own value-list
+        // parser (`explist`, `lparser.c`) does not call `enterlevel` per
+        // item - only each individual expression's own `subexpr` recursion
+        // is charged (via `parse_precedence`) - so this stays a plain loop
+        // with no additional per-item depth charge.
         let mut values = vec![self.parse_expr()?];
         while self.eat(&Token::Comma) {
             values.push(self.parse_expr()?);
@@ -1375,6 +1439,13 @@ impl Parser {
     // Lua's precedence table: exponentiation is right associative and binds
     // more tightly than unary minus, including on its right-hand operand.
     fn parse_precedence(&mut self, min: u8) -> Result<Expr, String> {
+        self.enter_level()?;
+        let result = self.parse_precedence_inner(min);
+        self.leave_level();
+        result
+    }
+
+    fn parse_precedence_inner(&mut self, min: u8) -> Result<Expr, String> {
         let line = self.line();
         let unary = match self.peek() {
             Some(Token::Minus) => Some(UnaryOp::Neg),
