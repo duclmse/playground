@@ -66,7 +66,7 @@ impl LuaRuntime {
                     }
                 }
                 self.charge_allocation(output.len())?;
-                Ok(vec![LuaValue::String(Rc::new(output))])
+                Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::Utf8Codepoint => {
                 let input = required(0)?;

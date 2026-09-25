@@ -216,6 +216,22 @@ fn annotate_bad_argument_error(err: &mut LuaError, proto: &Proto, pc: usize, bas
 }
 
 impl LuaRuntime {
+    /// Interns `bytes` as a canonical Lua string value. Strings are leaves in
+    /// the value graph (never reference other values), so unlike
+    /// tables/closures/coroutines they are already fully canonical.
+    pub(super) fn intern_str(&self, bytes: impl AsRef<[u8]>) -> CanonicalString {
+        CanonicalString::intern(self.canonical_heap.clone(), bytes)
+    }
+
+    /// Allocates `bytes` as a fresh canonical Lua string value with its own
+    /// identity, never aliasing an existing equal-content string. Use this
+    /// for every runtime-computed string (concatenation, string-library
+    /// results, formatted output, ...); use `intern_str` only for
+    /// compile-time literal constants and fixed structural labels.
+    pub(super) fn fresh_str(&self, bytes: impl AsRef<[u8]>) -> CanonicalString {
+        CanonicalString::fresh(self.canonical_heap.clone(), bytes)
+    }
+
     /// Semantic-ABI entry point used by specialized-tier adapters. The
     /// callable remains a normal value in the dynamic global environment;
     /// only scalar boxing policy belongs in the adapter.
@@ -413,7 +429,7 @@ impl LuaRuntime {
         if !interested {
             return Ok(());
         }
-        let mut args = vec![LuaValue::String(Rc::new(event.as_bytes().to_vec()))];
+        let mut args = vec![LuaValue::String(self.intern_str(event.as_bytes().to_vec()))];
         if let Some(line) = line {
             args.push(LuaValue::Integer(line));
         }
@@ -739,7 +755,7 @@ impl LuaRuntime {
                 unreachable!("values_table always returns a table")
             };
             named_varargs.borrow_mut().set(
-                LuaValue::String(Rc::new(b"n".to_vec())),
+                LuaValue::String(self.intern_str(b"n".to_vec())),
                 LuaValue::Integer(varargs.len() as i64),
             )?;
             reg_set(&mut regs, &cells, vararg_reg as usize, table);
@@ -1394,7 +1410,7 @@ impl LuaRuntime {
             let Some(method) = method else { continue };
             let err_arg = error
                 .clone()
-                .map(LuaError::into_lua_value)
+                .map(|e| e.into_lua_value(&self.canonical_heap))
                 .unwrap_or(LuaValue::Nil);
             if let Err(e) = self.call(method, vec![value, err_arg]) {
                 error = Some(e);
@@ -1548,7 +1564,7 @@ impl LuaRuntime {
         match cont {
             NativeCont::Pcall => Ok(CallStep::Done(vec![
                 LuaValue::Bool(false),
-                error.into_lua_value(),
+                error.into_lua_value(&self.canonical_heap),
             ])),
             NativeCont::Xpcall(XCallStage::Function { handler }) => {
                 // Stashed for `debug.traceback` to pick up if `handler` is (or
@@ -1558,10 +1574,11 @@ impl LuaRuntime {
                 // so the frame-name/line trail collected on `error.stack` while
                 // unwinding is the only surviving record of it.
                 self.pending_error_stack = Some(error.stack.clone());
+                let error_value = error.into_lua_value(&self.canonical_heap);
                 self.push_native_call(
                     NativeCont::Xpcall(XCallStage::Handler),
                     handler,
-                    vec![error.into_lua_value()],
+                    vec![error_value],
                     base_depth,
                     depth_charged,
                 )
@@ -1574,7 +1591,7 @@ impl LuaRuntime {
                 // again for its own error, it synthesizes this fixed message.
                 Ok(CallStep::Done(vec![
                     LuaValue::Bool(false),
-                    LuaValue::String(Rc::new(b"error in error handling".to_vec())),
+                    LuaValue::String(self.intern_str(b"error in error handling".to_vec())),
                 ]))
             }
             NativeCont::Once => {
@@ -1785,7 +1802,7 @@ impl LuaRuntime {
                 };
                 if let (Some(mut a), Some(b)) = (primitive(&left), primitive(&right)) {
                     a.extend(b);
-                    return Ok(BinaryResolution::Value(LuaValue::String(Rc::new(a))));
+                    return Ok(BinaryResolution::Value(LuaValue::String(self.fresh_str(a))));
                 }
                 match self.find_binary_metamethod(&left, &right, b"__concat")? {
                     Some(method) => Ok(BinaryResolution::Call {
@@ -2049,7 +2066,7 @@ impl LuaRuntime {
         };
         let value = metatable
             .borrow()
-            .get(&LuaValue::String(Rc::new(name.to_vec())))?;
+            .get(&LuaValue::String(self.intern_str(name.to_vec())))?;
         Ok((value != LuaValue::Nil).then_some(value))
     }
 
@@ -2429,7 +2446,7 @@ impl LuaRuntime {
                 // the shared `gsub_run_sync` helper.
                 let source = match args.first() {
                     Some(LuaValue::String(source)) => source.clone(),
-                    Some(value) => Rc::new(self.string(value)?.to_vec()),
+                    Some(value) => self.fresh_str(self.string(value)?),
                     None => {
                         return Err(LuaError::new(
                             "bad argument #1 to 'gsub' (string expected, got no value)",

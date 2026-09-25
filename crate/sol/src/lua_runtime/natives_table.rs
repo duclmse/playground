@@ -67,7 +67,7 @@ impl LuaRuntime {
                     }
                 }
                 self.charge_allocation(output.len())?;
-                Ok(vec![LuaValue::String(Rc::new(output))])
+                Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::TableInsert => {
                 // Defined in terms of the generic `t[i]` get/set (not a
@@ -160,7 +160,7 @@ impl LuaRuntime {
                     unreachable!()
                 };
                 table.borrow_mut().set(
-                    LuaValue::String(Rc::new(b"n".to_vec())),
+                    LuaValue::String(self.intern_str(b"n".to_vec())),
                     LuaValue::Integer(args.len() as i64),
                 )?;
                 Ok(vec![value])

@@ -417,7 +417,8 @@ impl lua_State {
     }
 
     fn push_error(&mut self, error: LuaError) -> c_int {
-        self.stack.push(error.clone().into_lua_value());
+        let heap = unsafe { self.runtime() }.canonical_heap.clone();
+        self.stack.push(error.clone().into_lua_value(&heap));
         self.pending_error = Some(error);
         LUA_ERRRUN
     }
@@ -597,7 +598,12 @@ pub(super) fn canonical_to_lua(
         .object(object)
         .map_err(|error| LuaError::new(error.to_string()))?
     {
-        sol_core::HeapObject::String(bytes) => Ok(LuaValue::String(Rc::new(bytes.clone()))),
+        sol_core::HeapObject::String(_) => {
+            drop(heap);
+            Ok(LuaValue::String(CanonicalString::root_existing(
+                heap_ref, object,
+            )))
+        }
         sol_core::HeapObject::Table(_) => {
             drop(heap);
             Ok(LuaValue::CanonicalTable(CanonicalTable::root_existing(
@@ -642,13 +648,12 @@ pub(super) fn lua_to_canonical(
             .insert(object, *pointer);
         return Ok(sol_core::Value::object(object));
     }
-    let mut heap = runtime.canonical_heap.borrow_mut();
     Ok(match value {
         LuaValue::Nil => sol_core::Value::NIL,
         LuaValue::Bool(value) => sol_core::Value::boolean(*value),
         LuaValue::Integer(value) => sol_core::Value::integer(*value),
         LuaValue::Float(value) => sol_core::Value::float(*value),
-        LuaValue::String(value) => sol_core::Value::object(heap.alloc_string(value.as_slice())),
+        LuaValue::String(value) => sol_core::Value::object(value.object_id()),
         LuaValue::CanonicalTable(value) => sol_core::Value::object(value.object_id()),
         LuaValue::Userdata(value) => sol_core::Value::object(value.object_id()),
         LuaValue::CFunction(value) => sol_core::Value::object(value.object_id()),
@@ -693,7 +698,7 @@ pub(super) fn canonical_metamethod(
     let Some(metatable) = metatable else {
         return Ok(None);
     };
-    let key = LuaValue::String(Rc::new(name.to_vec()));
+    let key = LuaValue::String(runtime.intern_str(name));
     let value = canonical_table_get(runtime, metatable, &key)?;
     Ok((value != LuaValue::Nil).then_some(value))
 }
@@ -1070,7 +1075,7 @@ pub unsafe extern "C" fn lua_pushlstring(
     } else {
         unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), len) }
     };
-    let value = Rc::new(slice.to_vec());
+    let value = unsafe { state.runtime() }.fresh_str(slice);
     state.stack.push(LuaValue::String(value));
     let mut terminated = slice.to_vec();
     terminated.push(0);
@@ -1149,7 +1154,8 @@ pub unsafe extern "C" fn lua_tolstring(
             LuaValue::Integer(_) | LuaValue::Float(_) => state.stack[slot].display_bytes(),
             _ => return ptr::null(),
         };
-        state.stack[slot] = LuaValue::String(Rc::new(bytes));
+        let interned = unsafe { state.runtime() }.fresh_str(bytes);
+        state.stack[slot] = LuaValue::String(interned);
     }
     let LuaValue::String(bytes) = &state.stack[slot] else {
         unreachable!()
@@ -1157,7 +1163,7 @@ pub unsafe extern "C" fn lua_tolstring(
     if !len.is_null() {
         unsafe { *len = bytes.len() };
     }
-    let mut terminated = bytes.as_ref().clone();
+    let mut terminated = bytes.as_bytes().to_vec();
     terminated.push(0);
     state.c_strings.push(terminated.into_boxed_slice());
     state.c_strings.last().unwrap().as_ptr().cast()
@@ -1413,11 +1419,13 @@ pub unsafe extern "C" fn luaL_loadbufferx(
     let mode = if mode.is_null() {
         LuaValue::Nil
     } else {
-        LuaValue::String(Rc::new(unsafe { CStr::from_ptr(mode) }.to_bytes().to_vec()))
+        LuaValue::String(
+            unsafe { state.runtime() }.intern_str(unsafe { CStr::from_ptr(mode) }.to_bytes()),
+        )
     };
     let args = vec![
-        LuaValue::String(Rc::new(source.to_vec())),
-        LuaValue::String(Rc::new(chunkname)),
+        LuaValue::String(unsafe { state.runtime() }.fresh_str(source)),
+        LuaValue::String(unsafe { state.runtime() }.fresh_str(chunkname)),
         mode,
     ];
     match unsafe { state.runtime() }.call_native_load(NativeFunction::Load, args) {
@@ -1426,12 +1434,11 @@ pub unsafe extern "C" fn luaL_loadbufferx(
             LUA_OK
         }
         Ok(values) => {
-            state.stack.push(
-                values
-                    .get(1)
-                    .cloned()
-                    .unwrap_or_else(|| LuaValue::String(Rc::new(b"load failed".to_vec()))),
-            );
+            let message = match values.get(1).cloned() {
+                Some(value) => value,
+                None => LuaValue::String(unsafe { state.runtime() }.intern_str(b"load failed")),
+            };
+            state.stack.push(message);
             LUA_ERRSYNTAX
         }
         Err(error) => state.push_error(error),
@@ -1455,9 +1462,9 @@ pub unsafe extern "C" fn luaL_loadfilex(
 ) -> c_int {
     if filename.is_null() {
         if let Some(state) = unsafe { state_mut(state) } {
-            state.stack.push(LuaValue::String(Rc::new(
-                b"stdin loading is not supported".to_vec(),
-            )));
+            let message =
+                unsafe { state.runtime() }.intern_str(b"stdin loading is not supported");
+            state.stack.push(LuaValue::String(message));
         }
         return LUA_ERRRUN;
     }
@@ -1468,9 +1475,9 @@ pub unsafe extern "C" fn luaL_loadfilex(
         },
         Err(error) => {
             if let Some(state) = unsafe { state_mut(state) } {
-                state.stack.push(LuaValue::String(Rc::new(
-                    format!("cannot open {}: {error}", path).into_bytes(),
-                )));
+                let message = unsafe { state.runtime() }
+                    .fresh_str(format!("cannot open {}: {error}", path));
+                state.stack.push(LuaValue::String(message));
             }
             LUA_ERRRUN
         }
@@ -1602,7 +1609,8 @@ pub unsafe extern "C-unwind" fn lua_concat(state: *mut lua_State, count: c_int) 
         return;
     };
     if count <= 0 {
-        state.stack.push(LuaValue::String(Rc::new(Vec::new())));
+        let empty = unsafe { state.runtime() }.intern_str(b"");
+        state.stack.push(LuaValue::String(empty));
         return;
     }
     let count = count as usize;
@@ -1818,7 +1826,8 @@ pub unsafe extern "C-unwind" fn lua_resume(
             }
             Err(error) => {
                 state.thread.status.set(CoroutineStatus::Dead);
-                state.stack.push(error.into_lua_value());
+                let heap = unsafe { state.runtime() }.canonical_heap.clone();
+                state.stack.push(error.into_lua_value(&heap));
                 state.status = LUA_ERRRUN;
                 if !result_count.is_null() {
                     unsafe { *result_count = 1 };
@@ -1827,11 +1836,13 @@ pub unsafe extern "C-unwind" fn lua_resume(
             }
         }
     }
-    let outcome = unsafe { state.runtime() }.resume_coroutine_outcome(&thread, args);
+    let runtime = unsafe { state.runtime() };
+    let outcome = runtime.resume_coroutine_outcome(&thread, args);
+    let heap = runtime.canonical_heap.clone();
     let (status, values) = match outcome {
         sol_core::CallOutcome::Returned(values) => (LUA_OK, values),
         sol_core::CallOutcome::Yielded(values) => (LUA_YIELD, values),
-        sol_core::CallOutcome::Raised(error) => (LUA_ERRRUN, vec![error.into_lua_value()]),
+        sol_core::CallOutcome::Raised(error) => (LUA_ERRRUN, vec![error.into_lua_value(&heap)]),
         sol_core::CallOutcome::TailCall(_) => {
             unreachable!("the coroutine trampoline consumes tail calls")
         }
@@ -1895,9 +1906,10 @@ pub unsafe extern "C-unwind" fn lua_gc(state: *mut lua_State, what: c_int) -> c_
         8 => b"incremental",
         _ => return -1,
     };
+    let option = unsafe { state.runtime() }.intern_str(option);
     match unsafe { state.runtime() }.call_native(
         NativeFunction::CollectGarbage,
-        vec![LuaValue::String(Rc::new(option.to_vec()))],
+        vec![LuaValue::String(option)],
     ) {
         Ok(values) => match values.first() {
             Some(LuaValue::Integer(value)) => *value as c_int,

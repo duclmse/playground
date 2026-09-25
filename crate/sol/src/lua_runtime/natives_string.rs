@@ -59,24 +59,24 @@ impl LuaRuntime {
                     bytes.push(byte);
                 }
                 self.charge_allocation(bytes.len())?;
-                Ok(vec![LuaValue::String(Rc::new(bytes))])
+                Ok(vec![LuaValue::String(self.fresh_str(bytes))])
             }
-            NativeFunction::StringLower => Ok(vec![LuaValue::String(Rc::new(
+            NativeFunction::StringLower => Ok(vec![LuaValue::String(self.fresh_str(
                 self.string(&required(0)?)?
                     .iter()
                     .map(u8::to_ascii_lowercase)
-                    .collect(),
+                    .collect::<Vec<u8>>(),
             ))]),
-            NativeFunction::StringUpper => Ok(vec![LuaValue::String(Rc::new(
+            NativeFunction::StringUpper => Ok(vec![LuaValue::String(self.fresh_str(
                 self.string(&required(0)?)?
                     .iter()
                     .map(u8::to_ascii_uppercase)
-                    .collect(),
+                    .collect::<Vec<u8>>(),
             ))]),
             NativeFunction::StringReverse => {
                 let mut value = self.string(&required(0)?)?.to_vec();
                 value.reverse();
-                Ok(vec![LuaValue::String(Rc::new(value))])
+                Ok(vec![LuaValue::String(self.fresh_str(value))])
             }
             NativeFunction::StringRep => {
                 let value = self.string(&required(0)?)?.to_vec();
@@ -87,7 +87,7 @@ impl LuaRuntime {
                     .transpose()?
                     .unwrap_or_default();
                 if count <= 0 {
-                    return Ok(vec![LuaValue::String(Rc::new(Vec::new()))]);
+                    return Ok(vec![LuaValue::String(self.intern_str(Vec::new()))]);
                 }
                 let count = count as usize;
                 // A huge `count` (e.g. `math.maxinteger`) must raise a Lua
@@ -115,7 +115,7 @@ impl LuaRuntime {
                     }
                     output.extend(&value);
                 }
-                Ok(vec![LuaValue::String(Rc::new(output))])
+                Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::StringDump => {
                 // The body is still a same-process handle (see
@@ -165,7 +165,7 @@ impl LuaRuntime {
                 bytes.extend_from_slice(&(key as u64).to_le_bytes());
                 bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(&payload);
-                Ok(vec![LuaValue::String(Rc::new(bytes))])
+                Ok(vec![LuaValue::String(self.fresh_str(bytes))])
             }
             NativeFunction::StringSub => {
                 let input = required(0)?;
@@ -179,7 +179,7 @@ impl LuaRuntime {
                 let bytes = byte_range(start, end, value.len())
                     .map(|(start, end)| value[start..=end].to_vec())
                     .unwrap_or_default();
-                Ok(vec![LuaValue::String(Rc::new(bytes))])
+                Ok(vec![LuaValue::String(self.fresh_str(bytes))])
             }
             NativeFunction::StringFind => {
                 let input = required(0)?;
@@ -249,7 +249,7 @@ impl LuaRuntime {
                 let source_value = required(0)?;
                 let source = match source_value {
                     LuaValue::String(source) => source,
-                    value => Rc::new(self.string(&value)?.to_vec()),
+                    value => self.fresh_str(self.string(&value)?),
                 };
                 let pattern = self.string(&required(1)?)?.to_vec();
                 let repl = required(2)?;
@@ -330,7 +330,7 @@ impl LuaRuntime {
                     output.extend(self.format_one(&spec, conversion, value)?);
                 }
                 self.charge_allocation(output.len())?;
-                Ok(vec![LuaValue::String(Rc::new(output))])
+                Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::StringPack => {
                 let format = self.string(&required(0)?)?.to_vec();
@@ -351,7 +351,7 @@ impl LuaRuntime {
                         LuaValue::Integer(n) => crate::lua_pack::PackValue::Int(*n),
                         LuaValue::Float(n) => crate::lua_pack::PackValue::Num(*n),
                         LuaValue::String(bytes) => {
-                            crate::lua_pack::PackValue::Str(bytes.as_ref().clone())
+                            crate::lua_pack::PackValue::Str(bytes.as_bytes().to_vec())
                         }
                         other => {
                             return Err(LuaError::new(format!(
@@ -363,7 +363,7 @@ impl LuaRuntime {
                 }
                 let packed = crate::lua_pack::pack(&format, &values).map_err(LuaError::new)?;
                 self.charge_allocation(packed.len())?;
-                Ok(vec![LuaValue::String(Rc::new(packed))])
+                Ok(vec![LuaValue::String(self.fresh_str(packed))])
             }
             NativeFunction::StringUnpack => {
                 let format = self.string(&required(0)?)?.to_vec();
@@ -392,7 +392,7 @@ impl LuaRuntime {
                     .map(|value| match value {
                         crate::lua_pack::PackValue::Int(n) => LuaValue::Integer(n),
                         crate::lua_pack::PackValue::Num(n) => LuaValue::Float(n),
-                        crate::lua_pack::PackValue::Str(bytes) => LuaValue::String(Rc::new(bytes)),
+                        crate::lua_pack::PackValue::Str(bytes) => LuaValue::String(self.fresh_str(bytes)),
                     })
                     .collect();
                 results.push(LuaValue::Integer(next as i64 + 1));
@@ -444,7 +444,7 @@ impl LuaRuntime {
     ) -> Vec<LuaValue> {
         if captures.is_empty() {
             if whole_if_empty {
-                vec![LuaValue::String(Rc::new(source[whole.0..whole.1].to_vec()))]
+                vec![LuaValue::String(self.fresh_str(source[whole.0..whole.1].to_vec()))]
             } else {
                 Vec::new()
             }
@@ -453,7 +453,7 @@ impl LuaRuntime {
                 .iter()
                 .map(|capture| match capture {
                     crate::lua_pattern::Capture::Str(start, end) => {
-                        LuaValue::String(Rc::new(source[*start..*end].to_vec()))
+                        LuaValue::String(self.fresh_str(source[*start..*end].to_vec()))
                     }
                     crate::lua_pattern::Capture::Position(position) => {
                         LuaValue::Integer(*position as i64)
@@ -472,7 +472,7 @@ impl LuaRuntime {
         let whole = source[m.start..m.end].to_vec();
         match repl {
             LuaValue::String(template) => {
-                expand_gsub_template(template, source, &whole, &m.captures)
+                expand_gsub_template(template.as_bytes(), source, &whole, &m.captures)
             }
             LuaValue::Integer(_) | LuaValue::Float(_) => {
                 expand_gsub_template(&repl.display_bytes(), source, &whole, &m.captures)
@@ -514,53 +514,54 @@ impl LuaRuntime {
 
     pub(super) fn gsub_run_sync(
         &mut self,
-        source: Rc<Vec<u8>>,
+        source: CanonicalString,
         body: &[u8],
         anchored: bool,
         max: usize,
         repl: &LuaValue,
     ) -> LuaResult<(LuaValue, usize)> {
+        let source_bytes = source.as_bytes();
         let mut output = Vec::new();
         let mut count = 0usize;
         let mut pos = 0usize;
         let mut last_match_end = None;
         while count < max {
-            match crate::lua_pattern::match_at(&source, body, pos).map_err(LuaError::new)? {
+            match crate::lua_pattern::match_at(source_bytes, body, pos).map_err(LuaError::new)? {
                 Some(m) if Some(m.end) != last_match_end => {
                     count += 1;
                     last_match_end = Some(m.end);
-                    let replacement = self.gsub_replacement(&source, &m, repl)?;
+                    let replacement = self.gsub_replacement(source_bytes, &m, repl)?;
                     self.charge_allocation(replacement.len())?;
                     output.extend_from_slice(&replacement);
                     if m.end > pos {
                         pos = m.end;
                     } else {
-                        if pos < source.len() {
-                            output.push(source[pos]);
+                        if pos < source_bytes.len() {
+                            output.push(source_bytes[pos]);
                         }
                         pos += 1;
                     }
                 }
                 Some(_) | None => {
-                    if pos < source.len() {
-                        output.push(source[pos]);
+                    if pos < source_bytes.len() {
+                        output.push(source_bytes[pos]);
                         pos += 1;
                     } else {
                         break;
                     }
                 }
             }
-            if anchored || pos > source.len() {
+            if anchored || pos > source_bytes.len() {
                 break;
             }
         }
-        if pos < source.len() {
-            output.extend_from_slice(&source[pos..]);
+        if pos < source_bytes.len() {
+            output.extend_from_slice(&source_bytes[pos..]);
         }
         let output = if count == 0 {
             LuaValue::String(source)
         } else {
-            LuaValue::String(Rc::new(output))
+            LuaValue::String(self.fresh_str(output))
         };
         Ok((output, count))
     }
@@ -580,14 +581,18 @@ impl LuaRuntime {
             }
         }
         while state.count < state.max {
-            match crate::lua_pattern::match_at(&state.source, &state.body, state.pos)
+            match crate::lua_pattern::match_at(state.source.as_bytes(), &state.body, state.pos)
                 .map_err(LuaError::new)?
             {
                 Some(m) if Some(m.end) != state.last_match_end => {
                     state.count += 1;
                     state.last_match_end = Some(m.end);
-                    let replacement_args =
-                        self.capture_values(&state.source, (m.start, m.end), &m.captures, true);
+                    let replacement_args = self.capture_values(
+                        state.source.as_bytes(),
+                        (m.start, m.end),
+                        &m.captures,
+                        true,
+                    );
                     if matches!(state.repl, LuaValue::Table(_)) {
                         let key = replacement_args.into_iter().next().unwrap_or(LuaValue::Nil);
                         match self.index_resolve(state.repl.clone(), key)? {
@@ -617,7 +622,7 @@ impl LuaRuntime {
                 }
                 Some(_) | None => {
                     if state.pos < state.source.len() {
-                        state.output.push(state.source[state.pos]);
+                        state.output.push(state.source.as_bytes()[state.pos]);
                         state.pos += 1;
                     } else {
                         break;
@@ -629,7 +634,9 @@ impl LuaRuntime {
             }
         }
         if state.pos < state.source.len() {
-            state.output.extend_from_slice(&state.source[state.pos..]);
+            state
+                .output
+                .extend_from_slice(&state.source.as_bytes()[state.pos..]);
         }
         Ok(self.finish_gsub(state))
     }
@@ -642,20 +649,22 @@ impl LuaRuntime {
         value: LuaValue,
     ) -> LuaResult<Option<GsubOutcome>> {
         state.changed |= !matches!(value, LuaValue::Nil | LuaValue::Bool(false));
-        let replacement = gsub_result_value(value, &state.source[start..end])?;
+        let replacement = gsub_result_value(value, &state.source.as_bytes()[start..end])?;
         self.charge_allocation(replacement.len())?;
         state.output.extend_from_slice(&replacement);
         if end > state.pos {
             state.pos = end;
         } else {
             if state.pos < state.source.len() {
-                state.output.push(state.source[state.pos]);
+                state.output.push(state.source.as_bytes()[state.pos]);
             }
             state.pos += 1;
         }
         if state.anchored || state.pos > state.source.len() {
             if state.pos < state.source.len() {
-                state.output.extend_from_slice(&state.source[state.pos..]);
+                state
+                    .output
+                    .extend_from_slice(&state.source.as_bytes()[state.pos..]);
             }
             return Ok(Some(self.finish_gsub(state)));
         }
@@ -664,7 +673,7 @@ impl LuaRuntime {
 
     fn finish_gsub(&self, state: &mut GsubState) -> GsubOutcome {
         let output = if state.changed {
-            LuaValue::String(Rc::new(std::mem::take(&mut state.output)))
+            LuaValue::String(self.fresh_str(std::mem::take(&mut state.output)))
         } else {
             LuaValue::String(state.source.clone())
         };
@@ -821,7 +830,7 @@ impl LuaRuntime {
                 space,
             ),
             b's' => {
-                if matches!(&value, LuaValue::String(bytes) if bytes.contains(&0))
+                if matches!(&value, LuaValue::String(bytes) if bytes.as_bytes().contains(&0))
                     && (width.is_some() || precision.is_some())
                 {
                     return Err(LuaError::new("string contains zeros"));

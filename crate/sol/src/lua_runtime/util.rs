@@ -78,13 +78,13 @@ pub(super) fn name_const(proto: &Proto, index: u32) -> Rc<Vec<u8>> {
     }
 }
 
-pub(super) fn const_to_value(value: &Const) -> LuaValue {
+pub(super) fn const_to_value(heap: &RcRef<sol_core::Heap>, value: &Const) -> LuaValue {
     match value {
         Const::Nil => LuaValue::Nil,
         Const::Bool(value) => LuaValue::Bool(*value),
         Const::Integer(value) => LuaValue::Integer(*value),
         Const::Float(value) => LuaValue::Float(*value),
-        Const::Str(value) => LuaValue::String(value.clone()),
+        Const::Str(value) => LuaValue::String(CanonicalString::intern(heap.clone(), value.as_slice())),
     }
 }
 
@@ -194,7 +194,7 @@ pub(super) fn coerce_number(value: &LuaValue) -> LuaResult<Number> {
         LuaValue::Integer(value) => Ok(Number::Integer(*value)),
         LuaValue::Float(value) => Ok(Number::Float(*value)),
         LuaValue::String(value) => {
-            parse_lua_number(value).ok_or_else(|| LuaError::new("number expected"))
+            parse_lua_number(value.as_bytes()).ok_or_else(|| LuaError::new("number expected"))
         }
         _ => Err(LuaError::new("number expected")),
     }

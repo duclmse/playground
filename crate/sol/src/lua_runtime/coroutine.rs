@@ -341,7 +341,8 @@ impl LuaRuntime {
             }
             DriveOutcome::Raised(error) => {
                 co.status.set(CoroutineStatus::Dead);
-                *co.dead_error.borrow_mut() = Some(error.clone().into_lua_value());
+                *co.dead_error.borrow_mut() =
+                    Some(error.clone().into_lua_value(&self.canonical_heap));
                 Err(error)
             }
             DriveOutcome::TailCall(_) => {

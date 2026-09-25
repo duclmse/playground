@@ -77,19 +77,37 @@ fn c_callback_is_callable_from_loaded_lua() {
 fn userdata_storage_is_canonical_and_precisely_rooted() {
     unsafe {
         let state = luaL_newstate();
-        let bytes = lua_newuserdatauv(state, 16, 0).cast::<u8>();
-        assert!(!bytes.is_null());
-        *bytes.add(15) = 99;
-        assert_eq!(lua_touserdata(state, -1).cast::<u8>().add(15).read(), 99);
         let state_ref = &mut *state;
-        assert_eq!((&*state_ref.runtime).canonical_heap.borrow().len(), 2);
-        lua_settop(state, 0);
-        assert_eq!((&*state_ref.runtime).canonical_heap.borrow().len(), 2);
+        // Native-library setup interns many rooted strings (function names,
+        // table keys) into the same canonical heap, so the live-object count
+        // right after `luaL_newstate()` is a large, version-dependent
+        // baseline rather than a small fixed number, and it isn't collected
+        // yet, so it may still include transient garbage from init. Collect
+        // once up front to get a clean baseline, then assert this test's
+        // userdata allocation/collection behavior as a *delta* against it.
         (&mut *state_ref.runtime)
             .canonical_heap
             .borrow_mut()
             .collect_major();
-        assert_eq!((&*state_ref.runtime).canonical_heap.borrow().len(), 1);
+        let baseline = (&*state_ref.runtime).canonical_heap.borrow().len();
+        let bytes = lua_newuserdatauv(state, 16, 0).cast::<u8>();
+        assert!(!bytes.is_null());
+        *bytes.add(15) = 99;
+        assert_eq!(lua_touserdata(state, -1).cast::<u8>().add(15).read(), 99);
+        assert_eq!(
+            (&*state_ref.runtime).canonical_heap.borrow().len(),
+            baseline + 1
+        );
+        lua_settop(state, 0);
+        assert_eq!(
+            (&*state_ref.runtime).canonical_heap.borrow().len(),
+            baseline + 1
+        );
+        (&mut *state_ref.runtime)
+            .canonical_heap
+            .borrow_mut()
+            .collect_major();
+        assert_eq!((&*state_ref.runtime).canonical_heap.borrow().len(), baseline);
         lua_close(state);
     }
 }

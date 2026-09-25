@@ -656,14 +656,20 @@ describe outstanding object-migration work: `LuaValue::Userdata` is already
 `CanonicalUserdata`, a precisely-rooted `sol_core::ObjectId` handle with no
 other representation left to migrate, and "dynamic libraries" names
 `package.loadlib`'s raw `dlopen` handles (`c_api::NativeLibrary`), which carry
-no `LuaValue`/GC identity at all and were never owned by either collector. The
-genuinely remaining, dependency-ordered work is tables (including metatables;
-the production global environment is just a table and needs no separate step),
-then closures, then coroutine frames — each still `Rc`-owned
-(`lua_runtime::value::LuaTable`/`LuaClosure`, `lua_runtime::coroutine::LuaCoroutine`)
-and depending on the one before it, since closures capture table-holding values
-and frames hold both. See
-[canonical-runtime-foundation.md](canonical-runtime-foundation.md).
+no `LuaValue`/GC identity at all and were never owned by either collector.
+Strings have since migrated too: `LuaValue::String`/`LuaKey::String` now hold
+a `CanonicalString` handle into `sol_core::Heap` instead of `Rc<Vec<u8>>`.
+Strings are a leaf value with no outgoing references, so this slice landed
+independently, ahead of the rest. The genuinely remaining work is tables
+(including metatables; the production global environment is just a table and
+needs no separate step), closures, and coroutine frames — each still
+`Rc`-owned (`lua_runtime::value::LuaTable`/`LuaClosure`,
+`lua_runtime::coroutine::LuaCoroutine`). Unlike strings, these three cannot
+migrate one at a time: closures capture table-holding values and coroutine
+frames hold both, so they must land together in one combined cutover rather
+than in dependency order — there is no intermediate state where only one of
+the three is canonical while the others still hold `Rc` references into it.
+See [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
 ### U3 — Unified bytecode, frames, and semantic call ABI — **completed 2026-09-16**
 

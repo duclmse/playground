@@ -300,6 +300,11 @@ impl Default for Heap {
 }
 
 impl Heap {
+    /// Real Lua's `LUAI_MAXSHORTLEN`: strings at or under this length are
+    /// always interned, regardless of whether they're a compile-time
+    /// literal or a runtime computation.
+    const MAX_SHORT_STRING_LEN: usize = 40;
+
     pub fn new(capabilities: Capabilities) -> Self {
         Self {
             slots: Vec::new(),
@@ -375,6 +380,27 @@ impl Heap {
         let id = self.alloc(HeapObject::String(owned.clone()));
         self.interned_strings.insert(owned, id);
         id
+    }
+
+    /// Allocates a string object the way a runtime computation (string
+    /// concatenation, a library call's result, ...) should: real Lua always
+    /// interns short strings (`LUAI_MAXSHORTLEN`, 40 bytes) regardless of
+    /// where they come from, so bytes at or under that length still
+    /// deduplicate against an existing equal-content string here. Past that
+    /// length, real Lua never interns, so every call allocates a distinct
+    /// `ObjectId`, even for bytes equal to an already interned or previously
+    /// fresh-allocated long string — a long runtime-computed string that
+    /// happens to equal an existing string's bytes must still compare
+    /// unequal by identity. Use `alloc_string` instead for values that
+    /// should always alias existing equal-content strings regardless of
+    /// length (e.g. compile-time literal constants); use this for
+    /// everything computed at run time.
+    pub fn alloc_string_fresh(&mut self, bytes: impl AsRef<[u8]>) -> ObjectId {
+        let bytes = bytes.as_ref();
+        if bytes.len() <= Self::MAX_SHORT_STRING_LEN {
+            return self.alloc_string(bytes);
+        }
+        self.alloc(HeapObject::String(bytes.to_vec()))
     }
 
     pub fn alloc_table(&mut self) -> ObjectId {

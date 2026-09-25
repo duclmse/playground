@@ -48,7 +48,10 @@ impl LuaRuntime {
                         results.append(&mut values);
                         Ok(results)
                     }
-                    Err(error) => Ok(vec![LuaValue::Bool(false), error.into_lua_value()]),
+                    Err(error) => Ok(vec![
+                        LuaValue::Bool(false),
+                        error.into_lua_value(&self.canonical_heap),
+                    ]),
                 }
             }
             NativeFunction::CoroutineYield => {
@@ -69,7 +72,7 @@ impl LuaRuntime {
             }
             NativeFunction::CoroutineStatus => {
                 let co = Self::expect_coroutine(&required(0)?)?;
-                Ok(vec![LuaValue::String(Rc::new(
+                Ok(vec![LuaValue::String(self.intern_str(
                     co.status.get().as_str().as_bytes().to_vec(),
                 ))])
             }
@@ -195,7 +198,10 @@ impl LuaRuntime {
                         self.call_depth -= co.depth_charged.take();
                         co.status.set(CoroutineStatus::Dead);
                         match error {
-                            Some(e) => Ok(vec![LuaValue::Bool(false), e.into_lua_value()]),
+                            Some(e) => Ok(vec![
+                                LuaValue::Bool(false),
+                                e.into_lua_value(&self.canonical_heap),
+                            ]),
                             None => Ok(vec![LuaValue::Bool(true)]),
                         }
                     }

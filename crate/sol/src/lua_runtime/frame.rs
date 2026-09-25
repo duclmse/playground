@@ -289,7 +289,7 @@ pub(super) enum SortOutcome {
 /// resuming with its result, since the original loop had no need to
 /// remember that across a (previously synchronous) call.
 pub(super) struct GsubState {
-    pub(super) source: Rc<Vec<u8>>,
+    pub(super) source: CanonicalString,
     pub(super) body: Vec<u8>,
     pub(super) anchored: bool,
     pub(super) max: usize,

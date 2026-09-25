@@ -60,28 +60,28 @@ impl LuaRuntime {
                     Some(value) => self.string(value)?.to_vec(),
                 };
                 match self.search_path_candidates(&name, &path, &sep, &dirsep) {
-                    Ok(found) => Ok(vec![LuaValue::String(Rc::new(found))]),
-                    Err(message) => Ok(vec![LuaValue::Nil, LuaValue::String(Rc::new(message))]),
+                    Ok(found) => Ok(vec![LuaValue::String(self.fresh_str(found))]),
+                    Err(message) => Ok(vec![LuaValue::Nil, LuaValue::String(self.fresh_str(message))]),
                 }
             }
             NativeFunction::PackageSearcherPreload => {
                 let name = self.string(&required(0)?)?.to_vec();
-                let key = LuaValue::String(Rc::new(name.clone()));
-                let preload_key = LuaValue::String(Rc::new(b"preload".to_vec()));
+                let key = LuaValue::String(self.intern_str(name.clone()));
+                let preload_key = LuaValue::String(self.intern_str(b"preload".to_vec()));
                 let preload = self.package_table.borrow().get(&preload_key)?;
                 if let LuaValue::Table(preload_table) = preload {
                     let loader = preload_table.borrow().get(&key)?;
                     if loader != LuaValue::Nil {
                         return Ok(vec![
                             loader,
-                            LuaValue::String(Rc::new(b":preload:".to_vec())),
+                            LuaValue::String(self.intern_str(b":preload:".to_vec())),
                         ]);
                     }
                 }
                 let mut message = b"\n\tno field package.preload['".to_vec();
                 message.extend_from_slice(&name);
                 message.extend_from_slice(b"']");
-                Ok(vec![LuaValue::String(Rc::new(message))])
+                Ok(vec![LuaValue::String(self.fresh_str(message))])
             }
             NativeFunction::PackageSearcherLua => {
                 let name = self.string(&required(0)?)?.to_vec();
@@ -103,9 +103,9 @@ impl LuaRuntime {
                                 error
                             ))
                         })?;
-                        Ok(vec![closure, LuaValue::String(Rc::new(filename))])
+                        Ok(vec![closure, LuaValue::String(self.fresh_str(filename))])
                     }
-                    Err(message) => Ok(vec![LuaValue::String(Rc::new(message))]),
+                    Err(message) => Ok(vec![LuaValue::String(self.fresh_str(message))]),
                 }
             }
             NativeFunction::PackageSearcherC => {
@@ -125,8 +125,8 @@ impl LuaRuntime {
                 if !self.capabilities.native_modules {
                     return Ok(vec![
                         LuaValue::Nil,
-                        LuaValue::String(Rc::new(b"native module capability is disabled".to_vec())),
-                        LuaValue::String(Rc::new(b"absent".to_vec())),
+                        LuaValue::String(self.intern_str(b"native module capability is disabled".to_vec())),
+                        LuaValue::String(self.intern_str(b"absent".to_vec())),
                     ]);
                 }
                 if symbol == b"*" {
@@ -137,8 +137,8 @@ impl LuaRuntime {
                         }
                         Err(error) => Ok(vec![
                             LuaValue::Nil,
-                            LuaValue::String(Rc::new(error.into_bytes())),
-                            LuaValue::String(Rc::new(b"open".to_vec())),
+                            LuaValue::String(self.fresh_str(error.into_bytes())),
+                            LuaValue::String(self.intern_str(b"open".to_vec())),
                         ]),
                     };
                 }
@@ -154,8 +154,8 @@ impl LuaRuntime {
                     }
                     Err(error) => Ok(vec![
                         LuaValue::Nil,
-                        LuaValue::String(Rc::new(error.into_bytes())),
-                        LuaValue::String(Rc::new(
+                        LuaValue::String(self.fresh_str(error.into_bytes())),
+                        LuaValue::String(self.intern_str(
                             if bytes_to_path(&path).is_some_and(|path| path.exists()) {
                                 b"init".to_vec()
                             } else {
@@ -185,7 +185,7 @@ impl LuaRuntime {
                 // `bad argument #1 to '<name>'` convention used elsewhere in
                 // this dispatch, e.g. `coroutine.create`).
                 let source: Vec<u8> = match &chunk_arg {
-                    LuaValue::String(bytes) => bytes.as_ref().clone(),
+                    LuaValue::String(bytes) => bytes.as_bytes().to_vec(),
                     LuaValue::Integer(_) | LuaValue::Float(_) => chunk_arg.display_bytes(),
                     LuaValue::Closure(_)
                     | LuaValue::NativeFunction(_)
@@ -212,7 +212,10 @@ impl LuaRuntime {
                             let mut results = match self.call(chunk_arg.clone(), Vec::new()) {
                                 Ok(results) => results,
                                 Err(error) => {
-                                    return Ok(vec![LuaValue::Nil, error.into_lua_value()]);
+                                    return Ok(vec![
+                                        LuaValue::Nil,
+                                        error.into_lua_value(&self.canonical_heap),
+                                    ]);
                                 }
                             };
                             let piece = if results.is_empty() {
@@ -226,7 +229,7 @@ impl LuaRuntime {
                                     if bytes.is_empty() {
                                         break;
                                     }
-                                    buffer.extend_from_slice(&bytes);
+                                    buffer.extend_from_slice(bytes.as_bytes());
                                 }
                                 LuaValue::Integer(_) | LuaValue::Float(_) => {
                                     buffer.extend_from_slice(&piece.display_bytes());
@@ -234,7 +237,7 @@ impl LuaRuntime {
                                 _ => {
                                     return Ok(vec![
                                         LuaValue::Nil,
-                                        LuaValue::String(Rc::new(
+                                        LuaValue::String(self.intern_str(
                                             b"reader function must return a string".to_vec(),
                                         )),
                                     ]);
@@ -258,7 +261,7 @@ impl LuaRuntime {
                 // `debug.getinfo(...).source` reports later - no `@`/`=`
                 // prefix is added implicitly here.
                 let chunkname: Vec<u8> = match args.get(1) {
-                    Some(LuaValue::String(bytes)) => bytes.as_ref().clone(),
+                    Some(LuaValue::String(bytes)) => bytes.as_bytes().to_vec(),
                     Some(value @ (LuaValue::Integer(_) | LuaValue::Float(_))) => {
                         value.display_bytes()
                     }
@@ -277,7 +280,7 @@ impl LuaRuntime {
                 // `LUA_SIGNATURE[0]` - see `string.dump`/`dumped_protos`) is
                 // accepted, independent of `load`'s other checks.
                 let mode: Vec<u8> = match args.get(2) {
-                    Some(LuaValue::String(bytes)) => bytes.as_ref().clone(),
+                    Some(LuaValue::String(bytes)) => bytes.as_bytes().to_vec(),
                     Some(LuaValue::Nil) | None => b"bt".to_vec(),
                     Some(value) => value.display_bytes(),
                 };
@@ -293,7 +296,7 @@ impl LuaRuntime {
                     message.extend_from_slice(b" chunk (mode is '");
                     message.extend_from_slice(&mode);
                     message.extend_from_slice(b"')");
-                    return Ok(vec![LuaValue::Nil, LuaValue::String(Rc::new(message))]);
+                    return Ok(vec![LuaValue::Nil, LuaValue::String(self.fresh_str(message))]);
                 }
                 let result = if is_binary_chunk {
                     self.load_binary_chunk(&source, env, Some(Rc::new(chunkname)))
@@ -309,7 +312,7 @@ impl LuaRuntime {
                     Ok(closure) => Ok(vec![closure]),
                     Err(error) => Ok(vec![
                         LuaValue::Nil,
-                        LuaValue::String(Rc::new(error.into_bytes())),
+                        LuaValue::String(self.fresh_str(error.into_bytes())),
                     ]),
                 }
             }
@@ -398,7 +401,7 @@ impl LuaRuntime {
         };
         let program = crate::parser::parse_lua(tokens).map_err(&format_error)?;
         let chunk_globals = match env {
-            Some(value) => Globals::from_value(value),
+            Some(value) => Globals::from_value(self.canonical_heap.clone(), value),
             None => self.globals.snapshot_for_load(),
         };
         let mut main_function: Option<Function> = None;
@@ -501,7 +504,7 @@ impl LuaRuntime {
             self.register_chunk_source(&proto, chunkname);
         }
         let chunk_globals = match env {
-            Some(value) => Globals::from_value(value),
+            Some(value) => Globals::from_value(self.canonical_heap.clone(), value),
             None => self.globals.snapshot_for_load(),
         };
         self.charge_allocation(std::mem::size_of::<LuaClosure>())
@@ -530,7 +533,7 @@ impl LuaRuntime {
 
     fn require(&mut self, name: LuaValue) -> LuaResult<Vec<LuaValue>> {
         let name = self.string(&name)?.to_vec();
-        let key = LuaValue::String(Rc::new(name.clone()));
+        let key = LuaValue::String(self.intern_str(name.clone()));
         let loaded = self.package_loaded.borrow().get(&key)?;
         // Real Lua's `require` treats `package.loaded[name]` as "already
         // loaded" only when it is truthy (`lua_toboolean`), not merely
@@ -568,7 +571,7 @@ impl LuaRuntime {
                     .map_err(LuaError::new)?;
             let base = self.globals.clone();
             let module = Globals::module(&base);
-            module.define("_NAME", LuaValue::String(Rc::new(name.clone())), true);
+            module.define("_NAME", LuaValue::String(self.intern_str(name.clone())), true);
             self.run_in_globals(&program, &module, &HashSet::new(), &HashMap::new())
         })();
         self.loading_modules.remove(&name);
@@ -587,7 +590,7 @@ impl LuaRuntime {
     }
 
     fn require_search(&mut self, name: Vec<u8>, key: LuaValue) -> LuaResult<Vec<LuaValue>> {
-        let searchers_key = LuaValue::String(Rc::new(b"searchers".to_vec()));
+        let searchers_key = LuaValue::String(self.intern_str(b"searchers".to_vec()));
         let searchers = self.package_table.borrow().get(&searchers_key)?;
         let LuaValue::Table(searchers) = searchers else {
             return Err(LuaError::new("'package.searchers' must be a table"));
@@ -599,13 +602,13 @@ impl LuaRuntime {
             if searcher == LuaValue::Nil {
                 break;
             }
-            let results = self.call(searcher, vec![LuaValue::String(Rc::new(name.clone()))])?;
+            let results = self.call(searcher, vec![LuaValue::String(self.intern_str(name.clone()))])?;
             match results.first() {
                 Some(loader) if loader.is_callable() => {
                     let extra = results.get(1).cloned().unwrap_or(LuaValue::Nil);
                     return self.require_call_loader(name, key, loader.clone(), extra);
                 }
-                Some(LuaValue::String(message)) => errors.extend_from_slice(message),
+                Some(LuaValue::String(message)) => errors.extend_from_slice(message.as_bytes()),
                 _ => {}
             }
             index += 1;
@@ -625,7 +628,7 @@ impl LuaRuntime {
     ) -> LuaResult<Vec<LuaValue>> {
         let filename = match self.require_search_field(path_name, b"cpath")? {
             Ok(filename) => filename,
-            Err(message) => return Ok(vec![LuaValue::String(Rc::new(message))]),
+            Err(message) => return Ok(vec![LuaValue::String(self.fresh_str(message))]),
         };
         if !self.capabilities.native_modules {
             return Err(LuaError::new("native module capability is disabled"));
@@ -657,7 +660,7 @@ impl LuaRuntime {
                 callable,
                 Vec::new(),
             )),
-            LuaValue::String(Rc::new(filename)),
+            LuaValue::String(self.fresh_str(filename)),
         ])
     }
 
@@ -666,7 +669,7 @@ impl LuaRuntime {
         name: &[u8],
         field: &[u8],
     ) -> LuaResult<Result<Vec<u8>, Vec<u8>>> {
-        let field_key = LuaValue::String(Rc::new(field.to_vec()));
+        let field_key = LuaValue::String(self.intern_str(field.to_vec()));
         let value = self.package_table.borrow().get(&field_key)?;
         let path = match value {
             LuaValue::String(bytes) => bytes,
@@ -678,7 +681,7 @@ impl LuaRuntime {
             }
         };
         let dirsep = default_dirsep();
-        Ok(self.search_path_candidates(name, &path, b".", &dirsep))
+        Ok(self.search_path_candidates(name, path.as_bytes(), b".", &dirsep))
     }
 
     fn require_call_loader(
@@ -688,7 +691,7 @@ impl LuaRuntime {
         loader: LuaValue,
         extra: LuaValue,
     ) -> LuaResult<Vec<LuaValue>> {
-        let mut values = self.call(loader, vec![LuaValue::String(Rc::new(name)), extra.clone()])?;
+        let mut values = self.call(loader, vec![LuaValue::String(self.intern_str(name)), extra.clone()])?;
         let returned = values.drain(..).next().unwrap_or(LuaValue::Nil);
         if returned != LuaValue::Nil {
             self.package_loaded

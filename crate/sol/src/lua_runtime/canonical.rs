@@ -72,7 +72,7 @@ impl CanonicalAdapter {
             LuaValue::Bool(value) => Ok(Value::boolean(*value)),
             LuaValue::Integer(value) => Ok(Value::integer(*value)),
             LuaValue::Float(value) => Ok(Value::float(*value)),
-            LuaValue::String(value) => Ok(Value::object(heap.alloc_string(value.as_slice()))),
+            LuaValue::String(value) => Ok(Value::object(heap.alloc_string(value.as_bytes()))),
             LuaValue::Table(table) => self.import_table(heap, table),
             LuaValue::CanonicalTable(table) => {
                 let object = table.object_id();
@@ -513,15 +513,17 @@ mod tests {
 
     use sol_core::Capabilities;
 
+    use super::super::CanonicalString;
     use super::*;
 
     #[test]
     fn table_cycles_and_repeated_references_keep_one_canonical_identity() {
+        let string_heap = Rc::new(RefCell::new(Heap::new(Capabilities::SANDBOX)));
         let table = Rc::new(RefCell::new(LuaTable::default()));
         table
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"self".to_vec())),
+                LuaValue::String(CanonicalString::intern(string_heap, "self")),
                 LuaValue::Table(table.clone()),
             )
             .unwrap();

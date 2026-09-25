@@ -88,7 +88,7 @@ impl LuaRuntime {
                         .get(index)
                         .map(|value| value.borrow().clone())
                         .unwrap_or(LuaValue::Nil);
-                    return Ok(vec![LuaValue::String(Rc::new(name.to_vec())), value]);
+                    return Ok(vec![LuaValue::String(self.intern_str(name.to_vec())), value]);
                 }
                 // The current bytecode keeps its implicit `_ENV` in the
                 // shared `Globals` scope rather than in `LuaClosure.upvals`.
@@ -97,7 +97,7 @@ impl LuaRuntime {
                 // compiler migrates to a physical implicit capture.
                 if index == closure.proto.upvals.len() && has_implicit_environment(&closure.proto) {
                     Ok(vec![
-                        LuaValue::String(Rc::new(b"_ENV".to_vec())),
+                        LuaValue::String(self.intern_str(b"_ENV".to_vec())),
                         closure.globals.as_value(),
                     ])
                 } else {
@@ -208,7 +208,7 @@ impl LuaRuntime {
                         .get(index)
                         .map(String::as_bytes)
                         .unwrap_or(b"?");
-                    Ok(vec![LuaValue::String(Rc::new(name.to_vec()))])
+                    Ok(vec![LuaValue::String(self.intern_str(name.to_vec()))])
                 } else if index == closure.proto.upvals.len()
                     && has_implicit_environment(&closure.proto)
                 {
@@ -216,7 +216,7 @@ impl LuaRuntime {
                     // shared scope cell during the transition. It is already
                     // the caller's default environment in the only binary
                     // chunk shape this compatibility path exposes.
-                    Ok(vec![LuaValue::String(Rc::new(b"_ENV".to_vec()))])
+                    Ok(vec![LuaValue::String(self.intern_str(b"_ENV".to_vec()))])
                 } else {
                     Ok(vec![LuaValue::Nil])
                 }
@@ -275,7 +275,7 @@ impl LuaRuntime {
                 let info = Rc::new(RefCell::new(LuaTable::default()));
                 let mut set = |key: &[u8], value: LuaValue| {
                     info.borrow_mut()
-                        .set(LuaValue::String(Rc::new(key.to_vec())), value)
+                        .set(LuaValue::String(self.intern_str(key.to_vec())), value)
                         .unwrap();
                 };
                 match &arg0 {
@@ -300,7 +300,7 @@ impl LuaRuntime {
                     LuaValue::NativeFunction(_)
                     | LuaValue::Native(_)
                     | LuaValue::RegisteredNative(_) => {
-                        Self::describe_native(&mut set);
+                        Self::describe_native(&self.canonical_heap, &mut set);
                     }
                     _ => {
                         let level = coerce_integer(&arg0).map_err(|_| {
@@ -360,17 +360,19 @@ impl LuaRuntime {
                                 if let Some((namewhat, name)) = self.call_site_name(level) {
                                     set(
                                         b"namewhat",
-                                        LuaValue::String(Rc::new(namewhat.as_bytes().to_vec())),
+                                        LuaValue::String(self.intern_str(namewhat.as_bytes().to_vec())),
                                     );
-                                    set(b"name", LuaValue::String(Rc::new(name.into_bytes())));
+                                    set(b"name", LuaValue::String(self.intern_str(name.into_bytes())));
                                 } else if let Some(name) = Self::declared_lua_name(&lua_frame.proto)
                                 {
-                                    set(b"namewhat", LuaValue::String(Rc::new(b"local".to_vec())));
-                                    set(b"name", LuaValue::String(Rc::new(name.to_vec())));
+                                    set(b"namewhat", LuaValue::String(self.intern_str(b"local".to_vec())));
+                                    set(b"name", LuaValue::String(self.intern_str(name.to_vec())));
                                 }
                                 set(b"nups", LuaValue::Integer(lua_frame.upvals.len() as i64));
                             }
-                            Frame::Native(_) => Self::describe_native(&mut set),
+                            Frame::Native(_) => {
+                                Self::describe_native(&self.canonical_heap, &mut set)
+                            }
                         }
                     }
                 }
@@ -464,7 +466,9 @@ impl LuaRuntime {
                 let message = args.first().cloned().unwrap_or(LuaValue::Nil);
                 let prefix = match &message {
                     LuaValue::Nil => None,
-                    LuaValue::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                    LuaValue::String(bytes) => {
+                        Some(String::from_utf8_lossy(bytes.as_bytes()).into_owned())
+                    }
                     other => return Ok(vec![other.clone()]),
                 };
                 let trail = self.pending_error_stack.take().unwrap_or_default();
@@ -478,7 +482,7 @@ impl LuaRuntime {
                     out.push_str("\n\t");
                     out.push_str(entry);
                 }
-                Ok(vec![LuaValue::String(Rc::new(out.into_bytes()))])
+                Ok(vec![LuaValue::String(self.fresh_str(out.into_bytes()))])
             }
             NativeFunction::DebugSethook => {
                 // `debug.sethook([thread,] hook, mask [, count])` -
@@ -596,7 +600,7 @@ impl LuaRuntime {
                         }
                         Ok(vec![
                             hook.callback.clone(),
-                            LuaValue::String(Rc::new(mask_string.into_bytes())),
+                            LuaValue::String(self.intern_str(mask_string.into_bytes())),
                             LuaValue::Integer(hook.count),
                         ])
                     }
@@ -654,14 +658,14 @@ impl LuaRuntime {
         } else {
             b"Lua"
         };
-        set(b"what", LuaValue::String(Rc::new(what.to_vec())));
-        set(b"namewhat", LuaValue::String(Rc::new(Vec::new())));
+        set(b"what", LuaValue::String(self.intern_str(what.to_vec())));
+        set(b"namewhat", LuaValue::String(self.intern_str(Vec::new())));
         set(b"name", LuaValue::Nil);
         if let Some(source) = self.chunk_sources.get(&(Rc::as_ptr(proto) as usize)) {
-            set(b"source", LuaValue::String(source.clone()));
+            set(b"source", LuaValue::String(self.intern_str(source.as_slice())));
             set(
                 b"short_src",
-                LuaValue::String(Rc::new(Self::short_src(source))),
+                LuaValue::String(self.intern_str(Self::short_src(source))),
             );
         }
     }
@@ -683,7 +687,7 @@ impl LuaRuntime {
     /// `"C"` case: no line info, `isvararg` unconditionally true (a C
     /// function has no fixed Lua parameter list), and the fixed synthetic
     /// `"=[C]"`/`"[C]"` source real Lua uses for every C function.
-    fn describe_native(set: &mut impl FnMut(&[u8], LuaValue)) {
+    fn describe_native(heap: &RcRef<sol_core::Heap>, set: &mut impl FnMut(&[u8], LuaValue)) {
         set(b"currentline", LuaValue::Integer(-1));
         set(b"extraargs", LuaValue::Integer(0));
         set(b"linedefined", LuaValue::Integer(-1));
@@ -692,11 +696,23 @@ impl LuaRuntime {
         set(b"nparams", LuaValue::Integer(0));
         set(b"nups", LuaValue::Integer(0));
         set(b"istailcall", LuaValue::Bool(false));
-        set(b"what", LuaValue::String(Rc::new(b"C".to_vec())));
-        set(b"namewhat", LuaValue::String(Rc::new(Vec::new())));
+        set(
+            b"what",
+            LuaValue::String(CanonicalString::intern(heap.clone(), b"C")),
+        );
+        set(
+            b"namewhat",
+            LuaValue::String(CanonicalString::intern(heap.clone(), b"")),
+        );
         set(b"name", LuaValue::Nil);
-        set(b"source", LuaValue::String(Rc::new(b"=[C]".to_vec())));
-        set(b"short_src", LuaValue::String(Rc::new(b"[C]".to_vec())));
+        set(
+            b"source",
+            LuaValue::String(CanonicalString::intern(heap.clone(), b"=[C]")),
+        );
+        set(
+            b"short_src",
+            LuaValue::String(CanonicalString::intern(heap.clone(), b"[C]")),
+        );
     }
 
     /// `luaO_chunkid`: `=name` sources report `name` verbatim (truncated to

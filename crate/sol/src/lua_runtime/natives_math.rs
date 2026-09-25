@@ -78,7 +78,7 @@ impl LuaRuntime {
                 let value = match required(0)? {
                     value @ LuaValue::Integer(_) => Some(value),
                     value @ LuaValue::Float(_) => Some(value),
-                    LuaValue::String(bytes) => match parse_lua_number(&bytes) {
+                    LuaValue::String(bytes) => match parse_lua_number(bytes.as_bytes()) {
                         Some(Number::Integer(value)) => Some(LuaValue::Integer(value)),
                         Some(Number::Float(value)) => Some(LuaValue::Float(value)),
                         None => None,
@@ -105,8 +105,8 @@ impl LuaRuntime {
                 }])
             }
             NativeFunction::MathType => Ok(vec![match required(0)? {
-                LuaValue::Integer(_) => LuaValue::String(Rc::new(b"integer".to_vec())),
-                LuaValue::Float(_) => LuaValue::String(Rc::new(b"float".to_vec())),
+                LuaValue::Integer(_) => LuaValue::String(self.intern_str(b"integer".to_vec())),
+                LuaValue::Float(_) => LuaValue::String(self.intern_str(b"float".to_vec())),
                 _ => LuaValue::Nil,
             }]),
             NativeFunction::MathSqrt

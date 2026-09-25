@@ -26,9 +26,9 @@ impl LuaRuntime {
             if let Some(metatable) = &table.borrow().metatable {
                 if let Ok(LuaValue::String(name)) = metatable
                     .borrow()
-                    .get(&LuaValue::String(Rc::new(b"__name".to_vec())))
+                    .get(&LuaValue::String(self.intern_str(b"__name".to_vec())))
                 {
-                    return String::from_utf8_lossy(&name).into_owned();
+                    return String::from_utf8_lossy(name.as_bytes()).into_owned();
                 }
             }
         }

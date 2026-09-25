@@ -38,6 +38,13 @@ pub struct CanonicalUserdata(Rc<CanonicalObjectRoot>);
 #[derive(Clone)]
 pub struct CanonicalTable(Rc<CanonicalObjectRoot>);
 
+/// A precisely rooted handle to a byte string interned in the canonical
+/// heap. Strings are immutable once allocated and hold no references to
+/// other values, so unlike tables/closures/coroutines they migrate onto
+/// `sol-core` independently of the rest of the value graph.
+#[derive(Clone)]
+pub struct CanonicalString(Rc<CanonicalObjectRoot>);
+
 #[derive(Clone)]
 pub struct CanonicalCFunction {
     root: Rc<CanonicalObjectRoot>,
@@ -69,6 +76,15 @@ impl fmt::Debug for CanonicalTable {
         output
             .debug_tuple("CanonicalTable")
             .field(&self.0.object)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalString {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_tuple("CanonicalString")
+            .field(&String::from_utf8_lossy(self.as_bytes()))
             .finish()
     }
 }
@@ -164,6 +180,108 @@ impl CanonicalTable {
     }
 }
 
+impl CanonicalString {
+    /// Interns `bytes` in the canonical heap, deduplicating identical
+    /// content into the same `ObjectId` (matching real Lua's short-string
+    /// interning, but applied uniformly since the heap tracks all strings
+    /// by content already).
+    pub(super) fn intern(heap: RcRef<sol_core::Heap>, bytes: impl AsRef<[u8]>) -> Self {
+        let (object, root) = {
+            let mut heap_ref = heap.borrow_mut();
+            let object = heap_ref.alloc_string(bytes);
+            let root = heap_ref.add_root(sol_core::Value::object(object));
+            (object, root)
+        };
+        Self(Rc::new(CanonicalObjectRoot { heap, object, root }))
+    }
+
+    /// Allocates a new string without deduplicating by content, so it never
+    /// aliases the identity of an existing equal-content string (real Lua
+    /// only interns short strings; a runtime-computed value must not alias a
+    /// pre-existing string just because the bytes match). Use this for every
+    /// string constructed at run time (concatenation, string-library
+    /// results, formatted output, ...); reserve `intern` for compile-time
+    /// literal constants and fixed structural labels.
+    pub(super) fn fresh(heap: RcRef<sol_core::Heap>, bytes: impl AsRef<[u8]>) -> Self {
+        let (object, root) = {
+            let mut heap_ref = heap.borrow_mut();
+            let object = heap_ref.alloc_string_fresh(bytes);
+            let root = heap_ref.add_root(sol_core::Value::object(object));
+            (object, root)
+        };
+        Self(Rc::new(CanonicalObjectRoot { heap, object, root }))
+    }
+
+    pub(super) fn root_existing(heap: RcRef<sol_core::Heap>, object: sol_core::ObjectId) -> Self {
+        let root = heap.borrow_mut().add_root(sol_core::Value::object(object));
+        Self(Rc::new(CanonicalObjectRoot { heap, object, root }))
+    }
+
+    pub fn object_id(&self) -> sol_core::ObjectId {
+        self.0.object
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        let heap = self.0.heap.borrow();
+        let sol_core::HeapObject::String(bytes) = heap
+            .object(self.0.object)
+            .expect("rooted string must remain live")
+        else {
+            unreachable!("canonical string has the wrong object kind")
+        };
+        // SAFETY: `bytes`'s heap-allocated buffer address is independent of
+        // the owning slab entry moving, and `self.0`'s root keeps the string
+        // live for as long as this borrowed slice can be observed - the same
+        // stable-pointer-into-owned-bytes precedent as
+        // `CanonicalUserdata::bytes_ptr`.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.as_bytes().as_ptr()
+    }
+}
+
+impl PartialEq for CanonicalString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for CanonicalString {}
+
+impl std::hash::Hash for CanonicalString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl PartialOrd for CanonicalString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.as_bytes().cmp(other.as_bytes()))
+    }
+}
+
+impl Ord for CanonicalString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl AsRef<[u8]> for CanonicalString {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 impl CanonicalCFunction {
     pub(super) fn allocate(
         heap: RcRef<sol_core::Heap>,
@@ -210,7 +328,7 @@ pub enum LuaValue {
     Bool(bool),
     Integer(i64),
     Float(f64),
-    String(Rc<Vec<u8>>),
+    String(CanonicalString),
     Table(RcRef<LuaTable>),
     /// Canonical table used by the embedding registry and userdata metatables
     /// while legacy interpreter tables are migrated incrementally.
@@ -588,7 +706,7 @@ pub(super) enum LuaKey {
     Bool(bool),
     Integer(i64),
     Float(u64),
-    String(Rc<Vec<u8>>),
+    String(CanonicalString),
     Table(RcRef<LuaTable>),
     CanonicalTable(CanonicalTable),
     Closure(Rc<LuaClosure>),
@@ -815,9 +933,11 @@ impl LuaError {
     /// this error: the original raised value if known, otherwise the error
     /// message as a plain Lua string (matching real Lua's behavior for
     /// errors it synthesizes itself, which are always strings).
-    pub(super) fn into_lua_value(self) -> LuaValue {
-        self.value
-            .unwrap_or_else(|| LuaValue::String(Rc::new(self.message.into_bytes())))
+    pub(super) fn into_lua_value(self, heap: &RcRef<sol_core::Heap>) -> LuaValue {
+        match self.value {
+            Some(value) => value,
+            None => LuaValue::String(CanonicalString::fresh(heap.clone(), self.message)),
+        }
     }
 }
 
@@ -866,8 +986,8 @@ pub struct GMatchState {
 #[derive(Clone, Debug)]
 pub(super) struct Globals(Rc<GlobalsInner>);
 
-#[derive(Debug)]
 struct GlobalsInner {
+    heap: RcRef<sol_core::Heap>,
     table: RcRef<LuaTable>,
     /// The live `_ENV` value shared by every closure compiled against this
     /// scope.  Lua permits it to be any value; global reads/writes then use
@@ -879,14 +999,26 @@ struct GlobalsInner {
     base: Option<Globals>,
 }
 
+impl fmt::Debug for GlobalsInner {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("GlobalsInner")
+            .field("table", &self.table)
+            .field("environment", &self.environment)
+            .field("constants", &self.constants)
+            .field("base", &self.base)
+            .finish()
+    }
+}
+
 impl Globals {
     pub(super) fn identity_address(&self) -> usize {
         Rc::as_ptr(&self.0) as usize
     }
 
-    pub(super) fn root() -> Self {
+    pub(super) fn root(heap: RcRef<sol_core::Heap>) -> Self {
         let table = Rc::new(RefCell::new(LuaTable::default()));
         Globals(Rc::new(GlobalsInner {
+            heap,
             table: table.clone(),
             environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
@@ -897,6 +1029,7 @@ impl Globals {
     pub(super) fn module(base: &Globals) -> Self {
         let table = Rc::new(RefCell::new(LuaTable::default()));
         Globals(Rc::new(GlobalsInner {
+            heap: base.0.heap.clone(),
             table: table.clone(),
             environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
@@ -907,12 +1040,13 @@ impl Globals {
     /// Wraps an arbitrary Lua value as a chunk's `_ENV`. This is valid Lua:
     /// the value is only required to be a table when the chunk actually
     /// indexes a global name.
-    pub(super) fn from_value(value: LuaValue) -> Self {
+    pub(super) fn from_value(heap: RcRef<sol_core::Heap>, value: LuaValue) -> Self {
         let table = match &value {
             LuaValue::Table(table) => table.clone(),
             _ => Rc::new(RefCell::new(LuaTable::default())),
         };
         Globals(Rc::new(GlobalsInner {
+            heap,
             table,
             environment: RefCell::new(value),
             constants: RefCell::new(HashSet::new()),
@@ -932,7 +1066,7 @@ impl Globals {
     /// `Globals::clone` is an `Rc` clone that shares one mutable cell across
     /// every closure holding it, which `load` must not do here).
     pub(super) fn snapshot_for_load(&self) -> Self {
-        let mut snapshot = Globals::from_value(self.as_value());
+        let mut snapshot = Globals::from_value(self.0.heap.clone(), self.as_value());
         Rc::get_mut(&mut snapshot.0)
             .expect("snapshot_for_load: freshly constructed Rc has no other owner yet")
             .base = self.0.base.clone();
@@ -971,7 +1105,7 @@ impl Globals {
     }
 
     pub(super) fn get(&self, name: &str) -> LuaValue {
-        let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
+        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
         let value = match &*self.0.environment.borrow() {
             LuaValue::Table(table) => table.borrow().get(&key).unwrap(),
             _ => LuaValue::Nil,
@@ -988,7 +1122,7 @@ impl Globals {
     /// Unconditional overwrite (a `global` declaration): ignores any
     /// existing binding's constness.
     pub(super) fn define(&self, name: &str, value: LuaValue, constant: bool) {
-        let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
+        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
         self.0.table.borrow_mut().set(key, value).unwrap();
         if constant {
             self.0.constants.borrow_mut().insert(name.to_string());
@@ -1002,7 +1136,7 @@ impl Globals {
     /// updates it in place, or creates a fresh non-const binding.
     pub(super) fn assign(&self, name: &str, value: LuaValue) -> LuaResult<()> {
         self.check_writable(name)?;
-        let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
+        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
         self.0.table.borrow_mut().set(key, value)?;
         Ok(())
     }
@@ -1124,7 +1258,7 @@ impl LuaValue {
             Self::Bool(value) => value.to_string().into_bytes(),
             Self::Integer(value) => value.to_string().into_bytes(),
             Self::Float(value) => format_lua_float(*value).into_bytes(),
-            Self::String(value) => value.as_ref().clone(),
+            Self::String(value) => value.as_bytes().to_vec(),
             value @ (Self::Table(_) | Self::CanonicalTable(_)) => {
                 format!("table: 0x{:x}", value.identity_address().unwrap()).into_bytes()
             }
@@ -1148,16 +1282,12 @@ impl LuaValue {
 
     pub(super) fn identity_address(&self) -> Option<usize> {
         match self {
-            Self::String(value) if value.len() <= 40 => {
-                // Lua interns short strings. The legacy value layer stores
-                // byte strings in `Rc<Vec<u8>>`, so expose the equivalent
-                // content-stable identity through `%p`; long strings retain
-                // allocation identity below, as in the reference runtime.
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(value.as_slice(), &mut hasher);
-                Some(std::hash::Hasher::finish(&hasher) as usize | 1)
+            Self::String(value) => {
+                // The canonical heap interns every string by content (real
+                // Lua only interns short strings), so `%p`-style identity is
+                // already content-stable and object-identical here.
+                Some(value.object_id().raw() as usize | 1)
             }
-            Self::String(value) => Some(Rc::as_ptr(value) as usize),
             Self::Table(value) => Some(Rc::as_ptr(value) as usize),
             Self::CanonicalTable(value) => Some(value.object_id().raw() as usize),
             Self::Closure(value) => Some(Rc::as_ptr(value) as usize),
@@ -1276,6 +1406,18 @@ impl LuaTable {
             .ok()
             .and_then(|key| self.hash.get(&key).cloned())
             .unwrap_or(LuaValue::Nil))
+    }
+
+    /// Reads a string-keyed field (metamethod-name lookups: `__mode`,
+    /// `__gc`, ...) by content, without needing a live canonical heap handle
+    /// to construct an interned `LuaKey::String` for an ordinary `get`. A
+    /// linear scan is fine here - real tables have only a handful of
+    /// metamethod fields, and this only runs off the GC's cold sweep path.
+    pub(super) fn get_str_field(&self, name: &[u8]) -> Option<LuaValue> {
+        self.hash.iter().find_map(|(key, value)| match key {
+            LuaKey::String(key) if key.as_bytes() == name => Some(value.clone()),
+            _ => None,
+        })
     }
 
     pub(super) fn set(&mut self, key: LuaValue, value: LuaValue) -> LuaResult<()> {
@@ -1422,9 +1564,11 @@ fn positive_array_index(value: &LuaValue) -> Option<usize> {
 /// Real Lua matches "k"/"v" as substrings of an arbitrary `__mode` string
 /// (so `"kv"` and `"vk"` both mean both), not an exact match.
 pub(super) fn table_weak_mode(metatable: &RcRef<LuaTable>) -> (bool, bool) {
-    let key = LuaValue::String(Rc::new(b"__mode".to_vec()));
-    match metatable.borrow().get(&key) {
-        Ok(LuaValue::String(mode)) => (mode.contains(&b'k'), mode.contains(&b'v')),
+    match metatable.borrow().get_str_field(b"__mode") {
+        Some(LuaValue::String(mode)) => (
+            mode.as_bytes().contains(&b'k'),
+            mode.as_bytes().contains(&b'v'),
+        ),
         _ => (false, false),
     }
 }
@@ -1434,8 +1578,7 @@ pub(super) fn table_weak_mode(metatable: &RcRef<LuaTable>) -> (bool, bool) {
 /// it.
 pub(super) fn table_finalizer(table: &RcRef<LuaTable>) -> Option<LuaValue> {
     let metatable = table.borrow().metatable.clone()?;
-    let key = LuaValue::String(Rc::new(b"__gc".to_vec()));
-    let value = metatable.borrow().get(&key).ok()?;
+    let value = metatable.borrow().get_str_field(b"__gc")?;
     match value {
         value @ (LuaValue::Closure(_)
         | LuaValue::NativeFunction(_)

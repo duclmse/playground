@@ -56,9 +56,10 @@ impl LuaRuntime {
                     let prefix = self.where_prefix(1).unwrap_or_default();
                     Err(match args.get(1) {
                         Some(LuaValue::String(bytes)) => {
-                            let message = format!("{prefix}{}", String::from_utf8_lossy(bytes));
+                            let message =
+                                format!("{prefix}{}", String::from_utf8_lossy(bytes.as_bytes()));
                             LuaError::raised(
-                                LuaValue::String(Rc::new(message.clone().into_bytes())),
+                                LuaValue::String(self.fresh_str(message.clone().into_bytes())),
                                 message,
                             )
                         }
@@ -72,7 +73,7 @@ impl LuaRuntime {
                         Some(LuaValue::Nil) => {
                             let text: &[u8] = b"<no error object>";
                             LuaError::raised(
-                                LuaValue::String(Rc::new(text.to_vec())),
+                                LuaValue::String(self.intern_str(text.to_vec())),
                                 "<no error object>",
                             )
                         }
@@ -84,32 +85,33 @@ impl LuaRuntime {
                         None => {
                             let message = format!("{prefix}assertion failed!");
                             LuaError::raised(
-                                LuaValue::String(Rc::new(message.clone().into_bytes())),
+                                LuaValue::String(self.fresh_str(message.clone().into_bytes())),
                                 message,
                             )
                         }
                     })
                 }
             }
-            NativeFunction::Type => Ok(vec![LuaValue::String(Rc::new(
+            NativeFunction::Type => Ok(vec![LuaValue::String(self.intern_str(
                 required(0)?.type_name().as_bytes().to_vec(),
             ))]),
             NativeFunction::ToString => {
                 let value = required(0)?;
-                Ok(vec![LuaValue::String(Rc::new(self.render_value(value)?))])
+                let rendered = self.render_value(value)?;
+                Ok(vec![LuaValue::String(self.fresh_str(rendered))])
             }
             NativeFunction::ToNumber => {
                 let value = required(0)?;
                 let base = args.get(1).map(|value| self.integer(value)).transpose()?;
                 let converted = match (value, base) {
                     (value @ (LuaValue::Integer(_) | LuaValue::Float(_)), None) => value,
-                    (LuaValue::String(bytes), None) => match parse_lua_number(&bytes) {
+                    (LuaValue::String(bytes), None) => match parse_lua_number(bytes.as_bytes()) {
                         Some(Number::Integer(value)) => LuaValue::Integer(value),
                         Some(Number::Float(value)) => LuaValue::Float(value),
                         None => LuaValue::Nil,
                     },
                     (LuaValue::String(bytes), Some(base @ 2..=36)) => {
-                        let text = String::from_utf8_lossy(&bytes);
+                        let text = String::from_utf8_lossy(bytes.as_bytes());
                         let text = text.trim();
                         let (negative, digits) = text
                             .strip_prefix('-')
@@ -246,18 +248,18 @@ impl LuaRuntime {
                     LuaValue::Nil => {
                         let text: &[u8] = b"<no error object>";
                         LuaError::raised(
-                            LuaValue::String(Rc::new(text.to_vec())),
+                            LuaValue::String(self.intern_str(text.to_vec())),
                             "<no error object>",
                         )
                     }
                     LuaValue::String(bytes) => {
-                        let message = String::from_utf8_lossy(bytes).into_owned();
+                        let message = String::from_utf8_lossy(bytes.as_bytes()).into_owned();
                         let message = match self.where_prefix(level) {
                             Some(prefix) => format!("{prefix}{message}"),
                             None => message,
                         };
                         LuaError::raised(
-                            LuaValue::String(Rc::new(message.clone().into_bytes())),
+                            LuaValue::String(self.fresh_str(message.clone().into_bytes())),
                             message,
                         )
                     }
@@ -274,7 +276,10 @@ impl LuaRuntime {
                         values.insert(0, LuaValue::Bool(true));
                         Ok(values)
                     }
-                    Err(error) => Ok(vec![LuaValue::Bool(false), error.into_lua_value()]),
+                    Err(error) => Ok(vec![
+                        LuaValue::Bool(false),
+                        error.into_lua_value(&self.canonical_heap),
+                    ]),
                 }
             }
             NativeFunction::XCall => {
@@ -287,8 +292,9 @@ impl LuaRuntime {
                         Ok(values)
                     }
                     Err(error) => {
+                        let error_value = error.into_lua_value(&self.canonical_heap);
                         let handled = self
-                            .call(handler, vec![error.into_lua_value()])?
+                            .call(handler, vec![error_value])?
                             .into_iter()
                             .next()
                             .unwrap_or(LuaValue::Nil);
@@ -298,7 +304,7 @@ impl LuaRuntime {
             }
             NativeFunction::Select => {
                 let selector = required(0)?;
-                if selector == LuaValue::String(Rc::new(b"#".to_vec())) {
+                if selector == LuaValue::String(self.intern_str(b"#".to_vec())) {
                     return Ok(vec![LuaValue::Integer(args.len().saturating_sub(1) as i64)]);
                 }
                 let index = self.integer(&selector)?;
@@ -389,7 +395,7 @@ impl LuaRuntime {
                         } else {
                             "generational"
                         };
-                        Ok(vec![LuaValue::String(Rc::new(
+                        Ok(vec![LuaValue::String(self.intern_str(
                             previous.as_bytes().to_vec(),
                         ))])
                     }
@@ -450,7 +456,7 @@ impl LuaRuntime {
                 .next()
                 .unwrap_or(LuaValue::Nil);
             return match rendered {
-                LuaValue::String(bytes) => Ok(bytes.as_ref().clone()),
+                LuaValue::String(bytes) => Ok(bytes.as_bytes().to_vec()),
                 _ => Err(LuaError::new("'__tostring' must return a string")),
             };
         }
@@ -459,11 +465,11 @@ impl LuaRuntime {
             if let Some(metatable) = metatable {
                 let name = metatable
                     .borrow()
-                    .get(&LuaValue::String(Rc::new(b"__name".to_vec())))?;
+                    .get(&LuaValue::String(self.intern_str(b"__name".to_vec())))?;
                 if let LuaValue::String(name) = name {
                     return Ok(format!(
                         "{}: 0x{:x}",
-                        String::from_utf8_lossy(&name),
+                        String::from_utf8_lossy(name.as_bytes()),
                         value.identity_address().unwrap()
                     )
                     .into_bytes());

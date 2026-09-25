@@ -187,7 +187,7 @@ impl LuaRuntime {
 
     pub(super) fn string<'a>(&self, value: &'a LuaValue) -> LuaResult<&'a [u8]> {
         match value {
-            LuaValue::String(value) => Ok(value),
+            LuaValue::String(value) => Ok(value.as_bytes()),
             _ => Err(LuaError::new("string expected")),
         }
     }

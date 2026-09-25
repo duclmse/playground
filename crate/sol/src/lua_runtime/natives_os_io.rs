@@ -22,7 +22,7 @@ impl LuaRuntime {
         };
         let stdin = io
             .borrow()
-            .get(&LuaValue::String(Rc::new(b"stdin".to_vec())))
+            .get(&LuaValue::String(self.intern_str(b"stdin".to_vec())))
             .unwrap_or(LuaValue::Nil);
         stdin
     }
@@ -96,7 +96,7 @@ impl LuaRuntime {
                         ("isdst", LuaValue::Bool(false)),
                     ] {
                         table
-                            .set(LuaValue::String(Rc::new(key.as_bytes().to_vec())), value)
+                            .set(LuaValue::String(self.intern_str(key.as_bytes().to_vec())), value)
                             .unwrap();
                     }
                     return Ok(vec![LuaValue::Table(
@@ -164,13 +164,13 @@ impl LuaRuntime {
                     }
                 }
                 self.charge_allocation(rendered.len())?;
-                Ok(vec![LuaValue::String(Rc::new(rendered.into_bytes()))])
+                Ok(vec![LuaValue::String(self.fresh_str(rendered.into_bytes()))])
             }
             NativeFunction::OsGetenv => {
                 let name = self.string(&required(0)?)?.to_vec();
                 let name = String::from_utf8_lossy(&name).into_owned();
                 match std::env::var(&name) {
-                    Ok(value) => Ok(vec![LuaValue::String(Rc::new(value.into_bytes()))]),
+                    Ok(value) => Ok(vec![LuaValue::String(self.fresh_str(value.into_bytes()))]),
                     Err(_) => Ok(vec![LuaValue::Nil]),
                 }
             }
@@ -217,7 +217,7 @@ impl LuaRuntime {
                             "filesystem capability is disabled; enable it explicitly",
                         ));
                     }
-                    let handle = self.open_output_file(path)?;
+                    let handle = self.open_output_file(path.as_bytes())?;
                     *self.default_output.borrow_mut() = handle.clone();
                     Ok(vec![handle])
                 }
@@ -254,7 +254,7 @@ impl LuaRuntime {
                     Ok(()) => Ok(vec![LuaValue::Bool(true)]),
                     Err(error) => Ok(vec![
                         LuaValue::Nil,
-                        LuaValue::String(Rc::new(
+                        LuaValue::String(self.fresh_str(
                             format!("{}: {error}", String::from_utf8_lossy(&path)).into_bytes(),
                         )),
                     ]),
@@ -279,12 +279,12 @@ impl LuaRuntime {
                     Some(value) => Some(self.string(value)?.to_vec()),
                 };
                 match locale {
-                    None => Ok(vec![LuaValue::String(Rc::new(
+                    None => Ok(vec![LuaValue::String(self.intern_str(
                         self.current_locale.clone().into_bytes(),
                     ))]),
                     Some(name) if name.is_empty() || name == b"C" => {
                         self.current_locale = "C".to_string();
-                        Ok(vec![LuaValue::String(Rc::new(b"C".to_vec()))])
+                        Ok(vec![LuaValue::String(self.intern_str(b"C".to_vec()))])
                     }
                     Some(_) => Ok(vec![LuaValue::Nil]),
                 }
@@ -309,7 +309,7 @@ impl LuaRuntime {
                 std::fs::File::create(&path).map_err(|error| {
                     LuaError::new(format!("unable to generate a unique filename: {error}"))
                 })?;
-                Ok(vec![LuaValue::String(Rc::new(
+                Ok(vec![LuaValue::String(self.fresh_str(
                     path.to_string_lossy().into_owned().into_bytes(),
                 ))])
             }
@@ -340,14 +340,14 @@ impl LuaRuntime {
                             }
                         }
                         self.charge_allocation(line.len())?;
-                        Ok(vec![LuaValue::String(Rc::new(line.into_bytes()))])
+                        Ok(vec![LuaValue::String(self.fresh_str(line.into_bytes()))])
                     }
                     b"a" => {
                         let mut buffer = String::new();
                         std::io::Read::read_to_string(&mut stdin.lock(), &mut buffer)
                             .map_err(|error| LuaError::new(format!("io.read: {error}")))?;
                         self.charge_allocation(buffer.len())?;
-                        Ok(vec![LuaValue::String(Rc::new(buffer.into_bytes()))])
+                        Ok(vec![LuaValue::String(self.fresh_str(buffer.into_bytes()))])
                     }
                     b"n" => {
                         let mut line = String::new();
@@ -412,7 +412,7 @@ impl LuaRuntime {
         let mut bytes = Vec::new();
         for value in values {
             match value {
-                LuaValue::String(rendered) => bytes.extend_from_slice(rendered),
+                LuaValue::String(rendered) => bytes.extend_from_slice(rendered.as_bytes()),
                 LuaValue::Integer(_) | LuaValue::Float(_) => {
                     bytes.extend(value.display_bytes());
                 }
@@ -445,7 +445,7 @@ impl LuaRuntime {
         Ok(())
     }
 
-    fn open_output_file(&mut self, path: &Rc<Vec<u8>>) -> LuaResult<LuaValue> {
+    fn open_output_file(&mut self, path: &[u8]) -> LuaResult<LuaValue> {
         let real_path = bytes_to_path(path).ok_or_else(|| LuaError::new("invalid file name"))?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -459,14 +459,14 @@ impl LuaRuntime {
         handle
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"write".to_vec())),
+                LuaValue::String(self.intern_str(b"write".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileWrite),
             )
             .unwrap();
         handle
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"close".to_vec())),
+                LuaValue::String(self.intern_str(b"close".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileClose),
             )
             .unwrap();

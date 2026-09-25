@@ -28,12 +28,13 @@ impl LuaRuntime {
         let mut heap = sol_core::Heap::new(Capabilities::default());
         let c_registry = heap.alloc_table();
         let c_registry_root = heap.add_root(sol_core::Value::object(c_registry));
+        let canonical_heap = Rc::new(RefCell::new(heap));
         let mut runtime = Self {
-            canonical_heap: Rc::new(RefCell::new(heap)),
+            canonical_heap: canonical_heap.clone(),
             c_registry,
             _c_registry_root: c_registry_root,
             c_next_reference: 1,
-            globals: Globals::root(),
+            globals: Globals::root(canonical_heap),
             output: Vec::new(),
             instructions_remaining: instruction_budget,
             call_depth: 0,
@@ -173,7 +174,7 @@ impl LuaRuntime {
     fn preload(&self, name: &[u8], value: LuaValue) {
         self.package_loaded
             .borrow_mut()
-            .set(LuaValue::String(Rc::new(name.to_vec())), value)
+            .set(LuaValue::String(self.intern_str(name.to_vec())), value)
             .unwrap();
     }
 
@@ -307,7 +308,7 @@ impl LuaRuntime {
             string
                 .borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -318,7 +319,7 @@ impl LuaRuntime {
         self.string_metatable
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"__index".to_vec())),
+                LuaValue::String(self.intern_str(b"__index".to_vec())),
                 LuaValue::Table(string),
             )
             .unwrap();
@@ -337,7 +338,7 @@ impl LuaRuntime {
             table
                 .borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -376,7 +377,7 @@ impl LuaRuntime {
         ] {
             math.borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -388,7 +389,7 @@ impl LuaRuntime {
             ("mininteger", LuaValue::Integer(i64::MIN)),
         ] {
             math.borrow_mut()
-                .set(LuaValue::String(Rc::new(name.as_bytes().to_vec())), value)
+                .set(LuaValue::String(self.intern_str(name.as_bytes().to_vec())), value)
                 .unwrap();
         }
         self.globals
@@ -405,7 +406,7 @@ impl LuaRuntime {
         ] {
             utf8.borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -415,8 +416,8 @@ impl LuaRuntime {
         // Lua string data even though they are not valid Rust UTF-8 text.
         utf8.borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"charpattern".to_vec())),
-                LuaValue::String(Rc::new(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*".to_vec())),
+                LuaValue::String(self.intern_str(b"charpattern".to_vec())),
+                LuaValue::String(self.intern_str(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*".to_vec())),
             )
             .unwrap();
         self.globals
@@ -428,13 +429,13 @@ impl LuaRuntime {
             let mut package_mut = package.borrow_mut();
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"loaded".to_vec())),
+                    LuaValue::String(self.intern_str(b"loaded".to_vec())),
                     LuaValue::Table(self.package_loaded.clone()),
                 )
                 .unwrap();
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"preload".to_vec())),
+                    LuaValue::String(self.intern_str(b"preload".to_vec())),
                     LuaValue::Table(Rc::new(RefCell::new(LuaTable::default()))),
                 )
                 .unwrap();
@@ -445,8 +446,8 @@ impl LuaRuntime {
             // after its compiled-in install-prefix ones.
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"path".to_vec())),
-                    LuaValue::String(Rc::new(b"./?.lua;./?/init.lua".to_vec())),
+                    LuaValue::String(self.intern_str(b"path".to_vec())),
+                    LuaValue::String(self.intern_str(b"./?.lua;./?/init.lua".to_vec())),
                 )
                 .unwrap();
             // Kept empty by default so sandboxed states never advertise a
@@ -454,25 +455,25 @@ impl LuaRuntime {
             // opting into `Capabilities::native_modules`.
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"cpath".to_vec())),
-                    LuaValue::String(Rc::new(Vec::new())),
+                    LuaValue::String(self.intern_str(b"cpath".to_vec())),
+                    LuaValue::String(self.intern_str(Vec::new())),
                 )
                 .unwrap();
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"config".to_vec())),
-                    LuaValue::String(Rc::new(package_config_bytes())),
+                    LuaValue::String(self.intern_str(b"config".to_vec())),
+                    LuaValue::String(self.intern_str(package_config_bytes())),
                 )
                 .unwrap();
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"searchpath".to_vec())),
+                    LuaValue::String(self.intern_str(b"searchpath".to_vec())),
                     LuaValue::NativeFunction(NativeFunction::PackageSearchPath),
                 )
                 .unwrap();
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"loadlib".to_vec())),
+                    LuaValue::String(self.intern_str(b"loadlib".to_vec())),
                     LuaValue::NativeFunction(NativeFunction::PackageLoadLib),
                 )
                 .unwrap();
@@ -498,7 +499,7 @@ impl LuaRuntime {
             }
             package_mut
                 .set(
-                    LuaValue::String(Rc::new(b"searchers".to_vec())),
+                    LuaValue::String(self.intern_str(b"searchers".to_vec())),
                     LuaValue::Table(Rc::new(RefCell::new(searchers))),
                 )
                 .unwrap();
@@ -534,7 +535,7 @@ impl LuaRuntime {
         ] {
             os.borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -552,7 +553,7 @@ impl LuaRuntime {
         ] {
             io.borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -560,40 +561,40 @@ impl LuaRuntime {
         self.io_stdout
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"write".to_vec())),
+                LuaValue::String(self.intern_str(b"write".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileWrite),
             )
             .unwrap();
         self.io_stdout
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"close".to_vec())),
+                LuaValue::String(self.intern_str(b"close".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileClose),
             )
             .unwrap();
         io.borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"stdout".to_vec())),
+                LuaValue::String(self.intern_str(b"stdout".to_vec())),
                 LuaValue::Table(self.io_stdout.clone()),
             )
             .unwrap();
         self.io_stderr
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"write".to_vec())),
+                LuaValue::String(self.intern_str(b"write".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileWrite),
             )
             .unwrap();
         self.io_stderr
             .borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"close".to_vec())),
+                LuaValue::String(self.intern_str(b"close".to_vec())),
                 LuaValue::NativeFunction(NativeFunction::FileClose),
             )
             .unwrap();
         io.borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"stderr".to_vec())),
+                LuaValue::String(self.intern_str(b"stderr".to_vec())),
                 LuaValue::Table(self.io_stderr.clone()),
             )
             .unwrap();
@@ -644,7 +645,7 @@ impl LuaRuntime {
         }
         io.borrow_mut()
             .set(
-                LuaValue::String(Rc::new(b"stdin".to_vec())),
+                LuaValue::String(self.intern_str(b"stdin".to_vec())),
                 stdin,
             )
             .unwrap();
@@ -662,7 +663,7 @@ impl LuaRuntime {
             coroutine
                 .borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -691,7 +692,7 @@ impl LuaRuntime {
             debug
                 .borrow_mut()
                 .set(
-                    LuaValue::String(Rc::new(name.as_bytes().to_vec())),
+                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
                     LuaValue::NativeFunction(function),
                 )
                 .unwrap();
@@ -774,7 +775,7 @@ impl LuaRuntime {
             }
             table
                 .borrow_mut()
-                .set(LuaValue::String(Rc::new(export.as_bytes().to_vec())), value)?;
+                .set(LuaValue::String(self.intern_str(export.as_bytes().to_vec())), value)?;
         }
         self.preload(name.as_bytes(), LuaValue::Table(table));
         Ok(())

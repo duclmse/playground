@@ -100,11 +100,34 @@ are raw `dlopen` pointers with no `LuaValue`/GC identity at all, never owned by
 either collector, so there is nothing to migrate there either; the checklist
 wording naming these as outstanding work was stale.
 
-U2 is complete only after production code uses canonical handles for tables
-(including metatables and the root `_ENV` table, which is just a table),
-closures, and coroutine frames, in that dependency order: closures capture
-`LuaValue`s that may be tables, and coroutine frames (`regs`/`upvals`/`cells`)
-hold both. `sol_core::TableObject::hash` moved from `HashMap` to an
+Strings are now fully canonical in production: `LuaValue::String` and
+`LuaKey::String` hold a `CanonicalString` handle into `sol_core::Heap` instead
+of `Rc<Vec<u8>>`. Strings are a leaf value (no outgoing references), so this
+slice landed independently of tables/closures/coroutines. It surfaced a real
+Lua-compatibility invariant the existing test suite already encoded: real Lua
+always interns short strings (`LUAI_MAXSHORTLEN`, 40 bytes) regardless of
+origin, but never interns long strings except through the compiler's own
+constant-pool deduplication, so a long runtime-computed string must not alias
+an existing string of equal content. The runtime therefore exposes two
+allocation paths — `Heap::alloc_string`/`CanonicalString::intern` (content
+deduplicating, delegated to for every length) for compile-time bytecode
+constants, fixed structural/native-library labels, global-variable-name
+lookups, and the canonical empty string; and
+`Heap::alloc_string_fresh`/`CanonicalString::fresh` (deduplicating only at or
+under the 40-byte short-string cutoff, otherwise always a distinct object) for
+everything else computed at run time — string-library results, concatenation,
+`tostring`/error-message construction, and the C API's equivalents
+(`lua_pushlstring`, numeric-to-string coercion in `lua_tolstring`, and
+dynamically loaded chunk source/name).
+
+U2 is complete only after production code also uses canonical handles for
+tables (including metatables and the root `_ENV` table, which is just a
+table), closures, and coroutine frames. Unlike strings, these three must land
+together in one combined cutover rather than in dependency order: closures
+capture `LuaValue`s that may be tables, and coroutine frames
+(`regs`/`upvals`/`cells`) hold both, so there is no intermediate state where
+only one of the three is canonical without the others still holding `Rc`
+references into it. `sol_core::TableObject::hash` moved from `HashMap` to an
 order-preserving `IndexMap` (matching `LuaTable::hash`'s existing rationale) as
 a prerequisite, since production tables cannot move onto it correctly
 otherwise. The existing `Rc` trial-deletion collector and typed arena must then

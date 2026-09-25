@@ -375,7 +375,7 @@ fn dynamic_lua_runtime_pcall_catches_an_error_raised_deep_below_it_without_nativ
     let run = runtime.run(&parse(source)).unwrap();
     match run {
         LuaValue::String(bytes) => assert!(
-            bytes.ends_with(b"bottom"),
+            bytes.as_bytes().ends_with(b"bottom"),
             "unexpected error message: {bytes:?}"
         ),
         other => panic!("expected a string error value, got {other:?}"),
@@ -442,7 +442,7 @@ fn dynamic_lua_runtime_xpcall_handles_an_error_raised_deep_below_it_without_nati
     let run = runtime.run(&parse(source)).unwrap();
     match run {
         LuaValue::String(bytes) => assert!(
-            bytes.starts_with(b"handled: "),
+            bytes.as_bytes().starts_with(b"handled: "),
             "unexpected error message: {bytes:?}"
         ),
         other => panic!("expected a string error value, got {other:?}"),

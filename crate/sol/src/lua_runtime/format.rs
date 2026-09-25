@@ -61,7 +61,7 @@ pub(super) fn expand_gsub_template(
 pub(super) fn gsub_result_value(value: LuaValue, whole: &[u8]) -> LuaResult<Vec<u8>> {
     match value {
         LuaValue::Nil | LuaValue::Bool(false) => Ok(whole.to_vec()),
-        LuaValue::String(bytes) => Ok(bytes.as_ref().clone()),
+        LuaValue::String(bytes) => Ok(bytes.as_bytes().to_vec()),
         value @ (LuaValue::Integer(_) | LuaValue::Float(_)) => Ok(value.display_bytes()),
         other => Err(LuaError::new(format!(
             "invalid replacement value (a {})",
@@ -213,7 +213,7 @@ pub(super) fn quote_value(value: &LuaValue) -> LuaResult<Vec<u8>> {
         LuaValue::String(bytes) => {
             let mut out = Vec::with_capacity(bytes.len() + 2);
             out.push(b'"');
-            let mut iter = bytes.iter().peekable();
+            let mut iter = bytes.as_bytes().iter().peekable();
             while let Some(&byte) = iter.next() {
                 if byte == b'"' || byte == b'\\' || byte == b'\n' {
                     out.push(b'\\');

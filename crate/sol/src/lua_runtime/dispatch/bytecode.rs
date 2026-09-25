@@ -110,7 +110,7 @@ impl LuaRuntime {
                         &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
-                        const_to_value(&proto.consts[*k as usize]),
+                        const_to_value(&self.canonical_heap, &proto.consts[*k as usize]),
                     );
                 }
                 Instr::LoadNil(dst) => {
@@ -166,7 +166,7 @@ impl LuaRuntime {
                         let value = frame.globals.get(name);
                         reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
                     } else {
-                        let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
+                        let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
                         match self.index_resolve(frame.globals.as_value(), key)? {
                             IndexResolution::Value(value) => {
                                 reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
@@ -192,7 +192,7 @@ impl LuaRuntime {
                         frame.globals.assign(name, value)?;
                     } else {
                         frame.globals.check_writable(name)?;
-                        let key = LuaValue::String(Rc::new(name.as_bytes().to_vec()));
+                        let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
                         match self.set_index_resolve(frame.globals.as_value(), key, value)? {
                             SetIndexResolution::Done => {}
                             SetIndexResolution::Call { method, args } => {
@@ -252,7 +252,7 @@ impl LuaRuntime {
                 }
                 Instr::GetField(dst, base, name) => {
                     let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
-                    let key = LuaValue::String(name_const(&proto, *name));
+                    let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
                     match self.index_resolve(base_value, key) {
                         Ok(IndexResolution::Value(value)) => {
                             reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
@@ -275,7 +275,7 @@ impl LuaRuntime {
                 }
                 Instr::SetField(base, name, src) => {
                     let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
-                    let key = LuaValue::String(name_const(&proto, *name));
+                    let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
                     let value = reg_get(&frame.regs, &frame.cells, *src as usize);
                     match self.set_index_resolve(base_value, key, value) {
                         Ok(SetIndexResolution::Done) => {}
@@ -633,7 +633,7 @@ impl LuaRuntime {
                             return Err(LuaError::new("named vararg pack is not a table"));
                         };
                         let table = table.borrow();
-                        let length = match table.get(&LuaValue::String(Rc::new(b"n".to_vec())))? {
+                        let length = match table.get(&LuaValue::String(self.intern_str(b"n".to_vec())))? {
                             LuaValue::Integer(length)
                                 if (0..=u16::MAX as i64).contains(&length) =>
                             {
