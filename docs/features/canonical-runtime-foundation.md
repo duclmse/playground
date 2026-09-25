@@ -122,9 +122,13 @@ dynamically loaded chunk source/name).
 
 U2 is complete only after production code also uses canonical handles for
 tables (including metatables and the root `_ENV` table, which is just a
-table), closures, and coroutine frames. Unlike strings, these three cannot be
-verified in isolation under realistic programs: closures capture `LuaValue`s
-that may be tables, and coroutine frames (`regs`/`upvals`/`cells`) hold both.
+table), closures, and coroutine frames. Unlike strings, these three cannot
+move storage in isolation: `sol_core::TableObject`/`UpvalueObject`/
+`ThreadObject` can only hold `sol_core::Value`, which can reference *other
+sol_core heap objects* but has no representation for a legacy `Rc<LuaClosure>`
+or `Rc<LuaCoroutine>` — and closures capture `LuaValue`s that may be tables,
+while coroutine frames (`regs`/`upvals`/`cells`) hold both, so the three
+storage backends are mutually recursive.
 The target design for this slice — a cheap `Copy` `ObjectId`-based value tier
 for the hot path (distinct from the existing `Rc<CanonicalObjectRoot>`-rooted
 `CanonicalTable`/`CanonicalString` handles, which stay reserved for long-lived

@@ -16,16 +16,35 @@ production `Rc`-based representations in `crate/sol/src/lua_runtime` (`value.rs`
 
 `unified-sol-runtime-plan.md` already notes these three "must land together...
 there is no intermediate state where only one of the three is canonical while
-the others still hold `Rc` references into it." That is true as an *exit*
-criterion — you cannot claim tables are done while every closure upvalue and
-every coroutine frame slot still boxes an old `LuaValue::Table(Rc<...>)` — but
-it does not mean the implementation has to happen as one undifferentiated
-patch. `LuaValue` and `LuaKey` are already ordinary Rust enums that hold a
-`CanonicalString`/`CanonicalTable`(embedding-only) variant next to legacy `Rc`
-variants today; nothing stops adding `Table`/`Closure`/`Thread` canonical
-variants the same way and flipping call sites incrementally, exactly as the
-string migration did. Section 8 gives the sequencing this document recommends;
-the rest of the document is the target shape each piece converges on.
+the others still hold `Rc` references into it." **Correction (found while
+starting implementation): this is not merely an exit/verification criterion —
+it is a hard storage-layer blocker.** `sol_core::TableObject::array`/`hash`,
+`UpvalueObject::value`, and `ThreadObject::stack`/`yielded` are all typed as
+`sol_core::Value`, a compact tagged union that can reference *only* other
+`sol_core` heap objects via `ObjectId`. It has no variant that can hold an
+opaque `Rc<LuaClosure>` or `Rc<LuaCoroutine>` pointer. Real Lua programs
+routinely store closures and coroutines as table values and as captured
+upvalues (`t.callback = function() ... end`), so flipping a table's *storage*
+onto `sol_core::TableObject` is not safely shippable — even behind a dual-rail
+`LuaValue` variant — until closures and coroutines are themselves
+`sol_core::Value`-representable (i.e. `ClosureRef`/`ThreadRef` over real
+`ClosureObject`/`ThreadObject` allocations already exist). The same is true in
+every other direction: an upvalue cell cannot hold a table value, and a
+coroutine's stack cannot hold a table or closure value, unless that value's
+kind is already canonical. The three storage backends are mutually
+recursive and cannot flip one at a time.
+
+What *can* happen incrementally, without triggering that blocker, is
+everything that stops short of making any object's internal storage actually
+hold `sol_core::Value` payloads sourced from real running programs:
+`TableRef`/`ClosureRef`/`ThreadRef` newtypes, `Heap` wrapper/helper methods,
+the closure-prototype registry, and unit tests against `sol_core::Heap`
+directly (synthetic values, not values threaded through the live `LuaValue`
+enum). The actual flip of `LuaValue`/`LuaKey`'s `Table`/`Closure`/`Thread`
+variants to canonical payloads has to land as one coordinated change once all
+three ref types and their allocation paths exist. Section 8 gives the
+sequencing this document recommends, with this constraint folded in; the rest
+of the document is the target shape each piece converges on.
 
 ## 2. Value representation: two tiers, not one
 
@@ -259,26 +278,43 @@ here per object kind:
 
 1. **`sol-core` prerequisites**: `TableObject` border cache; `Heap` byte-count
    API; confirm `alloc_upvalue`/`alloc_thread`/`alloc_closure` cover every
-   field production needs (mostly already true per §4–§6).
-2. **Tables**: add `TableRef`, the `LuaValue`/`LuaKey::Table` canonical variant,
-   flip table-literal creation, indexing, `table.*` library calls, and
-   `Globals`/`_ENV` onto it; delete `LuaTable` once nothing constructs it.
-3. **Closures**: add the prototype registry and `ClosureRef`; flip closure
-   creation and upvalue read/write onto `UpvalueObject`s; delete `LuaClosure`
-   and the old `Cells` alias.
-4. **Coroutines**: add `ThreadRef` and the side-table registry per §6 (starting
-   with the interim fallback), flip `coroutine.*` and the resume/yield
-   trampoline; decide on and, if adopted, build the conditional-root
-   `sol-core` extension as a follow-up.
+   field production needs (mostly already true per §4–§6). *(Done.)*
+2. **Ref-type and allocation plumbing, for all three at once, with no
+   `LuaValue` change yet**: `TableRef`/`ClosureRef`/`ThreadRef` newtypes;
+   `LuaRuntime`/`Heap` wrapper methods for table get/set/len/next, closure
+   creation, and upvalue read/write; the closure prototype registry; the
+   coroutine side-table registry per §6. This is tested directly against
+   `sol_core::Heap` (synthetic values), not through the live `LuaValue` enum,
+   so it carries no storage-layer risk and can land incrementally with its own
+   coverage, same as the string migration's helpers did.
+3. **Coroutine conditional-root decision (§6)**: decide interim fallback vs.
+   the conditional-root `sol-core` extension *before* the flip, since
+   frame-rooting has to work correctly from the moment real coroutine frames
+   go canonical, not be retrofitted after.
+4. **The coordinated flip**: because `TableObject`/`UpvalueObject`/
+   `ThreadObject` storage is mutually recursive (§1), `LuaValue`/`LuaKey`'s
+   `Table`, `Closure`, and `Thread` variants move to their canonical payloads
+   together, and every construction/read/write call site across table
+   literals/indexing/`table.*`, closure creation/upvalues, and
+   `coroutine.*`/resume/yield is converted in the same change. This is
+   necessarily the largest single patch in the sequence — it cannot be
+   split further by object kind — but step 2's plumbing means it is a
+   mechanical call-site rewrite onto already-built and already-tested
+   primitives, not new design work. `LuaTable`, `LuaClosure`,
+   `Rc<LuaCoroutine>`-as-ownership, and the old `Cells` alias are deleted once
+   nothing constructs them.
 5. **Safepoints and cleanup**: move collection triggering to the dispatch-loop
    safepoint (§3), delete `gc.rs`'s collector and the now-dead `Rc`/`RefCell`
    aliases, and run the U2 exit audit: identity, weak-reference, finalizer, and
    coroutine stress tests under forced collection across mixed dynamic/typed
    calls, with no object owned by two independent collectors.
 
-Each step should land with its own focused regression coverage (mirroring how
-the string migration's `alloc_string_fresh` fix got a targeted test), and the
-existing `lua55.rs`/`lua55_dynamic_runtime_*.rs`/`sol_conformance.rs` suites
-should stay green throughout — a legacy value and a canonical value already
-coexist safely in the same `LuaValue` enum today, so there is no point in this
-sequence where the crate doesn't compile and pass its existing tests.
+Steps 1–3 should each land with their own focused regression coverage
+(mirroring how the string migration's `alloc_string_fresh` fix got a targeted
+test), and the existing `lua55.rs`/`lua55_dynamic_runtime_*.rs`/
+`sol_conformance.rs` suites should stay green throughout those steps — none of
+them touch `LuaValue`'s definition, so there is no point before step 4 where
+the crate doesn't compile and pass its existing tests. Step 4 itself has to
+land as one change that compiles and passes those same suites at the end,
+since Rust's enum definition can't be half-migrated across a commit boundary
+the way step-2's additive plumbing can.
