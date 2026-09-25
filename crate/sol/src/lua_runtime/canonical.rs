@@ -8,10 +8,12 @@ use std::rc::Rc;
 
 use sol_core::{Heap, NativeCallableId, ObjectId, ThreadStatus, Value};
 
+use crate::lua_bytecode::Proto;
+
 use super::frame::{Frame, NativeCont, XCallStage};
 use super::{
     table_weak_mode, BridgeScalar, CoroutineStatus, GMatchState, LuaClosure, LuaCoroutine,
-    LuaError, LuaTable, LuaValue, NativeBridge, NativeFunction,
+    LuaError, LuaTable, LuaValue, NativeBridge, NativeFunction, ThreadRef,
 };
 
 const LEGACY_STATE_PROVIDER: u32 = u32::MAX;
@@ -507,13 +509,86 @@ impl CanonicalAdapter {
     }
 }
 
+// `#[allow(dead_code)]`: prerequisite plumbing for the coordinated
+// tables/closures/coroutines flip (docs/features/table-closure-coroutine-cutover.md
+// §8 step 2), unit-tested below but not yet wired into `LuaRuntime`.
+
+/// Interns `Rc<Proto>` identity into the portable `u32` registry key a
+/// canonical closure's `ClosureObject::prototype` field expects, and
+/// resolves it back to the prototype the interpreter needs to actually run
+/// the closure's bytecode. One registry is meant to live for a `LuaRuntime`'s
+/// entire lifetime (unlike `CanonicalAdapter::prototypes`, which is
+/// per-import and only used for the one-way snapshot adapter above).
+#[allow(dead_code)]
+#[derive(Default)]
+pub(super) struct PrototypeRegistry {
+    by_identity: HashMap<usize, u32>,
+    prototypes: Vec<Rc<Proto>>,
+}
+
+#[allow(dead_code)]
+impl PrototypeRegistry {
+    pub(super) fn intern(&mut self, proto: &Rc<Proto>) -> u32 {
+        let identity = Rc::as_ptr(proto) as usize;
+        if let Some(id) = self.by_identity.get(&identity) {
+            return *id;
+        }
+        let id = u32::try_from(self.prototypes.len()).expect("more than u32::MAX Lua prototypes");
+        self.by_identity.insert(identity, id);
+        self.prototypes.push(proto.clone());
+        id
+    }
+
+    pub(super) fn resolve(&self, id: u32) -> Option<&Rc<Proto>> {
+        self.prototypes.get(id as usize)
+    }
+}
+
+/// Owns each live `LuaCoroutine`'s executable state (registers, cells,
+/// hooks, `dead_error`; see `docs/features/table-closure-coroutine-cutover.md`
+/// §6), addressed by its canonical `ThreadObject`'s own `ObjectId` rather
+/// than by `Rc<LuaCoroutine>` refcounting. This is the interim-fallback
+/// registry: every entry here is treated as reachable while it is present
+/// (see §6 option 2 for the coroutine-cycle gap this does not close), and
+/// sweeping a `Thread` object whose id has no entry here is a no-op, not an
+/// error - the coroutine's canonical identity and its registry entry are
+/// removed together.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(super) struct CoroutineRegistry {
+    coroutines: HashMap<ObjectId, Rc<LuaCoroutine>>,
+}
+
+#[allow(dead_code)]
+impl CoroutineRegistry {
+    pub(super) fn insert(&mut self, thread: ThreadRef, coroutine: Rc<LuaCoroutine>) {
+        self.coroutines.insert(thread.object_id(), coroutine);
+    }
+
+    pub(super) fn get(&self, thread: ThreadRef) -> Option<&Rc<LuaCoroutine>> {
+        self.coroutines.get(&thread.object_id())
+    }
+
+    pub(super) fn remove(&mut self, thread: ThreadRef) -> Option<Rc<LuaCoroutine>> {
+        self.coroutines.remove(&thread.object_id())
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.coroutines.is_empty()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.coroutines.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
     use sol_core::Capabilities;
 
-    use super::super::CanonicalString;
+    use super::super::{CanonicalString, ClosureRef, TableRef};
     use super::*;
 
     #[test]
@@ -893,5 +968,104 @@ mod tests {
         heap.remove_root(root);
         heap.collect_major();
         assert!(!heap.contains(id));
+    }
+
+    #[test]
+    fn table_ref_wraps_the_matching_heap_table_methods() {
+        let mut heap = Heap::new(Capabilities::SANDBOX);
+        let table = TableRef::alloc(&mut heap);
+        let key = Value::integer(1);
+        table.set(&mut heap, key, Value::integer(42)).unwrap();
+        assert_eq!(table.get(&heap, key), Value::integer(42));
+        assert_eq!(table.len(&heap), 1);
+
+        let (next_key, next_value) = table.next(&mut heap, Value::NIL).unwrap().unwrap();
+        assert_eq!((next_key, next_value), (key, Value::integer(42)));
+        assert_eq!(table.next(&mut heap, next_key).unwrap(), None);
+
+        let round_tripped = TableRef::new(table.object_id());
+        assert_eq!(round_tripped, table);
+    }
+
+    #[test]
+    fn closure_ref_allocates_over_already_allocated_upvalue_cells() {
+        let mut heap = Heap::new(Capabilities::SANDBOX);
+        let environment_cell = heap.alloc_upvalue(Value::NIL, None);
+        let closure = ClosureRef::alloc(&mut heap, 3, vec![environment_cell], 0).unwrap();
+        let sol_core::HeapObject::Closure(object) = heap.object(closure.object_id()).unwrap()
+        else {
+            panic!("ClosureRef::alloc did not produce a canonical closure")
+        };
+        assert_eq!(object.prototype, 3);
+        assert_eq!(object.environment, 0);
+        assert_eq!(object.upvalues, vec![environment_cell]);
+    }
+
+    #[test]
+    fn thread_ref_alloc_produces_a_fresh_suspended_thread_object() {
+        let mut heap = Heap::new(Capabilities::SANDBOX);
+        let thread = ThreadRef::alloc(&mut heap);
+        assert!(matches!(
+            heap.object(thread.object_id()).unwrap(),
+            sol_core::HeapObject::Thread(_)
+        ));
+        let other = ThreadRef::alloc(&mut heap);
+        assert_ne!(thread, other);
+    }
+
+    #[test]
+    fn prototype_registry_interns_by_identity_and_resolves_back() {
+        let closure = |source: &[u8]| {
+            let LuaValue::Closure(closure) = super::super::run_source(source).unwrap().value
+            else {
+                panic!("run_source did not produce a closure")
+            };
+            closure
+        };
+        let first = closure(b"return function() return 1 end");
+        let second = closure(b"return function() return 2 end");
+
+        let mut registry = PrototypeRegistry::default();
+        let first_id = registry.intern(&first.proto);
+        let second_id = registry.intern(&second.proto);
+        assert_ne!(first_id, second_id);
+        // Interning the same `Rc<Proto>` identity again must not mint a new id.
+        assert_eq!(registry.intern(&first.proto), first_id);
+
+        assert!(Rc::ptr_eq(registry.resolve(first_id).unwrap(), &first.proto));
+        assert!(Rc::ptr_eq(
+            registry.resolve(second_id).unwrap(),
+            &second.proto
+        ));
+        assert!(registry.resolve(2).is_none());
+    }
+
+    #[test]
+    fn coroutine_registry_addresses_coroutines_by_their_thread_objects_own_id() {
+        let mut heap = Heap::new(Capabilities::SANDBOX);
+        let first_thread = ThreadRef::alloc(&mut heap);
+        let second_thread = ThreadRef::alloc(&mut heap);
+        let LuaValue::Thread(coroutine) = super::super::run_source(
+            br#"
+                return coroutine.create(function() end)
+            "#,
+        )
+        .unwrap()
+        .value
+        else {
+            panic!("run_source did not produce a coroutine")
+        };
+
+        let mut registry = CoroutineRegistry::default();
+        assert!(registry.is_empty());
+        registry.insert(first_thread, coroutine.clone());
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(second_thread).is_none());
+        assert!(Rc::ptr_eq(registry.get(first_thread).unwrap(), &coroutine));
+
+        let removed = registry.remove(first_thread).unwrap();
+        assert!(Rc::ptr_eq(&removed, &coroutine));
+        assert!(registry.is_empty());
+        assert!(registry.get(first_thread).is_none());
     }
 }

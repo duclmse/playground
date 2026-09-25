@@ -176,6 +176,7 @@ pub enum HeapError {
         upvalues: usize,
     },
     NativeProviderIdsExhausted,
+    InvalidNextKey,
 }
 
 impl fmt::Display for HeapError {
@@ -199,6 +200,7 @@ impl fmt::Display for HeapError {
             Self::NativeProviderIdsExhausted => {
                 f.write_str("canonical native-provider ID space is exhausted")
             }
+            Self::InvalidNextKey => f.write_str("invalid key to 'next'"),
         }
     }
 }
@@ -716,6 +718,68 @@ impl Heap {
         Ok(entries)
     }
 
+    /// `next(t, key)`: the key/value pair immediately after `key` in this
+    /// table's iteration order (array part in index order, then the hash
+    /// part in insertion order), skipping tombstoned (nil-valued) entries,
+    /// or `None` once iteration is exhausted. `key == Value::NIL` starts
+    /// from the beginning. A key that was live when last returned by `next`
+    /// - and has since been set to nil, which real Lua explicitly permits
+    /// mid-traversal - can still be located to resume from; any other
+    /// unrecognized key is `HeapError::InvalidNextKey`. Mirrors
+    /// `sol::lua_runtime::dispatch::LuaRuntime::next`'s tombstone-tolerant
+    /// resume behavior over `LuaTable::entries_with_tombstones`.
+    pub fn table_next(
+        &mut self,
+        table: ObjectId,
+        key: Value,
+    ) -> Result<Option<(Value, Value)>, HeapError> {
+        let object = self.table(table)?;
+        let array_len = object.array.len();
+        let start = if key == Value::NIL {
+            0
+        } else if let Some(index) = positive_array_index(key).filter(|index| *index <= array_len)
+        {
+            index
+        } else {
+            let hash_key = self.table_key(key)?;
+            let object = self.table(table)?;
+            let position = object
+                .hash
+                .get_index_of(&hash_key)
+                .ok_or(HeapError::InvalidNextKey)?;
+            array_len + position + 1
+        };
+
+        let object = self.table(table)?;
+        if start < array_len {
+            if let Some((offset, value)) = object.array[start..]
+                .iter()
+                .enumerate()
+                .find(|(_, value)| **value != Value::NIL)
+            {
+                return Ok(Some((Value::integer((start + offset + 1) as i64), *value)));
+            }
+        }
+        let hash_start = start.saturating_sub(array_len);
+        let found = object
+            .hash
+            .iter()
+            .skip(hash_start)
+            .find(|(_, value)| **value != Value::NIL)
+            .map(|(key, value)| (key.clone(), *value));
+        let Some((key, value)) = found else {
+            return Ok(None);
+        };
+        let key = match key {
+            TableKey::Boolean(value) => Value::boolean(value),
+            TableKey::Integer(value) => Value::integer(value),
+            TableKey::Float(bits) => Value::float(f64::from_bits(bits)),
+            TableKey::String(bytes) => Value::object(self.alloc_string(&bytes)),
+            TableKey::Object(value) => Value::object(value),
+        };
+        Ok(Some((key, value)))
+    }
+
     pub fn table_set(
         &mut self,
         table: ObjectId,
@@ -765,6 +829,17 @@ impl Heap {
         self.write_barrier(table, key);
         self.write_barrier(table, value);
         Ok(())
+    }
+
+    pub fn upvalue_value(&self, upvalue: ObjectId) -> Result<Value, HeapError> {
+        match &self.entry(upvalue)?.object {
+            HeapObject::Upvalue(cell) => Ok(cell.value),
+            actual => Err(HeapError::WrongKind {
+                handle: upvalue,
+                expected: ObjectKind::Upvalue,
+                actual: actual.kind(),
+            }),
+        }
     }
 
     pub fn set_upvalue(&mut self, upvalue: ObjectId, value: Value) -> Result<(), HeapError> {
@@ -1423,6 +1498,80 @@ mod tests {
             heap.live_bytes(),
             baseline,
             "dropping the last root and collecting must return to baseline"
+        );
+    }
+
+    #[test]
+    fn table_next_walks_array_then_hash_in_order_and_terminates() {
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        heap.table_set(table, Value::integer(1), Value::integer(10))
+            .unwrap();
+        heap.table_set(table, Value::integer(2), Value::integer(20))
+            .unwrap();
+        let name_key = Value::object(heap.alloc_string(b"name"));
+        heap.table_set(table, name_key, Value::integer(30)).unwrap();
+
+        let (key, value) = heap.table_next(table, Value::NIL).unwrap().unwrap();
+        assert_eq!((key, value), (Value::integer(1), Value::integer(10)));
+
+        let (key, value) = heap.table_next(table, key).unwrap().unwrap();
+        assert_eq!((key, value), (Value::integer(2), Value::integer(20)));
+
+        let (key, value) = heap.table_next(table, key).unwrap().unwrap();
+        assert_eq!((key, value), (name_key, Value::integer(30)));
+
+        assert_eq!(heap.table_next(table, key).unwrap(), None);
+    }
+
+    #[test]
+    fn table_next_skips_a_key_nilled_since_it_was_last_returned() {
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        heap.table_set(table, Value::integer(1), Value::integer(10))
+            .unwrap();
+        heap.table_set(table, Value::integer(2), Value::integer(20))
+            .unwrap();
+        heap.table_set(table, Value::integer(3), Value::integer(30))
+            .unwrap();
+
+        let (key, _) = heap.table_next(table, Value::NIL).unwrap().unwrap();
+        assert_eq!(key, Value::integer(1));
+        // Real Lua permits clearing the just-visited key mid-traversal;
+        // `next` must still resume correctly from it.
+        heap.table_set(table, key, Value::NIL).unwrap();
+        let (key, value) = heap.table_next(table, key).unwrap().unwrap();
+        assert_eq!((key, value), (Value::integer(2), Value::integer(20)));
+    }
+
+    #[test]
+    fn table_next_rejects_a_key_never_stored_in_the_table() {
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        heap.table_set(table, Value::integer(1), Value::integer(10))
+            .unwrap();
+        assert_eq!(
+            heap.table_next(table, Value::integer(99)).unwrap_err(),
+            HeapError::InvalidNextKey
+        );
+    }
+
+    #[test]
+    fn upvalue_value_reads_back_what_set_upvalue_wrote() {
+        let mut heap = Heap::default();
+        let cell = heap.alloc_upvalue(Value::integer(1), None);
+        assert_eq!(heap.upvalue_value(cell).unwrap(), Value::integer(1));
+        heap.set_upvalue(cell, Value::integer(2)).unwrap();
+        assert_eq!(heap.upvalue_value(cell).unwrap(), Value::integer(2));
+
+        let table = heap.alloc_table();
+        assert_eq!(
+            heap.upvalue_value(table).unwrap_err(),
+            HeapError::WrongKind {
+                handle: table,
+                expected: ObjectKind::Upvalue,
+                actual: ObjectKind::Table,
+            }
         );
     }
 

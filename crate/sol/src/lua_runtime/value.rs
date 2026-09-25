@@ -62,6 +62,115 @@ impl Drop for CanonicalObjectRoot {
     }
 }
 
+/// A cheap `Copy` handle into a canonical `sol-core` table object, distinct
+/// from the `Rc<CanonicalObjectRoot>`-rooted `CanonicalTable` above: it holds
+/// no root and has no `Drop` side effect, so it is safe to store at hot-path
+/// volume (registers, table cells, upvalues) once frame-walk rooting (see
+/// docs/features/table-closure-coroutine-cutover.md §3) makes every live one
+/// reachable from a GC safepoint. `CanonicalTable` stays reserved for
+/// genuinely long-lived anchors (the embedding registry, `lua_ref`-style
+/// persistent C handles). Not yet used by `LuaValue`/`LuaKey` — see
+/// docs/features/table-closure-coroutine-cutover.md §8 for why the flip has
+/// to land together with `ClosureRef`/`ThreadRef` rather than on its own.
+// `#[allow(dead_code)]` throughout this ref-type/wrapper-method group: this
+// is prerequisite plumbing (docs/features/table-closure-coroutine-cutover.md
+// §8 step 2), unit-tested directly against `sol_core::Heap` below, but not
+// yet wired into `LuaValue`/`LuaKey` or any call site — that has to land as
+// the single coordinated flip in step 4.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct TableRef(sol_core::ObjectId);
+
+/// The `ClosureRef` counterpart to `TableRef`; see its doc comment.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct ClosureRef(sol_core::ObjectId);
+
+/// The `ThreadRef` counterpart to `TableRef`; see its doc comment.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct ThreadRef(sol_core::ObjectId);
+
+#[allow(dead_code)]
+impl TableRef {
+    pub(super) fn new(object: sol_core::ObjectId) -> Self {
+        Self(object)
+    }
+
+    pub(super) fn object_id(self) -> sol_core::ObjectId {
+        self.0
+    }
+
+    pub(super) fn alloc(heap: &mut sol_core::Heap) -> Self {
+        Self(heap.alloc_table())
+    }
+
+    pub(super) fn get(self, heap: &sol_core::Heap, key: sol_core::Value) -> sol_core::Value {
+        heap.table_get(self.0, key)
+            .expect("TableRef must address a live table object")
+    }
+
+    pub(super) fn set(
+        self,
+        heap: &mut sol_core::Heap,
+        key: sol_core::Value,
+        value: sol_core::Value,
+    ) -> Result<(), sol_core::HeapError> {
+        heap.table_set(self.0, key, value)
+    }
+
+    pub(super) fn len(self, heap: &sol_core::Heap) -> usize {
+        heap.table_len(self.0)
+            .expect("TableRef must address a live table object")
+    }
+
+    pub(super) fn next(
+        self,
+        heap: &mut sol_core::Heap,
+        key: sol_core::Value,
+    ) -> Result<Option<(sol_core::Value, sol_core::Value)>, sol_core::HeapError> {
+        heap.table_next(self.0, key)
+    }
+}
+
+#[allow(dead_code)]
+impl ClosureRef {
+    pub(super) fn new(object: sol_core::ObjectId) -> Self {
+        Self(object)
+    }
+
+    pub(super) fn object_id(self) -> sol_core::ObjectId {
+        self.0
+    }
+
+    /// Allocates a closure over already-allocated upvalue cells (see
+    /// `sol_core::Heap::alloc_upvalue`/`upvalue_value`/`set_upvalue` for
+    /// creating and reading/writing those cells).
+    pub(super) fn alloc(
+        heap: &mut sol_core::Heap,
+        prototype: u32,
+        upvalues: Vec<sol_core::ObjectId>,
+        environment: usize,
+    ) -> Result<Self, sol_core::HeapError> {
+        Ok(Self(heap.alloc_closure(prototype, upvalues, environment)?))
+    }
+}
+
+#[allow(dead_code)]
+impl ThreadRef {
+    pub(super) fn new(object: sol_core::ObjectId) -> Self {
+        Self(object)
+    }
+
+    pub(super) fn object_id(self) -> sol_core::ObjectId {
+        self.0
+    }
+
+    pub(super) fn alloc(heap: &mut sol_core::Heap) -> Self {
+        Self(heap.alloc_thread(Vec::new()))
+    }
+}
+
 impl fmt::Debug for CanonicalUserdata {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         output
