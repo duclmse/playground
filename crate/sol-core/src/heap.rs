@@ -177,6 +177,7 @@ pub enum HeapError {
     },
     NativeProviderIdsExhausted,
     InvalidNextKey,
+    InvalidUpvalueIndex { index: usize, upvalues: usize },
 }
 
 impl fmt::Display for HeapError {
@@ -201,6 +202,10 @@ impl fmt::Display for HeapError {
                 f.write_str("canonical native-provider ID space is exhausted")
             }
             Self::InvalidNextKey => f.write_str("invalid key to 'next'"),
+            Self::InvalidUpvalueIndex { index, upvalues } => write!(
+                f,
+                "upvalue index {index} is outside {upvalues} upvalues"
+            ),
         }
     }
 }
@@ -445,6 +450,31 @@ impl Heap {
             upvalues,
             environment,
         })))
+    }
+
+    /// Rebinds one of a closure's upvalue cells to a different `Upvalue`
+    /// object - the primitive `debug.upvaluejoin` needs to alias two
+    /// closures' upvalues onto the same shared cell.
+    pub fn set_closure_upvalue(
+        &mut self,
+        closure: ObjectId,
+        index: usize,
+        upvalue: ObjectId,
+    ) -> Result<(), HeapError> {
+        self.expect_kind(closure, ObjectKind::Closure)?;
+        self.expect_kind(upvalue, ObjectKind::Upvalue)?;
+        let HeapObject::Closure(object) = &mut self.entry_mut(closure)?.object else {
+            unreachable!()
+        };
+        if index >= object.upvalues.len() {
+            return Err(HeapError::InvalidUpvalueIndex {
+                index,
+                upvalues: object.upvalues.len(),
+            });
+        }
+        object.upvalues[index] = upvalue;
+        self.write_barrier(closure, Value::object(upvalue));
+        Ok(())
     }
 
     pub fn alloc_native_callable(

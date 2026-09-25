@@ -152,3 +152,20 @@ canonical capability profile directly. These remove the old map-only global
 behavior and duplicate authority model, but do not count as canonical object
 ownership: tables and upvalue cells remain `Rc` objects until the next
 migration slice.
+
+Tables, closures, and coroutines have now moved onto canonical storage
+(`LuaValue::Table`/`Closure`/`Thread` hold `TableRef`/`ClosureRef`/`ThreadRef`,
+not `Rc`); `LuaTable`, `LuaClosure`, and the old `Rc`-based `Cells` alias are
+deleted. Root/safepoint discipline still runs through `gc.rs`'s per-instruction
+`charge_allocation` heuristic rather than the dispatch-loop safepoint design
+in [table-closure-coroutine-cutover.md](table-closure-coroutine-cutover.md)
+§3 — moving that trigger and deleting `gc.rs`'s now-fully-dead collector code
+is task #12, along with crediting reclaimed bytes back to the allocation
+budget after a collection (a pre-existing gap, not introduced by this slice,
+that leaves seven Lua-compatibility tests failing under a tight budget — see
+the cutover document's §9 for the honest accounting) and, for task #13, making
+a registered coroutine's frames a conditional rather than unconditional GC
+root so a coroutine kept alive only by a cycle through a weak-value table can
+be collected. U2's object-model migration itself — one heap, one collector,
+no production object owned by two independent collectors — is otherwise
+complete.

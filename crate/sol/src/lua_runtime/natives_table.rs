@@ -3,7 +3,6 @@
 //! table and its small cross-cutting coercion helpers.
 
 use crate::ast::BinaryOp;
-use indexmap::IndexMap;
 
 use super::frame::*;
 use super::tim_sort::{TimSort, TimSortStep};
@@ -66,7 +65,7 @@ impl LuaRuntime {
                         }
                     }
                 }
-                self.charge_allocation(output.len())?;
+                self.charge_allocation(output.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::TableInsert => {
@@ -154,15 +153,13 @@ impl LuaRuntime {
                 Ok(vec![removed])
             }
             NativeFunction::TablePack => {
-                self.charge_allocation(std::mem::size_of::<LuaTable>())?;
-                let value = self.values_table(&args);
+                let value = self.values_table(&args)?;
                 let LuaValue::Table(table) = &value else {
                     unreachable!()
                 };
-                table.borrow_mut().set(
-                    LuaValue::String(self.intern_str(b"n".to_vec())),
-                    LuaValue::Integer(args.len() as i64),
-                )?;
+                let table = *table;
+                let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+                self.table_set(table, n_key, LuaValue::Integer(args.len() as i64))?;
                 Ok(vec![value])
             }
             NativeFunction::TableUnpack => {
@@ -384,18 +381,12 @@ impl LuaRuntime {
                     return Err(LuaError::new("table overflow"));
                 }
 
-                let count = sizeseq as usize;
-                let nrec = sizerest as usize;
-                self.charge_allocation(count * std::mem::size_of::<LuaValue>())?;
-                self.charge_allocation(nrec * std::mem::size_of::<LuaValue>() * 2)?;
-                let table = LuaTable {
-                    array: vec![LuaValue::Nil; count],
-                    hash: IndexMap::with_capacity(nrec),
-                    ..LuaTable::default()
-                };
-                Ok(vec![LuaValue::Table(
-                    self.track_table(Rc::new(RefCell::new(table))),
-                )])
+                // The canonical table backing has no separate preallocation
+                // API - `new_table` always starts empty and grows on demand,
+                // so `sizeseq`/`sizerest` are validated above (matching real
+                // Lua's argument-checking behavior) but otherwise only serve
+                // as a no-op capacity hint here.
+                Ok(vec![LuaValue::Table(self.new_table(None)?)])
             }
             _ => unreachable!("call_native_table received a non-table NativeFunction"),
         }

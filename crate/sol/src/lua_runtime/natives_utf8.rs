@@ -65,7 +65,7 @@ impl LuaRuntime {
                         return Err(LuaError::new("value out of range for utf8.char"));
                     }
                 }
-                self.charge_allocation(output.len())?;
+                self.charge_allocation(output.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::Utf8Codepoint => {

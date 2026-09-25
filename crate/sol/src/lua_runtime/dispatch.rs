@@ -6,7 +6,6 @@
 //! `set_index_resolve`, `binary_resolve`, `metamethod`) and the
 //! frame/register-buffer recycling pools.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use sol_core::{FrameHeader, FrameState, FunctionId, ValueCount};
@@ -240,7 +239,7 @@ impl LuaRuntime {
         name: &str,
         args: Vec<LuaValue>,
     ) -> sol_core::CallOutcome<LuaValue, LuaError> {
-        match self.call(self.globals.get(name), args) {
+        match self.call(self.globals.get(self, name), args) {
             Ok(values) => sol_core::CallOutcome::Returned(values),
             Err(error) => sol_core::CallOutcome::Raised(error),
         }
@@ -372,11 +371,11 @@ impl LuaRuntime {
                 LuaValue::RegisteredNative(callable) => self.call_registered_native(callable, args),
                 LuaValue::CFunction(callable) => self.call_c_function(callable, args),
                 LuaValue::GMatchIterator(state) => self.call_gmatch_iterator(state),
-                LuaValue::CoroutineWrapper(co) => self.call_coroutine_wrapper(co, args),
+                LuaValue::CoroutineWrapper(thread) => self.call_coroutine_wrapper(thread, args),
                 LuaValue::Closure(closure) => {
-                    let name = closure.proto.metadata.name.clone();
-                    let upvals = closure.upvals.borrow().clone();
-                    self.call_closure(closure.proto.clone(), upvals, closure.globals.clone(), args)
+                    let (proto, upvals, globals) = self.closure_parts(closure)?;
+                    let name = proto.metadata.name.clone();
+                    self.call_closure(proto, upvals, globals, args)
                         .map_err(|error| error.at(&name))
                 }
                 other => {
@@ -607,9 +606,10 @@ impl LuaRuntime {
     fn take_cells_buffer(&mut self, captured_registers: &[bool]) -> Cells {
         let mut cells = self.cells_pool.pop().unwrap_or_default();
         cells.clear();
+        let mut heap = self.canonical_heap.borrow_mut();
         cells.extend(captured_registers.iter().map(|&captured| {
             if captured {
-                Some(Rc::new(RefCell::new(LuaValue::Nil)))
+                Some(heap.alloc_upvalue(sol_core::Value::NIL, None))
             } else {
                 None
             }
@@ -677,7 +677,7 @@ impl LuaRuntime {
     fn call_closure(
         &mut self,
         proto: Rc<Proto>,
-        upvals: Vec<RcRef<LuaValue>>,
+        upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
         args: Vec<LuaValue>,
     ) -> LuaResult<Vec<LuaValue>> {
@@ -720,7 +720,7 @@ impl LuaRuntime {
     fn new_lua_frame(
         &mut self,
         proto: Rc<Proto>,
-        upvals: Vec<RcRef<LuaValue>>,
+        upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
         args: Vec<LuaValue>,
         call_chain_hops: usize,
@@ -730,12 +730,13 @@ impl LuaRuntime {
         let parameter_count = proto.metadata.arity.parameters as usize;
         self.charge_allocation(
             (register_count + proto.captured_cell_count) * std::mem::size_of::<LuaValue>(),
+            None,
         )?;
         let mut regs = self.take_regs_buffer(register_count);
         let cells = self.take_cells_buffer(&proto.captured_registers);
         for i in 0..parameter_count.min(register_count) {
             let value = args.get(i).cloned().unwrap_or(LuaValue::Nil);
-            reg_set(&mut regs, &cells, i, value);
+            reg_set(self, &mut regs, &cells, i, value);
         }
         let varargs: Vec<LuaValue> = if proto.metadata.arity.variadic {
             // Reuses `args`' own allocation as `varargs` (draining the
@@ -750,15 +751,14 @@ impl LuaRuntime {
             Vec::new()
         };
         if let Some(vararg_reg) = proto.vararg_name {
-            let table = self.values_table(&varargs);
+            let table = self.values_table(&varargs)?;
             let LuaValue::Table(named_varargs) = &table else {
                 unreachable!("values_table always returns a table")
             };
-            named_varargs.borrow_mut().set(
-                LuaValue::String(self.intern_str(b"n".to_vec())),
-                LuaValue::Integer(varargs.len() as i64),
-            )?;
-            reg_set(&mut regs, &cells, vararg_reg as usize, table);
+            let named_varargs = *named_varargs;
+            let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+            self.table_set(named_varargs, n_key, LuaValue::Integer(varargs.len() as i64))?;
+            reg_set(self, &mut regs, &cells, vararg_reg as usize, table);
         }
         Ok(LuaFrame {
             header: FrameHeader::new(function, 0, 0),
@@ -1958,9 +1958,9 @@ impl LuaRuntime {
         }
     }
 
-    pub(super) fn expect_table(&self, value: &LuaValue) -> LuaResult<RcRef<LuaTable>> {
+    pub(super) fn expect_table(&self, value: &LuaValue) -> LuaResult<TableRef> {
         match value {
-            LuaValue::Table(table) => Ok(table.clone()),
+            LuaValue::Table(table) => Ok(*table),
             value => Err(LuaError::new(format!(
                 "table expected, got {}",
                 value.type_name()
@@ -1969,7 +1969,8 @@ impl LuaRuntime {
     }
 
     pub(super) fn raw_index(&self, value: LuaValue, key: LuaValue) -> LuaResult<LuaValue> {
-        self.expect_table(&value)?.borrow().get(&key)
+        let table = self.expect_table(&value)?;
+        self.table_get(table, &key)
     }
 
     /// Blocking, metamethod-respecting `t[key]`/`t[key] = v`/`#t`, for native
@@ -1997,7 +1998,7 @@ impl LuaRuntime {
         key: LuaValue,
         new_value: LuaValue,
     ) -> LuaResult<()> {
-        match self.set_index_resolve(value, key, new_value)? {
+        match self.set_index_resolve(value, key, new_value, None)? {
             SetIndexResolution::Done => Ok(()),
             SetIndexResolution::Call { method, args } => {
                 self.call(method, args)?;
@@ -2037,13 +2038,13 @@ impl LuaRuntime {
         value: LuaValue,
         key: LuaValue,
         new_value: LuaValue,
+        active_frame: Option<&LuaFrame>,
     ) -> LuaResult<()> {
         let table = self.expect_table(&value)?;
-        if table.borrow().get(&key)? == LuaValue::Nil {
-            self.charge_new_table_entry(&table)?;
+        if self.table_get(table, &key)? == LuaValue::Nil {
+            self.charge_new_table_entry(active_frame)?;
         }
-        let result = table.borrow_mut().set(key, new_value);
-        result
+        self.table_set(table, key, new_value)
     }
 
     pub(super) fn metamethod(&self, value: &LuaValue, name: &[u8]) -> LuaResult<Option<LuaValue>> {
@@ -2054,19 +2055,17 @@ impl LuaRuntime {
             return c_api::canonical_metamethod(self, value.object_id(), name);
         }
         let metatable = match value {
-            LuaValue::Table(table) => table.borrow().metatable.clone(),
-            LuaValue::String(_) => Some(self.string_metatable.clone()),
-            LuaValue::Integer(_) | LuaValue::Float(_) => self.number_metatable.clone(),
-            LuaValue::Bool(_) => self.boolean_metatable.clone(),
-            LuaValue::Nil => self.nil_metatable.clone(),
+            LuaValue::Table(table) => self.table_metatable(*table),
+            LuaValue::String(_) => Some(self.string_metatable),
+            LuaValue::Integer(_) | LuaValue::Float(_) => self.number_metatable,
+            LuaValue::Bool(_) => self.boolean_metatable,
+            LuaValue::Nil => self.nil_metatable,
             _ => None,
         };
         let Some(metatable) = metatable else {
             return Ok(None);
         };
-        let value = metatable
-            .borrow()
-            .get(&LuaValue::String(self.intern_str(name.to_vec())))?;
+        let value = self.table_get(metatable, &LuaValue::String(self.intern_str(name.to_vec())))?;
         Ok((value != LuaValue::Nil).then_some(value))
     }
 
@@ -2086,7 +2085,7 @@ impl LuaRuntime {
                 Ok(LenResolution::Value(LuaValue::Integer(bytes.len() as i64)))
             }
             LuaValue::Table(table) => Ok(LenResolution::Value(LuaValue::Integer(
-                table.borrow().len() as i64,
+                self.table_len(table) as i64,
             ))),
             other => Err(LuaError::new(format!(
                 "attempt to get length of a {} value",
@@ -2123,7 +2122,7 @@ impl LuaRuntime {
             // storage of its own and falls straight through to the
             // metamethod lookup below.
             let raw = match &value {
-                LuaValue::Table(table) => table.borrow().get(&key)?,
+                LuaValue::Table(table) => self.table_get(*table, &key)?,
                 LuaValue::CanonicalTable(table) => {
                     c_api::canonical_table_get(self, table.object_id(), &key)?
                 }
@@ -2174,10 +2173,11 @@ impl LuaRuntime {
         mut value: LuaValue,
         key: LuaValue,
         new_value: LuaValue,
+        active_frame: Option<&LuaFrame>,
     ) -> LuaResult<SetIndexResolution> {
         for _ in 0..MAX_METATABLE_CHAIN {
             let raw = match &value {
-                LuaValue::Table(table) => table.borrow().get(&key)?,
+                LuaValue::Table(table) => self.table_get(*table, &key)?,
                 LuaValue::CanonicalTable(table) => {
                     c_api::canonical_table_get(self, table.object_id(), &key)?
                 }
@@ -2190,7 +2190,7 @@ impl LuaRuntime {
             };
             if raw != LuaValue::Nil {
                 match &value {
-                    LuaValue::Table(table) => table.borrow_mut().set(key, new_value)?,
+                    LuaValue::Table(table) => self.table_set(*table, key, new_value)?,
                     LuaValue::CanonicalTable(table) => {
                         let key = c_api::lua_to_canonical(self, &key)?;
                         let new_value = c_api::lua_to_canonical(self, &new_value)?;
@@ -2217,12 +2217,8 @@ impl LuaRuntime {
                 None => {
                     match &value {
                         LuaValue::Table(table) => {
-                            // `raw` was `Nil` above with no `__newindex` to
-                            // fall back to, so this key is genuinely new to
-                            // `table` - not an overwrite of an existing
-                            // (possibly nil-tombstoned) entry.
-                            self.charge_new_table_entry(table)?;
-                            table.borrow_mut().set(key, new_value)?
+                            self.charge_new_table_entry(active_frame)?;
+                            self.table_set(*table, key, new_value)?;
                         }
                         LuaValue::CanonicalTable(table) => {
                             let key = c_api::lua_to_canonical(self, &key)?;
@@ -2243,27 +2239,10 @@ impl LuaRuntime {
 
     pub(super) fn next(&self, value: LuaValue, key: LuaValue) -> LuaResult<Vec<LuaValue>> {
         let table = self.expect_table(&value)?;
-        // Search the tombstone-inclusive view so a key that was live when
-        // last returned by `next` - and has since been set to nil, which
-        // real Lua explicitly permits mid-traversal - can still be located
-        // to resume from, then skip forward past any nil-valued (deleted)
-        // slots to find the next live entry.
-        let entries = table.borrow().entries_with_tombstones();
-        let start_index = if key == LuaValue::Nil {
-            0
-        } else {
-            entries
-                .iter()
-                .position(|(entry_key, _)| entry_key == &key)
-                .ok_or_else(|| LuaError::new("invalid key to 'next'"))?
-                + 1
-        };
-        let result = entries[start_index..]
-            .iter()
-            .find(|(_, value)| *value != LuaValue::Nil)
-            .map(|(key, value)| vec![key.clone(), value.clone()])
-            .unwrap_or_else(|| vec![LuaValue::Nil]);
-        Ok(result)
+        match self.table_next(table, &key)? {
+            Some((key, value)) => Ok(vec![key, value]),
+            None => Ok(vec![LuaValue::Nil]),
+        }
     }
 
     /// Shared by every `dispatch_step` call site that just resolved a
@@ -2561,9 +2540,7 @@ impl LuaRuntime {
         let mut hops = 0usize;
         loop {
             if let LuaValue::Closure(closure) = &resolved {
-                let proto = closure.proto.clone();
-                let upvals = closure.upvals.borrow().clone();
-                let globals = closure.globals.clone();
+                let (proto, upvals, globals) = self.closure_parts(*closure)?;
                 return Ok(StepResult::PushClosure {
                     proto,
                     upvals,

@@ -244,13 +244,11 @@ impl LuaRuntime {
         })
     }
 
-    pub(super) fn values_table(&self, values: &[LuaValue]) -> LuaValue {
-        let mut table = LuaTable::default();
+    pub(super) fn values_table(&mut self, values: &[LuaValue]) -> LuaResult<LuaValue> {
+        let table = self.new_table(None)?;
         for (index, value) in values.iter().enumerate() {
-            table
-                .set(LuaValue::Integer(index as i64 + 1), value.clone())
-                .unwrap();
+            self.table_set(table, LuaValue::Integer(index as i64 + 1), value.clone())?;
         }
-        LuaValue::Table(self.track_table(Rc::new(RefCell::new(table))))
+        Ok(LuaValue::Table(table))
     }
 }

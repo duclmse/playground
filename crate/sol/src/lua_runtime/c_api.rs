@@ -92,8 +92,9 @@ fn active_c_state(runtime: &LuaRuntime) -> Option<*mut lua_State> {
     let thread = runtime
         .coroutine_stack
         .last()
-        .unwrap_or(&runtime.main_coroutine);
-    let identity = Rc::as_ptr(thread) as usize;
+        .copied()
+        .unwrap_or(runtime.main_coroutine);
+    let identity = thread.object_id().raw();
     runtime.c_thread_states.borrow().get(&identity).copied()
 }
 
@@ -288,7 +289,7 @@ pub struct lua_State {
     allocator: LuaAlloc,
     allocator_data: *mut c_void,
     panic_function: Option<LuaCFunction>,
-    thread: Rc<LuaCoroutine>,
+    thread: ThreadRef,
     status: c_int,
     to_close: Vec<usize>,
     hook: Option<LuaHook>,
@@ -371,7 +372,7 @@ impl lua_State {
         }
     }
 
-    fn child(parent: &lua_State, thread: Rc<LuaCoroutine>) -> Box<Self> {
+    fn child(parent: &lua_State, thread: ThreadRef) -> Box<Self> {
         Box::new(Self {
             runtime: parent.runtime,
             _owned_runtime: None,
@@ -490,7 +491,7 @@ pub(super) fn invoke(
                         return Err(LuaError::new("invalid C yield result count"));
                     }
                     if let Some(continuation) = payload.continuation {
-                        let identity = Rc::as_ptr(&state.thread) as usize;
+                        let identity = state.thread.object_id().raw();
                         unsafe { state.runtime() }
                             .c_continuations
                             .borrow_mut()
@@ -520,7 +521,7 @@ pub(super) fn invoke(
 
 fn invoke_continuation(
     runtime: &mut LuaRuntime,
-    thread: Rc<LuaCoroutine>,
+    thread: ThreadRef,
     continuation: CContinuation,
     args: Vec<LuaValue>,
 ) -> LuaResult<CApiOutcome> {
@@ -543,7 +544,7 @@ fn invoke_continuation(
                         return Err(LuaError::new("invalid C yield result count"));
                     }
                     if let Some(next) = payload.continuation {
-                        let identity = Rc::as_ptr(&state.thread) as usize;
+                        let identity = state.thread.object_id().raw();
                         unsafe { state.runtime() }
                             .c_continuations
                             .borrow_mut()
@@ -715,7 +716,7 @@ fn register_owned_state(state: Box<lua_State>) -> *mut lua_State {
     let state = Box::into_raw(state);
     unsafe {
         let state_ref = &mut *state;
-        let identity = Rc::as_ptr(&state_ref.thread) as usize;
+        let identity = state_ref.thread.object_id().raw();
         (&mut *state_ref.runtime)
             .c_thread_states
             .borrow_mut()
@@ -823,10 +824,11 @@ unsafe fn push_library(state: *mut lua_State, name: &str) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
     };
+    let runtime = unsafe { state.runtime() };
     let value = if name.is_empty() {
-        unsafe { state.runtime() }.globals.as_value()
+        runtime.globals.as_value()
     } else {
-        unsafe { state.runtime() }.globals.get(name)
+        runtime.globals.get(runtime, name)
     };
     state.stack.push(value);
     1
@@ -1380,9 +1382,13 @@ pub unsafe extern "C" fn lua_topointer(state: *mut lua_State, index: c_int) -> *
 
 #[no_mangle]
 pub unsafe extern "C" fn lua_rawlen(state: *mut lua_State, index: c_int) -> usize {
-    match unsafe { state_mut(state) }.and_then(|state| state.value(index)) {
+    let Some(state) = (unsafe { state_mut(state) }) else {
+        return 0;
+    };
+    let value = state.value(index).cloned();
+    match value {
         Some(LuaValue::String(value)) => value.len(),
-        Some(LuaValue::Table(value)) => value.borrow().len(),
+        Some(LuaValue::Table(table)) => unsafe { state.runtime() }.table_len(table),
         Some(LuaValue::CanonicalTable(value)) => value.len(),
         Some(LuaValue::Userdata(value)) => value.len(),
         _ => 0,
@@ -1693,8 +1699,8 @@ pub unsafe extern "C-unwind" fn lua_newthread(state: *mut lua_State) -> *mut lua
         Ok(thread) => thread,
         Err(error) => api_jump(parent, error),
     };
-    let identity = Rc::as_ptr(&thread) as usize;
-    let child = Box::into_raw(lua_State::child(parent, thread.clone()));
+    let identity = thread.object_id().raw();
+    let child = Box::into_raw(lua_State::child(parent, thread));
     unsafe { parent.runtime() }
         .c_thread_states
         .borrow_mut()
@@ -1708,8 +1714,8 @@ pub unsafe extern "C" fn lua_pushthread(state: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
     };
-    let thread = state.thread.clone();
-    let is_main = Rc::ptr_eq(&thread, &unsafe { state.runtime() }.main_coroutine);
+    let thread = state.thread;
+    let is_main = thread == unsafe { state.runtime() }.main_coroutine;
     state.stack.push(LuaValue::Thread(thread));
     is_main as c_int
 }
@@ -1722,7 +1728,7 @@ pub unsafe extern "C" fn lua_tothread(state: *mut lua_State, index: c_int) -> *m
     let Some(LuaValue::Thread(thread)) = state.value(index) else {
         return ptr::null_mut();
     };
-    let identity = Rc::as_ptr(thread) as usize;
+    let identity = thread.object_id().raw();
     unsafe { state.runtime() }
         .c_thread_states
         .borrow()
@@ -1792,29 +1798,25 @@ pub unsafe extern "C-unwind" fn lua_resume(
     if argument_count > state.stack.len() {
         return state.push_error(LuaError::new("not enough arguments to resume"));
     }
-    let first_resume = state.thread.frames.borrow().is_empty();
+    let thread = state.thread;
+    let coroutine = unsafe { state.runtime() }.coroutine(thread);
+    let first_resume = coroutine.frames.borrow().is_empty();
     if first_resume && state.stack.len() <= argument_count {
         return state.push_error(LuaError::new("cannot resume a thread without a function"));
     }
     let mut args = state.stack.split_off(state.stack.len() - argument_count);
     if first_resume {
         let function = state.stack.pop().unwrap();
-        *state.thread.body.borrow_mut() = Some(function);
+        *coroutine.body.borrow_mut() = Some(function);
     }
     state.stack.clear();
-    let thread = state.thread.clone();
-    let identity = Rc::as_ptr(&thread) as usize;
+    let identity = thread.object_id().raw();
     let continuation = unsafe { state.runtime() }
         .c_continuations
         .borrow_mut()
         .remove(&identity);
     if let Some(continuation) = continuation {
-        match invoke_continuation(
-            unsafe { state.runtime() },
-            thread.clone(),
-            continuation,
-            args,
-        ) {
+        match invoke_continuation(unsafe { state.runtime() }, thread, continuation, args) {
             Ok(CApiOutcome::Returned(values)) => args = values,
             Ok(CApiOutcome::Yielded(values)) => {
                 state.stack = values;
@@ -1825,7 +1827,7 @@ pub unsafe extern "C-unwind" fn lua_resume(
                 return LUA_YIELD;
             }
             Err(error) => {
-                state.thread.status.set(CoroutineStatus::Dead);
+                coroutine.status.set(CoroutineStatus::Dead);
                 let heap = unsafe { state.runtime() }.canonical_heap.clone();
                 state.stack.push(error.into_lua_value(&heap));
                 state.status = LUA_ERRRUN;
@@ -1837,7 +1839,7 @@ pub unsafe extern "C-unwind" fn lua_resume(
         }
     }
     let runtime = unsafe { state.runtime() };
-    let outcome = runtime.resume_coroutine_outcome(&thread, args);
+    let outcome = runtime.resume_coroutine_outcome(thread, args);
     let heap = runtime.canonical_heap.clone();
     let (status, values) = match outcome {
         sol_core::CallOutcome::Returned(values) => (LUA_OK, values),
@@ -1860,16 +1862,17 @@ pub unsafe extern "C" fn lua_closethread(state: *mut lua_State, _from: *mut lua_
     let Some(state) = (unsafe { state_mut(state) }) else {
         return LUA_ERRRUN;
     };
-    let main_thread = unsafe { state.runtime() }.main_coroutine.clone();
-    if state.thread.status.get() == CoroutineStatus::Running
-        && !Rc::ptr_eq(&state.thread, &main_thread)
-    {
+    let thread = state.thread;
+    let runtime = unsafe { state.runtime() };
+    let main_thread = runtime.main_coroutine;
+    let coroutine = runtime.coroutine(thread);
+    if coroutine.status.get() == CoroutineStatus::Running && thread != main_thread {
         return LUA_ERRRUN;
     }
     state.stack.clear();
-    state.thread.frames.borrow_mut().clear();
-    *state.thread.body.borrow_mut() = None;
-    state.thread.status.set(CoroutineStatus::Dead);
+    coroutine.frames.borrow_mut().clear();
+    *coroutine.body.borrow_mut() = None;
+    coroutine.status.set(CoroutineStatus::Dead);
     state.status = LUA_OK;
     LUA_OK
 }
@@ -1886,8 +1889,8 @@ pub unsafe extern "C" fn lua_isyieldable(state: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
     };
-    let main_thread = unsafe { state.runtime() }.main_coroutine.clone();
-    (!Rc::ptr_eq(&state.thread, &main_thread)) as c_int
+    let main_thread = unsafe { state.runtime() }.main_coroutine;
+    (state.thread != main_thread) as c_int
 }
 
 #[no_mangle]
@@ -2007,7 +2010,7 @@ fn close_c_stack_slot(state: &mut lua_State, slot: usize) -> LuaResult<()> {
 
 fn raw_table_get(state: &mut lua_State, table: LuaValue, key: &LuaValue) -> LuaResult<LuaValue> {
     match table {
-        LuaValue::Table(table) => table.borrow().get(key),
+        LuaValue::Table(table) => unsafe { state.runtime() }.table_get(table, key),
         LuaValue::CanonicalTable(table) => {
             canonical_table_get(unsafe { state.runtime() }, table.object_id(), key)
         }
@@ -2025,7 +2028,7 @@ fn raw_table_set(
     value: LuaValue,
 ) -> LuaResult<()> {
     match table {
-        LuaValue::Table(table) => table.borrow_mut().set(key, value),
+        LuaValue::Table(table) => unsafe { state.runtime() }.table_set(table, key, value),
         LuaValue::CanonicalTable(table) => {
             let key = state.to_canonical(&key)?;
             let value = state.to_canonical(&value)?;

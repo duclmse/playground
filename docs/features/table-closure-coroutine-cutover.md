@@ -1,6 +1,7 @@
 # Tables, closures, and coroutines onto the canonical heap
 
-Status: design, implementation not started. Written 2026-09-25.
+Status: step 4 (the coordinated flip) implemented 2026-09-26; steps 1-4 done,
+step 5 (safepoints/cleanup) is task #12. Written 2026-09-25.
 
 This is the design for the last slice of U2 (see
 [unified-sol-runtime-plan.md](unified-sol-runtime-plan.md) and
@@ -377,12 +378,107 @@ constraint), unlike the string migration, which had no such constraint:
    mechanical call-site rewrite onto already-built and already-tested
    primitives, not new design work. `LuaTable`, `LuaClosure`,
    `Rc<LuaCoroutine>`-as-ownership, and the old `Cells` alias are deleted once
-   nothing constructs them.
+   nothing constructs them. *(Done — see §9 for bugs the flip found and fixed,
+   and the residual gaps it carries into task #12.)*
 5. **Safepoints and cleanup**: move collection triggering to the dispatch-loop
    safepoint (§3), delete `gc.rs`'s collector and the now-dead `Rc`/`RefCell`
    aliases, and run the U2 exit audit: identity, weak-reference, finalizer, and
    coroutine stress tests under forced collection across mixed dynamic/typed
-   calls, with no object owned by two independent collectors.
+   calls, with no object owned by two independent collectors. *(Task #12.)*
+
+## 9. Implementation notes from the flip (task #11)
+
+Landing step 4 surfaced four bugs not visible from the design in §2–§6, all
+fixed as part of the same change, plus two residual gaps that are real but
+out of this task's scope and are carried forward to task #12 rather than
+papered over.
+
+**Bugs found and fixed:**
+
+- **Frame-popped-during-dispatch-loop rooting gap, three instances.** The
+  interpreter's dispatch loop (`dispatch_step`) pops the currently-executing
+  `Frame::Lua` out of `LuaRuntime::frames` into a Rust local for the duration
+  of its instruction loop (so registers/cells/upvalues can be mutated without
+  re-indexing `frames` every instruction). Any GC-triggering call reachable
+  from inside that loop therefore cannot rely on walking `self.frames` alone
+  for roots — it must also be told about that popped frame. This surfaced in
+  three places before the frame-roots walk correctly accounted for all of
+  them: table/closure allocation (`new_table`/`new_closure`) and general
+  allocation charging (`charge_allocation`/`tick`) needed the popped frame
+  threaded through as an explicit `active_frame: Option<&LuaFrame>` parameter
+  from every `dispatch_step`-internal call site (`None` everywhere a
+  collection can't be mid-dispatch); table-growth charging (see below) needed
+  the same threading once it existed; and `__gc` finalizer invocation needed
+  a *second*, independent mechanism (`LuaRuntime::pinned_roots: Vec<Vec<sol_core::Value>>`,
+  pushed/popped around `collect_garbage_with`'s finalizer-invocation loop in
+  `gc.rs`) because a finalizer's own `self.call` drives a *nested* dispatch
+  loop with its own, different `active_frame` — the outer, still-in-flight
+  popped frame that triggered the finalizing collection in the first place is
+  invisible to that nested loop's own rooting unless pinned separately. A
+  `Vec<Vec<_>>` rather than one flat `Vec` so a finalizer whose own execution
+  triggers another collection with finalizers of its own unwinds cleanly.
+- **Table-growth allocation charging was dropped, not reimplemented.** The
+  deleted `Rc`-based collector charged `2 * size_of::<LuaValue>()` against the
+  allocation budget for every genuinely new table key written (checked via
+  "was the existing raw value at this key `Nil`?"), at exactly three call
+  sites: `raw_set_index`, `set_index_resolve`'s no-metamethod fallback, and
+  `Instr::SetArrayMulti`'s per-element loop. Nothing carried this forward
+  across the cutover, leaving a loop like `for i = 1, huge do t[i] = i end`
+  unmetered by anything but the instruction budget. Reimplemented as
+  `LuaRuntime::charge_new_table_entry` in `table.rs`, called from the same
+  three sites, with the same charge — deliberately *without* the old
+  collector's credit-back-on-reclaim half, which is a different, still-open
+  gap (see below).
+- **A synthetic upvalue cell broke `debug.*` upvalue introspection.**
+  `new_closure` appends a synthetic trailing environment cell to a closure's
+  canonical upvalue-object vector (for `_ENV`) whenever the closure has an
+  implicit environment. `debug.getupvalue`/`setupvalue`/`upvalueid`/
+  `upvaluejoin` (`natives_debug.rs`) previously assumed the upvalue-cell count
+  equaled `proto.upvals.len()`, which was true under the old `Rc` vector but
+  is no longer true with the trailing synthetic cell present — an
+  out-of-range Lua-visible upvalue index could resolve to that internal cell
+  instead of correctly erroring. Fixed by bounding every such lookup to
+  `proto.upvals.len()` and routing `_ENV` access only through the existing
+  explicit `has_implicit_environment` branch.
+- **A too-broad `.expect()` turned a legitimate `t[nil]`/`t[0/0]` read into a
+  panic.** `TableRef::get` (`value.rs`) asserted every `Heap::table_get`
+  error meant a dead/stale table handle. That was true before this flip
+  (nothing else called `table_get` with a key that could legitimately fail),
+  but the table-growth-charging fix above added new `table_get`-before-write
+  calls (to check whether a key is new) that are reachable with a nil key on
+  a write — surfacing `HeapError::NilTableKey`, a normal, expected outcome
+  for a *read* (Lua returns `nil` for `t[nil]`/`t[nan]`), not a bug. Fixed by
+  having `TableRef::get` return `Value::NIL` for `NilTableKey`/`NanTableKey`
+  specifically, while still panicking on any other `HeapError` (a genuine
+  dead-handle bug). The *write* path is unaffected: `table_set` already
+  converts any `HeapError`, including a nil/NaN key, into a catchable
+  `LuaError` — `t[nil] = v` still raises `"table index is nil"` as before.
+
+**Residual gaps, out of scope for task #11, carried to task #12/#13:**
+
+These are pre-existing, documented deferrals, not new problems introduced by
+the flip; task #11's Lua-compatibility test suite deliberately leaves seven
+tests red rather than force them green or quietly skip them:
+
+- **No credit-back to the allocation budget after a collection.**
+  `LuaRuntime::allocation_remaining` only ever decreases; nothing restores
+  bytes a collection just reclaimed. This is the collector-triggering/exit
+  work §8 scopes to task #12, not this flip. It was already visible as six
+  failing tests in `lua55_dynamic_runtime_gc.rs` (reference-cycle and
+  `gc_stress` reclamation tests that assert on a tight budget) before this
+  task's work began. Correctly reimplementing table-growth charging (above)
+  newly exposed the same gap in a seventh test,
+  `lua55_fuzz.rs::dynamic_lua_random_shaped_table_cycles_are_reclaimed_under_a_tight_budget`,
+  which explicitly relies on `collectgarbage()` crediting reclaimed cyclic
+  garbage back to the budget across 20 iterations. It only passed before this
+  task's changes by accident — table growth wasn't charged at all, so the
+  test's tight budget was never actually exercised. All seven are the same
+  underlying gap and are left failing, deferred to task #12, rather than
+  masked by loosening the newly-correct charging above.
+- **Every registered coroutine is an unconditional GC root forever** (§6,
+  decided as the interim fallback). A coroutine referenced only through a
+  weak-value table never becomes collectible. Deferred to task #13's
+  conditional/deferred-root `sol-core` hook.
 
 Steps 1–3 should each land with their own focused regression coverage
 (mirroring how the string migration's `alloc_string_fresh` fix got a targeted

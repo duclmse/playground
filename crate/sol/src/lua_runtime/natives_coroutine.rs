@@ -42,7 +42,7 @@ impl LuaRuntime {
             NativeFunction::CoroutineResume => {
                 let co = Self::expect_coroutine(&required(0)?)?;
                 let resume_args = args.into_iter().skip(1).collect();
-                match self.resume_coroutine(&co, resume_args) {
+                match self.resume_coroutine(co, resume_args) {
                     Ok(mut values) => {
                         let mut results = vec![LuaValue::Bool(true)];
                         results.append(&mut values);
@@ -73,7 +73,7 @@ impl LuaRuntime {
             NativeFunction::CoroutineStatus => {
                 let co = Self::expect_coroutine(&required(0)?)?;
                 Ok(vec![LuaValue::String(self.intern_str(
-                    co.status.get().as_str().as_bytes().to_vec(),
+                    self.coroutine(co).status.get().as_str().as_bytes().to_vec(),
                 ))])
             }
             NativeFunction::CoroutineWrap => {
@@ -108,17 +108,13 @@ impl LuaRuntime {
                 // `co` defaults to the currently running coroutine when
                 // omitted, matching `coroutine.running()`'s own
                 // default-to-main fallback.
-                let current = self
-                    .coroutine_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| self.main_coroutine.clone());
+                let current = self.coroutine_stack.last().copied().unwrap_or(self.main_coroutine);
                 let co = match args.first() {
                     Some(value) => Self::expect_coroutine(value)?,
-                    None => current.clone(),
+                    None => current,
                 };
-                let yieldable = !Rc::ptr_eq(&co, &self.main_coroutine)
-                    && !(Rc::ptr_eq(&co, &current) && self.in_non_yieldable_call());
+                let yieldable = co != self.main_coroutine
+                    && !(co == current && self.in_non_yieldable_call());
                 Ok(vec![LuaValue::Bool(yieldable)])
             }
             NativeFunction::CoroutineClose => {
@@ -134,13 +130,10 @@ impl LuaRuntime {
                 // `coroutine.isyieldable`'s own default-argument pattern.
                 let co = match args.first() {
                     Some(value) => Self::expect_coroutine(value)?,
-                    None => self
-                        .coroutine_stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| self.main_coroutine.clone()),
+                    None => self.coroutine_stack.last().copied().unwrap_or(self.main_coroutine),
                 };
-                match co.status.get() {
+                let coroutine = self.coroutine(co);
+                match coroutine.status.get() {
                     // `Running` can only ever describe the coroutine/main
                     // that is *currently executing* (see `resume_coroutine`:
                     // exactly one participant holds this status at a time,
@@ -151,7 +144,7 @@ impl LuaRuntime {
                     // coroutine it resumed instead sees main's status as
                     // `Normal`, reported by the generic "normal coroutine"
                     // message below.
-                    CoroutineStatus::Running if Rc::ptr_eq(&co, &self.main_coroutine) => {
+                    CoroutineStatus::Running if co == self.main_coroutine => {
                         return Err(LuaError::new("cannot close main thread"));
                     }
                     CoroutineStatus::Running => {
@@ -178,7 +171,7 @@ impl LuaRuntime {
                         // the thread's terminating status); closing it again
                         // afterward reports success like any other
                         // already-dead coroutine.
-                        match co.dead_error.borrow_mut().take() {
+                        match coroutine.dead_error.borrow_mut().take() {
                             Some(value) => Ok(vec![LuaValue::Bool(false), value]),
                             None => Ok(vec![LuaValue::Bool(true)]),
                         }
@@ -187,7 +180,7 @@ impl LuaRuntime {
                         // Take the frame stack out of the `RefCell` first so
                         // no borrow is held while `close_pending` (which
                         // needs `&mut self`) runs `__close` metamethods.
-                        let mut frames = std::mem::take(&mut *co.frames.borrow_mut());
+                        let mut frames = std::mem::take(&mut *coroutine.frames.borrow_mut());
                         let mut error: Option<LuaError> = None;
                         while let Some(frame) = frames.pop() {
                             if let Frame::Lua(mut lua_frame) = frame {
@@ -195,8 +188,8 @@ impl LuaRuntime {
                                 error = self.close_pending(&mut lua_frame, count, error);
                             }
                         }
-                        self.call_depth -= co.depth_charged.take();
-                        co.status.set(CoroutineStatus::Dead);
+                        self.call_depth -= coroutine.depth_charged.take();
+                        coroutine.status.set(CoroutineStatus::Dead);
                         match error {
                             Some(e) => Ok(vec![
                                 LuaValue::Bool(false),

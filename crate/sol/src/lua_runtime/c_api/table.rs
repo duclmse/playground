@@ -21,7 +21,8 @@ pub unsafe extern "C" fn lua_getglobal(state: *mut lua_State, name: *const c_cha
         return LUA_TNIL;
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
-    let value = unsafe { state.runtime() }.globals.get(&name);
+    let runtime = unsafe { state.runtime() };
+    let value = runtime.globals.get(runtime, &name);
     let tag = value_tag(&value);
     state.stack.push(value);
     tag
@@ -39,9 +40,8 @@ pub unsafe extern "C" fn lua_setglobal(state: *mut lua_State, name: *const c_cha
         return;
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
-    unsafe { state.runtime() }
-        .globals
-        .define(&name, value, false);
+    let runtime = unsafe { state.runtime() };
+    runtime.globals.define(runtime, &name, value, false);
 }
 
 #[no_mangle]
@@ -284,7 +284,7 @@ pub unsafe extern "C" fn lua_getmetatable(state: *mut lua_State, index: c_int) -
     };
     match value {
         LuaValue::Table(table) => {
-            let metatable = table.borrow().metatable.clone();
+            let metatable = unsafe { state.runtime() }.table_metatable(table);
             if let Some(metatable) = metatable {
                 state.stack.push(LuaValue::Table(metatable));
                 1
@@ -331,12 +331,12 @@ pub unsafe extern "C" fn lua_setmetatable(state: *mut lua_State, index: c_int) -
     };
     match (target, metatable) {
         (Some(LuaValue::Table(target)), LuaValue::Table(metatable)) => {
-            target.borrow_mut().metatable = Some(metatable);
-            1
+            let runtime = unsafe { state.runtime() };
+            runtime.table_set_metatable(target, Some(metatable)).is_ok() as c_int
         }
         (Some(LuaValue::Table(target)), LuaValue::Nil) => {
-            target.borrow_mut().metatable = None;
-            1
+            let runtime = unsafe { state.runtime() };
+            runtime.table_set_metatable(target, None).is_ok() as c_int
         }
         (Some(LuaValue::Userdata(target)), LuaValue::CanonicalTable(metatable)) => {
             let runtime = unsafe { state.runtime() };
@@ -389,9 +389,8 @@ pub unsafe extern "C" fn lua_rawgeti(
             .unwrap_or(LuaValue::Nil)
     } else {
         match state.value(index).cloned() {
-            Some(LuaValue::Table(table)) => table
-                .borrow()
-                .get(&LuaValue::Integer(key))
+            Some(LuaValue::Table(table)) => unsafe { state.runtime() }
+                .table_get(table, &LuaValue::Integer(key))
                 .unwrap_or(LuaValue::Nil),
             Some(LuaValue::CanonicalTable(table)) => canonical_table_get(
                 unsafe { state.runtime() },
@@ -422,7 +421,8 @@ pub unsafe extern "C" fn lua_rawseti(state: *mut lua_State, index: c_int, key: L
         }
     } else if let Some(absolute) = absolute {
         if let LuaValue::Table(table) = &state.stack[absolute] {
-            let _ = table.borrow_mut().set(LuaValue::Integer(key), value);
+            let table = *table;
+            let _ = unsafe { state.runtime() }.table_set(table, LuaValue::Integer(key), value);
         } else if let LuaValue::CanonicalTable(table) = state.stack[absolute].clone() {
             match state.to_canonical(&value) {
                 Ok(value) => {

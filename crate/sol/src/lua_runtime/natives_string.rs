@@ -58,7 +58,7 @@ impl LuaRuntime {
                         .map_err(|_| LuaError::new("value out of range for string.char"))?;
                     bytes.push(byte);
                 }
-                self.charge_allocation(bytes.len())?;
+                self.charge_allocation(bytes.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(bytes))])
             }
             NativeFunction::StringLower => Ok(vec![LuaValue::String(self.fresh_str(
@@ -107,7 +107,7 @@ impl LuaRuntime {
                     .and_then(|total| total.checked_sub(separator.len()))
                     .filter(|&total| total <= isize::MAX as usize)
                     .ok_or_else(|| LuaError::new("resulting string too large"))?;
-                self.charge_allocation(total)?;
+                self.charge_allocation(total, None)?;
                 let mut output = Vec::with_capacity(total);
                 for index in 0..count {
                     if index != 0 {
@@ -144,22 +144,23 @@ impl LuaRuntime {
                 // registering a proto clone with its `source_map` cleared
                 // under its own key, distinct from the original (still-
                 // running) closure's own full-debug-info proto.
+                let proto = self.closure_prototype(closure)?;
                 let strip = args.get(1).map(|value| value.truthy()).unwrap_or(false);
                 let dumped_proto = if strip {
-                    let mut stripped = (*closure.proto).clone();
+                    let mut stripped = (*proto).clone();
                     stripped.source_map = sol_core::SourceMap::new(Vec::new());
                     Rc::new(stripped)
                 } else {
-                    closure.proto.clone()
+                    proto.clone()
                 };
                 let key = Rc::as_ptr(&dumped_proto) as usize;
                 self.dumped_protos.insert(key, dumped_proto);
                 let mut payload = Vec::new();
-                let source_key = Rc::as_ptr(&closure.proto) as usize;
+                let source_key = Rc::as_ptr(&proto) as usize;
                 if let Some(source) = self.chunk_sources.get(&source_key) {
                     payload.extend_from_slice(source);
                 }
-                append_dump_constants(&closure.proto, &mut payload);
+                append_dump_constants(&proto, &mut payload);
                 let mut bytes = super::natives_load::lua55_binary_chunk_header();
                 bytes.extend_from_slice(super::natives_load::SOL_DUMP_MAGIC);
                 bytes.extend_from_slice(&(key as u64).to_le_bytes());
@@ -236,14 +237,8 @@ impl LuaRuntime {
                 let pattern = self.string(&required(1)?)?.to_vec();
                 let init_arg = args.get(2).map(|value| self.integer(value)).transpose()?;
                 let init = resolve_init(init_arg, source.len()).unwrap_or(source.len() + 1);
-                self.charge_allocation(source.len() + pattern.len())?;
-                let state = GMatchState {
-                    source: Rc::new(source),
-                    pattern: Rc::new(pattern),
-                    position: init,
-                    last_end: None,
-                };
-                Ok(vec![LuaValue::GMatchIterator(Rc::new(RefCell::new(state)))])
+                let state = self.gmatch_alloc(&source, &pattern, init)?;
+                Ok(vec![LuaValue::GMatchIterator(state)])
             }
             NativeFunction::StringGSub => {
                 let source_value = required(0)?;
@@ -329,7 +324,7 @@ impl LuaRuntime {
                     arg_index += 1;
                     output.extend(self.format_one(&spec, conversion, value)?);
                 }
-                self.charge_allocation(output.len())?;
+                self.charge_allocation(output.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(output))])
             }
             NativeFunction::StringPack => {
@@ -362,7 +357,7 @@ impl LuaRuntime {
                     });
                 }
                 let packed = crate::lua_pack::pack(&format, &values).map_err(LuaError::new)?;
-                self.charge_allocation(packed.len())?;
+                self.charge_allocation(packed.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(packed))])
             }
             NativeFunction::StringUnpack => {
@@ -407,31 +402,20 @@ impl LuaRuntime {
         }
     }
 
-    pub(super) fn call_gmatch_iterator(
-        &mut self,
-        state: RcRef<GMatchState>,
-    ) -> LuaResult<Vec<LuaValue>> {
-        let (source, pattern) = {
-            let state = state.borrow();
-            (state.source.clone(), state.pattern.clone())
-        };
-        let mut position = state.borrow().position;
-        let last_end = state.borrow().last_end;
+    pub(super) fn call_gmatch_iterator(&mut self, state: GMatchRef) -> LuaResult<Vec<LuaValue>> {
+        let (source, pattern, mut position, last_end) = self.gmatch_read(state)?;
         while position <= source.len() {
             match crate::lua_pattern::match_at(&source, &pattern, position)
                 .map_err(LuaError::new)?
             {
                 Some(m) if Some(m.end) != last_end => {
-                    let mut guard = state.borrow_mut();
-                    guard.position = m.end;
-                    guard.last_end = Some(m.end);
-                    drop(guard);
+                    self.gmatch_advance(state, m.end, Some(m.end))?;
                     return Ok(self.capture_values(&source, (m.start, m.end), &m.captures, true));
                 }
                 _ => position += 1,
             }
         }
-        state.borrow_mut().position = source.len() + 1;
+        self.gmatch_advance(state, source.len() + 1, last_end)?;
         Ok(vec![LuaValue::Nil])
     }
 
@@ -531,7 +515,7 @@ impl LuaRuntime {
                     count += 1;
                     last_match_end = Some(m.end);
                     let replacement = self.gsub_replacement(source_bytes, &m, repl)?;
-                    self.charge_allocation(replacement.len())?;
+                    self.charge_allocation(replacement.len(), None)?;
                     output.extend_from_slice(&replacement);
                     if m.end > pos {
                         pos = m.end;
@@ -650,7 +634,7 @@ impl LuaRuntime {
     ) -> LuaResult<Option<GsubOutcome>> {
         state.changed |= !matches!(value, LuaValue::Nil | LuaValue::Bool(false));
         let replacement = gsub_result_value(value, &state.source.as_bytes()[start..end])?;
-        self.charge_allocation(replacement.len())?;
+        self.charge_allocation(replacement.len(), None)?;
         state.output.extend_from_slice(&replacement);
         if end > state.pos {
             state.pos = end;

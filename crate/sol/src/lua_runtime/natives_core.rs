@@ -138,13 +138,13 @@ impl LuaRuntime {
                 .map(|value| vec![value]),
             NativeFunction::RawSet => {
                 let table = required(0)?;
-                self.raw_set_index(table.clone(), required(1)?, required(2)?)?;
+                self.raw_set_index(table.clone(), required(1)?, required(2)?, None)?;
                 Ok(vec![table])
             }
             NativeFunction::RawEqual => Ok(vec![LuaValue::Bool(required(0)? == required(1)?)]),
             NativeFunction::RawLen => match required(0)? {
                 LuaValue::String(value) => Ok(vec![LuaValue::Integer(value.len() as i64)]),
-                LuaValue::Table(value) => Ok(vec![LuaValue::Integer(value.borrow().len() as i64)]),
+                LuaValue::Table(value) => Ok(vec![LuaValue::Integer(self.table_len(value) as i64)]),
                 value => Err(LuaError::new(format!(
                     "attempt to get length of a {} value",
                     value.type_name()
@@ -156,10 +156,8 @@ impl LuaRuntime {
                     return Ok(vec![protected]);
                 }
                 match value {
-                    LuaValue::Table(table) => Ok(vec![table
-                        .borrow()
-                        .metatable
-                        .clone()
+                    LuaValue::Table(table) => Ok(vec![self
+                        .table_metatable(table)
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
                     LuaValue::String(_) => Ok(vec![LuaValue::Table(self.string_metatable.clone())]),
@@ -200,7 +198,7 @@ impl LuaRuntime {
             NativeFunction::SetMetatable => {
                 let value = required(0)?;
                 let metatable = required(1)?;
-                let LuaValue::Table(table_rc) = value.clone() else {
+                let LuaValue::Table(table) = value else {
                     return Err(LuaError::new("setmetatable expects a table"));
                 };
                 if self.metamethod(&value, b"__metatable")?.is_some() {
@@ -211,18 +209,8 @@ impl LuaRuntime {
                     LuaValue::Table(meta) => Some(meta),
                     _ => return Err(LuaError::new("metatable must be a table or nil")),
                 };
-                let is_weak = new_metatable
-                    .as_ref()
-                    .map(|meta| table_weak_mode(meta) != (false, false))
-                    .unwrap_or(false);
-                {
-                    let mut table = table_rc.borrow_mut();
-                    table.metatable = new_metatable;
-                    table.version = table.version.wrapping_add(1);
-                }
-                if is_weak {
-                    self.weak_tables.push(Rc::downgrade(&table_rc));
-                }
+                self.table_set_metatable(table, new_metatable)?;
+                self.table_sync_weak_mode(table)?;
                 Ok(vec![value])
             }
             NativeFunction::Error => {
@@ -367,24 +355,22 @@ impl LuaRuntime {
                         Ok(vec![LuaValue::Float(used)])
                     }
                     b"collect" => {
-                        self.sweep_weak_tables();
-                        self.collect_cycles();
+                        self.collect_garbage();
                         Ok(vec![LuaValue::Integer(0)])
                     }
                     b"step" => {
-                        self.sweep_weak_tables();
-                        self.collect_cycles();
+                        self.collect_garbage();
                         // No real incremental stepping exists - each "step"
-                        // call already runs a full trial-deletion cycle
-                        // collection pass, so it always finishes a
-                        // collection cycle immediately (unlike real Lua,
-                        // where finishing a cycle can take many steps).
+                        // call already runs a full `collect_major_with_roots`
+                        // pass, so it always finishes a collection cycle
+                        // immediately (unlike real Lua, where finishing a
+                        // cycle can take many steps).
                         Ok(vec![LuaValue::Bool(true)])
                     }
                     // No real incremental/generational collector mode
                     // difference exists yet ("collect" and "step" above
-                    // already always run a full trial-deletion cycle
-                    // collection pass) - but real Lua's `lua_gc` still
+                    // already always run a full major collection pass) -
+                    // but real Lua's `lua_gc` still
                     // returns the *previous* mode name when switching, and
                     // scripts assert on it, so that bookkeeping is tracked
                     // for real even though it doesn't change behavior.
@@ -461,11 +447,12 @@ impl LuaRuntime {
             };
         }
         if let LuaValue::Table(table) = &value {
-            let metatable = table.borrow().metatable.clone();
+            let metatable = self.table_metatable(*table);
             if let Some(metatable) = metatable {
-                let name = metatable
-                    .borrow()
-                    .get(&LuaValue::String(self.intern_str(b"__name".to_vec())))?;
+                let name = self.table_get(
+                    metatable,
+                    &LuaValue::String(self.intern_str(b"__name".to_vec())),
+                )?;
                 if let LuaValue::String(name) = name {
                     return Ok(format!(
                         "{}: 0x{:x}",

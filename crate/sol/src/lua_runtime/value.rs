@@ -6,11 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
-use std::rc::{Rc, Weak};
-
-use indexmap::IndexMap;
-
-use crate::lua_bytecode::Proto;
+use std::rc::Rc;
 
 use super::*;
 
@@ -19,15 +15,13 @@ use super::*;
 /// closure upvalue cells, `gmatch` iterator state, ...).
 pub(super) type RcRef<T> = Rc<RefCell<T>>;
 
-/// A non-owning counterpart to `RcRef<T>`, used by the GC's tracking registries
-/// (`weak_tables`, `gc_tables`) so holding a reference there never keeps the
-/// referent alive by itself.
-pub(super) type WeakRef<T> = Weak<RefCell<T>>;
-
 /// A closure's upvalue-cell storage: one slot per captured variable, `None`
 /// where a slot has been recycled from the frame pool but not yet initialized
-/// for the current call.
-pub(super) type Cells = Vec<Option<RcRef<LuaValue>>>;
+/// for the current call. Each `Some` is a canonical `sol_core::Heap`-resident
+/// `UpvalueObject`'s id, shared by `Copy` between a frame's `cells[reg]` and
+/// any closure's `ClosureObject.upvalues` - see `sol_core::Heap::alloc_upvalue`/
+/// `upvalue_value`/`set_upvalue`.
+pub(super) type Cells = Vec<Option<sol_core::ObjectId>>;
 
 /// A precisely rooted handle to an object owned by the canonical `sol-core`
 /// heap. Legacy frames and tables may clone this small guard while migration
@@ -69,29 +63,20 @@ impl Drop for CanonicalObjectRoot {
 /// docs/features/table-closure-coroutine-cutover.md §3) makes every live one
 /// reachable from a GC safepoint. `CanonicalTable` stays reserved for
 /// genuinely long-lived anchors (the embedding registry, `lua_ref`-style
-/// persistent C handles). Not yet used by `LuaValue`/`LuaKey` — see
-/// docs/features/table-closure-coroutine-cutover.md §8 for why the flip has
-/// to land together with `ClosureRef`/`ThreadRef` rather than on its own.
-// `#[allow(dead_code)]` throughout this ref-type/wrapper-method group: this
-// is prerequisite plumbing (docs/features/table-closure-coroutine-cutover.md
-// §8 step 2), unit-tested directly against `sol_core::Heap` below, but not
-// yet wired into `LuaValue`/`LuaKey` or any call site — that has to land as
-// the single coordinated flip in step 4.
-#[allow(dead_code)]
+/// persistent C handles). Backs `LuaValue::Table` as of the
+/// coordinated flip in docs/features/table-closure-coroutine-cutover.md §8
+/// step 4.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(super) struct TableRef(sol_core::ObjectId);
+pub struct TableRef(sol_core::ObjectId);
 
 /// The `ClosureRef` counterpart to `TableRef`; see its doc comment.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(super) struct ClosureRef(sol_core::ObjectId);
+pub struct ClosureRef(sol_core::ObjectId);
 
 /// The `ThreadRef` counterpart to `TableRef`; see its doc comment.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(super) struct ThreadRef(sol_core::ObjectId);
+pub struct ThreadRef(sol_core::ObjectId);
 
-#[allow(dead_code)]
 impl TableRef {
     pub(super) fn new(object: sol_core::ObjectId) -> Self {
         Self(object)
@@ -106,8 +91,18 @@ impl TableRef {
     }
 
     pub(super) fn get(self, heap: &sol_core::Heap, key: sol_core::Value) -> sol_core::Value {
-        heap.table_get(self.0, key)
-            .expect("TableRef must address a live table object")
+        // `NilTableKey`/`NanTableKey` are expected outcomes of a *read* (Lua
+        // returns `nil` for `t[nil]`/`t[0/0]`) - only a *write* with such a
+        // key raises a catchable Lua error, via `table_set`'s own
+        // `HeapError` -> `LuaError` conversion. Any other `HeapError` here
+        // means a genuinely dead/mistyped handle, which is an internal bug.
+        match heap.table_get(self.0, key) {
+            Ok(value) => value,
+            Err(sol_core::HeapError::NilTableKey | sol_core::HeapError::NanTableKey) => {
+                sol_core::Value::NIL
+            }
+            Err(_) => panic!("TableRef must address a live table object"),
+        }
     }
 
     pub(super) fn set(
@@ -133,7 +128,6 @@ impl TableRef {
     }
 }
 
-#[allow(dead_code)]
 impl ClosureRef {
     pub(super) fn new(object: sol_core::ObjectId) -> Self {
         Self(object)
@@ -156,7 +150,6 @@ impl ClosureRef {
     }
 }
 
-#[allow(dead_code)]
 impl ThreadRef {
     pub(super) fn new(object: sol_core::ObjectId) -> Self {
         Self(object)
@@ -168,6 +161,25 @@ impl ThreadRef {
 
     pub(super) fn alloc(heap: &mut sol_core::Heap) -> Self {
         Self(heap.alloc_thread(Vec::new()))
+    }
+}
+
+/// A cheap `Copy` handle to a `string.gmatch` iterator's state, stored as a
+/// `HeapObject::NativeCallable` under the shared `canonical::LEGACY_STATE_PROVIDER`
+/// namespace (see `table.rs`'s `gmatch_alloc`/`gmatch_read`/`gmatch_advance`)
+/// rather than as its own `HeapObject` kind - see
+/// docs/features/table-closure-coroutine-cutover.md §2. Never memoized: each
+/// `gmatch()` call is independently mutable even over identical text.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GMatchRef(sol_core::ObjectId);
+
+impl GMatchRef {
+    pub(super) fn new(object: sol_core::ObjectId) -> Self {
+        Self(object)
+    }
+
+    pub(super) fn object_id(self) -> sol_core::ObjectId {
+        self.0
     }
 }
 
@@ -438,11 +450,11 @@ pub enum LuaValue {
     Integer(i64),
     Float(f64),
     String(CanonicalString),
-    Table(RcRef<LuaTable>),
+    Table(TableRef),
     /// Canonical table used by the embedding registry and userdata metatables
     /// while legacy interpreter tables are migrated incrementally.
     CanonicalTable(CanonicalTable),
-    Closure(Rc<LuaClosure>),
+    Closure(ClosureRef),
     NativeFunction(NativeFunction),
     /// A Cranelift-compiled Sol function, callable from dynamic Lua code - see
     /// `docs/features/lua-compatibility.md`'s per-function typed/dynamic split.
@@ -459,14 +471,14 @@ pub enum LuaValue {
     CFunction(CanonicalCFunction),
     /// Stateful iterator returned by `string.gmatch`; carries its own position
     /// so repeated calls advance through the subject string.
-    GMatchIterator(RcRef<GMatchState>),
+    GMatchIterator(GMatchRef),
     /// A coroutine created by `coroutine.create`. See `LuaCoroutine`.
-    Thread(Rc<LuaCoroutine>),
+    Thread(ThreadRef),
     /// The callable wrapper `coroutine.wrap` returns: calling it resumes the
     /// underlying coroutine directly, propagating an error raised inside the
     /// coroutine as a real Lua error instead of `coroutine.resume`'s
     /// `(false, message)` pair - matching real Lua's `coroutine.wrap`.
-    CoroutineWrapper(Rc<LuaCoroutine>),
+    CoroutineWrapper(ThreadRef),
     /// Opaque host value; no host capabilities are exposed by default.
     Userdata(CanonicalUserdata),
     /// A `debug.upvalueid`-style opaque identity: `type()` reports "userdata"
@@ -802,126 +814,138 @@ impl NativeFunction {
             Self::DebugSetuservalue => "setuservalue",
         }
     }
-}
 
-/// A table key. Real Lua allows any non-nil, non-NaN value as a key,
-/// including tables and functions - those compare and hash by *identity*
-/// (`Rc` pointer), not by structural content, matching `LuaValue`'s own
-/// `PartialEq` for these variants. `PartialEq`/`Eq`/`Hash` are implemented
-/// by hand below rather than derived, since deriving them on the `Rc`
-/// payload would hash/compare by dereferenced content instead.
-#[derive(Clone, Debug)]
-pub(super) enum LuaKey {
-    Bool(bool),
-    Integer(i64),
-    Float(u64),
-    String(CanonicalString),
-    Table(RcRef<LuaTable>),
-    CanonicalTable(CanonicalTable),
-    Closure(Rc<LuaClosure>),
-    NativeFunction(NativeFunction),
-    Native(Rc<NativeBridge>),
-    RegisteredNative(sol_core::NativeCallableId),
-    CFunction(CanonicalCFunction),
-    GMatchIterator(RcRef<GMatchState>),
-    Thread(Rc<LuaCoroutine>),
-    CoroutineWrapper(Rc<LuaCoroutine>),
-    Userdata(CanonicalUserdata),
-    LightUserdata(usize),
-}
-
-impl PartialEq for LuaKey {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Integer(a), Self::Integer(b)) => a == b,
-            (Self::Float(a), Self::Float(b)) => a == b,
-            (Self::String(a), Self::String(b)) => a == b,
-            (Self::Table(a), Self::Table(b)) => Rc::ptr_eq(a, b),
-            (Self::CanonicalTable(a), Self::CanonicalTable(b)) => a.object_id() == b.object_id(),
-            (Self::Closure(a), Self::Closure(b)) => Rc::ptr_eq(a, b),
-            (Self::NativeFunction(a), Self::NativeFunction(b)) => a == b,
-            (Self::Native(a), Self::Native(b)) => Rc::ptr_eq(a, b),
-            (Self::RegisteredNative(a), Self::RegisteredNative(b)) => a == b,
-            (Self::CFunction(a), Self::CFunction(b)) => a.object_id() == b.object_id(),
-            (Self::GMatchIterator(a), Self::GMatchIterator(b)) => Rc::ptr_eq(a, b),
-            (Self::Thread(a), Self::Thread(b)) => Rc::ptr_eq(a, b),
-            (Self::CoroutineWrapper(a), Self::CoroutineWrapper(b)) => Rc::ptr_eq(a, b),
-            (Self::Userdata(a), Self::Userdata(b)) => a.object_id() == b.object_id(),
-            (Self::LightUserdata(a), Self::LightUserdata(b)) => a == b,
-            _ => false,
-        }
+    /// Reverse mapping for the codec's `NativeFunction` encoding
+    /// (`HeapObject::NativeCallable { provider: 0, function, .. }`, see
+    /// `docs/features/table-closure-coroutine-cutover.md` §2). Relies on
+    /// `#[repr(u32)]`'s implicit sequential discriminants matching this
+    /// list's declaration order exactly - covered by a round-trip test.
+    pub(super) fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Print,
+            1 => Self::Assert,
+            2 => Self::Type,
+            3 => Self::ToString,
+            4 => Self::ToNumber,
+            5 => Self::StringLen,
+            6 => Self::StringByte,
+            7 => Self::StringChar,
+            8 => Self::StringSub,
+            9 => Self::StringLower,
+            10 => Self::StringUpper,
+            11 => Self::StringReverse,
+            12 => Self::StringRep,
+            13 => Self::StringDump,
+            14 => Self::RawGet,
+            15 => Self::RawSet,
+            16 => Self::RawEqual,
+            17 => Self::RawLen,
+            18 => Self::GetMetatable,
+            19 => Self::SetMetatable,
+            20 => Self::Error,
+            21 => Self::PCall,
+            22 => Self::XCall,
+            23 => Self::Select,
+            24 => Self::Next,
+            25 => Self::Pairs,
+            26 => Self::IPairs,
+            27 => Self::IPairsIterator,
+            28 => Self::TableConcat,
+            29 => Self::TableInsert,
+            30 => Self::TableRemove,
+            31 => Self::TablePack,
+            32 => Self::TableUnpack,
+            33 => Self::TableSort,
+            34 => Self::TableMove,
+            35 => Self::MathAbs,
+            36 => Self::MathFloor,
+            37 => Self::MathCeil,
+            38 => Self::MathMin,
+            39 => Self::MathMax,
+            40 => Self::MathToInteger,
+            41 => Self::MathType,
+            42 => Self::MathSqrt,
+            43 => Self::MathSin,
+            44 => Self::MathCos,
+            45 => Self::MathTan,
+            46 => Self::MathExp,
+            47 => Self::MathLog,
+            48 => Self::MathAcos,
+            49 => Self::MathAsin,
+            50 => Self::MathAtan,
+            51 => Self::MathDeg,
+            52 => Self::MathRad,
+            53 => Self::MathFmod,
+            54 => Self::MathModf,
+            55 => Self::MathUlt,
+            56 => Self::MathFrexp,
+            57 => Self::MathLdexp,
+            58 => Self::MathRandom,
+            59 => Self::MathRandomSeed,
+            60 => Self::Utf8Len,
+            61 => Self::Utf8Char,
+            62 => Self::Utf8Codepoint,
+            63 => Self::Utf8Offset,
+            64 => Self::Utf8Codes,
+            65 => Self::Utf8IteratorStrict,
+            66 => Self::Utf8IteratorLax,
+            67 => Self::Require,
+            68 => Self::PackageSearchPath,
+            69 => Self::PackageSearcherPreload,
+            70 => Self::PackageSearcherLua,
+            71 => Self::PackageSearcherC,
+            72 => Self::PackageSearcherCRoot,
+            73 => Self::StringFind,
+            74 => Self::StringMatch,
+            75 => Self::StringGMatch,
+            76 => Self::StringGSub,
+            77 => Self::StringFormat,
+            78 => Self::TableCreate,
+            79 => Self::CollectGarbage,
+            80 => Self::OsTime,
+            81 => Self::OsClock,
+            82 => Self::OsDifftime,
+            83 => Self::OsDate,
+            84 => Self::OsGetenv,
+            85 => Self::OsExit,
+            86 => Self::IoWrite,
+            87 => Self::IoRead,
+            88 => Self::IoInput,
+            89 => Self::FileWrite,
+            90 => Self::IoOutput,
+            91 => Self::FileClose,
+            92 => Self::FileGc,
+            93 => Self::OsRemove,
+            94 => Self::OsSetlocale,
+            95 => Self::OsTmpname,
+            96 => Self::PackageLoadLib,
+            97 => Self::Load,
+            98 => Self::DoFile,
+            99 => Self::StringPack,
+            100 => Self::StringUnpack,
+            101 => Self::StringPackSize,
+            102 => Self::CoroutineCreate,
+            103 => Self::CoroutineResume,
+            104 => Self::CoroutineYield,
+            105 => Self::CoroutineStatus,
+            106 => Self::CoroutineWrap,
+            107 => Self::CoroutineRunning,
+            108 => Self::CoroutineIsYieldable,
+            109 => Self::CoroutineClose,
+            110 => Self::DebugGetupvalue,
+            111 => Self::DebugUpvalueid,
+            112 => Self::DebugUpvaluejoin,
+            113 => Self::DebugSetupvalue,
+            114 => Self::DebugGetinfo,
+            115 => Self::DebugGetmetatable,
+            116 => Self::DebugSetmetatable,
+            117 => Self::DebugTraceback,
+            118 => Self::DebugSethook,
+            119 => Self::DebugGethook,
+            120 => Self::DebugSetuservalue,
+            _ => return None,
+        })
     }
-}
-
-impl Eq for LuaKey {}
-
-impl std::hash::Hash for LuaKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Self::Bool(value) => value.hash(state),
-            Self::Integer(value) => value.hash(state),
-            Self::Float(value) => value.hash(state),
-            Self::String(value) => value.hash(state),
-            Self::Table(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::CanonicalTable(value) => value.object_id().hash(state),
-            Self::Closure(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::NativeFunction(value) => value.hash(state),
-            Self::Native(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::RegisteredNative(value) => value.hash(state),
-            Self::CFunction(value) => value.object_id().hash(state),
-            Self::GMatchIterator(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::Thread(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::CoroutineWrapper(value) => (Rc::as_ptr(value) as usize).hash(state),
-            Self::Userdata(value) => value.object_id().hash(state),
-            Self::LightUserdata(value) => value.hash(state),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct LuaTable {
-    pub(super) array: Vec<LuaValue>,
-    /// A cached, incrementally-maintained border (`len`'s fast path): the
-    /// largest known `n` with `array[0..n]` all non-nil. `#` is undefined by
-    /// the Lua manual for a table with holes (any border is a legal
-    /// answer), but real Lua's actual choice for a given construction
-    /// history is externally observable (e.g. from a table built through
-    /// `SetArrayMulti`/`SetArrayItem`), so this tracks the same border a
-    /// dense, append-only history naturally produces rather than a
-    /// generic-but-possibly-different one a fresh binary search over the
-    /// whole array could return. See `set` for how it's kept in sync in
-    /// O(1) amortized per write, and `recompute_array_border` for the rare
-    /// paths (direct array mutation) that must fall back to an explicit
-    /// scan.
-    pub(super) array_border: usize,
-    // An insertion-order-preserving map, not a plain `HashMap`: `next`
-    // resumes traversal by re-locating the last-returned key in a freshly
-    // fetched snapshot of this map and continuing from there (see
-    // `LuaRuntime::next`). A plain `HashMap` can silently reorder existing
-    // entries on `insert` even when overwriting an already-present key (its
-    // capacity-growth check runs before it knows whether the key already
-    // exists), which would let already-visited entries reappear after the
-    // "current" position or strand not-yet-visited entries before it -
-    // corrupting `pairs`/`next` traversal without any visible error.
-    // `IndexMap` never repositions an existing key on overwrite.
-    pub(super) hash: IndexMap<LuaKey, LuaValue>,
-    pub(super) metatable: Option<RcRef<LuaTable>>,
-    /// Incremented by every raw mutation and metatable replacement. Dynamic
-    /// inline caches can guard this value without changing table semantics.
-    pub(super) version: u64,
-    /// Set once this table's `__gc` metamethod (if any) has been called by
-    /// `collect_cycles`, so a finalizer never runs twice for the same table.
-    pub(super) finalized: bool,
-    /// Cumulative allocation-budget bytes `charge_new_table_entry` has
-    /// charged for this table's own field growth (beyond its fixed header,
-    /// which `charge_allocation(size_of::<LuaTable>())` already covers at
-    /// creation). `collect_cycles` credits this back alongside the header
-    /// when reclaiming the table, so a script that keeps a table's fields
-    /// churning under `collectgarbage()` doesn't leak budget it never
-    /// actually keeps allocated - see `set_index_resolve`/`raw_set_index`.
-    pub(super) charged_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1065,39 +1089,22 @@ impl fmt::Display for LuaError {
 
 impl std::error::Error for LuaError {}
 
-#[derive(Clone, Debug)]
-pub struct LuaClosure {
-    pub(super) proto: Rc<Proto>,
-    /// `RefCell`-wrapped so the cycle collector (see `collect_cycles`) can
-    /// clear a closure's captured upvalues once it determines the closure
-    /// is part of an unreachable reference cycle - breaking the cycle's
-    /// `Rc` links so normal refcounting reclaims the rest of it.
-    pub(super) upvals: RefCell<Vec<RcRef<LuaValue>>>,
-    pub(super) globals: Globals,
-}
-
-/// Internal state for a `string.gmatch` iterator: the subject/pattern bytes
-/// it was created with, and the byte offset to resume searching from.
-#[derive(Debug)]
-pub struct GMatchState {
-    pub(super) source: Rc<Vec<u8>>,
-    pub(super) pattern: Rc<Vec<u8>>,
-    pub(super) position: usize,
-    pub(super) last_end: Option<usize>,
-}
-
-/// A dynamic Lua global environment backed by an ordinary `LuaTable`, falling
 /// back to a shared `base` environment on a read miss. Every loaded module gets a fresh
 /// `Globals` whose `base` is the runtime's single shared root scope (never
 /// the requiring module's own scope) — this is `require`'s module isolation.
 /// All closures compiled from the same top-level program/module share one
 /// `Globals` clone; only `require` ever creates a new one.
+///
+/// Every method that can touch a stored value (as opposed to bookkeeping
+/// like `has_base`/`check_writable`) takes an explicit `&LuaRuntime`: the
+/// table itself is now a bare `TableRef` handle into the canonical heap, and
+/// reading or writing an arbitrary `LuaValue` through it always goes through
+/// `LuaRuntime`'s value codec (`codec.rs`), not just a raw heap borrow.
 #[derive(Clone, Debug)]
 pub(super) struct Globals(Rc<GlobalsInner>);
 
 struct GlobalsInner {
-    heap: RcRef<sol_core::Heap>,
-    table: RcRef<LuaTable>,
+    table: TableRef,
     /// The live `_ENV` value shared by every closure compiled against this
     /// scope.  Lua permits it to be any value; global reads/writes then use
     /// ordinary indexing semantics and naturally fail for non-indexable
@@ -1124,22 +1131,24 @@ impl Globals {
         Rc::as_ptr(&self.0) as usize
     }
 
-    pub(super) fn root(heap: RcRef<sol_core::Heap>) -> Self {
-        let table = Rc::new(RefCell::new(LuaTable::default()));
+    /// Only called during `LuaRuntime` construction itself (`init.rs`),
+    /// before a `&LuaRuntime` exists to pass - takes the heap directly
+    /// rather than `&LuaRuntime` for that reason, unlike every other
+    /// constructor here.
+    pub(super) fn root(heap: &RcRef<sol_core::Heap>) -> Self {
+        let table = TableRef::alloc(&mut heap.borrow_mut());
         Globals(Rc::new(GlobalsInner {
-            heap,
-            table: table.clone(),
+            table,
             environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
             base: None,
         }))
     }
 
-    pub(super) fn module(base: &Globals) -> Self {
-        let table = Rc::new(RefCell::new(LuaTable::default()));
+    pub(super) fn module(base: &Globals, runtime: &LuaRuntime) -> Self {
+        let table = TableRef::alloc(&mut runtime.canonical_heap.borrow_mut());
         Globals(Rc::new(GlobalsInner {
-            heap: base.0.heap.clone(),
-            table: table.clone(),
+            table,
             environment: RefCell::new(LuaValue::Table(table)),
             constants: RefCell::new(HashSet::new()),
             base: Some(base.clone()),
@@ -1149,13 +1158,12 @@ impl Globals {
     /// Wraps an arbitrary Lua value as a chunk's `_ENV`. This is valid Lua:
     /// the value is only required to be a table when the chunk actually
     /// indexes a global name.
-    pub(super) fn from_value(heap: RcRef<sol_core::Heap>, value: LuaValue) -> Self {
+    pub(super) fn from_value(runtime: &LuaRuntime, value: LuaValue) -> Self {
         let table = match &value {
-            LuaValue::Table(table) => table.clone(),
-            _ => Rc::new(RefCell::new(LuaTable::default())),
+            LuaValue::Table(table) => *table,
+            _ => TableRef::alloc(&mut runtime.canonical_heap.borrow_mut()),
         };
         Globals(Rc::new(GlobalsInner {
-            heap,
             table,
             environment: RefCell::new(value),
             constants: RefCell::new(HashSet::new()),
@@ -1174,8 +1182,8 @@ impl Globals {
     /// loaded chunk rebinds only that chunk's own cell, matching real Lua -
     /// `Globals::clone` is an `Rc` clone that shares one mutable cell across
     /// every closure holding it, which `load` must not do here).
-    pub(super) fn snapshot_for_load(&self) -> Self {
-        let mut snapshot = Globals::from_value(self.0.heap.clone(), self.as_value());
+    pub(super) fn snapshot_for_load(&self, runtime: &LuaRuntime) -> Self {
+        let mut snapshot = Globals::from_value(runtime, self.as_value());
         Rc::get_mut(&mut snapshot.0)
             .expect("snapshot_for_load: freshly constructed Rc has no other owner yet")
             .base = self.0.base.clone();
@@ -1213,26 +1221,27 @@ impl Globals {
         Ok(())
     }
 
-    pub(super) fn get(&self, name: &str) -> LuaValue {
-        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
+    pub(super) fn get(&self, runtime: &LuaRuntime, name: &str) -> LuaValue {
         let value = match &*self.0.environment.borrow() {
-            LuaValue::Table(table) => table.borrow().get(&key).unwrap(),
+            LuaValue::Table(table) => runtime
+                .table_get_str_field(*table, name.as_bytes())
+                .unwrap_or(LuaValue::Nil),
             _ => LuaValue::Nil,
         };
         if value != LuaValue::Nil {
             return value;
         }
         match &self.0.base {
-            Some(base) => base.get(name),
+            Some(base) => base.get(runtime, name),
             None => LuaValue::Nil,
         }
     }
 
     /// Unconditional overwrite (a `global` declaration): ignores any
     /// existing binding's constness.
-    pub(super) fn define(&self, name: &str, value: LuaValue, constant: bool) {
-        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
-        self.0.table.borrow_mut().set(key, value).unwrap();
+    pub(super) fn define(&self, runtime: &LuaRuntime, name: &str, value: LuaValue, constant: bool) {
+        let key = LuaValue::String(CanonicalString::intern(runtime.canonical_heap.clone(), name));
+        runtime.table_set(self.0.table, key, value).unwrap();
         if constant {
             self.0.constants.borrow_mut().insert(name.to_string());
         } else {
@@ -1243,10 +1252,10 @@ impl Globals {
     /// A plain assignment to a global-resolved name: errors if an existing
     /// binding (in this scope only, never `base`) is const; otherwise
     /// updates it in place, or creates a fresh non-const binding.
-    pub(super) fn assign(&self, name: &str, value: LuaValue) -> LuaResult<()> {
+    pub(super) fn assign(&self, runtime: &LuaRuntime, name: &str, value: LuaValue) -> LuaResult<()> {
         self.check_writable(name)?;
-        let key = LuaValue::String(CanonicalString::intern(self.0.heap.clone(), name));
-        self.0.table.borrow_mut().set(key, value)?;
+        let key = LuaValue::String(CanonicalString::intern(runtime.canonical_heap.clone(), name));
+        runtime.table_set(self.0.table, key, value)?;
         Ok(())
     }
 }
@@ -1397,9 +1406,9 @@ impl LuaValue {
                 // already content-stable and object-identical here.
                 Some(value.object_id().raw() as usize | 1)
             }
-            Self::Table(value) => Some(Rc::as_ptr(value) as usize),
+            Self::Table(value) => Some(value.object_id().raw() as usize),
             Self::CanonicalTable(value) => Some(value.object_id().raw() as usize),
-            Self::Closure(value) => Some(Rc::as_ptr(value) as usize),
+            Self::Closure(value) => Some(value.object_id().raw() as usize),
             Self::NativeFunction(value) => Some(*value as u32 as usize + 1),
             Self::Native(value) => Some(Rc::as_ptr(value) as usize),
             Self::RegisteredNative(value) => {
@@ -1408,46 +1417,13 @@ impl LuaValue {
                 Some(std::hash::Hasher::finish(&hasher) as usize | 1)
             }
             Self::CFunction(value) => Some(value.object_id().raw() as usize),
-            Self::GMatchIterator(value) => Some(Rc::as_ptr(value) as usize),
-            Self::Thread(value) | Self::CoroutineWrapper(value) => Some(Rc::as_ptr(value) as usize),
+            Self::GMatchIterator(value) => Some(value.object_id().raw() as usize),
+            Self::Thread(value) | Self::CoroutineWrapper(value) => {
+                Some(value.object_id().raw() as usize)
+            }
             Self::Userdata(value) => Some(value.object_id().raw() as usize),
             Self::LightUserdata(identity) => Some(*identity),
             Self::Nil | Self::Bool(_) | Self::Integer(_) | Self::Float(_) => None,
-        }
-    }
-
-    fn key(&self) -> LuaResult<LuaKey> {
-        match self {
-            Self::Bool(value) => Ok(LuaKey::Bool(*value)),
-            Self::Integer(value) => Ok(LuaKey::Integer(*value)),
-            Self::Float(value) if value.is_nan() => Err(LuaError::new("table index is NaN")),
-            // `i64::MAX as f64` rounds up to 2^63, one past the largest
-            // representable integer, so the upper bound must be strict -
-            // see the identical fix and rationale in `natives.rs`'s
-            // `MathToInteger` handler.
-            Self::Float(value)
-                if value.is_finite()
-                    && value.fract() == 0.0
-                    && *value >= i64::MIN as f64
-                    && *value < -(i64::MIN as f64) =>
-            {
-                Ok(LuaKey::Integer(*value as i64))
-            }
-            Self::Float(value) => Ok(LuaKey::Float(value.to_bits())),
-            Self::String(value) => Ok(LuaKey::String(value.clone())),
-            Self::Table(value) => Ok(LuaKey::Table(value.clone())),
-            Self::CanonicalTable(value) => Ok(LuaKey::CanonicalTable(value.clone())),
-            Self::Closure(value) => Ok(LuaKey::Closure(value.clone())),
-            Self::NativeFunction(value) => Ok(LuaKey::NativeFunction(*value)),
-            Self::Native(value) => Ok(LuaKey::Native(value.clone())),
-            Self::RegisteredNative(value) => Ok(LuaKey::RegisteredNative(*value)),
-            Self::CFunction(value) => Ok(LuaKey::CFunction(value.clone())),
-            Self::GMatchIterator(value) => Ok(LuaKey::GMatchIterator(value.clone())),
-            Self::Thread(value) => Ok(LuaKey::Thread(value.clone())),
-            Self::CoroutineWrapper(value) => Ok(LuaKey::CoroutineWrapper(value.clone())),
-            Self::Userdata(value) => Ok(LuaKey::Userdata(value.clone())),
-            Self::LightUserdata(value) => Ok(LuaKey::LightUserdata(*value)),
-            Self::Nil => Err(LuaError::new("table index is nil")),
         }
     }
 
@@ -1478,16 +1454,18 @@ impl PartialEq for LuaValue {
                     && *a == *b as i64
             }
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::Table(a), Self::Table(b)) => Rc::ptr_eq(a, b),
+            (Self::Table(a), Self::Table(b)) => a.object_id() == b.object_id(),
             (Self::CanonicalTable(a), Self::CanonicalTable(b)) => a.object_id() == b.object_id(),
-            (Self::Closure(a), Self::Closure(b)) => Rc::ptr_eq(a, b),
+            (Self::Closure(a), Self::Closure(b)) => a.object_id() == b.object_id(),
             (Self::NativeFunction(a), Self::NativeFunction(b)) => a == b,
             (Self::Native(a), Self::Native(b)) => Rc::ptr_eq(a, b),
             (Self::RegisteredNative(a), Self::RegisteredNative(b)) => a == b,
             (Self::CFunction(a), Self::CFunction(b)) => a.object_id() == b.object_id(),
-            (Self::GMatchIterator(a), Self::GMatchIterator(b)) => Rc::ptr_eq(a, b),
-            (Self::Thread(a), Self::Thread(b)) => Rc::ptr_eq(a, b),
-            (Self::CoroutineWrapper(a), Self::CoroutineWrapper(b)) => Rc::ptr_eq(a, b),
+            (Self::GMatchIterator(a), Self::GMatchIterator(b)) => a.object_id() == b.object_id(),
+            (Self::Thread(a), Self::Thread(b)) => a.object_id() == b.object_id(),
+            (Self::CoroutineWrapper(a), Self::CoroutineWrapper(b)) => {
+                a.object_id() == b.object_id()
+            }
             (Self::Userdata(a), Self::Userdata(b)) => a.object_id() == b.object_id(),
             (Self::LightUserdata(a), Self::LightUserdata(b)) => a == b,
             _ => false,
@@ -1501,307 +1479,18 @@ pub(super) enum Number {
     Float(f64),
 }
 
-impl LuaTable {
-    pub(super) fn get(&self, key: &LuaValue) -> LuaResult<LuaValue> {
-        if let Some(index) = positive_array_index(key) {
-            return Ok(self.array.get(index - 1).cloned().unwrap_or(LuaValue::Nil));
+#[cfg(test)]
+mod native_function_codec_tests {
+    use super::NativeFunction;
+
+    #[test]
+    fn from_u32_round_trips_every_discriminant() {
+        let mut count = 0u32;
+        while let Some(function) = NativeFunction::from_u32(count) {
+            assert_eq!(function as u32, count);
+            count += 1;
         }
-        // Real Lua only raises "table index is nil"/"table index is NaN"
-        // for a *write* (`luaH_newkey`); a read with such a key (or any
-        // other key `key()` can't represent) simply can't be present and
-        // returns nil, same as any other absent key.
-        Ok(key
-            .key()
-            .ok()
-            .and_then(|key| self.hash.get(&key).cloned())
-            .unwrap_or(LuaValue::Nil))
-    }
-
-    /// Reads a string-keyed field (metamethod-name lookups: `__mode`,
-    /// `__gc`, ...) by content, without needing a live canonical heap handle
-    /// to construct an interned `LuaKey::String` for an ordinary `get`. A
-    /// linear scan is fine here - real tables have only a handful of
-    /// metamethod fields, and this only runs off the GC's cold sweep path.
-    pub(super) fn get_str_field(&self, name: &[u8]) -> Option<LuaValue> {
-        self.hash.iter().find_map(|(key, value)| match key {
-            LuaKey::String(key) if key.as_bytes() == name => Some(value.clone()),
-            _ => None,
-        })
-    }
-
-    pub(super) fn set(&mut self, key: LuaValue, value: LuaValue) -> LuaResult<()> {
-        if let Some(index) = positive_array_index(&key) {
-            let index = index - 1;
-            if index >= self.array.len() {
-                self.array.resize(index + 1, LuaValue::Nil);
-            }
-            let is_nil = value == LuaValue::Nil;
-            self.array[index] = value;
-            if !is_nil {
-                // Filling exactly the slot right past the confirmed
-                // non-nil prefix extends it - the common `t[#t + 1] = v`
-                // append idiom hits this every time, keeping `len` O(1)
-                // amortized for it. A `while` (not `if`) because a prior
-                // out-of-order write past the border may already have left
-                // later slots non-nil too.
-                if index == self.array_border {
-                    self.array_border += 1;
-                    while self.array_border < self.array.len()
-                        && self.array[self.array_border] != LuaValue::Nil
-                    {
-                        self.array_border += 1;
-                    }
-                }
-            } else if index < self.array_border {
-                // The confirmed prefix can no longer include `index`, but
-                // everything strictly before it is still confirmed.
-                self.array_border = index;
-            }
-            self.version = self.version.wrapping_add(1);
-            return Ok(());
-        }
-        let key = key.key()?;
-        if value == LuaValue::Nil {
-            // Real Lua guarantees `next` may resume correctly even when the
-            // traversal has just set the *current* key to nil (the Lua
-            // manual explicitly permits "set[ting] existing fields to
-            // nil" mid-traversal). Actually removing the map entry here
-            // would erase its slot entirely, so a later `next(t, key)`
-            // resuming from it could no longer locate its position and
-            // would wrongly raise "invalid key to 'next'" (see
-            // `LuaTable::next`). Leaving a nil-valued tombstone in place
-            // keeps the slot locatable; `entries`/`len`/`get` already treat
-            // a nil value as "not present" so this is otherwise invisible.
-            // A key that was never present is left absent rather than
-            // inserted as a no-op tombstone.
-            if self.hash.contains_key(&key) {
-                self.hash.insert(key, LuaValue::Nil);
-            }
-        } else {
-            self.hash.insert(key, value);
-        }
-        self.version = self.version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// A "border" (any `n` with `t[n] ~= nil` and `t[n+1] == nil`, per the
-    /// Lua manual's `#` operator, which is left undefined when the array
-    /// part has holes): `array_border` is maintained incrementally by
-    /// `set` precisely so this is O(1), never a linear scan - `t[#t + 1] =
-    /// v` in a loop is a common idiom that must not make the loop O(n^2).
-    pub(super) fn len(&self) -> usize {
-        self.array_border
-    }
-
-    /// Recomputes `array_border` from scratch by scanning for the longest
-    /// non-nil prefix. Only needed after code that mutates `array` directly
-    /// instead of going through `set` (e.g. GC's weak-table pruning), which
-    /// is rare enough that an O(n) rescan there is fine.
-    pub(super) fn recompute_array_border(&mut self) {
-        self.array_border = self
-            .array
-            .iter()
-            .take_while(|value| **value != LuaValue::Nil)
-            .count();
-    }
-
-    pub(super) fn entries(&self, array_only: bool) -> Vec<(LuaValue, LuaValue)> {
-        let mut entries = self
-            .array
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| *value != &LuaValue::Nil)
-            .map(|(index, value)| (LuaValue::Integer(index as i64 + 1), value.clone()))
-            .collect::<Vec<_>>();
-        if !array_only {
-            entries.extend(
-                self.hash
-                    .iter()
-                    .filter(|(_, value)| *value != &LuaValue::Nil)
-                    .map(|(key, value)| (key.value(), value.clone())),
-            );
-        }
-        entries
-    }
-
-    /// Like `entries(false)`, but keeps nil-valued array slots and hash
-    /// tombstones instead of filtering them out. `LuaTable::next` (the
-    /// engine behind `next`/`pairs`) needs this unfiltered view to relocate
-    /// a key that was live when it was last yielded and has since been set
-    /// to nil - a pattern real Lua explicitly allows during traversal.
-    pub(super) fn entries_with_tombstones(&self) -> Vec<(LuaValue, LuaValue)> {
-        let mut entries = self
-            .array
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (LuaValue::Integer(index as i64 + 1), value.clone()))
-            .collect::<Vec<_>>();
-        entries.extend(
-            self.hash
-                .iter()
-                .map(|(key, value)| (key.value(), value.clone())),
-        );
-        entries
-    }
-
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-}
-
-fn positive_array_index(value: &LuaValue) -> Option<usize> {
-    // Sparse integer keys belong in the hash part. Treating every positive
-    // i64 as a vector offset lets `t[math.maxinteger] = value` overflow a
-    // Rust allocation instead of behaving like an ordinary Lua table key.
-    const MAX_DENSE_ARRAY_INDEX: i64 = 1 << 20;
-    let index = match value {
-        LuaValue::Integer(index) => *index,
-        LuaValue::Float(index)
-            if index.is_finite()
-                && index.fract() == 0.0
-                && *index >= 1.0
-                && *index <= i64::MAX as f64 =>
-        {
-            *index as i64
-        }
-        _ => return None,
-    };
-    (index > 0 && index <= MAX_DENSE_ARRAY_INDEX).then_some(index as usize)
-}
-
-/// Reads `(weak_keys, weak_values)` off a metatable's `__mode` field.
-/// Real Lua matches "k"/"v" as substrings of an arbitrary `__mode` string
-/// (so `"kv"` and `"vk"` both mean both), not an exact match.
-pub(super) fn table_weak_mode(metatable: &RcRef<LuaTable>) -> (bool, bool) {
-    match metatable.borrow().get_str_field(b"__mode") {
-        Some(LuaValue::String(mode)) => (
-            mode.as_bytes().contains(&b'k'),
-            mode.as_bytes().contains(&b'v'),
-        ),
-        _ => (false, false),
-    }
-}
-
-/// The table's `__gc` metamethod, if its metatable defines one as a callable
-/// value. Used by `collect_cycles` to finalize a table right before sweeping
-/// it.
-pub(super) fn table_finalizer(table: &RcRef<LuaTable>) -> Option<LuaValue> {
-    let metatable = table.borrow().metatable.clone()?;
-    let value = metatable.borrow().get_str_field(b"__gc")?;
-    match value {
-        value @ (LuaValue::Closure(_)
-        | LuaValue::NativeFunction(_)
-        | LuaValue::Native(_)
-        | LuaValue::RegisteredNative(_)) => Some(value),
-        _ => None,
-    }
-}
-
-/// True iff `value` is a reference type whose *only* remaining strong
-/// reference is the one this weak table itself is holding - i.e. nothing
-/// else in the program can still reach it, so a weak table must not keep
-/// it alive. Scalars and strings are never weakly collected (there's no
-/// separate identity/allocation to prune here, since this engine doesn't
-/// intern strings).
-fn reference_is_uniquely_held(value: &LuaValue) -> bool {
-    match value {
-        LuaValue::Table(rc) => Rc::strong_count(rc) == 1,
-        LuaValue::Closure(rc) => Rc::strong_count(rc) == 1,
-        LuaValue::Native(rc) => Rc::strong_count(rc) == 1,
-        LuaValue::GMatchIterator(rc) => Rc::strong_count(rc) == 1,
-        // A suspended coroutine owns a persistent `Once` continuation in
-        // its saved frame stack.  That continuation retains the coroutine's
-        // runtime handle while it is suspended, so unlike the other
-        // reference values a weak-table-only thread/wrapper has two strong
-        // references here: the table slot and that implementation detail.
-        // A live Lua reference adds at least one more.  Treat the former as
-        // weak-only, otherwise a `__mode = "v"` cache can keep every yielded
-        // `coroutine.wrap` result alive forever.
-        LuaValue::Thread(rc) => Rc::strong_count(rc) <= 2,
-        LuaValue::CoroutineWrapper(rc) => Rc::strong_count(rc) <= 2,
-        _ => false,
-    }
-}
-
-fn key_is_uniquely_held(key: &LuaKey) -> bool {
-    match key {
-        LuaKey::Table(rc) => Rc::strong_count(rc) == 1,
-        LuaKey::Closure(rc) => Rc::strong_count(rc) == 1,
-        LuaKey::Native(rc) => Rc::strong_count(rc) == 1,
-        LuaKey::GMatchIterator(rc) => Rc::strong_count(rc) == 1,
-        LuaKey::Thread(rc) => Rc::strong_count(rc) == 1,
-        LuaKey::CoroutineWrapper(rc) => Rc::strong_count(rc) == 1,
-        _ => false,
-    }
-}
-
-/// Pointer identity of `value`, if it's a cycle-collector candidate type
-/// (`Table`/`Closure` - the only reference types that can themselves hold an
-/// `Rc` to another candidate and thus participate in a cycle). Used by
-/// `LuaRuntime::collect_cycles` to build inter-candidate edges; the pointer
-/// value is only ever used as a `HashMap`/`HashSet` key against other
-/// candidates' own `Rc::as_ptr`, never dereferenced.
-pub(super) fn candidate_ptr(value: &LuaValue) -> Option<usize> {
-    match value {
-        LuaValue::Table(rc) => Some(Rc::as_ptr(rc) as usize),
-        LuaValue::Closure(rc) => Some(Rc::as_ptr(rc) as usize),
-        _ => None,
-    }
-}
-
-pub(super) fn candidate_key_ptr(key: &LuaKey) -> Option<usize> {
-    match key {
-        LuaKey::Table(rc) => Some(Rc::as_ptr(rc) as usize),
-        LuaKey::Closure(rc) => Some(Rc::as_ptr(rc) as usize),
-        _ => None,
-    }
-}
-
-/// Removes weakly-held entries from a single table, per its own `__mode`.
-/// Array-part removals become `Nil` (removing an array slot outright would
-/// shift every later index); hash-part removals drop the entry entirely,
-/// matching how `LuaTable::set` already treats a `Nil` value as a deletion.
-pub(super) fn prune_weak_table(table: &mut LuaTable, weak_keys: bool, weak_values: bool) {
-    if weak_values {
-        let mut pruned_any = false;
-        for slot in table.array.iter_mut() {
-            if reference_is_uniquely_held(slot) {
-                *slot = LuaValue::Nil;
-                pruned_any = true;
-            }
-        }
-        if pruned_any {
-            table.recompute_array_border();
-        }
-    }
-    if weak_keys || weak_values {
-        table.hash.retain(|key, value| {
-            !((weak_keys && key_is_uniquely_held(key))
-                || (weak_values && reference_is_uniquely_held(value)))
-        });
-    }
-    table.version = table.version.wrapping_add(1);
-}
-
-impl LuaKey {
-    fn value(&self) -> LuaValue {
-        match self {
-            Self::Bool(value) => LuaValue::Bool(*value),
-            Self::Integer(value) => LuaValue::Integer(*value),
-            Self::Float(value) => LuaValue::Float(f64::from_bits(*value)),
-            Self::String(value) => LuaValue::String(value.clone()),
-            Self::Table(value) => LuaValue::Table(value.clone()),
-            Self::CanonicalTable(value) => LuaValue::CanonicalTable(value.clone()),
-            Self::Closure(value) => LuaValue::Closure(value.clone()),
-            Self::NativeFunction(value) => LuaValue::NativeFunction(*value),
-            Self::Native(value) => LuaValue::Native(value.clone()),
-            Self::RegisteredNative(value) => LuaValue::RegisteredNative(*value),
-            Self::CFunction(value) => LuaValue::CFunction(value.clone()),
-            Self::GMatchIterator(value) => LuaValue::GMatchIterator(value.clone()),
-            Self::Thread(value) => LuaValue::Thread(value.clone()),
-            Self::CoroutineWrapper(value) => LuaValue::CoroutineWrapper(value.clone()),
-            Self::Userdata(value) => LuaValue::Userdata(value.clone()),
-            Self::LightUserdata(value) => LuaValue::LightUserdata(*value),
-        }
+        assert_eq!(NativeFunction::from_u32(count), None);
+        assert!(count > 0, "NativeFunction should have at least one variant");
     }
 }

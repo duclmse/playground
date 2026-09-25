@@ -75,19 +75,17 @@ impl LuaRuntime {
                 else {
                     return Ok(vec![LuaValue::Nil]);
                 };
-                if index < closure.proto.upvals.len() {
-                    let name = closure
-                        .proto
+                let (proto, upvalues, globals) = self.closure_parts(closure)?;
+                if index < proto.upvals.len() {
+                    let name = proto
                         .upval_names
                         .get(index)
                         .map(String::as_bytes)
                         .unwrap_or(b"?");
-                    let value = closure
-                        .upvals
-                        .borrow()
-                        .get(index)
-                        .map(|value| value.borrow().clone())
-                        .unwrap_or(LuaValue::Nil);
+                    let value = match upvalues.get(index) {
+                        Some(&cell) => self.upvalue_get(cell)?,
+                        None => LuaValue::Nil,
+                    };
                     return Ok(vec![LuaValue::String(self.intern_str(name.to_vec())), value]);
                 }
                 // The current bytecode keeps its implicit `_ENV` in the
@@ -95,10 +93,10 @@ impl LuaRuntime {
                 // Expose it at Lua's mandatory final upvalue slot so debug
                 // clients can discover the environment even while the
                 // compiler migrates to a physical implicit capture.
-                if index == closure.proto.upvals.len() && has_implicit_environment(&closure.proto) {
+                if index == proto.upvals.len() && has_implicit_environment(&proto) {
                     Ok(vec![
                         LuaValue::String(self.intern_str(b"_ENV".to_vec())),
-                        closure.globals.as_value(),
+                        globals.as_value(),
                     ])
                 } else {
                     Ok(vec![LuaValue::Nil])
@@ -117,25 +115,31 @@ impl LuaRuntime {
                 // with one upvalue would report.
                 let identity = match &subject {
                     LuaValue::Closure(closure) => {
-                        let upvals = closure.upvals.borrow();
+                        let (proto, upvalues, globals) = self.closure_parts(*closure)?;
                         usize::try_from(index)
                             .ok()
                             .and_then(|index| index.checked_sub(1))
-                            .and_then(|index| upvals.get(index))
-                            .map(|cell| Rc::as_ptr(cell) as usize)
+                            // `upvalues` also carries the synthetic trailing
+                            // environment cell `new_closure` appends (see its
+                            // own doc comment) - excluded here so an
+                            // out-of-range Lua index never resolves to it
+                            // except through the explicit `_ENV` check below.
+                            .filter(|&index| index < proto.upvals.len())
+                            .and_then(|index| upvalues.get(index))
+                            .map(|cell| cell.raw() as usize)
                             // The legacy bytecode frame still stores its
                             // implicit environment beside lexical upvalues.
                             // Expose the final mandatory `_ENV` identity at
                             // the same logical slot as getupvalue/setupvalue.
                             .or_else(|| {
                                 (usize::try_from(index).ok()
-                                    == Some(closure.proto.upvals.len() + 1)
-                                    && has_implicit_environment(&closure.proto))
-                                .then(|| closure.globals.identity_address())
+                                    == Some(proto.upvals.len() + 1)
+                                    && has_implicit_environment(&proto))
+                                .then(|| globals.identity_address())
                             })
                     }
                     LuaValue::GMatchIterator(state) if index == 1 => {
-                        Some(Rc::as_ptr(state) as usize)
+                        Some(state.object_id().raw() as usize)
                     }
                     LuaValue::GMatchIterator(_) => None,
                     other => {
@@ -164,21 +168,28 @@ impl LuaRuntime {
                 let n1 = coerce_integer(&required(1)?)?;
                 let f2 = closure_arg(2, 3)?;
                 let n2 = coerce_integer(&required(3)?)?;
+                // Bounded by `proto.upvals.len()`, not the raw upvalue-cell
+                // count: see `DebugUpvalueid`'s own comment - `upvalues` also
+                // carries `new_closure`'s synthetic trailing environment
+                // cell, which a Lua-visible upvalue index must never reach.
+                let (f2_proto, f2_upvalues, _) = self.closure_parts(f2)?;
                 let source_cell = usize::try_from(n2)
                     .ok()
                     .and_then(|index| index.checked_sub(1))
-                    .and_then(|index| f2.upvals.borrow().get(index).cloned())
+                    .filter(|&index| index < f2_proto.upvals.len())
+                    .and_then(|index| f2_upvalues.get(index).copied())
                     .ok_or_else(|| {
                         LuaError::new("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
                     })?;
+                let (f1_proto, _f1_upvalues, _) = self.closure_parts(f1)?;
                 let dst_index = usize::try_from(n1)
                     .ok()
                     .and_then(|index| index.checked_sub(1))
-                    .filter(|&index| index < f1.upvals.borrow().len())
+                    .filter(|&index| index < f1_proto.upvals.len())
                     .ok_or_else(|| {
                         LuaError::new("bad argument #2 to 'upvaluejoin' (invalid upvalue index)")
                     })?;
-                f1.upvals.borrow_mut()[dst_index] = source_cell;
+                self.closure_set_upvalue_cell(f1, dst_index, source_cell)?;
                 Ok(vec![])
             }
             NativeFunction::DebugSetupvalue => {
@@ -199,19 +210,20 @@ impl LuaRuntime {
                 let Some(index) = index else {
                     return Ok(vec![LuaValue::Nil]);
                 };
-                let upvals = closure.upvals.borrow_mut();
-                if let Some(cell) = upvals.get(index) {
-                    *cell.borrow_mut() = value;
-                    let name = closure
-                        .proto
+                let (proto, upvalues, _globals) = self.closure_parts(closure)?;
+                // See `DebugUpvalueid`: `upvalues` also carries the synthetic
+                // trailing environment cell, excluded here the same way so it
+                // is only reachable through the explicit `_ENV` branch below.
+                if index < proto.upvals.len() && upvalues.get(index).is_some() {
+                    let cell = upvalues[index];
+                    self.upvalue_set(cell, value)?;
+                    let name = proto
                         .upval_names
                         .get(index)
                         .map(String::as_bytes)
                         .unwrap_or(b"?");
                     Ok(vec![LuaValue::String(self.intern_str(name.to_vec()))])
-                } else if index == closure.proto.upvals.len()
-                    && has_implicit_environment(&closure.proto)
-                {
+                } else if index == proto.upvals.len() && has_implicit_environment(&proto) {
                     // See `DebugGetupvalue`: `_ENV` is represented by the
                     // shared scope cell during the transition. It is already
                     // the caller's default environment in the only binary
@@ -272,10 +284,9 @@ impl LuaRuntime {
                         ));
                     }
                 }
-                let info = Rc::new(RefCell::new(LuaTable::default()));
+                let info = self.new_table(None)?;
                 let mut set = |key: &[u8], value: LuaValue| {
-                    info.borrow_mut()
-                        .set(LuaValue::String(self.intern_str(key.to_vec())), value)
+                    self.table_set(info, LuaValue::String(self.intern_str(key.to_vec())), value)
                         .unwrap();
                 };
                 match &arg0 {
@@ -283,19 +294,20 @@ impl LuaRuntime {
                         // A function value has no active call frame, so real
                         // Lua reports `currentline = -1` and no `__call`-chain
                         // hop count (`extraargs = 0`) here.
-                        self.describe_lua_proto(&mut set, &closure.proto, -1, 0);
+                        let proto = self.closure_prototype(*closure)?;
+                        self.describe_lua_proto(&mut set, &proto, -1, 0);
                         set(
                             b"nups",
-                            LuaValue::Integer(closure.upvals.borrow().len() as i64),
+                            LuaValue::Integer(self.closure_upvalues(*closure)?.len() as i64),
                         );
                         // Only this direct-value lookup has the real closure
-                        // `Rc` in hand. The level-based lookup below unpacks a
+                        // in hand. The level-based lookup below unpacks a
                         // `LuaFrame`'s `proto`/`upvals`/`globals` rather than
                         // keeping the original closure, and reconstructing one
-                        // would fail `Rc::ptr_eq`-based `LuaValue` equality
-                        // against the actual running closure - worse than
-                        // leaving `func` unset there.
-                        set(b"func", LuaValue::Closure(closure.clone()));
+                        // would fail `LuaValue` equality against the actual
+                        // running closure - worse than leaving `func` unset
+                        // there.
+                        set(b"func", LuaValue::Closure(*closure));
                     }
                     LuaValue::NativeFunction(_)
                     | LuaValue::Native(_)
@@ -392,10 +404,8 @@ impl LuaRuntime {
                 // `nil` - `debug.getmetatable(nil)` and
                 // `debug.setmetatable(nil, mt)` are both valid calls.
                 Ok(vec![match required(0)? {
-                    LuaValue::Table(table) => table
-                        .borrow()
-                        .metatable
-                        .clone()
+                    LuaValue::Table(table) => self
+                        .table_metatable(table)
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil),
                     LuaValue::String(_) => LuaValue::Table(self.string_metatable.clone()),
@@ -430,7 +440,7 @@ impl LuaRuntime {
                 };
                 match &value {
                     LuaValue::Table(table) => {
-                        table.borrow_mut().metatable = new_metatable;
+                        self.table_set_metatable(*table, new_metatable)?;
                     }
                     LuaValue::Integer(_) | LuaValue::Float(_) => {
                         self.number_metatable = new_metatable;
@@ -502,8 +512,9 @@ impl LuaRuntime {
                         .unwrap_or_else(|| self.main_coroutine.clone())
                 };
                 let hook = args.get(index).cloned().unwrap_or(LuaValue::Nil);
+                let target_co = self.coroutine(target);
                 if matches!(hook, LuaValue::Nil) {
-                    *target.hook.borrow_mut() = None;
+                    *target_co.hook.borrow_mut() = None;
                 } else {
                     let mask_value = args.get(index + 1).cloned().ok_or_else(|| {
                         LuaError::new(
@@ -525,7 +536,7 @@ impl LuaRuntime {
                         None => 0,
                     };
                     mask.count = count > 0;
-                    *target.hook.borrow_mut() = Some(Rc::new(HookState {
+                    *target_co.hook.borrow_mut() = Some(Rc::new(HookState {
                         callback: hook,
                         mask,
                         count,
@@ -540,8 +551,8 @@ impl LuaRuntime {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| self.main_coroutine.clone());
-                if Rc::ptr_eq(&target, &running) {
-                    self.active_hook = target.hook.borrow().clone();
+                if target == running {
+                    self.active_hook = target_co.hook.borrow().clone();
                     // `fire_line_and_count_hooks` only updates
                     // `hook_last_pc`/`hook_last_line` while a hook is
                     // actually active (real Lua's own `oldpc` tracking in
@@ -585,7 +596,7 @@ impl LuaRuntime {
                         .cloned()
                         .unwrap_or_else(|| self.main_coroutine.clone())
                 };
-                let hook_state = target.hook.borrow().clone();
+                let hook_state = self.coroutine(target).hook.borrow().clone();
                 match hook_state {
                     Some(hook) => {
                         let mut mask_string = String::new();
@@ -629,16 +640,15 @@ impl LuaRuntime {
         // `activelines`: real Lua's `funcinfo` builds this as a set (line ->
         // `true`) of every line this prototype's own bytecode maps to - not
         // its nested closures', which carry separate `Proto`s/source maps.
-        let activelines = Rc::new(RefCell::new(LuaTable::default()));
+        let activelines = TableRef::alloc(&mut self.canonical_heap.borrow_mut());
         for pc in 0..proto.source_map.len() as u32 {
             if let Some(location) = proto.source_map.location(pc) {
-                activelines
-                    .borrow_mut()
-                    .set(
-                        LuaValue::Integer(location.line as i64),
-                        LuaValue::Bool(true),
-                    )
-                    .unwrap();
+                self.table_set(
+                    activelines,
+                    LuaValue::Integer(location.line as i64),
+                    LuaValue::Bool(true),
+                )
+                .unwrap();
             }
         }
         set(b"activelines", LuaValue::Table(activelines));

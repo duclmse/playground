@@ -23,11 +23,11 @@ impl LuaRuntime {
     /// customizes this label; other values use their normal type name.
     pub(super) fn error_type_label(&self, value: &LuaValue) -> String {
         if let LuaValue::Table(table) = value {
-            if let Some(metatable) = &table.borrow().metatable {
-                if let Ok(LuaValue::String(name)) = metatable
-                    .borrow()
-                    .get(&LuaValue::String(self.intern_str(b"__name".to_vec())))
-                {
+            if let Some(metatable) = self.table_metatable(*table) {
+                if let Ok(LuaValue::String(name)) = self.table_get(
+                    metatable,
+                    &LuaValue::String(self.intern_str(b"__name".to_vec())),
+                ) {
                     return String::from_utf8_lossy(name.as_bytes()).into_owned();
                 }
             }

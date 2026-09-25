@@ -68,9 +68,9 @@ impl LuaRuntime {
                 let name = self.string(&required(0)?)?.to_vec();
                 let key = LuaValue::String(self.intern_str(name.clone()));
                 let preload_key = LuaValue::String(self.intern_str(b"preload".to_vec()));
-                let preload = self.package_table.borrow().get(&preload_key)?;
+                let preload = self.table_get(self.package_table, &preload_key)?;
                 if let LuaValue::Table(preload_table) = preload {
-                    let loader = preload_table.borrow().get(&key)?;
+                    let loader = self.table_get(preload_table, &key)?;
                     if loader != LuaValue::Nil {
                         return Ok(vec![
                             loader,
@@ -401,8 +401,8 @@ impl LuaRuntime {
         };
         let program = crate::parser::parse_lua(tokens).map_err(&format_error)?;
         let chunk_globals = match env {
-            Some(value) => Globals::from_value(self.canonical_heap.clone(), value),
-            None => self.globals.snapshot_for_load(),
+            Some(value) => Globals::from_value(self, value),
+            None => self.globals.snapshot_for_load(self),
         };
         let mut main_function: Option<Function> = None;
         for function in &program.functions {
@@ -414,14 +414,10 @@ impl LuaRuntime {
             if let Some(chunkname) = &chunkname {
                 self.register_chunk_source(&proto, chunkname);
             }
-            self.charge_allocation(std::mem::size_of::<LuaClosure>())
+            let closure = self
+                .new_closure(proto, Vec::new(), chunk_globals.clone(), None)
                 .map_err(|error| error.message)?;
-            let closure = self.track_closure(Rc::new(LuaClosure {
-                proto,
-                upvals: RefCell::new(Vec::new()),
-                globals: chunk_globals.clone(),
-            }));
-            chunk_globals.define(&function.name, LuaValue::Closure(closure), false);
+            chunk_globals.define(self, &function.name, LuaValue::Closure(closure), false);
         }
         let body = main_function.unwrap_or_else(|| Function {
             name: "main".into(),
@@ -441,13 +437,10 @@ impl LuaRuntime {
         if let Some(chunkname) = &chunkname {
             self.register_chunk_source(&proto, chunkname);
         }
-        self.charge_allocation(std::mem::size_of::<LuaClosure>())
+        let closure = self
+            .new_closure(proto, Vec::new(), chunk_globals, None)
             .map_err(|error| error.message)?;
-        Ok(LuaValue::Closure(self.track_closure(Rc::new(LuaClosure {
-            proto,
-            upvals: RefCell::new(Vec::new()),
-            globals: chunk_globals,
-        }))))
+        Ok(LuaValue::Closure(closure))
     }
 
     fn load_binary_chunk(
@@ -504,23 +497,23 @@ impl LuaRuntime {
             self.register_chunk_source(&proto, chunkname);
         }
         let chunk_globals = match env {
-            Some(value) => Globals::from_value(self.canonical_heap.clone(), value),
-            None => self.globals.snapshot_for_load(),
+            Some(value) => Globals::from_value(self, value),
+            None => self.globals.snapshot_for_load(self),
         };
-        self.charge_allocation(std::mem::size_of::<LuaClosure>())
-            .map_err(|error| error.message)?;
         // A dumped Lua function retains its upvalue *descriptors* but not
         // their captured values. `load` creates one nil cell per descriptor
         // (Lua callers can then discover/rebind the final implicit `_ENV`
         // slot through debug.getupvalue/setupvalue).
-        let upvals = (0..proto.upvals.len())
-            .map(|_| Rc::new(RefCell::new(LuaValue::Nil)))
-            .collect();
-        Ok(LuaValue::Closure(self.track_closure(Rc::new(LuaClosure {
-            proto,
-            upvals: RefCell::new(upvals),
-            globals: chunk_globals,
-        }))))
+        let upvals = {
+            let mut heap = self.canonical_heap.borrow_mut();
+            (0..proto.upvals.len())
+                .map(|_| heap.alloc_upvalue(sol_core::Value::NIL, None))
+                .collect()
+        };
+        let closure = self
+            .new_closure(proto, upvals, chunk_globals, None)
+            .map_err(|error| error.message)?;
+        Ok(LuaValue::Closure(closure))
     }
 
     pub(super) fn register_chunk_source(&mut self, proto: &Rc<Proto>, chunkname: &Rc<Vec<u8>>) {
@@ -534,7 +527,7 @@ impl LuaRuntime {
     fn require(&mut self, name: LuaValue) -> LuaResult<Vec<LuaValue>> {
         let name = self.string(&name)?.to_vec();
         let key = LuaValue::String(self.intern_str(name.clone()));
-        let loaded = self.package_loaded.borrow().get(&key)?;
+        let loaded = self.table_get(self.package_loaded, &key)?;
         // Real Lua's `require` treats `package.loaded[name]` as "already
         // loaded" only when it is truthy (`lua_toboolean`), not merely
         // non-nil: a module whose loader legitimately cached `false` (e.g.
@@ -561,17 +554,20 @@ impl LuaRuntime {
     ) -> LuaResult<Vec<LuaValue>> {
         // Mark before execution so a cyclic require observes a deterministic
         // partial-initialization sentinel instead of recursively reloading.
-        self.package_loaded
-            .borrow_mut()
-            .set(key.clone(), LuaValue::Bool(true))?;
+        self.table_set(self.package_loaded, key.clone(), LuaValue::Bool(true))?;
         self.loading_modules.insert(name.clone());
         let result = (|| {
             let program =
                 crate::parser::parse_lua(crate::lexer::lex_bytes(&source).map_err(LuaError::new)?)
                     .map_err(LuaError::new)?;
             let base = self.globals.clone();
-            let module = Globals::module(&base);
-            module.define("_NAME", LuaValue::String(self.intern_str(name.clone())), true);
+            let module = Globals::module(&base, self);
+            module.define(
+                self,
+                "_NAME",
+                LuaValue::String(self.intern_str(name.clone())),
+                true,
+            );
             self.run_in_globals(&program, &module, &HashSet::new(), &HashMap::new())
         })();
         self.loading_modules.remove(&name);
@@ -579,11 +575,11 @@ impl LuaRuntime {
         match result {
             Ok(LuaValue::Nil) => Ok(vec![LuaValue::Bool(true)]),
             Ok(value) => {
-                self.package_loaded.borrow_mut().set(key, value.clone())?;
+                self.table_set(self.package_loaded, key, value.clone())?;
                 Ok(vec![value])
             }
             Err(error) => {
-                self.package_loaded.borrow_mut().set(key, LuaValue::Nil)?;
+                self.table_set(self.package_loaded, key, LuaValue::Nil)?;
                 Err(error.at(&format!("module '{}'", String::from_utf8_lossy(&name))))
             }
         }
@@ -591,14 +587,14 @@ impl LuaRuntime {
 
     fn require_search(&mut self, name: Vec<u8>, key: LuaValue) -> LuaResult<Vec<LuaValue>> {
         let searchers_key = LuaValue::String(self.intern_str(b"searchers".to_vec()));
-        let searchers = self.package_table.borrow().get(&searchers_key)?;
+        let searchers = self.table_get(self.package_table, &searchers_key)?;
         let LuaValue::Table(searchers) = searchers else {
             return Err(LuaError::new("'package.searchers' must be a table"));
         };
         let mut errors = Vec::new();
         let mut index = 1_i64;
         loop {
-            let searcher = searchers.borrow().get(&LuaValue::Integer(index))?;
+            let searcher = self.table_get(searchers, &LuaValue::Integer(index))?;
             if searcher == LuaValue::Nil {
                 break;
             }
@@ -670,7 +666,7 @@ impl LuaRuntime {
         field: &[u8],
     ) -> LuaResult<Result<Vec<u8>, Vec<u8>>> {
         let field_key = LuaValue::String(self.intern_str(field.to_vec()));
-        let value = self.package_table.borrow().get(&field_key)?;
+        let value = self.table_get(self.package_table, &field_key)?;
         let path = match value {
             LuaValue::String(bytes) => bytes,
             _ => {
@@ -694,15 +690,11 @@ impl LuaRuntime {
         let mut values = self.call(loader, vec![LuaValue::String(self.intern_str(name)), extra.clone()])?;
         let returned = values.drain(..).next().unwrap_or(LuaValue::Nil);
         if returned != LuaValue::Nil {
-            self.package_loaded
-                .borrow_mut()
-                .set(key.clone(), returned)?;
+            self.table_set(self.package_loaded, key.clone(), returned)?;
         }
-        let current = self.package_loaded.borrow().get(&key)?;
+        let current = self.table_get(self.package_loaded, &key)?;
         let result = if current == LuaValue::Nil {
-            self.package_loaded
-                .borrow_mut()
-                .set(key, LuaValue::Bool(true))?;
+            self.table_set(self.package_loaded, key, LuaValue::Bool(true))?;
             LuaValue::Bool(true)
         } else {
             current

@@ -36,7 +36,7 @@ impl LuaRuntime {
                     let count = results.len();
                     ensure_regs(&mut frame.regs, &mut frame.cells, base + count);
                     for (i, value) in results.into_iter().enumerate() {
-                        reg_set(&mut frame.regs, &frame.cells, base + i, value);
+                        reg_set(self, &mut frame.regs, &frame.cells, base + i, value);
                     }
                     frame.header.stack_top = (base + count) as u32;
                 }
@@ -47,8 +47,7 @@ impl LuaRuntime {
                     let n = count as usize;
                     ensure_regs(&mut frame.regs, &mut frame.cells, base + n);
                     for i in 0..n {
-                        reg_set(
-                            &mut frame.regs,
+                        reg_set(self, &mut frame.regs,
                             &frame.cells,
                             base + i,
                             results.get(i).cloned().unwrap_or(LuaValue::Nil),
@@ -58,7 +57,7 @@ impl LuaRuntime {
                 }
                 Pending::Index { dest } | Pending::Len { dest } | Pending::Unary { dest } => {
                     let value = results.into_iter().next().unwrap_or(LuaValue::Nil);
-                    reg_set(&mut frame.regs, &frame.cells, dest, value);
+                    reg_set(self, &mut frame.regs, &frame.cells, dest, value);
                 }
                 Pending::SetIndex => {}
                 Pending::Binary { dest, continuation } => {
@@ -68,7 +67,7 @@ impl LuaRuntime {
                         BinaryContinuation::Bool => LuaValue::Bool(raw.truthy()),
                         BinaryContinuation::BoolNegated => LuaValue::Bool(!raw.truthy()),
                     };
-                    reg_set(&mut frame.regs, &frame.cells, dest, value);
+                    reg_set(self, &mut frame.regs, &frame.cells, dest, value);
                 }
                 Pending::TForCall { base, nvars } => {
                     ensure_regs(&mut frame.regs, &mut frame.cells, base + 3 + nvars);
@@ -82,9 +81,9 @@ impl LuaRuntime {
                             .copied()
                             .unwrap_or(false)
                         {
-                            self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                            self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                         }
-                        reg_set_fresh(&mut frame.regs, &mut frame.cells, dst, value);
+                        reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value);
                     }
                 }
                 Pending::None => {
@@ -96,7 +95,7 @@ impl LuaRuntime {
         let proto = frame.proto.clone();
         let mut top = frame.header.stack_top as usize;
         'exec: loop {
-            self.tick()?;
+            self.tick(&*frame)?;
             // Keep the frame header's pc in step with the instruction about
             // to execute, not just the ones that explicitly save it before
             // suspending. Otherwise an error that propagates straight out
@@ -106,50 +105,63 @@ impl LuaRuntime {
             self.fire_line_and_count_hooks(frame, pc)?;
             match &proto.instrs[pc] {
                 Instr::LoadConst(dst, k) => {
-                    reg_set(
-                        &mut frame.regs,
+                    reg_set(self, &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
                         const_to_value(&self.canonical_heap, &proto.consts[*k as usize]),
                     );
                 }
                 Instr::LoadNil(dst) => {
-                    reg_set(&mut frame.regs, &frame.cells, *dst as usize, LuaValue::Nil);
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, LuaValue::Nil);
                 }
                 Instr::LoadBool(dst, value) => {
-                    reg_set(
-                        &mut frame.regs,
+                    reg_set(self, &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
                         LuaValue::Bool(*value),
                     );
                 }
                 Instr::Move(dst, src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                 }
                 Instr::NewLocal(dst, src, _) => {
                     let dst = *dst as usize;
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     if proto.captured_registers.get(dst).copied().unwrap_or(false) {
-                        self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                        self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                     }
-                    reg_set_fresh(&mut frame.regs, &mut frame.cells, dst, value);
+                    reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value);
                 }
                 Instr::GetUpval(dst, idx) => {
-                    let value = frame.upvals[*idx as usize].borrow().clone();
-                    reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                    let id = frame.upvals[*idx as usize];
+                    let encoded = self
+                        .canonical_heap
+                        .borrow()
+                        .upvalue_value(id)
+                        .expect("upvalue id must address a live upvalue object");
+                    let value = self
+                        .decode_value(encoded)
+                        .expect("a value already resident in an upvalue must decode cleanly");
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                 }
                 Instr::SetUpval(idx, src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    *frame.upvals[*idx as usize].borrow_mut() = value;
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    let id = frame.upvals[*idx as usize];
+                    let encoded = self
+                        .encode_value(&value)
+                        .expect("a value already resident in a register must encode cleanly");
+                    self.canonical_heap
+                        .borrow_mut()
+                        .set_upvalue(id, encoded)
+                        .expect("upvalue id must address a live upvalue object");
                 }
                 Instr::GetEnvironment(dst) => {
                     let value = frame.globals.as_value();
-                    reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                 }
                 Instr::SetEnvironment(src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     // `_ENV` is an ordinary upvalue in Lua and can hold any
                     // value. A later global access indexes that value and
                     // produces the usual Lua indexing error if needed.
@@ -163,13 +175,13 @@ impl LuaRuntime {
                     // (`has_base`) never carry a caller metatable, so they
                     // keep the cheaper direct `base`-chain path instead.
                     if frame.globals.has_base() {
-                        let value = frame.globals.get(name);
-                        reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                        let value = frame.globals.get(self, name);
+                        reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                     } else {
                         let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
                         match self.index_resolve(frame.globals.as_value(), key)? {
                             IndexResolution::Value(value) => {
-                                reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                                reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                             }
                             IndexResolution::Call { method, args } => {
                                 frame.header.pc = pc as u32;
@@ -185,15 +197,15 @@ impl LuaRuntime {
                     }
                 }
                 Instr::SetGlobal(name, src, constant, declare) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     if *declare {
-                        frame.globals.define(name, value, *constant);
+                        frame.globals.define(self, name, value, *constant);
                     } else if frame.globals.has_base() {
-                        frame.globals.assign(name, value)?;
+                        frame.globals.assign(self, name, value)?;
                     } else {
                         frame.globals.check_writable(name)?;
                         let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
-                        match self.set_index_resolve(frame.globals.as_value(), key, value)? {
+                        match self.set_index_resolve(frame.globals.as_value(), key, value, Some(&*frame))? {
                             SetIndexResolution::Done => {}
                             SetIndexResolution::Call { method, args } => {
                                 frame.header.pc = pc as u32;
@@ -207,15 +219,15 @@ impl LuaRuntime {
                     }
                 }
                 Instr::ErrorIfGlobalDefined(reg, name) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *reg as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *reg as usize);
                     if value != LuaValue::Nil {
                         return Err(LuaError::new(format!("global '{name}' already defined")));
                     }
                 }
                 Instr::NewTable(dst) => {
-                    self.charge_allocation(std::mem::size_of::<LuaTable>())?;
-                    let table = self.track_table(Rc::new(RefCell::new(LuaTable::default())));
+                    let table = self.new_table(Some(&*frame))?;
                     reg_set(
+                        self,
                         &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
@@ -224,26 +236,18 @@ impl LuaRuntime {
                 }
                 Instr::NewClosure(dst, idx) => {
                     let child_proto = proto.nested[*idx as usize].clone();
-                    self.charge_allocation(std::mem::size_of::<LuaClosure>())?;
                     let mut child_upvals = Vec::with_capacity(child_proto.upvals.len());
                     for source in &child_proto.upvals {
                         child_upvals.push(match source {
-                            UpvalSource::ParentLocal(reg) => frame.cells[*reg as usize]
-                                .as_ref()
-                                .expect(
-                                    "compiler marks any ParentLocal-captured register as captured",
-                                )
-                                .clone(),
-                            UpvalSource::ParentUpval(idx) => frame.upvals[*idx as usize].clone(),
+                            UpvalSource::ParentLocal(reg) => frame.cells[*reg as usize].expect(
+                                "compiler marks any ParentLocal-captured register as captured",
+                            ),
+                            UpvalSource::ParentUpval(idx) => frame.upvals[*idx as usize],
                         });
                     }
-                    let closure = LuaClosure {
-                        proto: child_proto,
-                        upvals: RefCell::new(child_upvals),
-                        globals: frame.globals.clone(),
-                    };
-                    let closure = self.track_closure(Rc::new(closure));
+                    let closure = self.new_closure(child_proto, child_upvals, frame.globals.clone(), Some(&*frame))?;
                     reg_set(
+                        self,
                         &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
@@ -251,11 +255,11 @@ impl LuaRuntime {
                     );
                 }
                 Instr::GetField(dst, base, name) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
                     let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
                     match self.index_resolve(base_value, key) {
                         Ok(IndexResolution::Value(value)) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                         }
                         Ok(IndexResolution::Call { method, args }) => {
                             frame.header.pc = pc as u32;
@@ -274,10 +278,10 @@ impl LuaRuntime {
                     }
                 }
                 Instr::SetField(base, name, src) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
                     let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    match self.set_index_resolve(base_value, key, value) {
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    match self.set_index_resolve(base_value, key, value, Some(&*frame)) {
                         Ok(SetIndexResolution::Done) => {}
                         Ok(SetIndexResolution::Call { method, args }) => {
                             frame.header.pc = pc as u32;
@@ -294,11 +298,11 @@ impl LuaRuntime {
                     }
                 }
                 Instr::GetIndex(dst, base, index) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
-                    let key = reg_get(&frame.regs, &frame.cells, *index as usize);
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
+                    let key = reg_get(self, &frame.regs, &frame.cells, *index as usize);
                     match self.index_resolve(base_value, key) {
                         Ok(IndexResolution::Value(value)) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, value);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                         }
                         Ok(IndexResolution::Call { method, args }) => {
                             frame.header.pc = pc as u32;
@@ -317,10 +321,10 @@ impl LuaRuntime {
                     }
                 }
                 Instr::SetIndex(base, index, src) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
-                    let key = reg_get(&frame.regs, &frame.cells, *index as usize);
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    match self.set_index_resolve(base_value, key, value) {
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
+                    let key = reg_get(self, &frame.regs, &frame.cells, *index as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    match self.set_index_resolve(base_value, key, value, Some(&*frame)) {
                         Ok(SetIndexResolution::Done) => {}
                         Ok(SetIndexResolution::Call { method, args }) => {
                             frame.header.pc = pc as u32;
@@ -337,29 +341,34 @@ impl LuaRuntime {
                     }
                 }
                 Instr::SetArrayItem(base, array_index, src) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
-                    self.raw_set_index(base_value, LuaValue::Integer(*array_index), value)?;
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    self.raw_set_index(
+                        base_value,
+                        LuaValue::Integer(*array_index),
+                        value,
+                        Some(&*frame),
+                    )?;
                 }
                 Instr::SetArrayMulti(base, start_index, from) => {
-                    let base_value = reg_get(&frame.regs, &frame.cells, *base as usize);
+                    let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
                     let table = self.expect_table(&base_value)?;
                     let mut index = *start_index;
                     for r in (*from as usize)..top {
-                        let value = reg_get(&frame.regs, &frame.cells, r);
+                        let value = reg_get(self, &frame.regs, &frame.cells, r);
                         let key = LuaValue::Integer(index);
-                        if table.borrow().get(&key)? == LuaValue::Nil {
-                            self.charge_new_table_entry(&table)?;
+                        if self.table_get(table, &key)? == LuaValue::Nil {
+                            self.charge_new_table_entry(Some(&*frame))?;
                         }
-                        table.borrow_mut().set(key, value)?;
+                        self.table_set(table, key, value)?;
                         index += 1;
                     }
                 }
                 Instr::Len(dst, src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     match self.len_resolve(value)? {
                         LenResolution::Value(result) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, result);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         LenResolution::Call { method, args } => {
                             frame.header.pc = pc as u32;
@@ -373,16 +382,15 @@ impl LuaRuntime {
                     }
                 }
                 Instr::Not(dst, src) => {
-                    let value = reg_truthy(&frame.regs, &frame.cells, *src as usize);
-                    reg_set(
-                        &mut frame.regs,
+                    let value = reg_truthy(self, &frame.regs, &frame.cells, *src as usize);
+                    reg_set(self, &mut frame.regs,
                         &frame.cells,
                         *dst as usize,
                         LuaValue::Bool(!value),
                     );
                 }
                 Instr::Neg(dst, src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     match self.unary_resolve(UnaryOp::Neg, value) {
                         Err(mut error) => {
                             if error.message.starts_with("attempt to perform arithmetic")
@@ -395,7 +403,7 @@ impl LuaRuntime {
                             return Err(error);
                         }
                         Ok(UnaryResolution::Value(result)) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, result);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         Ok(UnaryResolution::Call { method, args }) => {
                             frame.header.pc = pc as u32;
@@ -409,10 +417,10 @@ impl LuaRuntime {
                     }
                 }
                 Instr::BitNot(dst, src) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *src as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
                     match self.unary_resolve(UnaryOp::BitNot, value)? {
                         UnaryResolution::Value(result) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, result);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         UnaryResolution::Call { method, args } => {
                             frame.header.pc = pc as u32;
@@ -428,11 +436,11 @@ impl LuaRuntime {
                 Instr::Binary(op, dst, left, right) => {
                     let left_reg = *left as usize;
                     let right_reg = *right as usize;
-                    let left = reg_get(&frame.regs, &frame.cells, left_reg);
-                    let right = reg_get(&frame.regs, &frame.cells, right_reg);
+                    let left = reg_get(self, &frame.regs, &frame.cells, left_reg);
+                    let right = reg_get(self, &frame.regs, &frame.cells, right_reg);
                     match self.binary_resolve(*op, left, right) {
                         Ok(BinaryResolution::Value(result)) => {
-                            reg_set(&mut frame.regs, &frame.cells, *dst as usize, result);
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         Ok(BinaryResolution::Call {
                             method,
@@ -508,8 +516,8 @@ impl LuaRuntime {
                     }
                 }
                 Instr::IntegerBinary(op, dst, left, right) => {
-                    let left_value = reg_get(&frame.regs, &frame.cells, *left as usize);
-                    let right_value = reg_get(&frame.regs, &frame.cells, *right as usize);
+                    let left_value = reg_get(self, &frame.regs, &frame.cells, *left as usize);
+                    let right_value = reg_get(self, &frame.regs, &frame.cells, *right as usize);
                     if let (LuaValue::Integer(left), LuaValue::Integer(right)) =
                         (&left_value, &right_value)
                     {
@@ -519,8 +527,7 @@ impl LuaRuntime {
                             BinaryOp::Mul => left.wrapping_mul(*right),
                             _ => unreachable!("the U4 plan emits only integer add/sub/mul"),
                         };
-                        reg_set(
-                            &mut frame.regs,
+                        reg_set(self, &mut frame.regs,
                             &frame.cells,
                             *dst as usize,
                             LuaValue::Integer(result),
@@ -531,7 +538,7 @@ impl LuaRuntime {
                         // the generic coercion/metamethod path.
                         match self.binary_resolve(*op, left_value, right_value)? {
                             BinaryResolution::Value(result) => {
-                                reg_set(&mut frame.regs, &frame.cells, *dst as usize, result);
+                                reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                             }
                             BinaryResolution::Call {
                                 method,
@@ -555,27 +562,27 @@ impl LuaRuntime {
                     continue 'exec;
                 }
                 Instr::JumpIfFalse(reg, delta) => {
-                    if !reg_truthy(&frame.regs, &frame.cells, *reg as usize) {
+                    if !reg_truthy(self, &frame.regs, &frame.cells, *reg as usize) {
                         pc = (pc as i32 + delta) as usize;
                         continue 'exec;
                     }
                 }
                 Instr::JumpIfTrue(reg, delta) => {
-                    if reg_truthy(&frame.regs, &frame.cells, *reg as usize) {
+                    if reg_truthy(self, &frame.regs, &frame.cells, *reg as usize) {
                         pc = (pc as i32 + delta) as usize;
                         continue 'exec;
                     }
                 }
                 Instr::Call(base, arguments, results) => {
                     let base = *base as usize;
-                    let callee = reg_get(&frame.regs, &frame.cells, base);
+                    let callee = reg_get(self, &frame.regs, &frame.cells, base);
                     let mut call_args = self.take_values_buffer();
                     match arguments {
                         ValueCount::Open => call_args
-                            .extend((base + 1..top).map(|r| reg_get(&frame.regs, &frame.cells, r))),
+                            .extend((base + 1..top).map(|r| reg_get(self, &frame.regs, &frame.cells, r))),
                         ValueCount::Fixed(count) => call_args.extend(
                             (0..*count as usize)
-                                .map(|i| reg_get(&frame.regs, &frame.cells, base + 1 + i)),
+                                .map(|i| reg_get(self, &frame.regs, &frame.cells, base + 1 + i)),
                         ),
                     }
                     frame.header.pc = pc as u32;
@@ -589,14 +596,14 @@ impl LuaRuntime {
                 }
                 Instr::TailCall(base, arguments) => {
                     let base = *base as usize;
-                    let callee = reg_get(&frame.regs, &frame.cells, base);
+                    let callee = reg_get(self, &frame.regs, &frame.cells, base);
                     let mut call_args = self.take_values_buffer();
                     match arguments {
                         ValueCount::Open => call_args
-                            .extend((base + 1..top).map(|r| reg_get(&frame.regs, &frame.cells, r))),
+                            .extend((base + 1..top).map(|r| reg_get(self, &frame.regs, &frame.cells, r))),
                         ValueCount::Fixed(count) => call_args.extend(
                             (0..*count as usize)
-                                .map(|i| reg_get(&frame.regs, &frame.cells, base + 1 + i)),
+                                .map(|i| reg_get(self, &frame.regs, &frame.cells, base + 1 + i)),
                         ),
                     }
                     frame.header.pc = pc as u32;
@@ -628,12 +635,12 @@ impl LuaRuntime {
                     // vector captured when the frame was created.
                     let named_varargs = if let Some(vararg_reg) = frame.proto.vararg_name {
                         let LuaValue::Table(table) =
-                            reg_get(&frame.regs, &frame.cells, vararg_reg as usize)
+                            reg_get(self, &frame.regs, &frame.cells, vararg_reg as usize)
                         else {
                             return Err(LuaError::new("named vararg pack is not a table"));
                         };
-                        let table = table.borrow();
-                        let length = match table.get(&LuaValue::String(self.intern_str(b"n".to_vec())))? {
+                        let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+                        let length = match self.table_get(table, &n_key)? {
                             LuaValue::Integer(length)
                                 if (0..=u16::MAX as i64).contains(&length) =>
                             {
@@ -643,7 +650,7 @@ impl LuaRuntime {
                         };
                         let mut values = Vec::with_capacity(length);
                         for index in 1..=length {
-                            values.push(table.get(&LuaValue::Integer(index as i64))?);
+                            values.push(self.table_get(table, &LuaValue::Integer(index as i64))?);
                         }
                         Some(values)
                     } else {
@@ -654,7 +661,7 @@ impl LuaRuntime {
                         ValueCount::Open => {
                             ensure_regs(&mut frame.regs, &mut frame.cells, base + varargs.len());
                             for (i, value) in varargs.iter().cloned().enumerate() {
-                                reg_set(&mut frame.regs, &frame.cells, base + i, value);
+                                reg_set(self, &mut frame.regs, &frame.cells, base + i, value);
                             }
                             top = base + varargs.len();
                         }
@@ -663,7 +670,7 @@ impl LuaRuntime {
                             ensure_regs(&mut frame.regs, &mut frame.cells, base + n);
                             for i in 0..n {
                                 let value = varargs.get(i).cloned().unwrap_or(LuaValue::Nil);
-                                reg_set(&mut frame.regs, &frame.cells, base + i, value);
+                                reg_set(self, &mut frame.regs, &frame.cells, base + i, value);
                             }
                             top = base + n;
                         }
@@ -674,12 +681,12 @@ impl LuaRuntime {
                     let mut values = self.take_values_buffer();
                     match count {
                         ValueCount::Open => values
-                            .extend((base..top).map(|r| reg_get(&frame.regs, &frame.cells, r))),
+                            .extend((base..top).map(|r| reg_get(self, &frame.regs, &frame.cells, r))),
                         ValueCount::Fixed(count) => {
                             values.extend((0..*count as usize).map(|i| {
                                 let r = base + i;
                                 if r < frame.regs.len() {
-                                    reg_get(&frame.regs, &frame.cells, r)
+                                    reg_get(self, &frame.regs, &frame.cells, r)
                                 } else {
                                     LuaValue::Nil
                                 }
@@ -698,9 +705,9 @@ impl LuaRuntime {
                 }
                 Instr::ForPrep(base, delta) => {
                     let base = *base as usize;
-                    let start_value = reg_get(&frame.regs, &frame.cells, base);
-                    let stop_value = reg_get(&frame.regs, &frame.cells, base + 1);
-                    let step_value = reg_get(&frame.regs, &frame.cells, base + 2);
+                    let start_value = reg_get(self, &frame.regs, &frame.cells, base);
+                    let stop_value = reg_get(self, &frame.regs, &frame.cells, base + 1);
+                    let step_value = reg_get(self, &frame.regs, &frame.cells, base + 2);
                     // Lua's numeric `for` runs an all-integer loop whenever
                     // the initial value and step are already integers, even
                     // if the limit is a float (e.g. `for i = 1, 10.9 do`) -
@@ -738,8 +745,7 @@ impl LuaRuntime {
                         });
                         if cont {
                             let stop = stop.unwrap();
-                            reg_set(
-                                &mut frame.regs,
+                            reg_set(self, &mut frame.regs,
                                 &frame.cells,
                                 base + 1,
                                 LuaValue::Integer(stop),
@@ -750,10 +756,9 @@ impl LuaRuntime {
                                 .copied()
                                 .unwrap_or(false)
                             {
-                                self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                                self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
-                            reg_set_fresh(
-                                &mut frame.regs,
+                            reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Integer(start),
@@ -784,15 +789,13 @@ impl LuaRuntime {
                         if step == 0.0 {
                             return Err(LuaError::new("'for' step is zero"));
                         }
-                        reg_set(&mut frame.regs, &frame.cells, base, LuaValue::Float(start));
-                        reg_set(
-                            &mut frame.regs,
+                        reg_set(self, &mut frame.regs, &frame.cells, base, LuaValue::Float(start));
+                        reg_set(self, &mut frame.regs,
                             &frame.cells,
                             base + 1,
                             LuaValue::Float(stop),
                         );
-                        reg_set(
-                            &mut frame.regs,
+                        reg_set(self, &mut frame.regs,
                             &frame.cells,
                             base + 2,
                             LuaValue::Float(step),
@@ -809,10 +812,9 @@ impl LuaRuntime {
                                 .copied()
                                 .unwrap_or(false)
                             {
-                                self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                                self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
-                            reg_set_fresh(
-                                &mut frame.regs,
+                            reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Float(start),
@@ -825,10 +827,10 @@ impl LuaRuntime {
                 }
                 Instr::ForLoop(base, delta) => {
                     let base = *base as usize;
-                    let current_value = reg_get(&frame.regs, &frame.cells, base);
+                    let current_value = reg_get(self, &frame.regs, &frame.cells, base);
                     if let LuaValue::Float(current) = current_value {
-                        let stop = number_as_f64(&reg_get(&frame.regs, &frame.cells, base + 1))?;
-                        let step = number_as_f64(&reg_get(&frame.regs, &frame.cells, base + 2))?;
+                        let stop = number_as_f64(&reg_get(self, &frame.regs, &frame.cells, base + 1))?;
+                        let step = number_as_f64(&reg_get(self, &frame.regs, &frame.cells, base + 2))?;
                         let next = current + step;
                         let cont = if step > 0.0 {
                             next <= stop
@@ -836,17 +838,16 @@ impl LuaRuntime {
                             next >= stop
                         };
                         if cont {
-                            reg_set(&mut frame.regs, &frame.cells, base, LuaValue::Float(next));
+                            reg_set(self, &mut frame.regs, &frame.cells, base, LuaValue::Float(next));
                             if proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
                                 .unwrap_or(false)
                             {
-                                self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                                self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
-                            reg_set_fresh(
-                                &mut frame.regs,
+                            reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Float(next),
@@ -856,8 +857,8 @@ impl LuaRuntime {
                         }
                     } else {
                         let current = self.integer(&current_value)?;
-                        let stop = self.integer(&reg_get(&frame.regs, &frame.cells, base + 1))?;
-                        let step = self.integer(&reg_get(&frame.regs, &frame.cells, base + 2))?;
+                        let stop = self.integer(&reg_get(self, &frame.regs, &frame.cells, base + 1))?;
+                        let step = self.integer(&reg_get(self, &frame.regs, &frame.cells, base + 2))?;
                         let next = current.checked_add(step);
                         let cont =
                             next.is_some_and(
@@ -870,17 +871,16 @@ impl LuaRuntime {
                                 },
                             );
                         if let (true, Some(next)) = (cont, next) {
-                            reg_set(&mut frame.regs, &frame.cells, base, LuaValue::Integer(next));
+                            reg_set(self, &mut frame.regs, &frame.cells, base, LuaValue::Integer(next));
                             if proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
                                 .unwrap_or(false)
                             {
-                                self.charge_allocation(std::mem::size_of::<LuaValue>())?;
+                                self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
-                            reg_set_fresh(
-                                &mut frame.regs,
+                            reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Integer(next),
@@ -892,9 +892,9 @@ impl LuaRuntime {
                 }
                 Instr::TForCall(base, nvars) => {
                     let base = *base as usize;
-                    let f = reg_get(&frame.regs, &frame.cells, base);
-                    let s = reg_get(&frame.regs, &frame.cells, base + 1);
-                    let ctrl = reg_get(&frame.regs, &frame.cells, base + 2);
+                    let f = reg_get(self, &frame.regs, &frame.cells, base);
+                    let s = reg_get(self, &frame.regs, &frame.cells, base + 1);
+                    let ctrl = reg_get(self, &frame.regs, &frame.cells, base + 2);
                     frame.header.pc = pc as u32;
                     frame.header.stack_top = top as u32;
                     frame.header.state = FrameState::Suspended;
@@ -906,15 +906,15 @@ impl LuaRuntime {
                 }
                 Instr::TForLoop(base, delta) => {
                     let base = *base as usize;
-                    let first = reg_get(&frame.regs, &frame.cells, base + 3);
+                    let first = reg_get(self, &frame.regs, &frame.cells, base + 3);
                     if first != LuaValue::Nil {
-                        reg_set(&mut frame.regs, &frame.cells, base + 2, first);
+                        reg_set(self, &mut frame.regs, &frame.cells, base + 2, first);
                         pc = (pc as i32 + delta) as usize;
                         continue 'exec;
                     }
                 }
                 Instr::MarkClose(reg, name_idx) => {
-                    let value = reg_get(&frame.regs, &frame.cells, *reg as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *reg as usize);
                     if !matches!(value, LuaValue::Nil | LuaValue::Bool(false))
                         && self.metamethod(&value, b"__close")?.is_none()
                     {

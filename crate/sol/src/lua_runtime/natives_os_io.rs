@@ -17,14 +17,11 @@ impl LuaRuntime {
     /// `io.input()` is allowed to expose this identity without performing a
     /// read; `io.read()` remains capability-gated separately.
     pub(super) fn stdin_handle(&self) -> LuaValue {
-        let LuaValue::Table(io) = self.globals.get("io") else {
+        let LuaValue::Table(io) = self.globals.get(self, "io") else {
             return LuaValue::Nil;
         };
-        let stdin = io
-            .borrow()
-            .get(&LuaValue::String(self.intern_str(b"stdin".to_vec())))
-            .unwrap_or(LuaValue::Nil);
-        stdin
+        self.table_get(io, &LuaValue::String(self.intern_str(b"stdin".to_vec())))
+            .unwrap_or(LuaValue::Nil)
     }
 
     pub(super) fn call_native_os_io(
@@ -83,7 +80,7 @@ impl LuaRuntime {
                 let yday = (days - days_from_civil(year, 1, 1) + 1) as u32;
 
                 if format == b"*t" {
-                    let mut table = LuaTable::default();
+                    let table = self.new_table(None)?;
                     for (key, value) in [
                         ("year", LuaValue::Integer(year)),
                         ("month", LuaValue::Integer(month as i64)),
@@ -95,13 +92,10 @@ impl LuaRuntime {
                         ("yday", LuaValue::Integer(yday as i64)),
                         ("isdst", LuaValue::Bool(false)),
                     ] {
-                        table
-                            .set(LuaValue::String(self.intern_str(key.as_bytes().to_vec())), value)
+                        self.table_set(table, LuaValue::String(self.intern_str(key.as_bytes().to_vec())), value)
                             .unwrap();
                     }
-                    return Ok(vec![LuaValue::Table(
-                        self.track_table(Rc::new(RefCell::new(table))),
-                    )]);
+                    return Ok(vec![LuaValue::Table(table)]);
                 }
 
                 const WEEKDAYS: [&str; 7] = [
@@ -163,7 +157,7 @@ impl LuaRuntime {
                         None => rendered.push('%'),
                     }
                 }
-                self.charge_allocation(rendered.len())?;
+                self.charge_allocation(rendered.len(), None)?;
                 Ok(vec![LuaValue::String(self.fresh_str(rendered.into_bytes()))])
             }
             NativeFunction::OsGetenv => {
@@ -236,7 +230,7 @@ impl LuaRuntime {
                     None => self.default_output.borrow().clone(),
                 };
                 if let LuaValue::Table(table) = &handle {
-                    let key = Rc::as_ptr(table) as usize;
+                    let key = table.object_id().raw();
                     if let Some(file) = self.open_files.borrow_mut().remove(&key) {
                         use std::io::Write;
                         file.borrow_mut()
@@ -339,14 +333,14 @@ impl LuaRuntime {
                                 line.pop();
                             }
                         }
-                        self.charge_allocation(line.len())?;
+                        self.charge_allocation(line.len(), None)?;
                         Ok(vec![LuaValue::String(self.fresh_str(line.into_bytes()))])
                     }
                     b"a" => {
                         let mut buffer = String::new();
                         std::io::Read::read_to_string(&mut stdin.lock(), &mut buffer)
                             .map_err(|error| LuaError::new(format!("io.read: {error}")))?;
-                        self.charge_allocation(buffer.len())?;
+                        self.charge_allocation(buffer.len(), None)?;
                         Ok(vec![LuaValue::String(self.fresh_str(buffer.into_bytes()))])
                     }
                     b"n" => {
@@ -425,7 +419,7 @@ impl LuaRuntime {
             }
         }
         if let LuaValue::Table(table) = target {
-            let key = Rc::as_ptr(table) as usize;
+            let key = table.object_id().raw();
             if let Some(file) = self.open_files.borrow().get(&key).cloned() {
                 use std::io::Write;
                 file.borrow_mut()
@@ -433,7 +427,7 @@ impl LuaRuntime {
                     .map_err(|error| LuaError::new(format!("{error}")))?;
                 return Ok(());
             }
-            if Rc::as_ptr(table) == Rc::as_ptr(&self.io_stderr) {
+            if *table == self.io_stderr {
                 use std::io::Write;
                 std::io::stderr()
                     .write_all(&bytes)
@@ -455,23 +449,20 @@ impl LuaRuntime {
             .map_err(|error| {
                 LuaError::new(format!("{}: {error}", String::from_utf8_lossy(path)))
             })?;
-        let handle = Rc::new(RefCell::new(LuaTable::default()));
-        handle
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"write".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileWrite),
-            )
-            .unwrap();
-        handle
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"close".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileClose),
-            )
-            .unwrap();
-        let handle = self.track_table(handle);
-        let key = Rc::as_ptr(&handle) as usize;
+        let handle = self.new_table(None)?;
+        self.table_set(
+            handle,
+            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileWrite),
+        )
+        .unwrap();
+        self.table_set(
+            handle,
+            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileClose),
+        )
+        .unwrap();
+        let key = handle.object_id().raw();
         self.open_files
             .borrow_mut()
             .insert(key, Rc::new(RefCell::new(file)));

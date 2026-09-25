@@ -28,13 +28,23 @@ impl LuaRuntime {
         let mut heap = sol_core::Heap::new(Capabilities::default());
         let c_registry = heap.alloc_table();
         let c_registry_root = heap.add_root(sol_core::Value::object(c_registry));
+        let light_userdata_provider = heap
+            .reserve_native_provider()
+            .expect("first native-provider reservation on a fresh heap cannot exhaust u32 ids");
         let canonical_heap = Rc::new(RefCell::new(heap));
+        let globals = Globals::root(&canonical_heap);
+        let package_loaded = TableRef::alloc(&mut canonical_heap.borrow_mut());
+        let package_table = TableRef::alloc(&mut canonical_heap.borrow_mut());
+        let string_metatable = TableRef::alloc(&mut canonical_heap.borrow_mut());
+        let io_stdout = TableRef::alloc(&mut canonical_heap.borrow_mut());
+        let io_stderr = TableRef::alloc(&mut canonical_heap.borrow_mut());
+        let main_coroutine = ThreadRef::alloc(&mut canonical_heap.borrow_mut());
         let mut runtime = Self {
             canonical_heap: canonical_heap.clone(),
             c_registry,
             _c_registry_root: c_registry_root,
             c_next_reference: 1,
-            globals: Globals::root(canonical_heap),
+            globals,
             output: Vec::new(),
             instructions_remaining: instruction_budget,
             call_depth: 0,
@@ -44,15 +54,12 @@ impl LuaRuntime {
             capabilities: Capabilities::default(),
             module_sources: HashMap::new(),
             loading_modules: HashSet::new(),
-            package_loaded: Rc::new(RefCell::new(LuaTable::default())),
-            package_table: Rc::new(RefCell::new(LuaTable::default())),
+            package_loaded,
+            package_table,
             start_time: std::time::Instant::now(),
-            weak_tables: Vec::new(),
-            gc_tables: RefCell::new(Vec::new()),
-            gc_closures: RefCell::new(Vec::new()),
-            charge_ledger: RefCell::new(HashMap::new()),
+            closure_globals: RefCell::new(HashMap::new()),
             coroutine_stack: Vec::new(),
-            main_coroutine: LuaCoroutine::main_thread(),
+            main_coroutine,
             gc_stress: false,
             instructions_since_gc: 0,
             regs_pool: Vec::new(),
@@ -60,6 +67,7 @@ impl LuaRuntime {
             values_pool: Vec::new(),
             random_state: seeded_random_state(0x534f_4c55_4152_554e, 0),
             frames: Vec::new(),
+            pinned_roots: Vec::new(),
             pending_frame_label: None,
             pending_error_stack: None,
             prototype_ids: HashMap::new(),
@@ -81,7 +89,14 @@ impl LuaRuntime {
             native_libraries: Vec::new(),
             native_bridge_ids: HashMap::new(),
             next_native_function: 0,
-            string_metatable: Rc::new(RefCell::new(LuaTable::default())),
+            light_userdata_provider,
+            native_function_objects: RefCell::new(HashMap::new()),
+            registered_native_providers: RefCell::new(HashMap::new()),
+            registered_native_providers_reverse: RefCell::new(HashMap::new()),
+            registered_native_objects: RefCell::new(HashMap::new()),
+            prototype_registry: RefCell::new(canonical::PrototypeRegistry::default()),
+            coroutine_registry: RefCell::new(canonical::CoroutineRegistry::default()),
+            string_metatable,
             number_metatable: None,
             boolean_metatable: None,
             nil_metatable: None,
@@ -91,18 +106,30 @@ impl LuaRuntime {
             gc_stepmul: 100,
             current_locale: "C".to_string(),
             tmpname_counter: 0,
-            io_stdout: Rc::new(RefCell::new(LuaTable::default())),
-            io_stderr: Rc::new(RefCell::new(LuaTable::default())),
+            io_stdout,
+            io_stderr,
             default_output: RefCell::new(LuaValue::Nil),
             open_files: RefCell::new(HashMap::new()),
             active_hook: None,
             running_hook: false,
         };
-        *runtime.default_output.borrow_mut() = LuaValue::Table(runtime.io_stdout.clone());
         runtime
-            .globals
-            .define("_G", runtime.globals.as_value(), false);
-        runtime.install_base();
+            .coroutine_registry
+            .borrow_mut()
+            .insert(main_coroutine, LuaCoroutine::main_thread());
+        *runtime.default_output.borrow_mut() = LuaValue::Table(runtime.io_stdout);
+        let globals = runtime.globals.clone();
+        globals.define(&runtime, "_G", globals.as_value(), false);
+        // Bootstrap runs against an unlimited budget: `allocation_budget` is
+        // a contract with the embedded *script*, not with our own stdlib
+        // installation, so a caller-supplied budget (e.g. a small one used
+        // to test that user code trips the limit) must not be spent before
+        // the script even starts running.
+        runtime.allocation_remaining = usize::MAX;
+        runtime
+            .install_base()
+            .expect("stdlib installation exceeds allocation budget");
+        runtime.allocation_remaining = allocation_budget;
         runtime
     }
 
@@ -172,120 +199,136 @@ impl LuaRuntime {
     /// already-loaded check (which runs before the capability gate) resolve
     /// these without touching the loader at all.
     fn preload(&self, name: &[u8], value: LuaValue) {
-        self.package_loaded
-            .borrow_mut()
-            .set(LuaValue::String(self.intern_str(name.to_vec())), value)
-            .unwrap();
+        let key = LuaValue::String(self.intern_str(name.to_vec()));
+        self.table_set(self.package_loaded, key, value).unwrap();
     }
 
-    fn install_base(&mut self) {
-        self.globals.define(
+    fn install_base(&mut self) -> LuaResult<()> {
+        let globals = self.globals.clone();
+        globals.define(
+            self,
             "print",
             LuaValue::NativeFunction(NativeFunction::Print),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "assert",
             LuaValue::NativeFunction(NativeFunction::Assert),
             true,
         );
-        self.globals
-            .define("type", LuaValue::NativeFunction(NativeFunction::Type), true);
-        self.globals.define(
+        globals.define(self, "type", LuaValue::NativeFunction(NativeFunction::Type), true);
+        globals.define(
+            self,
             "tostring",
             LuaValue::NativeFunction(NativeFunction::ToString),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "tonumber",
             LuaValue::NativeFunction(NativeFunction::ToNumber),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "rawget",
             LuaValue::NativeFunction(NativeFunction::RawGet),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "rawset",
             LuaValue::NativeFunction(NativeFunction::RawSet),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "rawequal",
             LuaValue::NativeFunction(NativeFunction::RawEqual),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "rawlen",
             LuaValue::NativeFunction(NativeFunction::RawLen),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "getmetatable",
             LuaValue::NativeFunction(NativeFunction::GetMetatable),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "setmetatable",
             LuaValue::NativeFunction(NativeFunction::SetMetatable),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "error",
             LuaValue::NativeFunction(NativeFunction::Error),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "pcall",
             LuaValue::NativeFunction(NativeFunction::PCall),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "xpcall",
             LuaValue::NativeFunction(NativeFunction::XCall),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "select",
             LuaValue::NativeFunction(NativeFunction::Select),
             true,
         );
-        self.globals
-            .define("next", LuaValue::NativeFunction(NativeFunction::Next), true);
-        self.globals.define(
+        globals.define(self, "next", LuaValue::NativeFunction(NativeFunction::Next), true);
+        globals.define(
+            self,
             "pairs",
             LuaValue::NativeFunction(NativeFunction::Pairs),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "ipairs",
             LuaValue::NativeFunction(NativeFunction::IPairs),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "require",
             LuaValue::NativeFunction(NativeFunction::Require),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "collectgarbage",
             LuaValue::NativeFunction(NativeFunction::CollectGarbage),
             true,
         );
-        self.globals
-            .define("load", LuaValue::NativeFunction(NativeFunction::Load), true);
-        self.globals.define(
+        globals.define(self, "load", LuaValue::NativeFunction(NativeFunction::Load), true);
+        globals.define(
+            self,
             "loadstring",
             LuaValue::NativeFunction(NativeFunction::Load),
             true,
         );
-        self.globals.define(
+        globals.define(
+            self,
             "dofile",
             LuaValue::NativeFunction(NativeFunction::DoFile),
             true,
         );
-        let string = Rc::new(RefCell::new(LuaTable::default()));
+        let string = self.new_table(None)?;
         for (name, function) in [
             ("len", NativeFunction::StringLen),
             ("byte", NativeFunction::StringByte),
@@ -305,26 +348,23 @@ impl LuaRuntime {
             ("unpack", NativeFunction::StringUnpack),
             ("packsize", NativeFunction::StringPackSize),
         ] {
-            string
-                .borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
-        }
-        self.globals
-            .define("string", LuaValue::Table(string.clone()), true);
-        self.preload(b"string", LuaValue::Table(string.clone()));
-        self.string_metatable
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"__index".to_vec())),
-                LuaValue::Table(string),
+            self.table_set(
+                string,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
             )
             .unwrap();
+        }
+        globals.define(self, "string", LuaValue::Table(string), true);
+        self.preload(b"string", LuaValue::Table(string));
+        self.table_set(
+            self.string_metatable,
+            LuaValue::String(self.intern_str(b"__index".to_vec())),
+            LuaValue::Table(string),
+        )
+        .unwrap();
 
-        let table = Rc::new(RefCell::new(LuaTable::default()));
+        let table = self.new_table(None)?;
         for (name, function) in [
             ("concat", NativeFunction::TableConcat),
             ("insert", NativeFunction::TableInsert),
@@ -335,19 +375,17 @@ impl LuaRuntime {
             ("create", NativeFunction::TableCreate),
             ("move", NativeFunction::TableMove),
         ] {
-            table
-                .borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                table,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
-        self.globals
-            .define("table", LuaValue::Table(table.clone()), true);
+        globals.define(self, "table", LuaValue::Table(table), true);
         self.preload(b"table", LuaValue::Table(table));
 
-        let math = Rc::new(RefCell::new(LuaTable::default()));
+        let math = self.new_table(None)?;
         for (name, function) in [
             ("abs", NativeFunction::MathAbs),
             ("floor", NativeFunction::MathFloor),
@@ -375,12 +413,12 @@ impl LuaRuntime {
             ("random", NativeFunction::MathRandom),
             ("randomseed", NativeFunction::MathRandomSeed),
         ] {
-            math.borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                math,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
         for (name, value) in [
             ("pi", LuaValue::Float(std::f64::consts::PI)),
@@ -388,15 +426,17 @@ impl LuaRuntime {
             ("maxinteger", LuaValue::Integer(i64::MAX)),
             ("mininteger", LuaValue::Integer(i64::MIN)),
         ] {
-            math.borrow_mut()
-                .set(LuaValue::String(self.intern_str(name.as_bytes().to_vec())), value)
-                .unwrap();
+            self.table_set(
+                math,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                value,
+            )
+            .unwrap();
         }
-        self.globals
-            .define("math", LuaValue::Table(math.clone()), true);
+        globals.define(self, "math", LuaValue::Table(math), true);
         self.preload(b"math", LuaValue::Table(math));
 
-        let utf8 = Rc::new(RefCell::new(LuaTable::default()));
+        let utf8 = self.new_table(None)?;
         for (name, function) in [
             ("len", NativeFunction::Utf8Len),
             ("char", NativeFunction::Utf8Char),
@@ -404,83 +444,82 @@ impl LuaRuntime {
             ("offset", NativeFunction::Utf8Offset),
             ("codes", NativeFunction::Utf8Codes),
         ] {
-            utf8.borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                utf8,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
         // Lua 5.5's lutf8lib.c publishes this exact byte pattern. Keep it as
         // bytes: the leading NUL and the non-UTF-8 range endpoints are valid
         // Lua string data even though they are not valid Rust UTF-8 text.
-        utf8.borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"charpattern".to_vec())),
-                LuaValue::String(self.intern_str(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*".to_vec())),
-            )
-            .unwrap();
-        self.globals
-            .define("utf8", LuaValue::Table(utf8.clone()), true);
+        self.table_set(
+            utf8,
+            LuaValue::String(self.intern_str(b"charpattern".to_vec())),
+            LuaValue::String(self.intern_str(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*".to_vec())),
+        )
+        .unwrap();
+        globals.define(self, "utf8", LuaValue::Table(utf8), true);
         self.preload(b"utf8", LuaValue::Table(utf8));
 
-        let package = self.package_table.clone();
+        let package = self.package_table;
         {
-            let mut package_mut = package.borrow_mut();
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"loaded".to_vec())),
-                    LuaValue::Table(self.package_loaded.clone()),
-                )
-                .unwrap();
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"preload".to_vec())),
-                    LuaValue::Table(Rc::new(RefCell::new(LuaTable::default()))),
-                )
-                .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"loaded".to_vec())),
+                LuaValue::Table(self.package_loaded),
+            )
+            .unwrap();
+            let preload_table = self.new_table(None)?;
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"preload".to_vec())),
+                LuaValue::Table(preload_table),
+            )
+            .unwrap();
             // Sol installs nothing on the host (no `sol`-managed share/lib
             // prefix, no system package manager) - `./?.lua`/`./?/init.lua`
             // are the only honest default templates: "next to the running
             // script", matching real Lua's own trailing fallback templates
             // after its compiled-in install-prefix ones.
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"path".to_vec())),
-                    LuaValue::String(self.intern_str(b"./?.lua;./?/init.lua".to_vec())),
-                )
-                .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"path".to_vec())),
+                LuaValue::String(self.intern_str(b"./?.lua;./?/init.lua".to_vec())),
+            )
+            .unwrap();
             // Kept empty by default so sandboxed states never advertise a
             // host loader. Native embedders/CLI hosts may set this after
             // opting into `Capabilities::native_modules`.
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"cpath".to_vec())),
-                    LuaValue::String(self.intern_str(Vec::new())),
-                )
-                .unwrap();
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"config".to_vec())),
-                    LuaValue::String(self.intern_str(package_config_bytes())),
-                )
-                .unwrap();
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"searchpath".to_vec())),
-                    LuaValue::NativeFunction(NativeFunction::PackageSearchPath),
-                )
-                .unwrap();
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"loadlib".to_vec())),
-                    LuaValue::NativeFunction(NativeFunction::PackageLoadLib),
-                )
-                .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"cpath".to_vec())),
+                LuaValue::String(self.intern_str(Vec::new())),
+            )
+            .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"config".to_vec())),
+                LuaValue::String(self.intern_str(package_config_bytes())),
+            )
+            .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"searchpath".to_vec())),
+                LuaValue::NativeFunction(NativeFunction::PackageSearchPath),
+            )
+            .unwrap();
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"loadlib".to_vec())),
+                LuaValue::NativeFunction(NativeFunction::PackageLoadLib),
+            )
+            .unwrap();
             // Keep these as ordinary table entries: `require` deliberately
             // reads and calls the current contents so embedders can replace,
             // remove, or reorder searchers exactly as in Lua.
-            let mut searchers = LuaTable::default();
+            let searchers = self.new_table(None)?;
             for (index, searcher) in [
                 NativeFunction::PackageSearcherPreload,
                 NativeFunction::PackageSearcherLua,
@@ -490,19 +529,19 @@ impl LuaRuntime {
             .into_iter()
             .enumerate()
             {
-                searchers
-                    .set(
-                        LuaValue::Integer(index as i64 + 1),
-                        LuaValue::NativeFunction(searcher),
-                    )
-                    .unwrap();
-            }
-            package_mut
-                .set(
-                    LuaValue::String(self.intern_str(b"searchers".to_vec())),
-                    LuaValue::Table(Rc::new(RefCell::new(searchers))),
+                self.table_set(
+                    searchers,
+                    LuaValue::Integer(index as i64 + 1),
+                    LuaValue::NativeFunction(searcher),
                 )
                 .unwrap();
+            }
+            self.table_set(
+                package,
+                LuaValue::String(self.intern_str(b"searchers".to_vec())),
+                LuaValue::Table(searchers),
+            )
+            .unwrap();
         }
         // Unlike most other standard-library globals, `package` is left
         // reassignable (not constant): real Lua's own globals - `package`
@@ -516,12 +555,11 @@ impl LuaRuntime {
         // regardless of what the global currently points to (see
         // `package_table`'s doc comment), so this reassignment is otherwise
         // inert to this runtime's own behavior.
-        self.globals
-            .define("package", LuaValue::Table(package.clone()), false);
+        globals.define(self, "package", LuaValue::Table(package), false);
         self.preload(b"package", LuaValue::Table(package));
-        self.preload(b"_G", self.globals.as_value());
+        self.preload(b"_G", globals.as_value());
 
-        let os = Rc::new(RefCell::new(LuaTable::default()));
+        let os = self.new_table(None)?;
         for (name, function) in [
             ("time", NativeFunction::OsTime),
             ("clock", NativeFunction::OsClock),
@@ -533,17 +571,17 @@ impl LuaRuntime {
             ("setlocale", NativeFunction::OsSetlocale),
             ("tmpname", NativeFunction::OsTmpname),
         ] {
-            os.borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                os,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
-        self.globals.define("os", LuaValue::Table(os.clone()), true);
+        globals.define(self, "os", LuaValue::Table(os), true);
         self.preload(b"os", LuaValue::Table(os));
 
-        let io = Rc::new(RefCell::new(LuaTable::default()));
+        let io = self.new_table(None)?;
         for (name, function) in [
             ("write", NativeFunction::IoWrite),
             ("read", NativeFunction::IoRead),
@@ -551,53 +589,49 @@ impl LuaRuntime {
             ("output", NativeFunction::IoOutput),
             ("close", NativeFunction::FileClose),
         ] {
-            io.borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                io,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
-        self.io_stdout
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"write".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileWrite),
-            )
-            .unwrap();
-        self.io_stdout
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"close".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileClose),
-            )
-            .unwrap();
-        io.borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"stdout".to_vec())),
-                LuaValue::Table(self.io_stdout.clone()),
-            )
-            .unwrap();
-        self.io_stderr
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"write".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileWrite),
-            )
-            .unwrap();
-        self.io_stderr
-            .borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"close".to_vec())),
-                LuaValue::NativeFunction(NativeFunction::FileClose),
-            )
-            .unwrap();
-        io.borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"stderr".to_vec())),
-                LuaValue::Table(self.io_stderr.clone()),
-            )
-            .unwrap();
+        self.table_set(
+            self.io_stdout,
+            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileWrite),
+        )
+        .unwrap();
+        self.table_set(
+            self.io_stdout,
+            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileClose),
+        )
+        .unwrap();
+        self.table_set(
+            io,
+            LuaValue::String(self.intern_str(b"stdout".to_vec())),
+            LuaValue::Table(self.io_stdout),
+        )
+        .unwrap();
+        self.table_set(
+            self.io_stderr,
+            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileWrite),
+        )
+        .unwrap();
+        self.table_set(
+            self.io_stderr,
+            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::NativeFunction(NativeFunction::FileClose),
+        )
+        .unwrap();
+        self.table_set(
+            io,
+            LuaValue::String(self.intern_str(b"stderr".to_vec())),
+            LuaValue::Table(self.io_stderr),
+        )
+        .unwrap();
         // Stable default-input handle. File handles are full userdata, not
         // tables, so `rawlen` and numeric-for diagnostics retain Lua's type
         // distinction without exposing host storage to ordinary indexing.
@@ -643,13 +677,13 @@ impl LuaRuntime {
             heap.set_metatable(userdata.object_id(), Some(metatable.object_id()))
                 .expect("fresh canonical file userdata accepts a metatable");
         }
-        io.borrow_mut()
-            .set(
-                LuaValue::String(self.intern_str(b"stdin".to_vec())),
-                stdin,
-            )
-            .unwrap();
-        let coroutine = Rc::new(RefCell::new(LuaTable::default()));
+        self.table_set(
+            io,
+            LuaValue::String(self.intern_str(b"stdin".to_vec())),
+            stdin,
+        )
+        .unwrap();
+        let coroutine = self.new_table(None)?;
         for (name, function) in [
             ("create", NativeFunction::CoroutineCreate),
             ("resume", NativeFunction::CoroutineResume),
@@ -660,22 +694,20 @@ impl LuaRuntime {
             ("isyieldable", NativeFunction::CoroutineIsYieldable),
             ("close", NativeFunction::CoroutineClose),
         ] {
-            coroutine
-                .borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                coroutine,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
-        self.globals
-            .define("coroutine", LuaValue::Table(coroutine.clone()), true);
+        globals.define(self, "coroutine", LuaValue::Table(coroutine), true);
         self.preload(b"coroutine", LuaValue::Table(coroutine));
 
-        self.globals.define("io", LuaValue::Table(io.clone()), true);
+        globals.define(self, "io", LuaValue::Table(io), true);
         self.preload(b"io", LuaValue::Table(io));
 
-        let debug = Rc::new(RefCell::new(LuaTable::default()));
+        let debug = self.new_table(None)?;
         for (name, function) in [
             ("getupvalue", NativeFunction::DebugGetupvalue),
             ("upvalueid", NativeFunction::DebugUpvalueid),
@@ -689,17 +721,16 @@ impl LuaRuntime {
             ("gethook", NativeFunction::DebugGethook),
             ("setuservalue", NativeFunction::DebugSetuservalue),
         ] {
-            debug
-                .borrow_mut()
-                .set(
-                    LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
-                    LuaValue::NativeFunction(function),
-                )
-                .unwrap();
+            self.table_set(
+                debug,
+                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::NativeFunction(function),
+            )
+            .unwrap();
         }
-        self.globals
-            .define("debug", LuaValue::Table(debug.clone()), true);
+        globals.define(self, "debug", LuaValue::Table(debug), true);
         self.preload(b"debug", LuaValue::Table(debug));
+        Ok(())
     }
 
     /// Registers `name` (real Lua's `@`-prefixed filename convention, e.g.
@@ -743,7 +774,7 @@ impl LuaRuntime {
             &natives,
             Some(optimization_plan),
         )?;
-        let main = globals.get("main");
+        let main = globals.get(self, "main");
         let values = self.call(main, Vec::new())?;
         Ok(values.into_iter().next().unwrap_or(LuaValue::Nil))
     }
@@ -766,16 +797,18 @@ impl LuaRuntime {
     /// values installed in the root globals, so `import` and `require` do not
     /// instantiate separate module objects or callable identities.
     pub fn preload_namespace_module(&mut self, name: &str, exports: &[String]) -> LuaResult<()> {
-        self.charge_allocation(std::mem::size_of::<LuaTable>())?;
-        let table = self.track_table(Rc::new(RefCell::new(LuaTable::default())));
+        let table = self.new_table(None)?;
+        let globals = self.globals.clone();
         for export in exports {
-            let value = self.globals.get(&format!("{name}.{export}"));
+            let value = globals.get(self, &format!("{name}.{export}"));
             if value == LuaValue::Nil {
                 continue;
             }
-            table
-                .borrow_mut()
-                .set(LuaValue::String(self.intern_str(export.as_bytes().to_vec())), value)?;
+            self.table_set(
+                table,
+                LuaValue::String(self.intern_str(export.as_bytes().to_vec())),
+                value,
+            )?;
         }
         self.preload(name.as_bytes(), LuaValue::Table(table));
         Ok(())
@@ -795,7 +828,7 @@ impl LuaRuntime {
         natives: &HashMap<String, LuaValue>,
     ) -> LuaResult<LuaValue> {
         self.load_in_globals(program, globals, native_names, natives, None)?;
-        let main = globals.get("main");
+        let main = globals.get(self, "main");
         let values = self.call(main, Vec::new())?;
         Ok(values.into_iter().next().unwrap_or(LuaValue::Nil))
     }
@@ -820,13 +853,8 @@ impl LuaRuntime {
             if let Some(chunk_name) = self.default_chunk_name.clone() {
                 self.register_chunk_source(&proto, &chunk_name);
             }
-            self.charge_allocation(std::mem::size_of::<LuaClosure>())?;
-            let closure = self.track_closure(Rc::new(LuaClosure {
-                proto,
-                upvals: RefCell::new(Vec::new()),
-                globals: globals.clone(),
-            }));
-            globals.define(&function.name, LuaValue::Closure(closure), false);
+            let closure = self.new_closure(proto, Vec::new(), globals.clone(), None)?;
+            globals.define(self, &function.name, LuaValue::Closure(closure), false);
         }
         for (name, value) in natives {
             let value = match value {
@@ -835,7 +863,7 @@ impl LuaRuntime {
                 }
                 value => value.clone(),
             };
-            globals.define(name, value, false);
+            globals.define(self, name, value, false);
         }
         Ok(())
     }
@@ -883,7 +911,7 @@ mod tests {
             LuaValue::Integer(42)
         );
         assert!(matches!(
-            runtime.globals.get("add"),
+            runtime.globals.get(&runtime, "add"),
             LuaValue::RegisteredNative(_)
         ));
         assert_eq!(runtime.native_bridges.len(), 1);

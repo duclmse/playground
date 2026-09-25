@@ -4,7 +4,6 @@
 //! byte-range/plain-substring helpers, and proleptic-Gregorian civil-date
 //! conversion (`civil_from_days`/`days_from_civil`) used by `os.date`/`os.time`.
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -20,31 +19,61 @@ pub(super) fn ensure_regs(regs: &mut Vec<LuaValue>, cells: &mut Cells, len: usiz
 }
 
 /// Reads register `i`: from its cell if captured, otherwise the plain slot.
-pub(super) fn reg_get(regs: &[LuaValue], cells: &[Option<RcRef<LuaValue>>], i: usize) -> LuaValue {
-    match &cells[i] {
-        Some(cell) => cell.borrow().clone(),
+/// A captured slot's value lives in a canonical `sol_core::Heap` upvalue
+/// object, so this round-trips it through the codec - infallible in
+/// practice, since only a value this same runtime already encoded is ever
+/// stored there.
+pub(super) fn reg_get(
+    runtime: &LuaRuntime,
+    regs: &[LuaValue],
+    cells: &[Option<sol_core::ObjectId>],
+    i: usize,
+) -> LuaValue {
+    match cells[i] {
+        Some(id) => {
+            let value = runtime
+                .canonical_heap
+                .borrow()
+                .upvalue_value(id)
+                .expect("cell id must address a live upvalue object");
+            runtime
+                .decode_value(value)
+                .expect("a value already resident in a cell must decode cleanly")
+        }
         None => regs[i].clone(),
     }
 }
 
-pub(super) fn reg_truthy(regs: &[LuaValue], cells: &[Option<RcRef<LuaValue>>], i: usize) -> bool {
-    match &cells[i] {
-        Some(cell) => cell.borrow().truthy(),
-        None => regs[i].truthy(),
-    }
+pub(super) fn reg_truthy(
+    runtime: &LuaRuntime,
+    regs: &[LuaValue],
+    cells: &[Option<sol_core::ObjectId>],
+    i: usize,
+) -> bool {
+    reg_get(runtime, regs, cells, i).truthy()
 }
 
 /// Writes register `i` in place: through its existing cell if captured,
 /// otherwise the plain slot. Use this for ordinary assignments that must be
 /// visible through any closure that already captured this register's cell.
 pub(super) fn reg_set(
+    runtime: &LuaRuntime,
     regs: &mut [LuaValue],
-    cells: &[Option<RcRef<LuaValue>>],
+    cells: &[Option<sol_core::ObjectId>],
     i: usize,
     value: LuaValue,
 ) {
-    match &cells[i] {
-        Some(cell) => *cell.borrow_mut() = value,
+    match cells[i] {
+        Some(id) => {
+            let encoded = runtime
+                .encode_value(&value)
+                .expect("a value already resident in a register must encode cleanly");
+            runtime
+                .canonical_heap
+                .borrow_mut()
+                .set_upvalue(id, encoded)
+                .expect("cell id must address a live upvalue object");
+        }
         None => regs[i] = value,
     }
 }
@@ -56,13 +85,21 @@ pub(super) fn reg_set(
 /// materialization, where a new "declaration" of a local must not retroactively
 /// change what an earlier closure captured.
 pub(super) fn reg_set_fresh(
+    runtime: &LuaRuntime,
     regs: &mut [LuaValue],
-    cells: &mut [Option<RcRef<LuaValue>>],
+    cells: &mut [Option<sol_core::ObjectId>],
     i: usize,
     value: LuaValue,
 ) {
     if cells[i].is_some() {
-        cells[i] = Some(Rc::new(RefCell::new(value)));
+        let encoded = runtime
+            .encode_value(&value)
+            .expect("a value already resident in a register must encode cleanly");
+        let id = runtime
+            .canonical_heap
+            .borrow_mut()
+            .alloc_upvalue(encoded, None);
+        cells[i] = Some(id);
     } else {
         regs[i] = value;
     }

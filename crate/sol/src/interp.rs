@@ -743,7 +743,7 @@ mod tests {
                 .map(|value| crate::lua_runtime::LuaValue::Integer(*value as i64))
                 .collect();
             let handle = coroutine.borrow().as_ref().unwrap().clone();
-            match runtime.resume_coroutine_outcome(&handle, arguments) {
+            match runtime.resume_coroutine_outcome(handle, arguments) {
                 sol_core::CallOutcome::Returned(values) => {
                     match values
                         .into_iter()

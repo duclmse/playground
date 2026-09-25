@@ -1,21 +1,32 @@
-//! Garbage collection: opt-in GC-stress mode, allocation-budget charging
-//! (`charge_allocation`, `tick`), weak-table sweeping, and the
-//! trial-deletion cycle collector (`collect_cycles`) layered on top of `Rc`
-//! refcounting. See `LuaRuntime`'s `gc_tables`/`gc_closures`/`weak_tables`
-//! field docs for the design rationale.
+//! Garbage collection: allocation-budget charging (`charge_allocation`/
+//! `tick`) and the `collectgarbage()`/`__gc` bridge onto `sol_core::Heap`'s
+//! own tracing collector (`collect_major_with_roots`/`register_finalizer`/
+//! `finish_finalizer`) - see
+//! docs/features/table-closure-coroutine-cutover.md §3. The old `Rc`-
+//! refcounting trial-deletion cycle collector this file used to contain is
+//! gone now that `sol_core::Heap` traces real reachability itself; moving
+//! the *trigger* sites (currently still the old per-instruction/per-
+//! allocation heuristic below) to real dispatch-loop/native-trampoline
+//! safepoints is task #12's scope, not this one's.
+//!
+//! Known gap, deferred to task #13 ("sol-core: conditional/deferred-root GC
+//! hook for coroutine frames"): `frame_roots` below only walks the
+//! currently-active dispatch/resume chain (`LuaRuntime::frames` plus
+//! `main_coroutine`/`coroutine_stack`). A coroutine that is reachable from a
+//! live `LuaValue::Thread` but is not currently part of that resume chain
+//! has its own saved `LuaCoroutine::frames` left unrooted here - the same
+//! gap `canonical::CoroutineRegistry`'s own doc comment already calls out as
+//! not yet closed.
 
-use std::rc::Rc;
+use sol_core::Value;
 
+use super::frame::*;
 use super::*;
 
 /// How many dispatched instructions (`tick`) trigger one automatic (non-
-/// `gc_stress`) collection pass - see `LuaRuntime::instructions_since_gc`'s
-/// field doc. Chosen small enough that a script relying on real Lua's
-/// automatic collector to clear a weak reference (e.g.
-/// `lua-5.5.1-tests/closure.lua`'s `while weak_table[k] do ... end`) still
-/// finishes comfortably inside the default 1,000,000-instruction budget, but
-/// large enough that `collect_cycles`'s O(tracked tables/closures) cost
-/// stays a small fraction of total run time for ordinary scripts.
+/// `gc_stress`) collection pass. Unchanged pacing from the old trial-
+/// deletion collector's own constant of the same name - only the collector
+/// underneath has changed.
 const AUTO_GC_INSTRUCTION_INTERVAL: u64 = 65_536;
 
 impl LuaRuntime {
@@ -27,34 +38,48 @@ impl LuaRuntime {
         self.gc_stress = enabled;
     }
 
-    /// Runs the same work `collectgarbage("collect")` does (weak-table
-    /// pruning, then trial-deletion cycle collection) - shared by the
+    /// Runs the same work `collectgarbage("collect")` does - shared by the
     /// explicit `collectgarbage` native and, when `gc_stress` is enabled, by
-    /// every allocation point and every dispatched instruction.
-    fn stress_collect_if_enabled(&mut self) {
+    /// every allocation point and every dispatched instruction. `active_frame`
+    /// is the frame currently being dispatched (see `tick`'s doc comment for
+    /// why this can't just be read off `self.frames`), if any - `None` at
+    /// every call site that isn't itself inside `dispatch_step`.
+    fn stress_collect_if_enabled(&mut self, active_frame: Option<&LuaFrame>) {
         if self.gc_stress {
-            self.sweep_weak_tables();
-            self.collect_cycles();
+            self.collect_garbage_with(active_frame);
         }
     }
 
-    pub(super) fn tick(&mut self) -> LuaResult<()> {
+    /// `dispatch_step`'s own instruction loop holds `frame` as a plain local
+    /// (popped off `self.frames` for the duration of the call, since
+    /// mutating it in place while also calling back into `&mut self` for
+    /// register/upvalue helpers would double-borrow) - so while a dispatch
+    /// step is in flight, `frame_roots`'s walk of `self.frames` alone would
+    /// miss every register, captured-local cell, and upvalue this exact
+    /// frame is the only reference to. `frame` here is that popped frame;
+    /// threading it through to `collect_garbage_with` keeps it rooted for
+    /// every collection triggered from inside this loop, matching the
+    /// `Rc`-refcounting liveness this frame used to get for free before the
+    /// tables/closures/coroutines cutover (see
+    /// docs/features/table-closure-coroutine-cutover.md §8 step 4).
+    pub(super) fn tick(&mut self, frame: &LuaFrame) -> LuaResult<()> {
         if self.instructions_remaining == 0 {
             return Err(LuaError::new("Lua instruction budget exhausted"));
         }
         self.instructions_remaining -= 1;
-        self.stress_collect_if_enabled();
-        self.maybe_auto_collect();
+        self.stress_collect_if_enabled(Some(frame));
+        self.maybe_auto_collect(Some(frame));
         Ok(())
     }
 
     /// The production (non-`gc_stress`) default's automatic collection
     /// trigger - see `instructions_since_gc`'s field doc and
     /// `AUTO_GC_INSTRUCTION_INTERVAL` for the rationale and pacing. A no-op
-    /// under `gc_stress`, which already collects unconditionally on every
-    /// instruction via `stress_collect_if_enabled`.
-    fn maybe_auto_collect(&mut self) {
-        if self.gc_stress {
+    /// under `gc_stress` (already collects unconditionally via
+    /// `stress_collect_if_enabled`) or while `collectgarbage("stop")` has
+    /// disabled the collector.
+    fn maybe_auto_collect(&mut self, active_frame: Option<&LuaFrame>) {
+        if self.gc_stress || !self.gc_running {
             return;
         }
         self.instructions_since_gc += 1;
@@ -62,12 +87,21 @@ impl LuaRuntime {
             return;
         }
         self.instructions_since_gc = 0;
-        self.sweep_weak_tables();
-        self.collect_cycles();
+        self.collect_garbage_with(active_frame);
     }
 
-    pub(super) fn charge_allocation(&mut self, bytes: usize) -> LuaResult<()> {
-        self.stress_collect_if_enabled();
+    /// `active_frame`: same meaning as `tick`'s own parameter - `Some` from
+    /// the two call sites inside `dispatch_step` (`NewLocal`/`TForCall`),
+    /// where a `gc_stress` collection would otherwise see the currently
+    /// dispatching frame's registers/cells/upvalues as unreachable; `None`
+    /// everywhere else, where the relevant frame (if any) is already back on
+    /// `self.frames` (see `tick`'s doc comment).
+    pub(super) fn charge_allocation(
+        &mut self,
+        bytes: usize,
+        active_frame: Option<&LuaFrame>,
+    ) -> LuaResult<()> {
+        self.stress_collect_if_enabled(active_frame);
         if bytes > self.allocation_remaining {
             return Err(LuaError::new("Lua allocation budget exhausted"));
         }
@@ -75,349 +109,172 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Charges a genuinely new table entry (a key that did not previously
-    /// exist on `table`) against the allocation budget and records the
-    /// charge on the table itself so `collect_cycles` can credit it back
-    /// when the table becomes garbage. Table *creation* already charges
-    /// `size_of::<LuaTable>()` (`Instr::NewTable`) for the fixed header;
-    /// this covers the otherwise-unbounded per-field growth a loop like
-    /// `for i = 1, math.huge do t[i] = i end` drives, which previously ran
-    /// unmetered until only the hard, non-resettable instruction budget
-    /// stopped it - unlike real Lua's allocator-driven, `pcall`-catchable
-    /// out-of-memory error, that isn't attributable to a *specific*
-    /// allocation and can't be recovered from by continuing the script
-    /// after a `pcall` catches it.
-    pub(super) fn charge_new_table_entry(&mut self, table: &RcRef<LuaTable>) -> LuaResult<()> {
-        let cost = 2 * std::mem::size_of::<LuaValue>();
-        self.charge_allocation(cost)?;
-        table.borrow_mut().charged_bytes += cost;
-        Ok(())
-    }
-
-    /// Approximate the currently live, runtime-managed heap for Lua's
-    /// `collectgarbage("count")`. Allocation-budget consumption is
-    /// intentionally not used here: that counter is cumulative and would
-    /// report temporary frames/tables forever after Rust's `Rc` has already
-    /// reclaimed them.
+    /// `collectgarbage("count")`: a live snapshot of the canonical heap's
+    /// currently retained bytes (see `sol_core::Heap::live_bytes`'s own
+    /// doc), not a cumulative allocation counter.
     pub(super) fn live_heap_bytes(&self) -> usize {
-        let table_bytes = self
-            .gc_tables
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|table| {
-                let table = table.borrow();
-                std::mem::size_of::<LuaTable>()
-                    + table.array.capacity() * std::mem::size_of::<LuaValue>()
-                    + table.hash.capacity() * (std::mem::size_of::<LuaValue>() * 2)
-            })
-            .sum::<usize>();
-        let closure_bytes = self
-            .gc_closures
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|closure| {
-                std::mem::size_of::<LuaClosure>()
-                    + closure.upvals.borrow().capacity() * std::mem::size_of::<RcRef<LuaValue>>()
-            })
-            .sum::<usize>();
-        table_bytes + closure_bytes
+        self.canonical_heap.borrow().live_bytes()
     }
 
-    /// `collectgarbage("collect"/"step")`'s actual work: prune weakly-held
-    /// entries out of every table registered as weak-mode by `setmetatable`,
-    /// then run the cycle collector (`collect_cycles`) over every tracked
-    /// table/closure.
-    pub(super) fn sweep_weak_tables(&mut self) {
-        self.weak_tables.retain(|weak| weak.strong_count() > 0);
-        for weak in &self.weak_tables {
-            let Some(table_rc) = weak.upgrade() else {
+    /// `collectgarbage("collect"/"step")`'s actual work: a full
+    /// `sol_core::Heap::collect_major_with_roots` pass rooted at every
+    /// `Value` reachable only through a `LuaRuntime`/`LuaFrame` Rust field
+    /// (`frame_roots`), then running any `__gc` finalizer the collection
+    /// queued. A finalizer error is discarded rather than propagated -
+    /// `collectgarbage()` itself must not fail because of a broken `__gc`,
+    /// matching the old trial-deletion collector's same behavior.
+    pub(super) fn collect_garbage(&mut self) {
+        self.collect_garbage_with(None);
+    }
+
+    /// `collect_garbage`, plus one extra frame's roots - see `tick`'s doc
+    /// comment for why a collection triggered from inside `dispatch_step`
+    /// needs this.
+    fn collect_garbage_with(&mut self, active_frame: Option<&LuaFrame>) {
+        let roots = self.frame_roots(active_frame);
+        let collection = self
+            .canonical_heap
+            .borrow_mut()
+            .collect_major_with_roots(&roots);
+        if collection.finalizers.is_empty() {
+            return;
+        }
+        // Every `self.call(finalizer, ...)` below drives its own nested
+        // dispatch loop, whose collections only know about *its* active
+        // frame and `self.frames` - neither includes `active_frame` here,
+        // which (if `Some`) is this same outer, still-in-flight call's own
+        // popped frame (see `pinned_roots`'s doc comment). Pin it for the
+        // whole finalizer-invocation loop, not just the roots snapshot
+        // above, so it survives any collection nested inside a finalizer.
+        let mut pinned = Vec::new();
+        if let Some(frame) = active_frame {
+            self.push_lua_frame_roots(frame, &mut pinned);
+        }
+        self.pinned_roots.push(pinned);
+        for id in collection.finalizers {
+            // Only tables register a finalizer today (`table_set_metatable`
+            // is the sole `register_finalizer` call site) - `CanonicalUserdata`
+            // is a separate, permanently-self-rooted tier (see its own doc
+            // comment in `value.rs`) that a `collect_major_with_roots` sweep
+            // never reclaims through this queue in the first place, so no
+            // `Userdata` case belongs here.
+            let Ok(LuaValue::Table(table)) = self.decode_value(Value::object(id)) else {
+                let _ = self.canonical_heap.borrow_mut().finish_finalizer(id);
                 continue;
             };
-            let (weak_keys, weak_values) = match &table_rc.borrow().metatable {
-                Some(meta) => table_weak_mode(meta),
-                None => (false, false),
-            };
-            if weak_keys || weak_values {
-                prune_weak_table(&mut table_rc.borrow_mut(), weak_keys, weak_values);
+            if let Some(finalizer) = self.table_finalizer(table) {
+                let _ = self.call(finalizer, vec![LuaValue::Table(table)]);
+            }
+            let _ = self.canonical_heap.borrow_mut().finish_finalizer(id);
+        }
+        self.pinned_roots.pop();
+    }
+
+    /// Every `Value` reachable only through a `LuaRuntime`/`LuaFrame` Rust
+    /// field rather than already-heap-linked storage - the `frame_roots`
+    /// argument `collect_major_with_roots` needs per
+    /// docs/features/table-closure-coroutine-cutover.md §3. Anything
+    /// reachable *from* one of these (e.g. `string`/`math`/`table` hanging
+    /// off the globals table) needs no separate entry: the collector traces
+    /// outward from every root it's given.
+    fn frame_roots(&self, active_frame: Option<&LuaFrame>) -> Vec<Value> {
+        let mut roots = Vec::new();
+        roots.push(self.encode_value(&self.globals.as_value()).unwrap_or(Value::NIL));
+        // `require`/`package.searchpath` close over these two directly
+        // (see `package_table`'s field doc), independent of whatever the
+        // reassignable `package` global currently points to - and likewise
+        // for the metatables/default file handles below, which dispatch and
+        // the `io`/string-method natives consult directly rather than via a
+        // global lookup.
+        roots.push(Value::object(self.package_loaded.object_id()));
+        roots.push(Value::object(self.package_table.object_id()));
+        roots.push(Value::object(self.string_metatable.object_id()));
+        for metatable in [
+            self.number_metatable,
+            self.boolean_metatable,
+            self.nil_metatable,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            roots.push(Value::object(metatable.object_id()));
+        }
+        roots.push(Value::object(self.io_stdout.object_id()));
+        roots.push(Value::object(self.io_stderr.object_id()));
+        roots.push(
+            self.encode_value(&self.default_output.borrow())
+                .unwrap_or(Value::NIL),
+        );
+        // The active resume chain - see this module's own doc comment for
+        // the not-currently-resumed-coroutine gap this leaves (task #13).
+        for thread in std::iter::once(self.main_coroutine).chain(self.coroutine_stack.iter().copied()) {
+            let coroutine = self.coroutine(thread);
+            self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut roots);
+        }
+        self.push_frame_stack_roots(&self.frames, &mut roots);
+        // The frame `dispatch_step` popped off `self.frames` for the
+        // duration of the instruction loop currently running - see `tick`'s
+        // doc comment.
+        if let Some(frame) = active_frame {
+            self.push_lua_frame_roots(frame, &mut roots);
+        }
+        // Any outer, still-in-flight popped frame(s) pinned around a
+        // reentrant finalizer call - see `pinned_roots`'s own doc comment.
+        for segment in &self.pinned_roots {
+            roots.extend(segment.iter().copied());
+        }
+        roots
+    }
+
+    fn push_frame_stack_roots(&self, frames: &[Frame], roots: &mut Vec<Value>) {
+        for frame in frames {
+            match frame {
+                Frame::Lua(lua_frame) => self.push_lua_frame_roots(lua_frame, roots),
+                Frame::Native(cont) => self.push_native_cont_roots(cont, roots),
             }
         }
     }
 
-    /// Registers an ordinary table as a cycle-collector candidate. Must not be
-    /// called for the permanent library/bootstrap tables built by
-    /// `install_base` (`string`/`math`/`table`/`utf8`/`package`/`os`/`io`) or
-    /// `package_loaded` - those are always reachable via `globals`, which this
-    /// collector treats as an opaque, untracked root, so tracking them would
-    /// only add churn with no correctness benefit.
-    pub(super) fn track_table(&self, table: RcRef<LuaTable>) -> RcRef<LuaTable> {
-        self.gc_tables.borrow_mut().push(Rc::downgrade(&table));
-        table
-    }
-
-    /// Registers an ordinary closure as a cycle-collector candidate. See
-    /// `track_table` for the same caveat about permanent roots (closures
-    /// created for bootstrap library entries don't exist, so this has no
-    /// analogous exclusion today).
-    pub(super) fn track_closure(&self, closure: Rc<LuaClosure>) -> Rc<LuaClosure> {
-        self.gc_closures.borrow_mut().push(Rc::downgrade(&closure));
-        closure
-    }
-
-    /// A CPython-style trial-deletion cycle collector layered on top of the
-    /// ordinary `Rc<RefCell<...>>` value graph. Never needs to enumerate
-    /// program roots (globals, live VM registers, upvalue cells outside a
-    /// tracked object) directly: any strong reference reaching a candidate
-    /// from outside the tracked set shows up automatically as a positive
-    /// residual once every *inter-candidate* edge has been subtracted from
-    /// each candidate's real `Rc::strong_count`.
-    ///
-    /// Safety note: under-counting an edge in the children-enumeration below
-    /// only makes this more conservative (something stays alive that could
-    /// have been collected) - never unsound. Over-counting (attributing the
-    /// same stored `Rc` slot to more than one edge) would be unsound: it
-    /// could drive a genuinely-reachable candidate's residual down to zero
-    /// and cause it to be swept while still referenced. Every enumeration
-    /// function below must therefore visit each stored `Rc` slot exactly
-    /// once.
-    pub(super) fn collect_cycles(&mut self) {
-        self.record_charge_ledger();
-
-        let tables: Vec<RcRef<LuaTable>> = self
-            .gc_tables
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        let closures: Vec<Rc<LuaClosure>> = self
-            .gc_closures
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-
-        // `- 1` discounts the strong reference `tables`/`closures` themselves
-        // just took when upgrading each `Weak` above - without it, every
-        // candidate's count would be inflated by exactly one purely from
-        // being snapshotted, masking real cycles (e.g. a lone self-referencing
-        // table would show `strong_count == 2`, not `1`, and never reach zero
-        // after subtracting its own self-edge).
-        let mut refs: HashMap<usize, i64> = HashMap::new();
-        for table in &tables {
-            refs.insert(
-                Rc::as_ptr(table) as usize,
-                Rc::strong_count(table) as i64 - 1,
-            );
+    fn push_lua_frame_roots(&self, frame: &LuaFrame, roots: &mut Vec<Value>) {
+        for value in &frame.regs {
+            roots.push(self.encode_value(value).unwrap_or(Value::NIL));
         }
-        for closure in &closures {
-            refs.insert(
-                Rc::as_ptr(closure) as usize,
-                Rc::strong_count(closure) as i64 - 1,
-            );
+        for cell in frame.cells.iter().flatten() {
+            roots.push(Value::object(*cell));
         }
-
-        let table_children = |table: &RcRef<LuaTable>| -> Vec<usize> {
-            let mut children = Vec::new();
-            let borrowed = table.borrow();
-            for value in &borrowed.array {
-                if let Some(ptr) = candidate_ptr(value) {
-                    children.push(ptr);
-                }
-            }
-            for (key, value) in borrowed.hash.iter() {
-                if let Some(ptr) = candidate_key_ptr(key) {
-                    children.push(ptr);
-                }
-                if let Some(ptr) = candidate_ptr(value) {
-                    children.push(ptr);
-                }
-            }
-            if let Some(meta) = &borrowed.metatable {
-                children.push(Rc::as_ptr(meta) as usize);
-            }
-            children
-        };
-        let closure_children = |closure: &Rc<LuaClosure>| -> Vec<usize> {
-            closure
-                .upvals
-                .borrow()
-                .iter()
-                .filter_map(|cell| candidate_ptr(&cell.borrow()))
-                .collect()
-        };
-
-        for table in &tables {
-            for child in table_children(table) {
-                if let Some(count) = refs.get_mut(&child) {
-                    *count -= 1;
-                }
-            }
+        for upvalue in &frame.upvals {
+            roots.push(Value::object(*upvalue));
         }
-        for closure in &closures {
-            for child in closure_children(closure) {
-                if let Some(count) = refs.get_mut(&child) {
-                    *count -= 1;
-                }
-            }
+        for value in &frame.varargs {
+            roots.push(self.encode_value(value).unwrap_or(Value::NIL));
         }
-
-        let mut reachable: HashSet<usize> = HashSet::new();
-        let mut worklist: Vec<usize> = refs
-            .iter()
-            .filter(|(_, count)| **count > 0)
-            .map(|(ptr, _)| *ptr)
-            .collect();
-        reachable.extend(worklist.iter().copied());
-
-        let table_by_ptr: HashMap<usize, &RcRef<LuaTable>> = tables
-            .iter()
-            .map(|table| (Rc::as_ptr(table) as usize, table))
-            .collect();
-        let closure_by_ptr: HashMap<usize, &Rc<LuaClosure>> = closures
-            .iter()
-            .map(|closure| (Rc::as_ptr(closure) as usize, closure))
-            .collect();
-
-        while let Some(ptr) = worklist.pop() {
-            let children = if let Some(table) = table_by_ptr.get(&ptr) {
-                table_children(table)
-            } else if let Some(closure) = closure_by_ptr.get(&ptr) {
-                closure_children(closure)
-            } else {
-                Vec::new()
-            };
-            for child in children {
-                if reachable.insert(child) {
-                    worklist.push(child);
-                }
-            }
-        }
-
-        // Run `__gc` finalizers for newly-unreachable tables before clearing
-        // anything, so the finalizer sees the table's fields intact - matches
-        // real Lua's "finalizer runs while the object is still whole" timing.
-        // Unlike real Lua, a table referenced from inside its own `__gc` call
-        // is not resurrected: this collector always proceeds to clear it
-        // afterward (see Phase 4b in `docs/features/lua-superset-plan.md`),
-        // so a finalizer must not assume the table will keep working past the
-        // call. A finalizer error is discarded rather than propagated -
-        // `collectgarbage()` itself must not fail because of a broken `__gc`.
-        let mut finalizers: Vec<(RcRef<LuaTable>, LuaValue)> = Vec::new();
-        for table in &tables {
-            let ptr = Rc::as_ptr(table) as usize;
-            if reachable.contains(&ptr) || table.borrow().finalized {
-                continue;
-            }
-            if let Some(finalizer) = table_finalizer(table) {
-                finalizers.push((table.clone(), finalizer));
-            }
-        }
-        for (table, finalizer) in finalizers {
-            table.borrow_mut().finalized = true;
-            let _ = self.call(finalizer, vec![LuaValue::Table(table)]);
-        }
-
-        for table in &tables {
-            let ptr = Rc::as_ptr(table) as usize;
-            if !reachable.contains(&ptr) {
-                let mut borrowed = table.borrow_mut();
-                borrowed.array.clear();
-                borrowed.array_border = 0;
-                borrowed.hash.clear();
-                borrowed.metatable = None;
-                borrowed.version = borrowed.version.wrapping_add(1);
-                borrowed.charged_bytes = 0;
-            }
-        }
-        for closure in &closures {
-            let ptr = Rc::as_ptr(closure) as usize;
-            if !reachable.contains(&ptr) {
-                closure.upvals.borrow_mut().clear();
-            }
-        }
-
-        // Drop these strong-ref snapshots before crediting so anything just
-        // cleared above - and with no other referrer left - actually reaches
-        // `Rc` strong count zero now, matching `credit_dead_ledger_entries`'s
-        // liveness check against reality instead of against a table this
-        // function is itself still (transitively) keeping alive.
-        drop(tables);
-        drop(closures);
-
-        self.gc_tables
-            .borrow_mut()
-            .retain(|weak| weak.strong_count() > 0);
-        self.gc_closures
-            .borrow_mut()
-            .retain(|weak| weak.strong_count() > 0);
-
-        self.credit_dead_ledger_entries();
-    }
-
-    /// Snapshots every currently-alive tracked table/closure's total
-    /// allocation-budget charge (header +, for tables, accumulated field
-    /// growth) into `charge_ledger`, keyed by `Rc` pointer identity. Called
-    /// at the very start of every `collect_cycles` pass, before any clearing,
-    /// so growth since the previous pass is captured ahead of
-    /// `credit_dead_ledger_entries`'s comparison at the end of this one.
-    fn record_charge_ledger(&mut self) {
-        let mut ledger = self.charge_ledger.borrow_mut();
-        for weak in self.gc_tables.borrow().iter() {
-            if let Some(table) = weak.upgrade() {
-                let charge = std::mem::size_of::<LuaTable>() + table.borrow().charged_bytes;
-                ledger.insert(Rc::as_ptr(&table) as usize, charge);
-            }
-        }
-        for weak in self.gc_closures.borrow().iter() {
-            if let Some(closure) = weak.upgrade() {
-                ledger.insert(
-                    Rc::as_ptr(&closure) as usize,
-                    std::mem::size_of::<LuaClosure>(),
-                );
-            }
+        for value in &frame.to_close {
+            roots.push(self.encode_value(value).unwrap_or(Value::NIL));
         }
     }
 
-    /// Credits back every `charge_ledger` entry whose tracked table/closure
-    /// has since died - either from this same `collect_cycles` pass's own
-    /// trial deletion, or from ordinary `Rc` refcounting sometime between the
-    /// previous pass and this one. The latter is what a non-cyclic table
-    /// dropped by plain scope exit (e.g. a loop-local table reassigned on the
-    /// next iteration) hits: `collect_cycles`'s reachability walk never sees
-    /// it at all, because its `Weak` entry in `gc_tables` is already dead by
-    /// the time any pass runs. Comparing against the last-recorded charge
-    /// (rather than re-deriving it from the table, which no longer exists) is
-    /// what makes that case creditable here.
-    fn credit_dead_ledger_entries(&mut self) {
-        let alive: HashSet<usize> = self
-            .gc_tables
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|table| Rc::as_ptr(&table) as usize)
-            .chain(
-                self.gc_closures
-                    .borrow()
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .map(|closure| Rc::as_ptr(&closure) as usize),
-            )
-            .collect();
-        let mut reclaimed = 0usize;
-        self.charge_ledger.borrow_mut().retain(|ptr, charge| {
-            if alive.contains(ptr) {
-                true
-            } else {
-                reclaimed += *charge;
-                false
+    fn push_native_cont_roots(&self, cont: &NativeCont, roots: &mut Vec<Value>) {
+        match cont {
+            NativeCont::Sort(state) => {
+                roots.push(self.encode_value(&state.table).unwrap_or(Value::NIL));
+                if let Some(comparator) = &state.comparator {
+                    roots.push(self.encode_value(comparator).unwrap_or(Value::NIL));
+                }
+                // Every element being sorted is always present in
+                // `sorter.values()` even mid-merge (a merge step clones
+                // values out of their original slots into a scratch buffer
+                // and writes results back progressively - it never removes
+                // an element from `values` without another copy of it still
+                // sitting in `values` somewhere), so the in-progress merge
+                // buffer itself needs no separate root.
+                for value in state.sorter.values() {
+                    roots.push(self.encode_value(value).unwrap_or(Value::NIL));
+                }
             }
-        });
-        // Credit reclaimed memory back to the allocation budget - otherwise a
-        // script that allocates garbage (cyclic or not) in a loop would
-        // exhaust its budget even though `collectgarbage()` is actually
-        // reclaiming it.
-        self.allocation_remaining =
-            (self.allocation_remaining + reclaimed).min(self.allocation_budget);
+            NativeCont::Gsub(state) => {
+                roots.push(self.encode_value(&state.repl).unwrap_or(Value::NIL));
+            }
+            NativeCont::Pcall | NativeCont::Xpcall(_) | NativeCont::Once => {}
+        }
     }
 }

@@ -31,12 +31,13 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use crate::ast::Program;
 
 pub mod c_api;
 mod canonical;
+mod codec;
 mod coroutine;
 mod diagnostics;
 mod dispatch;
@@ -54,11 +55,12 @@ mod natives_os_io;
 mod natives_string;
 mod natives_table;
 mod natives_utf8;
+mod table;
 mod tim_sort;
 mod util;
 mod value;
 
-pub use canonical::{CanonicalAdapter, CanonicalAdapterError};
+pub use canonical::CanonicalAdapterError;
 pub use coroutine::{CoroutineStatus, LuaCoroutine};
 use coroutine::{HookMask, HookState};
 pub use sol_core::Capabilities;
@@ -87,11 +89,15 @@ pub struct LuaRuntime {
     call_depth: usize,
     max_call_depth: usize,
     allocation_remaining: usize,
+    // Not read back yet: resetting `allocation_remaining` from this on each
+    // `collect_garbage()` pass is task #12's scope (moving GC triggering
+    // onto real safepoints), not this flip's.
+    #[allow(dead_code)]
     allocation_budget: usize,
     capabilities: Capabilities,
     module_sources: HashMap<Vec<u8>, Vec<u8>>,
     loading_modules: HashSet<Vec<u8>>,
-    package_loaded: RcRef<LuaTable>,
+    package_loaded: TableRef,
     /// The original `package` table object created in `install_base`,
     /// captured directly (like `package_loaded` above) rather than looked up
     /// through the current `package` global on every call. Real Lua's own
@@ -101,55 +107,31 @@ pub struct LuaRuntime {
     /// `lua-5.5.1-tests/attrib.lua`'s "testing preload" section does),
     /// `require` must keep consulting the original table's `preload`/`path`/
     /// `cpath` fields, not whatever the global `package` now points to.
-    package_table: RcRef<LuaTable>,
+    package_table: TableRef,
     start_time: std::time::Instant,
-    /// Tables ever given a metatable with a weak `__mode`, registered by
-    /// `setmetatable` (see `table_weak_mode`). `Weak` so the registry itself
-    /// never keeps a table alive; `collectgarbage("collect"/"step")` sweeps
-    /// this list (`sweep_weak_tables`) rather than the whole value graph -
-    /// there is no general heap/root scan today (see Phase 4b in
-    /// `docs/features/lua-superset-plan.md`), so only tables that opted into
-    /// weak mode are ever examined.
-    weak_tables: Vec<WeakRef<LuaTable>>,
-    /// Every ordinary (non-library-bootstrap) table and closure ever
-    /// created, registered by `track_table`/`track_closure` at creation
-    /// time. `Weak` so tracking never keeps anything alive by itself.
-    /// `collect_cycles` (run from `collectgarbage("collect"/"step")`) uses
-    /// this as the "candidate" set for a CPython-style trial-deletion cycle
-    /// collector layered on top of ordinary `Rc` refcounting: it never
-    /// needs to enumerate program roots (globals, live VM registers,
-    /// upvalue cells) directly, because any strong reference reaching a
-    /// candidate from outside this registry shows up automatically as a
-    /// non-zero residual once every *inter-candidate* reference has been
-    /// subtracted from each candidate's real `Rc::strong_count`.
-    gc_tables: RefCell<Vec<WeakRef<LuaTable>>>,
-    gc_closures: RefCell<Vec<Weak<LuaClosure>>>,
-    /// Last-recorded total allocation-budget charge (header + growth) for
-    /// every tracked table/closure that was alive as of the most recent
-    /// `collect_cycles` pass, keyed by `Rc` pointer identity. `collect_cycles`
-    /// refreshes this for everything still alive at the *start* of each pass,
-    /// then - after clearing whatever its own trial deletion just made
-    /// unreachable and dropping its strong-ref snapshots - credits back every
-    /// entry whose table/closure has since died, whether from its own cycle
-    /// collection this pass or from ordinary `Rc` refcounting sometime
-    /// between the previous pass and this one (e.g. a non-cyclic table whose
-    /// local variable went out of scope). That second case has no
-    /// `collect_cycles`-driven reachability signal at all - by the time it
-    /// runs, the table's `Weak` entry in `gc_tables` is already dead - so
-    /// crediting it back requires having captured its charge while it was
-    /// still alive, which is exactly what this ledger is for.
-    charge_ledger: RefCell<HashMap<usize, usize>>,
+    /// Every closure's `Globals` (Sol's module-isolation/constants
+    /// bookkeeping, which has no equivalent field on canonical
+    /// `HeapObject::Closure`'s `ClosureObject{prototype, upvalues,
+    /// environment}` - `_ENV` there is just an ordinary captured upvalue
+    /// slot), keyed by the closure's own canonical `ObjectId`. Populated by
+    /// `Instr::NewClosure` at creation time, consulted whenever a
+    /// `LuaValue::Closure` is invoked. Same interim-fallback pattern as
+    /// `canonical::PrototypeRegistry`/`CoroutineRegistry`: every entry here
+    /// is treated as reachable while present, and a closure's entry is
+    /// removed only when its own canonical identity is (see
+    /// docs/features/table-closure-coroutine-cutover.md §8 step 4).
+    closure_globals: RefCell<HashMap<sol_core::ObjectId, Globals>>,
     /// The currently active chain of resumed coroutines, innermost last.
     /// Empty means the main chunk (not inside any coroutine) is running.
     /// Doubles as: (a) whether `coroutine.yield` is even legal right now
     /// (`step_result_for_call` errors if this is empty instead of producing
     /// `StepResult::Yield`), and (b) `coroutine.running`/`isyieldable`'s
     /// source of truth.
-    coroutine_stack: Vec<Rc<LuaCoroutine>>,
+    coroutine_stack: Vec<ThreadRef>,
     /// Stable identity for the main Lua thread. It is not placed on
     /// `coroutine_stack` (the empty stack still means yielding is illegal),
     /// but `coroutine.running()` returns this handle with `is_main = true`.
-    main_coroutine: Rc<LuaCoroutine>,
+    main_coroutine: ThreadRef,
     /// Opt-in GC stress mode (see `set_gc_stress`/`SOL_LUA_GC_STRESS`): runs
     /// a full weak-table sweep + cycle-collection pass at every allocation
     /// point (`charge_allocation`) and after every dispatched dynamic
@@ -214,6 +196,23 @@ pub struct LuaRuntime {
     /// `table.sort`'s comparator, on targets (wasm32) with no fiber/thread
     /// suspension primitive. See `docs/features/lua-debug-frames.md`.
     frames: Vec<Frame>,
+    /// Extra GC roots pinned for the duration of a reentrant call driven from
+    /// inside `collect_garbage_with` (currently: `__gc` finalizer
+    /// invocation). A finalizer's own `self.call` drives a fresh nested
+    /// dispatch loop with its own `active_frame`, but that nested loop's
+    /// `frame_roots` walk of `self.frames` does not include whatever frame
+    /// the *outer*, still-in-flight `dispatch_step` call already popped into
+    /// a Rust local (see `tick`'s doc comment) - it is neither on
+    /// `self.frames` nor threaded through `self.call`. Pushing that frame's
+    /// roots here before invoking a finalizer, and popping them back off
+    /// after, keeps values reachable only through it (e.g. an enclosing
+    /// local a `__gc` closure's upvalue is the sole other reference to)
+    /// alive across any collection nested inside the finalizer call. A
+    /// `Vec<Vec<_>>` rather than one flat `Vec` so nested finalizer calls
+    /// (a finalizer whose own execution triggers another collection with
+    /// finalizers of its own) unwind cleanly, each popping only its own
+    /// segment.
+    pinned_roots: Vec<Vec<sol_core::Value>>,
     /// Set immediately before dispatching a `__index`/`__newindex`
     /// metamethod call (`"index"`/`"newindex"`), and consumed by `drive`'s
     /// `StepResult::PushClosure` handling on the very next step to tag the
@@ -273,12 +272,41 @@ pub struct LuaRuntime {
     file_userdata: HashSet<sol_core::ObjectId>,
     c_warning_function: Option<c_api::LuaWarnFunction>,
     c_warning_data: *mut std::ffi::c_void,
-    c_thread_states: RefCell<HashMap<usize, *mut c_api::lua_State>>,
-    c_continuations: RefCell<HashMap<usize, c_api::CContinuation>>,
+    c_thread_states: RefCell<HashMap<u64, *mut c_api::lua_State>>,
+    c_continuations: RefCell<HashMap<u64, c_api::CContinuation>>,
     c_upvalue_identities: RefCell<HashMap<(sol_core::ObjectId, usize), Box<u8>>>,
     native_libraries: Vec<c_api::NativeLibrary>,
     native_bridge_ids: HashMap<usize, sol_core::NativeCallableId>,
     next_native_function: u32,
+    /// Reserved `HeapObject::NativeCallable` provider id for `LightUserdata`
+    /// encoding (see `docs/features/table-closure-coroutine-cutover.md` §2).
+    /// Minted once via `Heap::reserve_native_provider` at construction time -
+    /// unlike `NativeFunction`/`GMatchIterator`, which reuse
+    /// `canonical::LEGACY_STATE_PROVIDER`/provider `0`, nothing pre-flip ever
+    /// put `LightUserdata` on `NativeCallable`, so it needs a genuinely fresh
+    /// provider rather than a precedented shared one.
+    light_userdata_provider: u32,
+    /// Memoizes `NativeFunction` discriminant -> canonical `NativeCallable`
+    /// object id (provider `0`, `function` = the discriminant), so
+    /// `t[print] = 1; print(t[print])` round-trips to the same object
+    /// identity instead of allocating a fresh one on every encode.
+    native_function_objects: RefCell<HashMap<u32, sol_core::ObjectId>>,
+    /// Reserves one real `HeapObject::NativeCallable` provider per distinct
+    /// `RegisteredNative`'s legacy `NativeCallableId::provider`, for this
+    /// `LuaRuntime`'s whole lifetime - legacy provider -> reserved real
+    /// provider, and its inverse for decoding a `NativeCallable` object back
+    /// into a `RegisteredNative`.
+    registered_native_providers: RefCell<HashMap<u32, u32>>,
+    registered_native_providers_reverse: RefCell<HashMap<u32, u32>>,
+    /// Memoizes `NativeCallableId` -> canonical object id so the same
+    /// registered native always encodes to the same identity.
+    registered_native_objects: RefCell<HashMap<sol_core::NativeCallableId, sol_core::ObjectId>>,
+    /// `string.dump`-style prototype identity used by `HeapObject::Closure`'s
+    /// `prototype: u32` field - see `canonical::PrototypeRegistry`.
+    prototype_registry: RefCell<canonical::PrototypeRegistry>,
+    /// Owns each live `LuaCoroutine`'s executable state, addressed by its
+    /// canonical `ThreadObject`'s `ObjectId` - see `canonical::CoroutineRegistry`.
+    coroutine_registry: RefCell<canonical::CoroutineRegistry>,
     /// The single shared metatable every string value indexes through
     /// (`{ __index = string }`), matching real Lua's `G(L)->strmt`. Strings
     /// have no per-value metatable slot of their own - `getmetatable("")`
@@ -287,20 +315,20 @@ pub struct LuaRuntime {
     /// to add metamethods to all strings) is visible to every subsequent
     /// string operation, since `index`/`metamethod` resolve strings through
     /// this table rather than a hardcoded reference straight to `string`.
-    string_metatable: RcRef<LuaTable>,
+    string_metatable: TableRef,
     /// The shared metatable for every number (`Integer`/`Float` alike, as
     /// real Lua uses one `LUA_TNUMBER` slot for both subtypes), settable
     /// only through `debug.setmetatable` since ordinary `setmetatable`
     /// rejects non-table values. `None` until first set, unlike
     /// `string_metatable` which always exists (strings get method dispatch
     /// by default; numbers don't).
-    number_metatable: Option<RcRef<LuaTable>>,
+    number_metatable: Option<TableRef>,
     /// The shared metatable for every boolean, mirroring `number_metatable`
     /// but for real Lua's single `LUA_TBOOLEAN` basic-type slot.
-    boolean_metatable: Option<RcRef<LuaTable>>,
+    boolean_metatable: Option<TableRef>,
     /// The shared metatable for `nil`, mirroring `number_metatable` but for
     /// real Lua's single `LUA_TNIL` basic-type slot.
-    nil_metatable: Option<RcRef<LuaTable>>,
+    nil_metatable: Option<TableRef>,
     /// Bookkeeping-only GC collector mode, `"incremental"` or
     /// `"generational"` (real Lua's default is `"incremental"`). Sol always
     /// runs the same trial-deletion cycle collection pass regardless of this
@@ -336,7 +364,7 @@ pub struct LuaRuntime {
     /// stdout stream), so this handle is a lightweight table with a single
     /// `write` method rather than a full file-handle implementation
     /// (`close`/`seek`/`lines`/real `io.open` are out of scope here).
-    io_stdout: RcRef<LuaTable>,
+    io_stdout: TableRef,
     /// The handle `io.stderr` exposes - structurally identical to
     /// `io_stdout` (a lightweight `write`/`close`-method table, not a real
     /// open file), but `write_values_to_target` special-cases this table's
@@ -346,7 +374,7 @@ pub struct LuaRuntime {
     /// (e.g. `lua-5.5.1-tests/heavy.lua`'s progress-reporting
     /// `io.stderr:write(...)` calls) expect stderr writes to be genuinely
     /// separate from stdout, not interleaved into it.
-    io_stderr: RcRef<LuaTable>,
+    io_stderr: TableRef,
     /// The handle `io.write`/`io.output()` (no arguments) currently target -
     /// `io_stdout` by default, or a table returned by `io.output(path)` once
     /// redirected to a real file (see `open_files`). Real Lua's default
@@ -356,14 +384,14 @@ pub struct LuaRuntime {
     /// Real, host-backed files opened by `io.output(path)` (there is no
     /// general `io.open` yet - only the default-output redirection
     /// `lua-5.5.1-tests/attrib.lua`'s `createfiles`/`removefiles` helpers
-    /// need), keyed by the identity (`Rc::as_ptr`) of the lightweight
-    /// `LuaTable` handle returned to Lua code for that file. `LuaValue` has
-    /// no variant for an open file descriptor (see its doc comment - the
-    /// bridge only carries pointer-free/scalar data), so the real
-    /// `std::fs::File` lives only here, off to the side, and the handle
+    /// need), keyed by the object identity (`TableRef::object_id().raw()`)
+    /// of the lightweight table handle returned to Lua code for that file.
+    /// `LuaValue` has no variant for an open file descriptor (see its doc
+    /// comment - the bridge only carries pointer-free/scalar data), so the
+    /// real `std::fs::File` lives only here, off to the side, and the handle
     /// table Lua code holds is just a `write`/`close`-method dispatch
-    /// target that looks itself up in this map by pointer identity.
-    open_files: RefCell<HashMap<usize, Rc<RefCell<std::fs::File>>>>,
+    /// target that looks itself up in this map by object identity.
+    open_files: RefCell<HashMap<u64, Rc<RefCell<std::fs::File>>>>,
     /// The `debug.sethook` state of whichever coroutine/main is currently
     /// executing, cached here so `dispatch_step`'s per-instruction line/count
     /// check and `call`'s per-call call/return check are a cheap `Option`

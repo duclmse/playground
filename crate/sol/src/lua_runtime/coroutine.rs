@@ -121,16 +121,18 @@ impl fmt::Debug for LuaCoroutine {
 }
 
 impl LuaRuntime {
-    pub fn create_global_coroutine(&mut self, name: &str) -> LuaResult<Rc<LuaCoroutine>> {
-        self.new_coroutine(self.globals.get(name))
+    pub fn create_global_coroutine(&mut self, name: &str) -> LuaResult<ThreadRef> {
+        let f = self.globals.get(self, name);
+        self.new_coroutine(f)
     }
 
     pub fn resume_coroutine_outcome(
         &mut self,
-        coroutine: &Rc<LuaCoroutine>,
+        thread: ThreadRef,
         args: Vec<LuaValue>,
     ) -> sol_core::CallOutcome<LuaValue, LuaError> {
-        match self.resume_coroutine(coroutine, args) {
+        let coroutine = self.coroutine(thread);
+        match self.resume_coroutine(thread, args) {
             Ok(values) if coroutine.status.get() == CoroutineStatus::Suspended => {
                 sol_core::CallOutcome::Yielded(values)
             }
@@ -139,9 +141,9 @@ impl LuaRuntime {
         }
     }
 
-    pub(super) fn expect_coroutine(value: &LuaValue) -> LuaResult<Rc<LuaCoroutine>> {
+    pub(super) fn expect_coroutine(value: &LuaValue) -> LuaResult<ThreadRef> {
         match value {
-            LuaValue::Thread(co) => Ok(co.clone()),
+            LuaValue::Thread(thread) => Ok(*thread),
             other => Err(LuaError::new(format!(
                 "bad argument (coroutine expected, got {})",
                 other.type_name()
@@ -149,19 +151,35 @@ impl LuaRuntime {
         }
     }
 
+    /// Resolves a `ThreadRef` to its own executable state - see
+    /// `canonical::CoroutineRegistry`'s doc comment for why this is a
+    /// side-table lookup rather than a field access. Every `ThreadRef` ever
+    /// handed out (`new_coroutine`, the main thread) has an entry for as
+    /// long as this runtime lives.
+    pub(super) fn coroutine(&self, thread: ThreadRef) -> Rc<LuaCoroutine> {
+        self.coroutine_registry
+            .borrow()
+            .get(thread)
+            .cloned()
+            .expect("every live ThreadRef has a coroutine_registry entry")
+    }
+
     /// Builds a new coroutine around `f` without starting it. `f` is invoked
     /// lazily on the very first `resume`; see `LuaCoroutine`'s doc comment
     /// for the overall design.
-    pub(super) fn new_coroutine(&mut self, f: LuaValue) -> LuaResult<Rc<LuaCoroutine>> {
-        self.charge_allocation(std::mem::size_of::<LuaCoroutine>())?;
-        Ok(Rc::new(LuaCoroutine {
+    pub(super) fn new_coroutine(&mut self, f: LuaValue) -> LuaResult<ThreadRef> {
+        self.charge_allocation(std::mem::size_of::<LuaCoroutine>(), None)?;
+        let coroutine = Rc::new(LuaCoroutine {
             status: Cell::new(CoroutineStatus::Suspended),
             body: RefCell::new(Some(f)),
             frames: RefCell::new(Vec::new()),
             depth_charged: Cell::new(0),
             dead_error: RefCell::new(None),
             hook: RefCell::new(None),
-        }))
+        });
+        let thread = ThreadRef::alloc(&mut self.canonical_heap.borrow_mut());
+        self.coroutine_registry.borrow_mut().insert(thread, coroutine);
+        Ok(thread)
     }
 
     /// Resumes `co` with `args`, driving its own frame stack (see
@@ -207,9 +225,10 @@ impl LuaRuntime {
     /// errored).
     pub(super) fn resume_coroutine(
         &mut self,
-        co: &Rc<LuaCoroutine>,
+        thread: ThreadRef,
         args: Vec<LuaValue>,
     ) -> LuaResult<Vec<LuaValue>> {
+        let co = self.coroutine(thread);
         match co.status.get() {
             CoroutineStatus::Dead => return Err(LuaError::new("cannot resume dead coroutine")),
             CoroutineStatus::Running => {
@@ -228,14 +247,11 @@ impl LuaRuntime {
         // still needs its `status` updated so e.g. `coroutine.close(main)`
         // from within a nested coroutine reports "normal" rather than
         // leaving `main`'s status stuck at its initial `running`.
-        let parent = self
-            .coroutine_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| self.main_coroutine.clone());
+        let parent_thread = self.coroutine_stack.last().copied().unwrap_or(self.main_coroutine);
+        let parent = self.coroutine(parent_thread);
         parent.status.set(CoroutineStatus::Normal);
         co.status.set(CoroutineStatus::Running);
-        self.coroutine_stack.push(co.clone());
+        self.coroutine_stack.push(thread);
 
         // Swap in this coroutine's own frame stack (and outstanding
         // call_depth charge) for the duration of the resume - see the
@@ -355,10 +371,10 @@ impl LuaRuntime {
     /// real Lua error rather than the `(false, message)` pair `resume` uses.
     pub(super) fn call_coroutine_wrapper(
         &mut self,
-        co: Rc<LuaCoroutine>,
+        thread: ThreadRef,
         args: Vec<LuaValue>,
     ) -> LuaResult<Vec<LuaValue>> {
-        self.resume_coroutine(&co, args)
+        self.resume_coroutine(thread, args)
     }
 }
 

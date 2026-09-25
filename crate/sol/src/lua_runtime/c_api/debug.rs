@@ -18,11 +18,12 @@ pub unsafe extern "C-unwind" fn lua_getupvalue(
     let subject = state.value(function_index).cloned();
     let is_lua = matches!(subject, Some(LuaValue::Closure(_)));
     let value = match subject {
-        Some(LuaValue::Closure(closure)) => closure
-            .upvals
-            .borrow()
-            .get(index)
-            .map(|value| value.borrow().clone()),
+        Some(LuaValue::Closure(closure)) => {
+            let runtime = unsafe { state.runtime() };
+            runtime
+                .closure_upvalue_cell(closure, index)
+                .and_then(|cell| runtime.upvalue_get(cell).ok())
+        }
         Some(LuaValue::CFunction(function)) => {
             let canonical = {
                 let runtime = unsafe { state.runtime() };
@@ -75,10 +76,13 @@ pub unsafe extern "C-unwind" fn lua_setupvalue(
     };
     let name = match subject {
         LuaValue::Closure(closure) => {
-            let Some(cell) = closure.upvals.borrow().get(index).cloned() else {
+            let runtime = unsafe { state.runtime() };
+            let Some(cell) = runtime.closure_upvalue_cell(closure, index) else {
                 return ptr::null();
             };
-            *cell.borrow_mut() = value;
+            if let Err(error) = runtime.upvalue_set(cell, value) {
+                api_jump(state, error);
+            }
             c"_ENV".as_ptr()
         }
         LuaValue::CFunction(function) => {
@@ -127,12 +131,21 @@ pub unsafe extern "C" fn lua_upvalueid(
         return ptr::null_mut();
     };
     match state.value(function_index).cloned() {
-        Some(LuaValue::Closure(closure)) => closure
-            .upvals
-            .borrow()
-            .get(index)
-            .map(|cell| Rc::as_ptr(cell).cast::<c_void>().cast_mut())
-            .unwrap_or(ptr::null_mut()),
+        Some(LuaValue::Closure(closure)) => {
+            let runtime = unsafe { state.runtime() };
+            let exists = runtime
+                .closure_upvalues(closure)
+                .map(|upvalues| index < upvalues.len())
+                .unwrap_or(false);
+            if !exists {
+                return ptr::null_mut();
+            }
+            let mut identities = runtime.c_upvalue_identities.borrow_mut();
+            let identity = identities
+                .entry((closure.object_id(), index))
+                .or_insert_with(|| Box::new(0));
+            (&mut **identity as *mut u8).cast()
+        }
         Some(LuaValue::CFunction(function)) => {
             let exists = {
                 let runtime = unsafe { state.runtime() };
@@ -189,13 +202,11 @@ pub unsafe extern "C" fn lua_upvaluejoin(
     else {
         return;
     };
-    let Some(source) = second.upvals.borrow().get(second_index).cloned() else {
+    let runtime = unsafe { state.runtime() };
+    let Some(source) = runtime.closure_upvalue_cell(second, second_index) else {
         return;
     };
-    let mut destination = first.upvals.borrow_mut();
-    if first_index < destination.len() {
-        destination[first_index] = source;
-    }
+    let _ = runtime.closure_set_upvalue_cell(first, first_index, source);
 }
 
 #[no_mangle]
@@ -220,15 +231,19 @@ pub unsafe extern "C" fn lua_getstack(
             .filter(|frame| matches!(frame, Frame::Lua(_)))
             .nth(level as usize)
             .is_some()
-    } || state
-        .thread
-        .frames
-        .borrow()
-        .iter()
-        .rev()
-        .filter(|frame| matches!(frame, Frame::Lua(_)))
-        .nth(level as usize)
-        .is_some();
+    } || {
+        let thread = state.thread;
+        let runtime = unsafe { state.runtime() };
+        runtime
+            .coroutine(thread)
+            .frames
+            .borrow()
+            .iter()
+            .rev()
+            .filter(|frame| matches!(frame, Frame::Lua(_)))
+            .nth(level as usize)
+            .is_some()
+    };
     if !exists {
         return 0;
     }
@@ -252,12 +267,20 @@ pub unsafe extern "C-unwind" fn lua_getinfo(
     let options = unsafe { CStr::from_ptr(what) }.to_bytes();
     let descriptor = if options.first() == Some(&b'>') {
         match state.stack.pop() {
-            Some(LuaValue::Closure(closure)) => Some((
-                closure.proto.clone(),
-                -1,
-                closure.upvals.borrow().len(),
-                0usize,
-            )),
+            Some(LuaValue::Closure(closure)) => {
+                let runtime = unsafe { state.runtime() };
+                let proto_result = runtime.closure_prototype(closure);
+                let nups_result = runtime.closure_upvalues(closure).map(|upvalues| upvalues.len());
+                let proto = match proto_result {
+                    Ok(proto) => proto,
+                    Err(error) => api_jump(state, error),
+                };
+                let nups = match nups_result {
+                    Ok(nups) => nups,
+                    Err(error) => api_jump(state, error),
+                };
+                Some((proto, -1, nups, 0usize))
+            }
             Some(LuaValue::CFunction(_)) | Some(LuaValue::NativeFunction(_)) => None,
             _ => return 0,
         }
@@ -281,8 +304,10 @@ pub unsafe extern "C-unwind" fn lua_getinfo(
                 .nth(level)
         };
         active.or_else(|| {
-            state
-                .thread
+            let thread = state.thread;
+            let runtime = unsafe { state.runtime() };
+            runtime
+                .coroutine(thread)
                 .frames
                 .borrow()
                 .iter()

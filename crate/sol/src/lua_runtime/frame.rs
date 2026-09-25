@@ -132,7 +132,7 @@ pub(super) enum BinaryResolution {
 pub(super) struct LuaFrame {
     pub(super) header: FrameHeader,
     pub(super) proto: Rc<Proto>,
-    pub(super) upvals: Vec<RcRef<LuaValue>>,
+    pub(super) upvals: Vec<sol_core::ObjectId>,
     pub(super) globals: Globals,
     pub(super) regs: Vec<LuaValue>,
     pub(super) cells: Cells,
@@ -324,7 +324,7 @@ pub(super) enum StepResult {
     /// that instead, with no new native Rust call frame.
     PushClosure {
         proto: Rc<Proto>,
-        upvals: Vec<RcRef<LuaValue>>,
+        upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
         args: Vec<LuaValue>,
         /// See `LuaFrame::call_chain_hops`.
@@ -334,7 +334,7 @@ pub(super) enum StepResult {
     /// current frame without increasing semantic call depth.
     TailClosure {
         proto: Rc<Proto>,
-        upvals: Vec<RcRef<LuaValue>>,
+        upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
         args: Vec<LuaValue>,
         /// See `LuaFrame::call_chain_hops`.
