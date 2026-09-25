@@ -9,3 +9,4 @@ name = "sol_core"
 path = "src/lib.rs"
 
 [dependencies]
+indexmap = "2"

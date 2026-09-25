@@ -93,12 +93,24 @@ These checks run in `scripts/test.sh` with warnings denied.
 
 ## Remaining U2 migration
 
-U2 is complete only after production code uses canonical handles for dynamic
-libraries and metatables, closures and native callables, userdata, errors,
-coroutine frames, and the root `_ENV` table. The existing `Rc` trial-deletion
-collector and typed arena must then cease owning production-visible objects.
-The exit audit must demonstrate one identity and reachability domain under
-forced collection across mixed dynamic/typed calls.
+Userdata and installed native callables (`RegisteredNative`/`CFunction`) are
+already canonical in production — there is no other representation left for
+either. `package.loadlib`'s native-library handles (`c_api::NativeLibrary`)
+are raw `dlopen` pointers with no `LuaValue`/GC identity at all, never owned by
+either collector, so there is nothing to migrate there either; the checklist
+wording naming these as outstanding work was stale.
+
+U2 is complete only after production code uses canonical handles for tables
+(including metatables and the root `_ENV` table, which is just a table),
+closures, and coroutine frames, in that dependency order: closures capture
+`LuaValue`s that may be tables, and coroutine frames (`regs`/`upvals`/`cells`)
+hold both. `sol_core::TableObject::hash` moved from `HashMap` to an
+order-preserving `IndexMap` (matching `LuaTable::hash`'s existing rationale) as
+a prerequisite, since production tables cannot move onto it correctly
+otherwise. The existing `Rc` trial-deletion collector and typed arena must then
+cease owning production-visible objects. The exit audit must demonstrate one
+identity and reachability domain under forced collection across mixed
+dynamic/typed calls.
 
 The first production-facing semantic steps are now in place: the legacy
 bytecode runtime stores each global environment in a `LuaTable`, exposes `_G`,

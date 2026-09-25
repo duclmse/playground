@@ -946,6 +946,9 @@ dependencies = [
 [[package]]
 name = "sol-core"
 version = "0.1.0"
+dependencies = [
+ "indexmap",
+]
 
 [[package]]
 name = "sol-lsp"

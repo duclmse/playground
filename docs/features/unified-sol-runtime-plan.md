@@ -634,13 +634,35 @@ process, stdin, and stdout effects are independently gated, the native CLI opts
 into the declared `NATIVE_CLI` profile, and library embedding remains
 sandboxed by default.
 
+`sol_core::TableObject::hash` was a plain `HashMap<TableKey, Value>`; it is now
+an `IndexMap`, and `Heap::table_set` tombstones a `nil`-assigned key (inserts
+`Value::NIL` in place) instead of removing it. This mirrors
+`sol::lua_runtime::value::LuaTable::hash`'s own existing design (an `IndexMap`
+for the identical reason, already documented on that field) and is a
+prerequisite for migrating production tables onto `sol_core`'s table object at
+all: a plain `HashMap`'s insert-time reordering on key overwrite would silently
+strand or reorder entries out from under `pairs`/`next`-style traversal, and
+`sol-core` had no external dependencies before this, so it had never had reason
+to pull in `indexmap` for its own table object. Covered by a new regression
+test proving overwrite-in-place and tombstone-in-place ordering.
+
 U2 remains in progress because the production Lua interpreter and typed runtime
 still own objects in their existing `Rc` and arena collectors. The adapter is a
 migration seam, not a second production owner: imported canonical graphs are
-snapshots and must not be mutated concurrently with legacy graphs. Dynamic
-libraries, native callables, closures, userdata, coroutine frames, and the
-production global environment still need to move onto canonical handles before
-the exit gate can be claimed. See
+snapshots and must not be mutated concurrently with legacy graphs. Re-auditing
+the remaining categories directly against the current source (rather than
+trusting this document's earlier list) found two entries that don't actually
+describe outstanding object-migration work: `LuaValue::Userdata` is already
+`CanonicalUserdata`, a precisely-rooted `sol_core::ObjectId` handle with no
+other representation left to migrate, and "dynamic libraries" names
+`package.loadlib`'s raw `dlopen` handles (`c_api::NativeLibrary`), which carry
+no `LuaValue`/GC identity at all and were never owned by either collector. The
+genuinely remaining, dependency-ordered work is tables (including metatables;
+the production global environment is just a table and needs no separate step),
+then closures, then coroutine frames — each still `Rc`-owned
+(`lua_runtime::value::LuaTable`/`LuaClosure`, `lua_runtime::coroutine::LuaCoroutine`)
+and depending on the one before it, since closures capture table-holding values
+and frames hold both. See
 [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
 ### U3 — Unified bytecode, frames, and semantic call ABI — **completed 2026-09-16**

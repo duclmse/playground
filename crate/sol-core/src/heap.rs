@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use indexmap::IndexMap;
+
 use crate::{Capabilities, ObjectId, Value, ValueTag};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,7 +50,13 @@ pub enum TableKey {
 #[derive(Debug, Clone, Default)]
 pub struct TableObject {
     pub array: Vec<Value>,
-    pub hash: HashMap<TableKey, Value>,
+    /// Insertion-order-preserving, not a plain `HashMap`: assigning `nil` to
+    /// an existing key stores a tombstone (`table_set`) rather than removing
+    /// the entry, so a `HashMap`'s insert-time reordering on a later
+    /// overwrite can never strand or reorder still-live entries out from
+    /// under an in-progress `table_entries`/`next`-style traversal - see
+    /// `sol::lua_runtime::value::LuaTable::hash`'s identical rationale.
+    pub hash: IndexMap<TableKey, Value>,
     pub metatable: Option<ObjectId>,
     pub weak_keys: bool,
     pub weak_values: bool,
@@ -671,9 +679,11 @@ impl Heap {
                 object.array.resize(index + 1, Value::NIL);
             }
             object.array[index] = value;
-        } else if value.tag() == ValueTag::Nil {
-            object.hash.remove(hash_key.as_ref().unwrap());
         } else {
+            // Always `insert`, even for `nil` (a tombstone, not a removal):
+            // `IndexMap::remove`/`shift_remove` would either reorder or
+            // shift already-live entries, exactly what the ordering
+            // guarantee on `hash` above exists to prevent.
             object.hash.insert(hash_key.unwrap(), value);
         }
         object.version = object.version.wrapping_add(1);
@@ -1140,6 +1150,43 @@ mod tests {
             heap.table_get(table, Value::float(0.0)).unwrap(),
             Value::integer(7)
         );
+    }
+
+    #[test]
+    fn table_hash_part_preserves_insertion_order_across_overwrite_and_tombstone() {
+        // Regression test for `TableObject::hash` being an `IndexMap`, not a
+        // `HashMap`: overwriting an existing key must not move it, and
+        // clearing a key with `nil` (a tombstone, not a removal) must not
+        // reorder or drop the entries that come after it - exactly the
+        // corruption a plain `HashMap` risks on insert-time reordering,
+        // which would silently strand or duplicate entries for a caller
+        // walking `table_entries` (`lua_next`) while mutating.
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        let key_a = heap.alloc_string("a");
+        let key_b = heap.alloc_string("b");
+        let key_c = heap.alloc_string("c");
+        heap.table_set(table, Value::object(key_a), Value::integer(1))
+            .unwrap();
+        heap.table_set(table, Value::object(key_b), Value::integer(2))
+            .unwrap();
+        heap.table_set(table, Value::object(key_c), Value::integer(3))
+            .unwrap();
+
+        // Overwriting an existing key keeps its original position.
+        heap.table_set(table, Value::object(key_b), Value::integer(20))
+            .unwrap();
+        // Clearing a key with `nil` tombstones it in place instead of
+        // shifting later entries into its slot.
+        heap.table_set(table, Value::object(key_a), Value::NIL)
+            .unwrap();
+
+        let entries = heap.table_entries(table).unwrap();
+        let values: Vec<i64> = entries
+            .into_iter()
+            .map(|(_, value)| value.as_integer().unwrap())
+            .collect();
+        assert_eq!(values, vec![20, 3]);
     }
 
     #[test]
