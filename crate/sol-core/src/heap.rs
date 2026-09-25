@@ -956,16 +956,37 @@ impl Heap {
     }
 
     fn mark_ephemerons(&self, marked: &mut HashSet<ObjectId>, queue: &mut VecDeque<ObjectId>) {
+        // Which objects are weak-key (non-weak-value) tables is a structural
+        // property of the heap that doesn't change during collection, so
+        // it's computed once here, over *all* live objects. The previous
+        // version instead re-derived "which of the currently marked ids are
+        // ephemeron tables" by re-collecting and rescanning the *entire*
+        // `marked` set on every fixed-point round - most of which is never a
+        // table at all - so each round's cost grew with the (monotonically
+        // growing) total marked-object count rather than with the number of
+        // ephemeron tables, making the whole loop quadratic in marked-object
+        // count whenever more than one round was needed to converge (e.g. a
+        // chain of ephemeron tables whose values key into each other). Each
+        // round below instead only walks this fixed, typically-much-smaller
+        // candidate list and skips any not yet marked.
+        let ephemeron_tables: Vec<ObjectId> = self
+            .live_ids()
+            .filter(|id| {
+                matches!(
+                    self.object(*id),
+                    Ok(HeapObject::Table(table)) if table.weak_keys && !table.weak_values
+                )
+            })
+            .collect();
         loop {
             let before = marked.len();
-            let tables: Vec<ObjectId> = marked.iter().copied().collect();
-            for id in tables {
+            for &id in &ephemeron_tables {
+                if !marked.contains(&id) {
+                    continue;
+                }
                 let Ok(HeapObject::Table(table)) = self.object(id) else {
                     continue;
                 };
-                if !table.weak_keys || table.weak_values {
-                    continue;
-                }
                 for (key, value) in &table.hash {
                     if key_is_live(key, marked) {
                         mark_value(*value, self, marked, queue);
@@ -1199,6 +1220,44 @@ mod tests {
             HeapError::StaleHandle(key)
         );
         heap.remove_root(table_root);
+    }
+
+    #[test]
+    fn a_chain_of_ephemeron_tables_reaches_a_fixed_point_across_multiple_rounds() {
+        // Regression test for `mark_ephemerons`'s fixed-point loop: `table_b`
+        // is only reachable as a *value* inside `table_a`'s single entry, so
+        // it isn't marked until the loop's first round processes `table_a` -
+        // it must still be recognized (on the loop's second round) as an
+        // ephemeron table in its own right and have its own entry scanned,
+        // not just be marked and left unscanned. This distinguishes "an
+        // object became marked" from "an object became marked *and* is
+        // itself an ephemeron table whose own entries still need a round to
+        // be examined" - the case the quadratic-rescan fix above must still
+        // get right despite computing its candidate table list once, up
+        // front, rather than re-deriving it from `marked` every round.
+        let mut heap = Heap::default();
+        let table_a = heap.alloc_table();
+        heap.set_table_weak_mode(table_a, true, false).unwrap();
+        let root_a = heap.add_root(Value::object(table_a));
+        let key_a = heap.alloc_table();
+        let root_key_a = heap.add_root(Value::object(key_a));
+        let table_b = heap.alloc_table();
+        heap.set_table_weak_mode(table_b, true, false).unwrap();
+        heap.table_set(table_a, Value::object(key_a), Value::object(table_b))
+            .unwrap();
+        let key_b = heap.alloc_table();
+        let root_key_b = heap.add_root(Value::object(key_b));
+        let value_b = heap.alloc_table();
+        heap.table_set(table_b, Value::object(key_b), Value::object(value_b))
+            .unwrap();
+
+        heap.collect_major();
+        assert!(heap.contains(table_b));
+        assert!(heap.contains(value_b));
+
+        heap.remove_root(root_a);
+        heap.remove_root(root_key_a);
+        heap.remove_root(root_key_b);
     }
 
     #[test]

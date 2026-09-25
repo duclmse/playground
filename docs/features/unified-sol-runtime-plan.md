@@ -618,6 +618,16 @@ the unified executable frame ABI. Canonical native callables carry portable
 provider/function registry IDs and traced captures, never raw host pointers;
 heap-issued provider namespaces prevent collisions across adapters.
 
+`Heap::mark_ephemerons`'s fixed-point loop previously re-derived its per-round
+candidate table list by filtering the entire (monotonically growing) marked-object
+set every round, making convergence quadratic in marked-object count whenever a
+chain of ephemeron tables needed more than one round. It now computes the
+(structurally static, heap-size-bounded) list of weak-key tables once via
+`live_ids()` and only re-checks mark status against that fixed list each round,
+preserving identical marking semantics at a lower asymptotic cost. Covered by a
+new multi-round ephemeron-chain regression test alongside the existing
+single-hop one.
+
 The production Lua runtime now uses `sol_core::Capabilities` directly instead
 of maintaining a second coarse `os`/`io` authority type. Clock, environment,
 process, stdin, and stdout effects are independently gated, the native CLI opts
