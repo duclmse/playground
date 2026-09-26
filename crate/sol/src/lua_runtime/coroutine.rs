@@ -67,12 +67,15 @@ pub(super) struct HookState {
 /// identically on `wasm32`, which has no fiber/thread-suspension primitive -
 /// see Phase 5 in `docs/features/lua-superset-plan.md`.
 ///
-/// Known, deliberate limitations: coroutines are not tracked by
-/// `collect_cycles` (see `track_table`/`track_closure`) - a reference cycle
-/// routed through a coroutine (e.g. a table holding a coroutine whose
-/// function upvalue-captures that same table) leaks, the same conservative
-/// class of gap as any other untracked type. Threads also can't yet be used
-/// as table keys.
+/// GC: a coroutine's own frames are rooted by `gc.rs`'s `frame_roots` only
+/// *conditionally* once it isn't on the active resume chain (see
+/// `canonical::CoroutineRegistry`'s doc comment and
+/// docs/features/table-closure-coroutine-cutover.md §11) - so a reference
+/// cycle routed through a coroutine (e.g. a table holding a coroutine whose
+/// function upvalue-captures that same table) is correctly collected once
+/// nothing external reaches either side, rather than leaking forever.
+/// Remaining, deliberate limitation: threads can't yet be used as table
+/// keys.
 pub struct LuaCoroutine {
     pub(super) status: Cell<CoroutineStatus>,
     /// The callable to invoke on the very first `resume` - `Some` until
@@ -258,6 +261,21 @@ impl LuaRuntime {
         // `frames`/`depth_charged` field docs on `LuaCoroutine` for why this
         // is required for correctness, not just an optimization.
         let caller_frames = std::mem::replace(&mut self.frames, co.frames.take());
+        // `caller_frames` is only a plain Rust local for as long as this call
+        // is on the Rust stack - invisible to `gc.rs`'s `frame_roots` (it
+        // walks `self.frames`, which now holds `co`'s frames instead, and the
+        // `main_coroutine`/`coroutine_stack` loop finds nothing here either,
+        // since this coroutine's *real* content is what we just swapped out,
+        // not what's left behind in its registry entry). If the caller is
+        // itself a coroutine partway down a nested `resume` chain (A resumes
+        // B resumes C), this is the only place its live registers/cells are
+        // reachable at all for the duration of the nested resume - pin them
+        // for exactly that duration, the same way a reentrant finalizer call
+        // pins its own outer popped frame (see `pinned_roots`'s doc comment
+        // and docs/features/table-closure-coroutine-cutover.md §11).
+        let mut caller_pin = Vec::new();
+        self.push_frame_stack_roots(&caller_frames, &mut caller_pin);
+        self.pinned_roots.push(caller_pin);
         // `debug.sethook` is per-coroutine (`LuaCoroutine::hook`) - swap in
         // whichever hook `co` itself has installed for the duration of this
         // resume, same as `frames`, and restore the caller's own hook
@@ -340,6 +358,7 @@ impl LuaRuntime {
         };
 
         *co.frames.borrow_mut() = std::mem::replace(&mut self.frames, caller_frames);
+        self.pinned_roots.pop();
         self.active_hook = caller_hook;
         co.depth_charged.set(depth_charged);
 

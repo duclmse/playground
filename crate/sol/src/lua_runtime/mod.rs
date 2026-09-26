@@ -115,11 +115,13 @@ pub struct LuaRuntime {
     /// environment}` - `_ENV` there is just an ordinary captured upvalue
     /// slot), keyed by the closure's own canonical `ObjectId`. Populated by
     /// `Instr::NewClosure` at creation time, consulted whenever a
-    /// `LuaValue::Closure` is invoked. Same interim-fallback pattern as
-    /// `canonical::PrototypeRegistry`/`CoroutineRegistry`: every entry here
-    /// is treated as reachable while present, and a closure's entry is
-    /// removed only when its own canonical identity is (see
-    /// docs/features/table-closure-coroutine-cutover.md §8 step 4).
+    /// `LuaValue::Closure` is invoked. Same side-table pattern as
+    /// `canonical::PrototypeRegistry`: every entry here is treated as
+    /// reachable while present (unlike `CoroutineRegistry`, whose entries are
+    /// only *conditionally* rooted as of task #13 - see its own doc comment
+    /// and docs/features/table-closure-coroutine-cutover.md §11), and a
+    /// closure's entry is removed only when its own canonical identity is
+    /// (see docs/features/table-closure-coroutine-cutover.md §8 step 4).
     closure_globals: RefCell<HashMap<sol_core::ObjectId, Globals>>,
     /// The currently active chain of resumed coroutines, innermost last.
     /// Empty means the main chunk (not inside any coroutine) is running.

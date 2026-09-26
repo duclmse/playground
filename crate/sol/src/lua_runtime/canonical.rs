@@ -102,13 +102,17 @@ impl PrototypeRegistry {
 
 /// Owns each live `LuaCoroutine`'s executable state (registers, cells,
 /// hooks, `dead_error`; see `docs/features/table-closure-coroutine-cutover.md`
-/// §6), addressed by its canonical `ThreadObject`'s own `ObjectId` rather
-/// than by `Rc<LuaCoroutine>` refcounting. This is the interim-fallback
-/// registry: every entry here is treated as reachable while it is present
-/// (see §6 option 2 for the coroutine-cycle gap this does not close), and
-/// sweeping a `Thread` object whose id has no entry here is a no-op, not an
-/// error - the coroutine's canonical identity and its registry entry are
-/// removed together.
+/// §6/§11), addressed by its canonical `ThreadObject`'s own `ObjectId` rather
+/// than by `Rc<LuaCoroutine>` refcounting. A registered entry's `frames`/
+/// `body` count as GC roots only *conditionally*, once its own `ThreadObject`
+/// id is independently reachable (`gc.rs`'s `frame_roots` builds the
+/// `conditional_roots` map `sol_core::Heap::collect_major_with_conditional_roots`
+/// takes from this registry's `entries()`) - so a coroutine kept alive only
+/// by a reference cycle routed through its own frames is correctly
+/// collected, not kept alive forever (task #13; see §11). Sweeping a
+/// `Thread` object whose id has no entry here is a no-op, not an error - the
+/// coroutine's canonical identity and its registry entry are removed
+/// together.
 #[allow(dead_code)]
 #[derive(Default)]
 pub(super) struct CoroutineRegistry {
@@ -129,13 +133,13 @@ impl CoroutineRegistry {
         self.coroutines.remove(&thread.object_id())
     }
 
-    /// Every currently-registered coroutine, per this registry's own
-    /// interim-fallback contract (its struct doc comment): each is "treated
-    /// as reachable while it is present," so `gc.rs`'s `frame_roots` walks
-    /// this to root every one's `frames` unconditionally, not just whichever
-    /// coroutine is on the active resume chain right now.
-    pub(super) fn values(&self) -> impl Iterator<Item = &Rc<LuaCoroutine>> {
-        self.coroutines.values()
+    /// Every currently-registered coroutine, keyed by its own `ThreadObject`
+    /// id - `gc.rs`'s `frame_roots` uses this key to build the
+    /// `conditional_roots` map handed to
+    /// `sol_core::Heap::collect_major_with_conditional_roots` (see this
+    /// struct's own doc comment).
+    pub(super) fn entries(&self) -> impl Iterator<Item = (ObjectId, &Rc<LuaCoroutine>)> {
+        self.coroutines.iter().map(|(id, coroutine)| (*id, coroutine))
     }
 
     pub(super) fn is_empty(&self) -> bool {

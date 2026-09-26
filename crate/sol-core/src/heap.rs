@@ -883,11 +883,47 @@ impl Heap {
     }
 
     pub fn collect_major(&mut self) -> Collection {
-        self.collect(CollectionKind::Major, &[])
+        self.collect(CollectionKind::Major, &[], &HashMap::new())
     }
 
     pub fn collect_major_with_roots(&mut self, frame_roots: &[Value]) -> Collection {
-        self.collect(CollectionKind::Major, frame_roots)
+        self.collect(CollectionKind::Major, frame_roots, &HashMap::new())
+    }
+
+    /// Like [`collect_major_with_roots`](Self::collect_major_with_roots), but
+    /// `conditional_roots` supplies extra out-edges for `Thread` objects
+    /// specifically: whenever a `Thread` id in this map is (or becomes, via
+    /// the ordinary mark queue) reachable, every `Value` in its associated
+    /// list is marked too, exactly as if it were one of that `Thread`'s own
+    /// fields. This is a strict one-way dependency (a conditionally-rooted
+    /// value never makes the `Thread` itself more reachable), so unlike
+    /// [`mark_ephemerons`](Self::mark_ephemerons)'s genuine fixed point it
+    /// needs no separate round-trip loop: `drain_mark_queue` already visits
+    /// every marked id exactly once, so looking the id up in this map at
+    /// that single visit is sufficient, including for a `Thread` id that only
+    /// becomes reachable *because* an ephemeron round or another
+    /// conditionally-rooted `Thread` pulled it in - all three mechanisms
+    /// share the same `queue`/`marked` pair, so whichever one first marks an
+    /// id is followed, on that same id's single queue visit, by any edges
+    /// this map has for it. A `Thread` id absent from this map (not a
+    /// registered coroutine, or a coroutine already covered by an
+    /// unconditional root elsewhere) contributes nothing extra.
+    ///
+    /// This is `sol_core`'s half of closing the coroutine-frame-rooting gap
+    /// documented in
+    /// `docs/features/table-closure-coroutine-cutover.md` §6/§11: a
+    /// coroutine kept alive only by a reference cycle routed through its own
+    /// suspended frames is correctly *not* rooted by this map alone (nothing
+    /// external ever marks its `Thread` id to begin with), while one
+    /// reachable from any ordinary root (ephemeron-qualified or not) has its
+    /// frame contents rooted too, matching the liveness a directly-embedded
+    /// `HeapObject` field would get for free.
+    pub fn collect_major_with_conditional_roots(
+        &mut self,
+        frame_roots: &[Value],
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) -> Collection {
+        self.collect(CollectionKind::Major, frame_roots, conditional_roots)
     }
 
     /// The initial U2 collector shares the precise full tracing algorithm for
@@ -895,7 +931,7 @@ impl Heap {
     /// already maintained, allowing a later performance-only change to limit
     /// minor tracing without changing object semantics.
     pub fn collect_minor(&mut self) -> Collection {
-        self.collect(CollectionKind::Minor, &[])
+        self.collect(CollectionKind::Minor, &[], &HashMap::new())
     }
 
     /// Approximates the currently live, heap-managed byte footprint (for
@@ -1069,7 +1105,12 @@ impl Heap {
         }
     }
 
-    fn collect(&mut self, kind: CollectionKind, frame_roots: &[Value]) -> Collection {
+    fn collect(
+        &mut self,
+        kind: CollectionKind,
+        frame_roots: &[Value],
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) -> Collection {
         let mut marked = HashSet::new();
         let mut queue = VecDeque::new();
         let roots: Vec<Value> = self.roots.values().copied().collect();
@@ -1079,8 +1120,8 @@ impl Heap {
         for root in frame_roots {
             mark_value(*root, self, &mut marked, &mut queue);
         }
-        self.drain_mark_queue(&mut marked, &mut queue);
-        self.mark_ephemerons(&mut marked, &mut queue);
+        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots);
+        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots);
 
         let mut result = Collection {
             kind,
@@ -1104,8 +1145,8 @@ impl Heap {
             result.finalizers.push(id);
             mark_id(id, self, &mut marked, &mut queue);
         }
-        self.drain_mark_queue(&mut marked, &mut queue);
-        self.mark_ephemerons(&mut marked, &mut queue);
+        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots);
+        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots);
         self.sweep_weak_tables(&marked);
 
         for index in 0..self.slots.len() {
@@ -1141,7 +1182,12 @@ impl Heap {
         })
     }
 
-    fn drain_mark_queue(&self, marked: &mut HashSet<ObjectId>, queue: &mut VecDeque<ObjectId>) {
+    fn drain_mark_queue(
+        &self,
+        marked: &mut HashSet<ObjectId>,
+        queue: &mut VecDeque<ObjectId>,
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) {
         while let Some(id) = queue.pop_front() {
             let Ok(entry) = self.entry(id) else {
                 continue;
@@ -1181,6 +1227,11 @@ impl Heap {
                     for value in thread.stack.iter().chain(&thread.yielded) {
                         mark_value(*value, self, marked, queue);
                     }
+                    if let Some(extra) = conditional_roots.get(&id) {
+                        for value in extra {
+                            mark_value(*value, self, marked, queue);
+                        }
+                    }
                 }
                 HeapObject::Userdata(userdata) => {
                     if let Some(metatable) = userdata.metatable {
@@ -1200,7 +1251,12 @@ impl Heap {
         }
     }
 
-    fn mark_ephemerons(&self, marked: &mut HashSet<ObjectId>, queue: &mut VecDeque<ObjectId>) {
+    fn mark_ephemerons(
+        &self,
+        marked: &mut HashSet<ObjectId>,
+        queue: &mut VecDeque<ObjectId>,
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) {
         // Which objects are weak-key (non-weak-value) tables is a structural
         // property of the heap that doesn't change during collection, so
         // it's computed once here, over *all* live objects. The previous
@@ -1242,7 +1298,7 @@ impl Heap {
                     mark_value(*value, self, marked, queue);
                 }
             }
-            self.drain_mark_queue(marked, queue);
+            self.drain_mark_queue(marked, queue, conditional_roots);
             if marked.len() == before {
                 break;
             }
@@ -1750,6 +1806,108 @@ mod tests {
 
         heap.remove_root(root);
         assert_eq!(heap.collect_major().reclaimed, 2);
+    }
+
+    #[test]
+    fn conditional_thread_roots_only_apply_once_the_thread_is_independently_reachable() {
+        let mut heap = Heap::default();
+        let thread = heap.alloc_thread(vec![]);
+        let extra = heap.alloc_table();
+        let mut conditional_roots = HashMap::new();
+        conditional_roots.insert(thread, vec![Value::object(extra)]);
+
+        // Nothing roots `thread` itself: `extra` must not be kept alive just
+        // because it's in the conditional-roots map.
+        let collection = heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(!heap.contains(thread));
+        assert!(!heap.contains(extra));
+        assert_eq!(collection.reclaimed, 2);
+
+        // Re-allocate and this time root the thread directly (e.g. a local
+        // variable holding this coroutine): its conditional edge must now
+        // fire and keep `extra` alive too.
+        let thread = heap.alloc_thread(vec![]);
+        let extra = heap.alloc_table();
+        let mut conditional_roots = HashMap::new();
+        conditional_roots.insert(thread, vec![Value::object(extra)]);
+        let root = heap.add_root(Value::object(thread));
+
+        heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(heap.contains(thread));
+        assert!(heap.contains(extra));
+
+        heap.remove_root(root);
+        assert_eq!(heap.collect_major().reclaimed, 2);
+    }
+
+    #[test]
+    fn a_cycle_of_conditionally_rooted_threads_collects_together_when_unreachable() {
+        let mut heap = Heap::default();
+        let thread_a = heap.alloc_thread(vec![]);
+        let thread_b = heap.alloc_thread(vec![]);
+        let mut conditional_roots = HashMap::new();
+        // Each thread's "frame contents" reference the other, mirroring two
+        // suspended coroutines whose only remaining live locals point back
+        // at each other - the exact self-cycle-through-a-coroutine leak this
+        // mechanism exists to close (see
+        // docs/features/table-closure-coroutine-cutover.md §6/§11).
+        conditional_roots.insert(thread_a, vec![Value::object(thread_b)]);
+        conditional_roots.insert(thread_b, vec![Value::object(thread_a)]);
+
+        let collection = heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(!heap.contains(thread_a));
+        assert!(!heap.contains(thread_b));
+        assert_eq!(collection.reclaimed, 2);
+
+        // Same cycle, but this time thread_a is also independently
+        // reachable (e.g. a surviving Lua local still holds it): both must
+        // now survive, since thread_b is reachable transitively through
+        // thread_a's conditional edge.
+        let thread_a = heap.alloc_thread(vec![]);
+        let thread_b = heap.alloc_thread(vec![]);
+        let mut conditional_roots = HashMap::new();
+        conditional_roots.insert(thread_a, vec![Value::object(thread_b)]);
+        conditional_roots.insert(thread_b, vec![Value::object(thread_a)]);
+        let root = heap.add_root(Value::object(thread_a));
+
+        heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(heap.contains(thread_a));
+        assert!(heap.contains(thread_b));
+
+        heap.remove_root(root);
+        assert_eq!(heap.collect_major().reclaimed, 2);
+    }
+
+    #[test]
+    fn conditional_thread_roots_and_ephemeron_marking_interact_correctly() {
+        // A Thread reachable only via an ephemeron table's *value* (so it
+        // only becomes marked partway through `mark_ephemerons`'s fixed
+        // point, not in the initial `drain_mark_queue` pass) must still have
+        // its own conditional roots applied - proving the two mechanisms,
+        // sharing one `queue`/`marked` pair, compose without a dedicated
+        // extra round-trip.
+        let mut heap = Heap::default();
+        let ephemeron = heap.alloc_table();
+        heap.set_table_weak_mode(ephemeron, true, false).unwrap();
+        let ephemeron_root = heap.add_root(Value::object(ephemeron));
+        let key = heap.alloc_table();
+        let key_root = heap.add_root(Value::object(key));
+        let thread = heap.alloc_thread(vec![]);
+        heap.table_set(ephemeron, Value::object(key), Value::object(thread))
+            .unwrap();
+        let extra = heap.alloc_table();
+        let mut conditional_roots = HashMap::new();
+        conditional_roots.insert(thread, vec![Value::object(extra)]);
+
+        heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(heap.contains(thread));
+        assert!(heap.contains(extra));
+
+        heap.remove_root(key_root);
+        heap.collect_major_with_conditional_roots(&[], &conditional_roots);
+        assert!(!heap.contains(thread));
+        assert!(!heap.contains(extra));
+        heap.remove_root(ephemeron_root);
     }
 
     #[test]

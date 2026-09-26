@@ -13,24 +13,24 @@
 //! live `TableRef`/`ClosureRef`/`ThreadRef` in an unrooted Rust local across
 //! its own charge/collection point - none needed to move.
 //!
-//! `frame_roots` below walks every currently-registered coroutine's own
-//! `frames` (task #12's empirical stress testing found this had never
-//! actually been wired up: `canonical::CoroutineRegistry`'s doc comment
-//! already claimed "every entry is an unconditional root while present" per
-//! docs/features/table-closure-coroutine-cutover.md §6 option 2, but
-//! `frame_roots` previously only walked the active resume chain
-//! (`main_coroutine`/`coroutine_stack`), so a coroutine merely suspended
-//! between resumes - not currently part of that chain - had its own body
-//! closure and locals genuinely swept under `gc_stress`). That is now fixed.
-//!
-//! Known gap, still deferred to task #13 ("sol-core: conditional/deferred-root
-//! GC hook for coroutine frames"): rooting every registered coroutine
-//! unconditionally means a coroutine kept "alive" only by a reference cycle
-//! routed through its own frames never becomes collectible either - the
-//! cycle-through-a-coroutine leak §6 explicitly accepts as this interim
-//! fallback's known cost until the conditional/deferred-root hook exists.
+//! `frame_roots` below roots every currently-registered coroutine's own
+//! `frames`/`body`, but (task #13; see
+//! docs/features/table-closure-coroutine-cutover.md §11) only the active
+//! resume chain (`main_coroutine`/`coroutine_stack`) does so
+//! unconditionally - every other registered coroutine is fed to
+//! `sol_core::Heap::collect_major_with_conditional_roots` as a *conditional*
+//! root, keyed by its own `ThreadObject` id, so its frame contents only
+//! count once that id is independently reachable (task #12's empirical
+//! stress testing had found the unconditional-only version of this walk
+//! necessary first, before #13's conditional hook existed to do better; see
+//! §10 for that interim state). This closes the last gap §6 named: a
+//! coroutine kept "alive" only by a reference cycle routed through its own
+//! frames is no longer rooted forever - it collects correctly once nothing
+//! external points at it.
 
-use sol_core::Value;
+use std::collections::HashMap;
+
+use sol_core::{ObjectId, Value};
 
 use super::frame::*;
 use super::*;
@@ -143,7 +143,7 @@ impl LuaRuntime {
     /// comment for why a collection triggered from inside `dispatch_step`
     /// needs this.
     fn collect_garbage_with(&mut self, active_frame: Option<&LuaFrame>) {
-        let roots = self.frame_roots(active_frame);
+        let (roots, conditional_roots) = self.frame_roots(active_frame);
         // `live_bytes` covers the *whole* heap (globals, metatables, interned
         // strings, the registry, ...), not just what `charge_allocation` ever
         // charged against `allocation_budget` - resetting `allocation_remaining`
@@ -159,7 +159,7 @@ impl LuaRuntime {
         let collection = self
             .canonical_heap
             .borrow_mut()
-            .collect_major_with_roots(&roots);
+            .collect_major_with_conditional_roots(&roots, &conditional_roots);
         let live_after = self.canonical_heap.borrow().live_bytes();
         let reclaimed_bytes = live_before.saturating_sub(live_after);
         self.allocation_remaining = self
@@ -202,12 +202,20 @@ impl LuaRuntime {
 
     /// Every `Value` reachable only through a `LuaRuntime`/`LuaFrame` Rust
     /// field rather than already-heap-linked storage - the `frame_roots`
-    /// argument `collect_major_with_roots` needs per
-    /// docs/features/table-closure-coroutine-cutover.md §3. Anything
+    /// argument `collect_major_with_conditional_roots` needs per
+    /// docs/features/table-closure-coroutine-cutover.md §3/§11. Anything
     /// reachable *from* one of these (e.g. `string`/`math`/`table` hanging
     /// off the globals table) needs no separate entry: the collector traces
-    /// outward from every root it's given.
-    fn frame_roots(&self, active_frame: Option<&LuaFrame>) -> Vec<Value> {
+    /// outward from every root it's given. The second element is the
+    /// `conditional_roots` map: every registered coroutine NOT on the active
+    /// resume chain has its frame contents listed there instead, keyed by
+    /// its own `ThreadObject` id, so they only count once that id is
+    /// independently reachable (see this function's coroutine-registry loop
+    /// below and §11).
+    fn frame_roots(
+        &self,
+        active_frame: Option<&LuaFrame>,
+    ) -> (Vec<Value>, HashMap<ObjectId, Vec<Value>>) {
         let mut roots = Vec::new();
         roots.push(self.encode_value(&self.globals.as_value()).unwrap_or(Value::NIL));
         // `require`/`package.searchpath` close over these two directly
@@ -235,21 +243,50 @@ impl LuaRuntime {
             self.encode_value(&self.default_output.borrow())
                 .unwrap_or(Value::NIL),
         );
-        // Every currently-registered coroutine, not just whichever is on the
-        // active resume chain - `CoroutineRegistry`'s own interim-fallback
-        // contract (docs/features/table-closure-coroutine-cutover.md §6
-        // option 2) is "every entry is an unconditional root while present,"
-        // which requires walking the whole registry: a coroutine merely
-        // suspended (not currently being resumed) still has its own
-        // `frames` - and whatever closure/table values they hold - reachable
-        // only through this side table, not through anything
-        // `sol_core::Heap` itself traces. A coroutine currently being
-        // resumed has its `frames` swapped out into `self.frames` for the
-        // duration (see `resume_coroutine`), so walking both here never
-        // double-roots or misses it. This still doesn't close the
-        // cycle-through-a-coroutine leak §6 accepts as this fallback's known
-        // cost (deferred to task #13's conditional/deferred-root hook).
-        for coroutine in self.coroutine_registry.borrow().values() {
+        // The genuinely-live nested-resume chain: `main_coroutine` plus every
+        // coroutine currently suspended mid-`resume` waiting on a nested
+        // `resume` further down `coroutine_stack`. These are real,
+        // unconditional GC roots regardless of what points at them in Lua -
+        // a coroutine actively on this chain is live by definition, the same
+        // way a normal call stack's frames are (not in scope for task #13 to
+        // change; see docs/features/table-closure-coroutine-cutover.md §11).
+        // A coroutine currently being resumed has its `frames` swapped out
+        // into `self.frames` for the duration (see `resume_coroutine`), so
+        // walking both `self.frames` below and this loop never double-roots
+        // or misses it. An *intermediate* coroutine on this chain (suspended
+        // mid-`resume` waiting on a nested `resume` further down) has its own
+        // real frame contents sitting in `resume_coroutine`'s own
+        // `caller_frames` Rust local instead - invisible to both `frames`
+        // here and to `self.frames` - so `resume_coroutine` pins them onto
+        // `pinned_roots` for the nested call's duration (see its own comment
+        // and §11); this loop only needs to cover `main_coroutine` and
+        // whichever coroutine is currently innermost (already `self.frames`).
+        for &thread in std::iter::once(&self.main_coroutine).chain(&self.coroutine_stack) {
+            let coroutine = self.coroutine(thread);
+            if let Some(body) = coroutine.body.borrow().as_ref() {
+                roots.push(self.encode_value(body).unwrap_or(Value::NIL));
+            }
+            self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut roots);
+        }
+        // Every OTHER registered coroutine - merely created or suspended
+        // between resumes, not on the active chain above - only counts as a
+        // root *conditionally*, once its own `ThreadObject` id is
+        // independently reachable (task #13; see §11). A coroutine reachable
+        // only via a Lua local holding its `LuaValue::Thread` is already
+        // covered by the ordinary root-tracing below (`push_lua_frame_roots`
+        // walks live registers), which marks its `ThreadObject` id and so
+        // correctly unlocks this entry; a coroutine kept "alive" only by a
+        // reference cycle routed through its own frames is correctly never
+        // marked, and so correctly collected instead of leaking forever.
+        let mut conditional_roots = HashMap::new();
+        let active_chain: std::collections::HashSet<ThreadRef> = std::iter::once(self.main_coroutine)
+            .chain(self.coroutine_stack.iter().copied())
+            .collect();
+        for (id, coroutine) in self.coroutine_registry.borrow().entries() {
+            if active_chain.contains(&ThreadRef::new(id)) {
+                continue;
+            }
+            let mut extra = Vec::new();
             // Before its very first `resume`, a coroutine's body closure sits
             // only in this `RefCell`, not yet part of `frames` (see
             // `resume_coroutine`'s doc comment on why `body` is `.take()`n
@@ -257,9 +294,10 @@ impl LuaRuntime {
             // between `coroutine.create` and the first `resume` that would
             // have called it.
             if let Some(body) = coroutine.body.borrow().as_ref() {
-                roots.push(self.encode_value(body).unwrap_or(Value::NIL));
+                extra.push(self.encode_value(body).unwrap_or(Value::NIL));
             }
-            self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut roots);
+            self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut extra);
+            conditional_roots.insert(id, extra);
         }
         self.push_frame_stack_roots(&self.frames, &mut roots);
         // The frame `dispatch_step` popped off `self.frames` for the
@@ -273,10 +311,10 @@ impl LuaRuntime {
         for segment in &self.pinned_roots {
             roots.extend(segment.iter().copied());
         }
-        roots
+        (roots, conditional_roots)
     }
 
-    fn push_frame_stack_roots(&self, frames: &[Frame], roots: &mut Vec<Value>) {
+    pub(super) fn push_frame_stack_roots(&self, frames: &[Frame], roots: &mut Vec<Value>) {
         for frame in frames {
             match frame {
                 Frame::Lua(lua_frame) => self.push_lua_frame_roots(lua_frame, roots),

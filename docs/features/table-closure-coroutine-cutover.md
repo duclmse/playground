@@ -310,14 +310,16 @@ Two ways forward, in order of preference:
    new representation, and can be shipped as a scoped, called-out gap rather
    than blocking the rest of the cutover on it.
 
-**Decided: (2), the interim fallback**, so table/closure migration isn't
-blocked on a new tracing-collector feature. `canonical.rs`'s `CoroutineRegistry`
-already implements this: every entry it holds is fed back as an unconditional
-root on each collection while present, and its doc comment states the gap this
-leaves open. Closing that gap via (1) — a conditional/deferred-root `sol-core`
-hook mirroring `mark_ephemerons`'s fixed-point approach — is filed as its own
-follow-up design task, scoped and tested independently of the rest of this
-cutover, not a blocker for task #11's flip.
+**Decided (task #11/#12): (2), the interim fallback first**, so table/closure
+migration wasn't blocked on a new tracing-collector feature — landed and
+scoped as its own follow-up per the plan above.
+
+**Update (task #13): (1) is now implemented.** See §11 below for the
+`sol-core` API (`Heap::collect_major_with_conditional_roots`) and how
+`gc.rs`/`CoroutineRegistry` use it. The cycle-through-a-coroutine leak this
+section describes is closed: a coroutine's frames only count as roots once
+its own `ThreadObject` id is independently reachable, matching option (1)'s
+original design rather than option (2)'s permanent fallback.
 
 `LuaValue::Thread(ThreadRef)` addresses a lightweight `ThreadObject`; its
 `LuaCoroutine` (executable frames, hook, `dead_error`) is owned by the
@@ -325,9 +327,11 @@ cutover, not a blocker for task #11's flip.
 `ObjectId` (already unique and generation-checked, so no separate slot-index
 field on `ThreadObject` is needed) rather than by an `Rc` refcount. Sweeping a
 `Thread` object whose id has no live `CoroutineRegistry` entry removes nothing
-further; sweeping one whose entry is confirmed unreachable (once (1) exists —
-under (2), only once its owning `LuaRuntime` explicitly removes the entry)
-drops that entry's `frames`, `hook`, and `dead_error` state.
+further; §11's conditional rooting governs whether the *heap* keeps a
+registered coroutine's `Thread` object and frame contents alive at all -
+`CoroutineRegistry::remove` (unused as of task #13; the registry does not yet
+shrink on its own) is a separate, pre-existing concern this task does not
+change.
 
 ## 7. What gets deleted
 
@@ -608,3 +612,103 @@ collector is the only one left standing (the old `Rc`-refcounting trial
 deletion cycle collector was deleted from `gc.rs` as part of task #11's
 flip), and `CoroutineRegistry`'s side-table entries are Rust-owned data fed
 into that same tracing pass as roots, not a second collector.
+
+## 11. Conditional/deferred-root GC hook for coroutine frames (task #13)
+
+§6 named the gap and preferred option (1) over the interim fallback (2) that
+task #11/#12 shipped first. This section documents (1) as implemented.
+
+**The `sol-core` API.** A coroutine's frames are *not* a genuine cyclic
+fixed-point dependency the way ephemeron values are (a value's liveness
+computed from a key's liveness, both drawn from the same in-progress marked
+set) — they're a strict one-way edge: "if this `Thread` id is marked, also
+mark these extra values." `Heap::collect_major_with_conditional_roots(&mut
+self, frame_roots: &[Value], conditional_roots: &HashMap<ObjectId,
+Vec<Value>>) -> Collection` threads a `conditional_roots` map through
+`collect`/`drain_mark_queue`/`mark_ephemerons`; `drain_mark_queue`'s existing
+`HeapObject::Thread` arm, after marking `thread.stack`/`thread.yielded` as
+before, now also marks every value in `conditional_roots.get(&id)` when
+present. No separate round-trip loop is needed: the existing single
+BFS-with-dedup (`marked`/`queue`) already visits each `Thread` id exactly
+once, and that visit is where the extra edge gets applied — if the id is
+reached late (e.g. only via `mark_ephemerons`'s own fixed-point growth), its
+conditional roots still get applied on that same pass, because
+`mark_ephemerons` calls back into the same `drain_mark_queue`. This was
+proven, not just asserted, by a dedicated sol-core test
+(`conditional_thread_roots_and_ephemeron_marking_interact_correctly`)
+covering a `Thread` reachable only through an ephemeron table's value.
+`collect_major`/`collect_major_with_roots`/`collect_minor` pass an empty map,
+unchanged in behavior. Also covered:
+`conditional_thread_roots_only_apply_once_the_thread_is_independently_reachable`
+and `a_cycle_of_conditionally_rooted_threads_collects_together_when_unreachable`
+(two mutually-conditionally-rooted threads collect together when neither is
+externally reachable, and survive together once one is).
+
+**`gc.rs`'s usage.** `frame_roots` used to walk every `CoroutineRegistry`
+entry unconditionally (task #12's interim fallback). It now only does that
+for the genuinely-live nested-resume chain — `main_coroutine` plus
+`coroutine_stack`, via `LuaRuntime::coroutine` — pushed into the ordinary
+`roots: Vec<Value>` exactly as before. Every *other* registered coroutine
+(created or suspended between resumes, not on that chain) instead has its
+`body`/`frames` collected into a `conditional_roots: HashMap<ObjectId,
+Vec<Value>>` entry keyed by its own `ThreadObject` id, via
+`CoroutineRegistry::entries()`. `frame_roots` now returns `(Vec<Value>,
+HashMap<ObjectId, Vec<Value>>)`, and `collect_garbage_with` calls
+`collect_major_with_conditional_roots` with both. A coroutine reachable only
+through a live Lua local holding its `LuaValue::Thread` is already covered by
+ordinary root-tracing (`push_lua_frame_roots` walks live registers, which
+marks the `Thread` object's id via the normal BFS), so its conditional entry
+correctly activates; a coroutine kept "alive" only by a reference cycle
+routed through its own frames (nothing external points at it) is correctly
+never marked, and its entry's values are correctly never applied — this is
+exactly the leak §6 named as still open under the interim fallback.
+
+**Closing the leak.** `dynamic_lua_runtime_collects_a_coroutine_kept_alive_only_by_a_cycle_through_its_own_frames`
+(`lua55_dynamic_runtime_gc.rs`) creates a coroutine whose only reachability
+path back to itself is a suspended local (inside the coroutine's own yielded
+frame) holding a table with a `__gc` finalizer, itself upvalue-captured by
+the coroutine's own body closure — i.e. table → (via `__gc`'s registered
+finalizer bookkeeping) coroutine's frame → coroutine's body closure's
+upvalue → the same table, with nothing outside the coroutine pointing at any
+of it. Dropping the only outside reference to the coroutine's `Thread` value
+and forcing a collection now fires the finalizer, proving the table (and
+therefore the cycle, and therefore the coroutine's own frame contents) was
+actually reclaimed rather than kept alive forever; under task #12's
+unconditional-registry-walk fallback this same test hangs the finalizer
+forever (never called), which is exactly the regression this test is
+guarding against. The whole create/resume/drop sequence is wrapped in a
+helper function (`spawn`) rather than living directly in the top-level
+chunk: this VM's register file is conservatively rooted (an argument-staging
+temp register used to pass `co` to `coroutine.resume` is never cleared once
+the call returns), so a value ever touched by the *top-level* chunk's own
+frame stays an unconditional root for the rest of the script, since that
+frame is never popped. A helper function's frame is popped from
+`self.frames` entirely once it returns, taking any such leftover temp
+register with it, which is what actually lets this test exercise conditional
+coroutine rooting instead of an unrelated whole-frame conservatism.
+
+`dynamic_lua_runtime_gc_stress_mode_survives_many_coroutine_resume_yield_cycles`
+(task #12) continues to pass unmodified — that coroutine stays on the active
+chain for the duration of every resume, which is still walked
+unconditionally. A new nested-coroutine stress test,
+`dynamic_lua_runtime_gc_stress_mode_survives_a_coroutine_resuming_a_coroutine_resuming_a_coroutine`,
+exercises a genuinely deeper case (A resumes B resumes C) and surfaced a
+real, separate, pre-existing gap in `resume_coroutine`
+(`lua_runtime/coroutine.rs`): while a coroutine is being resumed, its caller's
+own frame stack is `mem::replace`d out of `self.frames` and held only in a
+plain Rust local (`caller_frames`) for the duration, so it needs no rooting
+help when the caller is `main` or a coroutine already covered elsewhere —
+but when the caller is itself an *intermediate* coroutine (B, between A and
+C), `caller_frames` holds its **only** live copy of B's registers/cells for
+as long as C is running: not `self.frames` (which is C's), not
+`main_coroutine`/`coroutine_stack`'s walk above (B's own `CoroutineRegistry`
+entry has had its frames `.take()`n empty for the same duration), and not
+`conditional_roots` either (B is excluded from that map, being on the active
+chain). Under task #12's fallback this same gap already existed but was
+never exercised (no existing test had a coroutine resume another coroutine
+from inside a resume). The fix: `resume_coroutine` now pins `caller_frames`'s
+roots onto `pinned_roots` for exactly the nested call's duration, the same
+mechanism already used to protect a popped frame around a reentrant
+finalizer call (this function's own module doc comment). With that fix, the
+nested-resume stress test passes under the same forced-collection stress as
+#12's single-level version.

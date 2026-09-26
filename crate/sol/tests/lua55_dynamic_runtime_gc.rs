@@ -405,6 +405,121 @@ fn dynamic_lua_runtime_gc_stress_mode_survives_many_coroutine_resume_yield_cycle
 }
 
 #[test]
+fn dynamic_lua_runtime_collects_a_coroutine_kept_alive_only_by_a_cycle_through_its_own_frames() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // task #13 (see docs/features/table-closure-coroutine-cutover.md §11):
+    // `t`'s only remaining path back to itself is a genuine reference cycle
+    // routed entirely through `co`'s own suspended frame - `t` (via its
+    // field `co`) points at the coroutine's `Thread` value, and the
+    // coroutine's own conditionally-rooted frame (once reachable) points
+    // back at its local `t`. Nothing outside the coroutine references any of
+    // it once `spawn` returns. Under task #12's unconditional-registry-walk
+    // fallback, every registered coroutine's frames were rooted regardless
+    // of reachability, so `t` (and this finalizer) would never have been
+    // collected at all - `calls` would stay 0 forever instead of reaching 1
+    // here.
+    //
+    // `co` is created, resumed, and dropped entirely inside `spawn`'s own
+    // frame (rather than the top-level chunk's) deliberately: this VM's
+    // register file is conservatively rooted (an argument-staging temp
+    // register used to pass `co` to `coroutine.resume` is never cleared
+    // after the call returns), so a value like `co` that's ever touched by
+    // the *top-level* chunk's own frame stays reachable for the rest of the
+    // script, since that frame is never popped. A helper function's frame,
+    // by contrast, is popped from `self.frames` entirely once it returns,
+    // taking any such leftover temp register with it - which is what lets
+    // this test actually exercise conditional coroutine rooting rather than
+    // an unrelated whole-frame conservatism.
+    let source = br#"
+        local calls = 0
+        local mt = { __gc = function(t) calls = calls + 1 end }
+        local function spawn()
+            local co
+            co = coroutine.create(function()
+                local t = setmetatable({}, mt)
+                t.co = co
+                coroutine.yield()
+            end)
+            coroutine.resume(co)
+        end
+        spawn()
+        collectgarbage()
+        return calls
+    "#;
+    let LuaValue::Integer(calls) = run_source(source).unwrap().value else {
+        panic!("expected an integer result");
+    };
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn dynamic_lua_runtime_gc_stress_mode_survives_a_coroutine_resuming_a_coroutine_resuming_a_coroutine() {
+    use sol::lua_runtime::{LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // Task #13's nested-chain counterpart to
+    // `dynamic_lua_runtime_gc_stress_mode_survives_many_coroutine_resume_yield_cycles`
+    // (task #12, single-level): `a` resumes `b` resumes `c`, three deep, with
+    // a collection forced on every allocation and every instruction
+    // throughout. While `c` is actually executing, `coroutine_stack` holds
+    // all three (`[a, b, c]`) and every level must stay rooted via that
+    // unconditional active-chain walk; between top-level resumes of `a`,
+    // `b`/`c` are off that chain entirely and rely on their `Thread` values
+    // still being reachable through `a`'s and `b`'s own locals - the ordinary
+    // root-tracing path that unlocks task #13's conditional frame roots.
+    let mut stress = LuaRuntime::with_budgets(1_000_000, 200_000, 1024 * 1024);
+    stress.set_gc_stress(true);
+    let result = stress
+        .run(&parse(
+            br#"
+            local c = coroutine.create(function()
+                local sum = 0
+                for i = 1, 50 do
+                    local tmp = { value = i }
+                    sum = sum + tmp.value
+                    coroutine.yield(sum)
+                end
+                return sum
+            end)
+            local b = coroutine.create(function()
+                local total = 0
+                for i = 1, 50 do
+                    local ok, value = coroutine.resume(c)
+                    if not ok then return false end
+                    total = value
+                    coroutine.yield(total)
+                end
+                return total
+            end)
+            local a = coroutine.create(function()
+                local total = 0
+                for i = 1, 50 do
+                    local ok, value = coroutine.resume(b)
+                    if not ok then return false end
+                    total = value
+                    coroutine.yield(total)
+                end
+                return total
+            end)
+            local last
+            for i = 1, 50 do
+                local ok, value = coroutine.resume(a)
+                if not ok then
+                    return false
+                end
+                last = value
+            end
+            return last
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(result, LuaValue::Integer(1275));
+}
+
+#[test]
 fn dynamic_lua_runtime_call_chain_resolves_in_order_with_no_metatable_cycle_hang() {
     use sol::lua_runtime::{run_source, LuaValue};
 
