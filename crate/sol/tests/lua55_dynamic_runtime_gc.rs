@@ -360,6 +360,51 @@ fn dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_c
 }
 
 #[test]
+fn dynamic_lua_runtime_gc_stress_mode_survives_many_coroutine_resume_yield_cycles() {
+    use sol::lua_runtime::{LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // The coroutine-stress leg of task #12's exit audit (see
+    // docs/features/table-closure-coroutine-cutover.md §10): every
+    // `resume`/`yield` runs its own dispatch loop with a collection forced at
+    // every allocation and every instruction, so the coroutine's own live
+    // locals (`sum`, reassigned every iteration; `tmp`, a fresh table
+    // declared every iteration) must survive being suspended mid-frame
+    // across 50 forced collections, and the still-running coroutine itself
+    // (reachable only via `coroutine_stack` while suspended, per
+    // `frame_roots`) must never be mistaken for garbage.
+    let mut stress = LuaRuntime::with_budgets(1_000_000, 100_000, 1024 * 1024);
+    stress.set_gc_stress(true);
+    let result = stress
+        .run(&parse(
+            br#"
+            local co = coroutine.create(function()
+                local sum = 0
+                for i = 1, 50 do
+                    local tmp = { value = i }
+                    sum = sum + tmp.value
+                    coroutine.yield(sum)
+                end
+                return sum
+            end)
+            local last
+            for i = 1, 50 do
+                local ok, value = coroutine.resume(co)
+                if not ok then
+                    return false
+                end
+                last = value
+            end
+            return last
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(result, LuaValue::Integer(1275));
+}
+
+#[test]
 fn dynamic_lua_runtime_call_chain_resolves_in_order_with_no_metatable_cycle_hang() {
     use sol::lua_runtime::{run_source, LuaValue};
 

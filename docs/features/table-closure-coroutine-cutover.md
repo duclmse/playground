@@ -384,7 +384,8 @@ constraint), unlike the string migration, which had no such constraint:
    safepoint (§3), delete `gc.rs`'s collector and the now-dead `Rc`/`RefCell`
    aliases, and run the U2 exit audit: identity, weak-reference, finalizer, and
    coroutine stress tests under forced collection across mixed dynamic/typed
-   calls, with no object owned by two independent collectors. *(Task #12.)*
+   calls, with no object owned by two independent collectors. *(Done — see
+   §10.)*
 
 ## 9. Implementation notes from the flip (task #11)
 
@@ -478,7 +479,11 @@ tests red rather than force them green or quietly skip them:
 - **Every registered coroutine is an unconditional GC root forever** (§6,
   decided as the interim fallback). A coroutine referenced only through a
   weak-value table never becomes collectible. Deferred to task #13's
-  conditional/deferred-root `sol-core` hook.
+  conditional/deferred-root `sol-core` hook. (Task #12 found that this
+  decision's implementation was itself incomplete — `frame_roots` only walked
+  the active resume chain, not the whole registry — and closed that gap; see
+  §10. The cycle-through-a-coroutine leak this bullet describes remains real
+  and is still task #13's to close.)
 
 Steps 1–3 should each land with their own focused regression coverage
 (mirroring how the string migration's `alloc_string_fresh` fix got a targeted
@@ -489,3 +494,117 @@ the crate doesn't compile and pass its existing tests. Step 4 itself has to
 land as one change that compiles and passes those same suites at the end,
 since Rust's enum definition can't be half-migrated across a commit boundary
 the way step-2's additive plumbing can.
+
+## 10. Implementation notes from safepoints + cleanup (task #12)
+
+Step 5 closed all seven tests §9 left deliberately red, closed one gap the
+safepoint audit only surfaced under empirical coroutine stress testing (not
+visible from static review of call sites alone), and fixed one unrelated
+register-allocation bug the audit's stress testing incidentally exposed.
+
+**Credit-back-on-reclaim.** `LuaRuntime::allocation_remaining` (`mod.rs`)
+previously only ever decreased — nothing restored bytes a collection actually
+reclaimed, which was §9's residual gap behind all seven red tests. The fix
+(`gc.rs`'s `collect_garbage_with`) snapshots `sol_core::Heap::live_bytes`
+immediately before and after each `collect_major_with_roots` pass and credits
+back exactly that *delta*, saturating at the original `allocation_budget`.
+An earlier, simpler design — reset `allocation_remaining` to an absolute
+`allocation_budget - live_bytes` — is wrong: `live_bytes` covers the whole
+heap (globals, metatables, interned strings, the registry, …), not just
+whatever `charge_allocation` ever charged against the budget, so an absolute
+reset against that fixed overhead would immediately exhaust any small
+test/embedding budget the first time it ran, regardless of what the
+collection actually reclaimed. Crediting back only the observed delta matches
+what the deleted `Rc`-based trial-deletion collector's own credit-back did:
+give back what was actually freed, not resynchronize against a metric
+nothing ever charged from in the first place. All seven previously-red tests
+(six in `lua55_dynamic_runtime_gc.rs`, one in `lua55_fuzz.rs`) now pass
+unmodified.
+
+**Safepoint-trigger audit.** Every `charge_allocation`/
+`stress_collect_if_enabled`/`.tick()` call site outside `gc.rs` (~20 sites
+across `coroutine.rs`, `dispatch.rs`, `natives_os_io.rs`, `natives_table.rs`,
+`natives_utf8.rs`, `natives_string.rs`, `table.rs`, `dispatch/bytecode.rs`)
+was checked against `frame_roots`'s walk for a live `TableRef`/`ClosureRef`/
+`ThreadRef` held only in an unrooted Rust local across its own charge/
+collection point. None needed restructuring: `tick`'s placement at the top of
+`dispatch_step`'s per-instruction loop is already a safepoint by this
+crate's own definition, and static review of the remaining sites found
+nothing unrooted. That static conclusion was correct but incomplete — it
+didn't cover a coroutine actually being driven through many resume/yield
+cycles under forced collection, which is what surfaced the real gap below.
+
+**Coroutine-frame rooting was never actually wired up to the whole registry.**
+Adding the coroutine-stress leg of the exit audit (a coroutine resumed and
+yielded in a loop with `gc_stress` forcing a collection on every allocation
+and every instruction) failed immediately with `"internal error: closure
+object missing"` — a coroutine's own body closure was being swept while the
+coroutine sat suspended between resumes. §6 decided (option 2, the interim
+fallback) that "every registered coroutine is an unconditional root while
+present," and `canonical::CoroutineRegistry`'s own doc comment already
+asserted this was implemented, but `gc.rs`'s `frame_roots` only ever walked
+`main_coroutine` plus `coroutine_stack` — the *active* resume chain — not the
+full registry. A coroutine merely suspended (not currently being resumed) had
+its own saved `LuaCoroutine::frames`, and, before its very first `resume`,
+its still-unconsumed `body` closure, reachable only through this Rust-side
+side table, invisible to anything `sol_core::Heap` itself traces. Fixed by
+adding `CoroutineRegistry::values()` and having `frame_roots` walk every
+currently-registered coroutine's `frames` and (if not yet consumed) `body`
+unconditionally, not just whichever one is on the active resume chain. A
+coroutine currently being resumed has its `frames` swapped out into
+`self.frames` for that duration (`resume_coroutine`), so walking both never
+double-roots or misses one. This closes the correctness gap; it does not
+close the cycle-through-a-coroutine leak §6 already named as this fallback's
+accepted cost, still deferred to task #13's conditional/deferred-root hook.
+
+**An unrelated register-leak/GC-rooting bug, found via the same stress
+testing.** `Stmt::Local`'s compiler (`compile_stmt.rs`) used to compile its
+initializer into one register and then allocate a *separate*, new register
+for the declared local itself, copying between them with `NewLocal` — the
+exact pattern `Stmt::MultiLocal`'s own code comment already documents as
+having been fixed for the multi-local case, but `Stmt::Local` itself was
+never updated to match. The initializer's original register was never freed
+or overwritten again, so it retained a stale duplicate reference for the rest
+of the enclosing scope — harmless while the local stays live, but a real
+rooting bug once the local is later reassigned or set to `nil`, since
+`frame_roots`'s full-register-array walk re-roots the orphaned duplicate
+indefinitely. Fixed by mirroring `MultiLocal`'s existing pattern: compile the
+initializer directly into what becomes the local's own register
+(`compile_into`), then emit a self-referential `NewLocal(dst, dst, name)` to
+freshen the slot's cell identity in place. This was not a coroutine-registry
+bug — the previously-red
+`dynamic_lua_runtime_weak_value_tables_do_not_retain_suspended_coroutines`
+test that motivated §9's coroutine-registry residual-gap bullet was actually
+failing because of this general register-leak, not because of any
+coroutine-specific rooting mechanism; see the correction on that bullet
+above.
+
+**Exit audit, pointing at existing coverage rather than duplicating it:**
+
+- **Identity** (a live value's contents survive forced collection unchanged):
+  `dynamic_lua_runtime_gc_stress_mode_never_collects_a_still_reachable_value`
+  (`lua55_dynamic_runtime_gc.rs`) — a value held in a live local survives 200
+  rounds of unrelated cyclic-garbage churn under `gc_stress`, with collection
+  forced on every allocation and every instruction.
+- **Weak references**: `dynamic_lua_runtime_weak_value_tables_drop_entries_once_unreachable`
+  and `dynamic_lua_runtime_weak_value_tables_do_not_retain_suspended_coroutines`
+  (`lua55_dynamic_runtime_gc.rs`), plus the `kv`/`v`-mode weak-table fixtures
+  in `tests/fixtures/lua55/garbage_collection.lua`.
+- **Finalizers**: `dynamic_lua_runtime_calls_gc_finalizers_for_collected_cycles`
+  and `dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_cycles`
+  (`lua55_dynamic_runtime_gc.rs`), plus the block-scope-exit `__gc` fixture in
+  `tests/fixtures/lua55/garbage_collection.lua`.
+- **Coroutine stress**: newly added
+  `dynamic_lua_runtime_gc_stress_mode_survives_many_coroutine_resume_yield_cycles`
+  (`lua55_dynamic_runtime_gc.rs`) — this pillar had no existing coverage
+  before task #12 (neither the coroutine fixtures nor `lua55_fuzz.rs` touch
+  `collectgarbage`/`gc_stress` at all), and is what surfaced the rooting gap
+  above. It resumes/yields a coroutine 50 times under `gc_stress`, with each
+  cycle reassigning a live local and allocating a fresh table, forcing a
+  collection on every allocation and every instruction throughout.
+
+No object is owned by two independent collectors: `sol_core::Heap`'s tracing
+collector is the only one left standing (the old `Rc`-refcounting trial
+deletion cycle collector was deleted from `gc.rs` as part of task #11's
+flip), and `CoroutineRegistry`'s side-table entries are Rust-owned data fed
+into that same tracing pass as roots, not a second collector.

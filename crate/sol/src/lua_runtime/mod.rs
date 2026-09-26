@@ -89,10 +89,10 @@ pub struct LuaRuntime {
     call_depth: usize,
     max_call_depth: usize,
     allocation_remaining: usize,
-    // Not read back yet: resetting `allocation_remaining` from this on each
-    // `collect_garbage()` pass is task #12's scope (moving GC triggering
-    // onto real safepoints), not this flip's.
-    #[allow(dead_code)]
+    /// The fixed cap `allocation_remaining` is reset toward after every
+    /// collection (`gc.rs`'s `collect_garbage_with`), crediting back
+    /// whatever `sol_core::Heap::live_bytes` no longer counts as retained -
+    /// see docs/features/table-closure-coroutine-cutover.md §10 (task #12).
     allocation_budget: usize,
     capabilities: Capabilities,
     module_sources: HashMap<Vec<u8>, Vec<u8>>,

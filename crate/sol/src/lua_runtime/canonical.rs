@@ -129,6 +129,15 @@ impl CoroutineRegistry {
         self.coroutines.remove(&thread.object_id())
     }
 
+    /// Every currently-registered coroutine, per this registry's own
+    /// interim-fallback contract (its struct doc comment): each is "treated
+    /// as reachable while it is present," so `gc.rs`'s `frame_roots` walks
+    /// this to root every one's `frames` unconditionally, not just whichever
+    /// coroutine is on the active resume chain right now.
+    pub(super) fn values(&self) -> impl Iterator<Item = &Rc<LuaCoroutine>> {
+        self.coroutines.values()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.coroutines.is_empty()
     }

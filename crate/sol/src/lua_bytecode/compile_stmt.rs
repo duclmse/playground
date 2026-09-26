@@ -126,10 +126,24 @@ impl Compiler {
                 line,
                 ..
             } => {
-                let value_reg = self.compile_expr(value)?;
-                let dst = self.stack.last_mut().unwrap().alloc_reg();
+                // Compile the initializer directly into what will become the
+                // local's own register (mirroring `Stmt::MultiLocal` below,
+                // which fixed the same issue: a separate `value_reg` +
+                // freshly-`alloc_reg`'d `dst` used to leave `value_reg`
+                // permanently allocated and holding a stale, uncleared
+                // duplicate of the initializer's value for the rest of the
+                // enclosing scope - harmless for a still-live local, but a
+                // real leak/GC-rooting bug for one later reassigned, since
+                // nothing ever clears that orphaned register again).
+                // `NewLocal(dst, dst, name)` then "freshens" the slot's cell
+                // identity in place - safe because `reg_set_fresh` reads a
+                // register's current value before replacing its cell, so a
+                // self-referential `dst == src` is an ordinary in-place
+                // update.
+                let dst = self.stack[level].next_reg;
+                self.compile_into(value, dst)?;
                 let name_const = self.stack[level].push_name_const(name);
-                self.stack[level].emit(Instr::NewLocal(dst, value_reg, name_const), *line);
+                self.stack[level].emit(Instr::NewLocal(dst, dst, name_const), *line);
                 self.stack
                     .last_mut()
                     .unwrap()

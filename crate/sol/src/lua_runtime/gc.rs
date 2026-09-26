@@ -4,19 +4,31 @@
 //! `finish_finalizer`) - see
 //! docs/features/table-closure-coroutine-cutover.md §3. The old `Rc`-
 //! refcounting trial-deletion cycle collector this file used to contain is
-//! gone now that `sol_core::Heap` traces real reachability itself; moving
-//! the *trigger* sites (currently still the old per-instruction/per-
-//! allocation heuristic below) to real dispatch-loop/native-trampoline
-//! safepoints is task #12's scope, not this one's.
+//! gone now that `sol_core::Heap` traces real reachability itself. Every
+//! `charge_allocation`/`stress_collect_if_enabled`/`tick` call site outside
+//! this file has been audited against `frame_roots`'s walk (task #12; see
+//! docs/features/table-closure-coroutine-cutover.md §10): `tick`'s own
+//! placement at the top of `dispatch_step`'s per-instruction loop already is
+//! a safepoint by this module's own definition, and no other site holds a
+//! live `TableRef`/`ClosureRef`/`ThreadRef` in an unrooted Rust local across
+//! its own charge/collection point - none needed to move.
 //!
-//! Known gap, deferred to task #13 ("sol-core: conditional/deferred-root GC
-//! hook for coroutine frames"): `frame_roots` below only walks the
-//! currently-active dispatch/resume chain (`LuaRuntime::frames` plus
-//! `main_coroutine`/`coroutine_stack`). A coroutine that is reachable from a
-//! live `LuaValue::Thread` but is not currently part of that resume chain
-//! has its own saved `LuaCoroutine::frames` left unrooted here - the same
-//! gap `canonical::CoroutineRegistry`'s own doc comment already calls out as
-//! not yet closed.
+//! `frame_roots` below walks every currently-registered coroutine's own
+//! `frames` (task #12's empirical stress testing found this had never
+//! actually been wired up: `canonical::CoroutineRegistry`'s doc comment
+//! already claimed "every entry is an unconditional root while present" per
+//! docs/features/table-closure-coroutine-cutover.md §6 option 2, but
+//! `frame_roots` previously only walked the active resume chain
+//! (`main_coroutine`/`coroutine_stack`), so a coroutine merely suspended
+//! between resumes - not currently part of that chain - had its own body
+//! closure and locals genuinely swept under `gc_stress`). That is now fixed.
+//!
+//! Known gap, still deferred to task #13 ("sol-core: conditional/deferred-root
+//! GC hook for coroutine frames"): rooting every registered coroutine
+//! unconditionally means a coroutine kept "alive" only by a reference cycle
+//! routed through its own frames never becomes collectible either - the
+//! cycle-through-a-coroutine leak §6 explicitly accepts as this interim
+//! fallback's known cost until the conditional/deferred-root hook exists.
 
 use sol_core::Value;
 
@@ -132,10 +144,28 @@ impl LuaRuntime {
     /// needs this.
     fn collect_garbage_with(&mut self, active_frame: Option<&LuaFrame>) {
         let roots = self.frame_roots(active_frame);
+        // `live_bytes` covers the *whole* heap (globals, metatables, interned
+        // strings, the registry, ...), not just what `charge_allocation` ever
+        // charged against `allocation_budget` - resetting `allocation_remaining`
+        // from an absolute `allocation_budget - live_bytes` would immediately
+        // exhaust any small test/embedding budget against that fixed
+        // overhead alone. Instead credit back exactly the *delta* this one
+        // collection reclaimed (bounded so it can never exceed the original
+        // budget), matching what the deleted trial-deletion collector's own
+        // credit-back did: give back what was actually freed, not resync
+        // against a metric `charge_allocation` never charged from in the
+        // first place.
+        let live_before = self.canonical_heap.borrow().live_bytes();
         let collection = self
             .canonical_heap
             .borrow_mut()
             .collect_major_with_roots(&roots);
+        let live_after = self.canonical_heap.borrow().live_bytes();
+        let reclaimed_bytes = live_before.saturating_sub(live_after);
+        self.allocation_remaining = self
+            .allocation_remaining
+            .saturating_add(reclaimed_bytes)
+            .min(self.allocation_budget);
         if collection.finalizers.is_empty() {
             return;
         }
@@ -205,10 +235,30 @@ impl LuaRuntime {
             self.encode_value(&self.default_output.borrow())
                 .unwrap_or(Value::NIL),
         );
-        // The active resume chain - see this module's own doc comment for
-        // the not-currently-resumed-coroutine gap this leaves (task #13).
-        for thread in std::iter::once(self.main_coroutine).chain(self.coroutine_stack.iter().copied()) {
-            let coroutine = self.coroutine(thread);
+        // Every currently-registered coroutine, not just whichever is on the
+        // active resume chain - `CoroutineRegistry`'s own interim-fallback
+        // contract (docs/features/table-closure-coroutine-cutover.md §6
+        // option 2) is "every entry is an unconditional root while present,"
+        // which requires walking the whole registry: a coroutine merely
+        // suspended (not currently being resumed) still has its own
+        // `frames` - and whatever closure/table values they hold - reachable
+        // only through this side table, not through anything
+        // `sol_core::Heap` itself traces. A coroutine currently being
+        // resumed has its `frames` swapped out into `self.frames` for the
+        // duration (see `resume_coroutine`), so walking both here never
+        // double-roots or misses it. This still doesn't close the
+        // cycle-through-a-coroutine leak §6 accepts as this fallback's known
+        // cost (deferred to task #13's conditional/deferred-root hook).
+        for coroutine in self.coroutine_registry.borrow().values() {
+            // Before its very first `resume`, a coroutine's body closure sits
+            // only in this `RefCell`, not yet part of `frames` (see
+            // `resume_coroutine`'s doc comment on why `body` is `.take()`n
+            // exactly once) - unrooted here, it could otherwise be swept
+            // between `coroutine.create` and the first `resume` that would
+            // have called it.
+            if let Some(body) = coroutine.body.borrow().as_ref() {
+                roots.push(self.encode_value(body).unwrap_or(Value::NIL));
+            }
             self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut roots);
         }
         self.push_frame_stack_roots(&self.frames, &mut roots);
