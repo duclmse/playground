@@ -108,9 +108,7 @@ impl Compiler {
         let old_next_reg = state.next_reg;
         if old_next_reg > new_next_reg {
             let clear_line = state.last_line().unwrap_or(line);
-            for reg in new_next_reg..old_next_reg {
-                state.emit(Instr::LoadNil(reg), clear_line);
-            }
+            state.clear_retired_registers(new_next_reg, old_next_reg, clear_line);
         }
         state.next_reg = new_next_reg;
     }
@@ -173,6 +171,13 @@ impl Compiler {
                 // self-referential `dst == src` is an ordinary in-place
                 // update.
                 let dst = self.stack[level].next_reg;
+                // A prior loop iteration (or an unrelated sibling scope) may
+                // have left this exact register number captured by an
+                // earlier closure - detach it *before* compiling the
+                // initializer directly into `dst`, so that write can't
+                // silently mutate the old cell out from under whatever
+                // already captured it (see `Instr::DetachCell`'s doc).
+                self.stack[level].emit(Instr::DetachCell(dst), *line);
                 self.compile_into(value, dst)?;
                 let name_const = self.stack[level].push_name_const(name);
                 self.stack[level].emit(Instr::NewLocal(dst, dst, name_const), *line);
@@ -229,6 +234,12 @@ impl Compiler {
                 // in-place update.
                 let base = self.stack[level].next_reg;
                 let count = names.len();
+                // See `Stmt::Local`'s matching comment: detach every
+                // destination register up front, before any initializer
+                // (including the nil-padding below) writes into it.
+                for offset in 0..count as u16 {
+                    self.stack[level].emit(Instr::DetachCell(base + offset), *line);
+                }
                 let mut filled: usize = 0;
                 for (index, value) in values.iter().enumerate() {
                     let is_last = index + 1 == values.len();
@@ -381,10 +392,10 @@ impl Compiler {
                 let leaked_top = self.stack[level].next_reg;
                 let needs_clear = leaked_top > cond_before;
                 if needs_clear {
-                    for reg in cond_before..leaked_top {
-                        self.stack.last_mut().unwrap().emit(Instr::LoadNil(reg), test_line);
-                    }
-                    self.stack.last_mut().unwrap().next_reg = cond_before;
+                    self.stack
+                        .last_mut()
+                        .unwrap()
+                        .retire_registers_to(cond_before, test_line);
                 }
                 self.compile_block(then_block)?;
                 if else_block.is_some() || needs_clear {
@@ -400,12 +411,10 @@ impl Compiler {
                         .unwrap()
                         .patch_jump(jump_to_else, else_start as i32);
                     if needs_clear {
-                        for reg in cond_before..leaked_top {
-                            self.stack
-                                .last_mut()
-                                .unwrap()
-                                .emit(Instr::LoadNil(reg), test_line);
-                        }
+                        self.stack
+                            .last_mut()
+                            .unwrap()
+                            .clear_retired_registers(cond_before, leaked_top, test_line);
                     }
                     if let Some(else_block) = else_block {
                         self.compile_block(else_block)?;
@@ -472,19 +481,27 @@ impl Compiler {
                 let leaked_top = self.stack[level].next_reg;
                 let needs_clear = leaked_top > cond_before;
                 if needs_clear {
-                    for reg in cond_before..leaked_top {
-                        self.stack
-                            .last_mut()
-                            .unwrap()
-                            .emit(Instr::LoadNil(reg), cond_line);
-                    }
-                    self.stack.last_mut().unwrap().next_reg = cond_before;
+                    // Clears the condition's own leaked temporaries' *value*
+                    // every iteration (the GC-hygiene concern this comment
+                    // block explains above) without giving the register
+                    // *number* back to the pool: the `LoopCtx` pushed right
+                    // below seeds `reg_floor` at `leaked_top`, so nothing the
+                    // loop body declares can land on top of a slot this same
+                    // re-executing condition test still writes to on every
+                    // later iteration - the same class of stale-cell-aliasing
+                    // hazard `Instr::DetachCell`'s doc describes, just for a
+                    // register this condition test itself (rather than a
+                    // sibling scope) keeps reusing.
+                    self.stack
+                        .last_mut()
+                        .unwrap()
+                        .clear_retired_registers(cond_before, leaked_top, cond_line);
                 }
                 let scope_depth = self.stack[level].scopes.len();
                 self.stack.last_mut().unwrap().loops.push(LoopCtx {
                     break_patches: Vec::new(),
                     scope_depth,
-                    reg_floor: 0,
+                    reg_floor: leaked_top,
                 });
                 self.compile_block(body)?;
                 let back_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
@@ -503,12 +520,10 @@ impl Compiler {
                     .unwrap()
                     .patch_jump(exit_jump, end as i32);
                 if needs_clear {
-                    for reg in cond_before..leaked_top {
-                        self.stack
-                            .last_mut()
-                            .unwrap()
-                            .emit(Instr::LoadNil(reg), cond_line);
-                    }
+                    self.stack
+                        .last_mut()
+                        .unwrap()
+                        .clear_retired_registers(cond_before, leaked_top, cond_line);
                 }
                 let ctx = self.stack.last_mut().unwrap().loops.pop().unwrap();
                 if let Some(parent) = self.stack.last_mut().unwrap().loops.last_mut() {

@@ -40,6 +40,15 @@ pub enum Instr {
     /// Binds `dst` as a new local from `src`; the final operand names the
     /// local in `Proto::consts` for Lua debug/error diagnostics.
     NewLocal(Reg, Reg, u32),
+    /// Emitted before the instructions that compute a new local's
+    /// initializer, directly into that local's own eventual register (see
+    /// `Stmt::Local`/`Stmt::MultiLocal`): clears this register's current
+    /// cell association so that write can't alias - and silently corrupt -
+    /// whatever cell an earlier loop iteration or sibling scope's `NewLocal`
+    /// left captured here. The following `NewLocal` gives it a real fresh
+    /// cell again if the register turns out to be captured; a no-op on an
+    /// uncaptured register.
+    DetachCell(Reg),
     GetUpval(Reg, u16),
     SetUpval(u16, Reg),
     /// Loads the frame's default environment table. Lexically rebound `_ENV`

@@ -302,6 +302,51 @@ impl FuncState {
         self.instrs.len() - 1
     }
 
+    /// Emits the compiler-synthesized clear for every register in
+    /// `from..to` being retired/freed for reuse (a scope exit, an `if`/
+    /// `while`/`repeat` condition's leaked temporaries, or any other point
+    /// `next_reg` drops back down): `DetachCell` before `LoadNil` for each
+    /// one, not just `LoadNil`. A register number about to be freed here may
+    /// still be the exact one an earlier loop iteration's (or an already-
+    /// compiled sibling branch's) `NewLocal` left captured - see
+    /// `Instr::DetachCell`'s doc - and a bare `LoadNil` would alias straight
+    /// through that stale cell via `reg_set`, nil-ing out a value some
+    /// still-live closure elsewhere already captured, instead of leaving it
+    /// alone and only clearing *this* frame's now-dead reference to it.
+    /// `DetachCell` is a no-op on an already-uncaptured register, so this is
+    /// always safe to call unconditionally on any retiring range.
+    pub(super) fn clear_retired_registers(&mut self, from: Reg, to: Reg, line: u32) {
+        for reg in from..to {
+            self.emit(Instr::DetachCell(reg), line);
+            self.emit(Instr::LoadNil(reg), line);
+        }
+    }
+
+    /// Shrinks `next_reg` back down toward `floor`, clamped - like
+    /// `pop_scope`'s own shrink - to never drop below `retired_floor` or
+    /// `loop_reg_floor()`, clearing whatever range actually gets vacated.
+    /// Callers that reset `next_reg` directly to a saved watermark (e.g. an
+    /// `if`/`while` condition's leaked temporaries) must go through this
+    /// rather than assigning `next_reg` straight to that watermark: a
+    /// register `alloc_reg` already handed out earlier in the *same loop
+    /// iteration's* compiled code (say, the condition test itself) has
+    /// already raised `loop_reg_floor()` past it, and hand-assigning past
+    /// that floor would let a `local` declared right after reuse that exact
+    /// register number within the same textual iteration - which, unlike an
+    /// ordinary next *iteration* reusing it (already handled by every
+    /// declaration site detaching its own destination), leaves the loop's
+    /// own reg-floor bookkeeping never actually retiring the register down
+    /// again afterward, so it keeps being handed back out, uncleared, at the
+    /// top of every subsequent iteration.
+    pub(super) fn retire_registers_to(&mut self, floor: Reg, line: u32) {
+        let old_next_reg = self.next_reg;
+        let new_next_reg = floor.max(self.retired_floor).max(self.loop_reg_floor());
+        if old_next_reg > new_next_reg {
+            self.clear_retired_registers(new_next_reg, old_next_reg, line);
+        }
+        self.next_reg = new_next_reg;
+    }
+
     /// The line of the most recently emitted instruction, if any. Real
     /// Lua's line-info generation (`lcode.c`'s `savelineinfo`) tags every
     /// instruction with `ls->lastline` - the line of the most recent token
@@ -433,9 +478,7 @@ impl FuncState {
         // introduce a spurious extra `debug.sethook` `"line"` transition.
         if old_next_reg > self.next_reg {
             let clear_line = self.last_line().unwrap_or(line);
-            for reg in self.next_reg..old_next_reg {
-                self.emit(Instr::LoadNil(reg), clear_line);
-            }
+            self.clear_retired_registers(self.next_reg, old_next_reg, clear_line);
         }
         if self.scopes.last().is_some() {
             for mut pending in scope.unresolved_gotos {
