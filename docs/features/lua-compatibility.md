@@ -185,6 +185,19 @@ represented by the current scalar-only `any` box.
       the corresponding typed helpers. Arithmetic still has no automatic string-to-number
       coercion at all (`"2" + "3"` errors; real Lua coerces numeral strings
       in arithmetic contexts) — open.
+
+      Known, deliberate divergence: `LuaValue::identity_address`
+      (`lua_runtime/value.rs`) derives a string's `%p` identity from its
+      canonical heap `ObjectId`, and Sol's canonical heap interns every string
+      by content regardless of length, where real Lua's `lstring.c` only
+      interns short strings (<= `LUAI_MAXSHORTLEN`, 40 bytes) - long strings
+      each get their own allocation/address on every call. This makes
+      `lua-5.5.1-tests/strings.lua`'s "long strings aren't internalized"
+      assertion (`topointer(s1) ~= topointer(s2)` for two content-identical
+      300-byte strings) permanently false without a short/long split in the
+      string heap's interning policy - a representational change, not a local
+      fix. Tracked as `pending` in `tests/lua55/manifest.toml`'s
+      `strings.lua` entry.
 - [x] Add Lua bytecode registers, constants, upvalue descriptors, and source
       spans. Interpret dynamic code through this VM; do not force it through
       typed Cranelift lowering. `lua_bytecode.rs` compiles each Lua function
@@ -265,9 +278,36 @@ typed top-level function values.
       top-level dotted/method declarations are no longer hoisted ahead of the
       statement that creates their base table, matching real Lua's
       sequential-sugar semantics.
+
+      Fixed 2026-09-27: a loop-body local captured as an upvalue by a nested
+      closure could be re-assigned the same register number as an
+      earlier-compiled, textually-preceding scratch temp within the same loop
+      body (e.g. a `while` guard condition), because ordinary stack-discipline
+      register recycling only protected already-captured registers
+      (`retired_floor`) going forward, not registers a still-open loop had
+      used earlier in its own body. Fixed by adding `LoopCtx.reg_floor`
+      (`lua_bytecode/func_state.rs`): the highest register any `alloc_reg`
+      call has handed out anywhere in the current loop's body, which now also
+      floors `reset_to`/`pop_scope`/`end_statement`'s recycling, and the
+      `while`-condition cleanup site's own re-tested register, for as long as
+      that loop is being compiled. See `tests/lua55/manifest.toml`'s
+      `closure.lua` entry.
 - [~] Implement Lua call frames, recursive calls, proper vararg packs, and
       multi-result propagation through call, return, assignment, table
       construction, and parenthesized-expression truncation sites.
+
+      Known gap: a named vararg parameter (`function f(...v)`) is supposed to
+      bind `v` to the call's varargs without allocating any table/object (real
+      Lua 5.5 semantics; see `lua-5.5.1-tests/vararg.lua`'s `notab` case,
+      which asserts `collectgarbage"count"` is unchanged across two identical
+      calls). Sol's `lua_runtime/dispatch.rs::call_closure` frame-construction
+      code instead unconditionally allocates a fresh `Table` via
+      `self.values_table(&varargs)` for every call with a named vararg
+      parameter. Matching real Lua would need a lazy/virtual vararg-table view
+      sharing the frame's own `varargs: Vec<LuaValue>` storage directly rather
+      than copying into a separate heap `Table` - a new indexing/dispatch/
+      GC-root-scanning primitive, not a local fix. Tracked as `pending` in
+      `tests/lua55/manifest.toml`'s `vararg.lua` entry.
 - [x] Implement `pcall`, `xpcall`, `error`, `assert`, and `select`, preserving
       error values and a bounded, useful stack trace. Add recursion/instruction
       budgets before host-exposed sandbox use. Recursion, instruction/backedge,
@@ -591,6 +631,18 @@ are explicit.
       fixtures beyond these, dedicated repeated resume/yield stress, and
       GC-during-suspension tests remain open.
 
+      Fixed 2026-09-27: `LuaValue::CoroutineWrapper` and `LuaValue::Thread`
+      both wrap the same `HeapObject::Thread` representation and encode
+      identically (`Value::object(thread_id)`), so `codec.rs`'s
+      `decode_object` always decoded a value read back out of canonical
+      storage (a table entry, an upvalue cell) as a plain `Thread`, silently
+      discarding a `coroutine.wrap`-created closure's true identity on every
+      round trip. Fixed by adding a `LuaCoroutine::is_wrapper` flag, set once
+      at creation (`coroutine.rs::new_coroutine`), that `decode_object` now
+      consults to pick `DecodeKind::Thread` vs. a new
+      `DecodeKind::CoroutineWrapper`. Found and fixed while extending
+      `coroutine.lua` corpus coverage; see `tests/lua55/manifest.toml`.
+
       Known, deliberate limitations: coroutines are not tracked by the
       Phase 4b cycle collector (`collect_cycles`), so a reference cycle
       routed through a coroutine leaks, the same conservative class of gap as
@@ -602,9 +654,10 @@ are explicit.
 
 **Exit gate:** portable assertions from `coroutine.lua` pass and a suspended
 coroutine remains valid across full collections, protected errors, and module
-calls. (`tests/lua55/manifest.toml`'s `coroutine.lua` entry stays `pending`:
-the upstream test also exercises `<close>` to-be-closed variables, which is a
-separate, unimplemented feature.)
+calls. `tests/lua55/manifest.toml`'s `coroutine.lua` entry is now `pass`
+(to-be-closed coroutine frames and the debug-library upvalue replacement the
+upstream case exercises are both covered) after a 2026-09-27 fix to a
+`coroutine.wrap` identity-loss bug: see the `[~]` item above.
 
 ## L8 — Optimization, differential testing, and release gates
 
