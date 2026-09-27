@@ -18,12 +18,12 @@
 # in typed CLIF: an indirect call (`call_indirect`, vs. a statically-resolved
 # `call`) or a call to one of the runtime helpers that exist specifically to
 # service `any`-typed/dynamic values (`sol_dynamic_binary`, `sol_dynamic_compare`,
-# `sol_dynamic_neg`, `sol_truth` - see crates/sol/src/codegen.rs's
+# `sol_dynamic_neg`, `sol_truth` - see crate/sol/src/codegen.rs's
 # declare_runtime). A typed-only benchmark has no `any`/dynamic values by
 # construction, so any of these appearing in its own dump is a strong signal
 # that a strict kernel started boxing/dispatching dynamically. This does NOT
 # detect boxing itself (Box/Unbox compile to inline bit-packing, not a call -
-# see crates/sol/src/codegen.rs), nor does it replace reading generated
+# see crate/sol/src/codegen.rs), nor does it replace reading generated
 # assembly by hand for subtler regressions; it automates the specific,
 # mechanically-checkable "did a dynamic-dispatch call creep in" question.
 #
@@ -67,9 +67,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-log "Building crates/sol in release mode"
+log "Building crate/sol in release mode"
 target_root=$(cargo_target_root)
-CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
+CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crate/sol/Cargo.toml"
 SOL_BIN="$target_root/release/sol"
 
 # The same "typed-only" set scripts/benchmark.sh's second loop measures: a

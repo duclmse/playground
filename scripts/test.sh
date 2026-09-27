@@ -7,12 +7,12 @@ source ./lib.sh
 
 require_cmd cargo "Install Rust: https://rustup.rs"
 
-log "cargo test + clippy (crates/sol-core: canonical values, heap, roots, and GC)"
-cargo test --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml"
-cargo clippy --offline --manifest-path "$ROOT/crates/sol-core/Cargo.toml" --all-targets -- -D warnings
+log "cargo test + clippy (crate/sol-core: canonical values, heap, roots, and GC)"
+cargo test --offline --manifest-path "$ROOT/crate/sol-core/Cargo.toml"
+cargo clippy --offline --manifest-path "$ROOT/crate/sol-core/Cargo.toml" --all-targets -- -D warnings
 
-log "cargo test (crates/sol: compiler, bytecode/JIT/AOT, and Lua compatibility)"
-cargo test --offline --manifest-path "$ROOT/crates/sol/Cargo.toml"
+log "cargo test (crate/sol: compiler, bytecode/JIT/AOT, and Lua compatibility)"
+cargo test --offline --manifest-path "$ROOT/crate/sol/Cargo.toml"
 
 log "Lua 5.5 embedding ABI and native-module fixtures"
 require_cmd cc "Install a C11 compiler to validate Sol's public Lua headers"
@@ -24,12 +24,12 @@ else
   log "Skipping native-module corpus fixture (lua-5.5.1-tests checkout unavailable)"
 fi
 
-log "cargo clippy (crates/sol, warnings denied)"
-cargo clippy --offline --manifest-path "$ROOT/crates/sol/Cargo.toml" --all-targets -- -D warnings
+log "cargo clippy (crate/sol, warnings denied)"
+cargo clippy --offline --manifest-path "$ROOT/crate/sol/Cargo.toml" --all-targets -- -D warnings
 
-log "cargo test + clippy (crates/sol-lsp)"
-cargo test --offline --manifest-path "$ROOT/crates/sol-lsp/Cargo.toml"
-cargo clippy --offline --manifest-path "$ROOT/crates/sol-lsp/Cargo.toml" --all-targets -- -D warnings
+log "cargo test + clippy (crate/sol-lsp)"
+cargo test --offline --manifest-path "$ROOT/crate/sol-lsp/Cargo.toml"
+cargo clippy --offline --manifest-path "$ROOT/crate/sol-lsp/Cargo.toml" --all-targets -- -D warnings
 
 log "Lua 5.5 corpus-manifest regression checks"
 "$ROOT/scripts/test-lua55-manifest.sh"
@@ -41,7 +41,7 @@ log "Focused supported-Lua fixture regressions"
 "$ROOT/scripts/test-sol-conformance.sh"
 
 log "Sol M10 typed-map benchmark smoke test"
-benchmark_output="$(cargo run --quiet --offline --manifest-path "$ROOT/crates/sol/Cargo.toml" -- run "$ROOT/benchmarks/hashmap_lookup.sol")"
+benchmark_output="$(cargo run --quiet --offline --manifest-path "$ROOT/crate/sol/Cargo.toml" -- run "$ROOT/benchmarks/hashmap_lookup.sol")"
 [ "$benchmark_output" = "50050000" ] || die "typed-map benchmark returned '$benchmark_output', expected 50050000"
 
 if command -v npm >/dev/null 2>&1 && [ -d "$ROOT/node_modules" ]; then

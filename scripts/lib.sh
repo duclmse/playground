@@ -7,7 +7,7 @@
 # Repo root, regardless of where a script is invoked from.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Must match the `wasm-bindgen = "=X.Y.Z"` pin in crates/lua-vm/Cargo.toml -
+# Must match the `wasm-bindgen = "=X.Y.Z"` pin in crate/lua-vm/Cargo.toml -
 # the wasm-bindgen CLI and the crate's wasm-bindgen dependency have to be
 # the exact same version or the generated JS glue fails at runtime.
 WASM_BINDGEN_VERSION="0.2.100"
@@ -39,7 +39,7 @@ ensure_sol_bin() {
   fi
   if [[ ! -x "$SOL_BIN" ]]; then
     require_cmd cargo "Install Rust: https://rustup.rs"
-    local args=(build --offline --manifest-path "$ROOT/crates/sol/Cargo.toml")
+    local args=(build --offline --manifest-path "$ROOT/crate/sol/Cargo.toml")
     [[ "$profile" == release ]] && args+=(--release)
     CARGO_TARGET_DIR="$target_root" cargo "${args[@]}"
   fi
@@ -205,5 +205,5 @@ require_wasm_bindgen_cli() {
   local installed
   installed="$(wasm-bindgen --version | awk '{print $2}')"
   [ "$installed" = "$WASM_BINDGEN_VERSION" ] || die \
-    "wasm-bindgen CLI is v${installed}, but crates/lua-vm/Cargo.toml pins v${WASM_BINDGEN_VERSION}. Run: cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION} --locked"
+    "wasm-bindgen CLI is v${installed}, but crate/lua-vm/Cargo.toml pins v${WASM_BINDGEN_VERSION}. Run: cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION} --locked"
 }

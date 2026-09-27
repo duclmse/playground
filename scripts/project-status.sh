@@ -68,9 +68,9 @@ if [[ -d "$root_dir/editors/vscode-sol" ]]; then vscode_client=true; else vscode
 # the explicit migration seam until U2 moves production objects onto the
 # canonical heap and the final fallback can be removed. U3's shared semantic
 # ABI intentionally keeps this differential seam available during migration.
-if grep -q 'run_lua_partitioned' "$root_dir/crates/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
-if [[ -f "$root_dir/crates/sol-lsp/Cargo.toml" ]]; then lsp_present=true; else lsp_present=false; fi
-if [[ -f "$root_dir/crates/sol-core/src/heap.rs" ]]; then canonical_heap_foundation=true; else canonical_heap_foundation=false; fi
+if grep -q 'run_lua_partitioned' "$root_dir/crate/sol/src/main.rs"; then runtime_unified=false; else runtime_unified=true; fi
+if [[ -f "$root_dir/crate/sol-lsp/Cargo.toml" ]]; then lsp_present=true; else lsp_present=false; fi
+if [[ -f "$root_dir/crate/sol-core/src/heap.rs" ]]; then canonical_heap_foundation=true; else canonical_heap_foundation=false; fi
 commit=$(git -C "$root_dir" rev-parse --short HEAD 2>/dev/null || printf unknown)
 
 if ((check)); then

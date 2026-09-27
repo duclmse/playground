@@ -143,9 +143,9 @@ append_markdown_summary() {
   } >> "$EXPORT_MARKDOWN"
 }
 
-log "Building crates/sol in release mode"
+log "Building crate/sol in release mode"
 target_root=$(cargo_target_root)
-CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crates/sol/Cargo.toml"
+CARGO_TARGET_DIR="$target_root" cargo build --release --manifest-path "$ROOT/crate/sol/Cargo.toml"
 SOL_BIN="$target_root/release/sol"
 
 LUA_RUNTIMES=(lua)

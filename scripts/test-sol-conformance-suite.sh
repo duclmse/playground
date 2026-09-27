@@ -7,9 +7,9 @@
 # This is a different script from scripts/test-sol-conformance.sh, which
 # predates this suite and checks a small set of already-supported `.lua`
 # fixtures for exact `true` output - see that script and
-# crates/sol/tests/fixtures/lua55/README.md. This one instead validates
+# crate/sol/tests/fixtures/lua55/README.md. This one instead validates
 # tests/sol-conformance/manifest.toml against
-# crates/sol/tests/fixtures/sol-conformance/*.sol; see
+# crate/sol/tests/fixtures/sol-conformance/*.sol; see
 # tests/sol-conformance/README.md.
 #
 # Unlike scripts/test-lua55-suite.sh, this does NOT compare against a real
@@ -25,7 +25,7 @@ root_dir=$(cd "$(dirname "$0")/.." && pwd)
 source "$root_dir/scripts/lib.sh"
 suite_dir=${1:-"$root_dir/lua-5.5.1-tests"}
 manifest=${SOL_CONFORMANCE_MANIFEST:-"$root_dir/tests/sol-conformance/manifest.toml"}
-fixtures_dir="$root_dir/crates/sol/tests/fixtures/sol-conformance"
+fixtures_dir="$root_dir/crate/sol/tests/fixtures/sol-conformance"
 validate_only=${SOL_CONFORMANCE_VALIDATE_ONLY:-0}
 
 usage() {

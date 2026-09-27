@@ -18,14 +18,14 @@ reference_bin=${LUA55_REFERENCE_BIN:-/opt/homebrew/bin/lua5.5}
   exit 77
 }
 
-cargo build --manifest-path "$repo_root/crates/sol/Cargo.toml" --lib --bin sol
+cargo build --manifest-path "$repo_root/crate/sol/Cargo.toml" --lib --bin sol
 mkdir -p "$build_dir/libs"
 cp "$source_dir/attrib.lua" "$build_dir/attrib.lua"
 cp -R "$source_dir/libs/P1" "$build_dir/libs/P1"
 
 common_flags=(
   -std=c11 -Wall -Wextra -Wno-unused-parameter -shared -fPIC
-  -I"$repo_root/crates/sol/include"
+  -I"$repo_root/crate/sol/include"
   -L"$repo_root/target/debug" -lsol
 )
 

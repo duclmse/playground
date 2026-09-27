@@ -12,9 +12,9 @@ ensure_sol_bin debug
 sol_bin=$SOL_BIN
 
 fixtures=(
-  "$ROOT/crates/sol/tests/fixtures/lua55/dynamic_core.lua"
+  "$ROOT/crate/sol/tests/fixtures/lua55/dynamic_core.lua"
 )
-while IFS= read -r fixture; do fixtures+=("$fixture"); done < <(find "$ROOT/crates/sol/tests/fixtures/lua55/native" -maxdepth 1 -name '*.lua' -type f | sort)
+while IFS= read -r fixture; do fixtures+=("$fixture"); done < <(find "$ROOT/crate/sol/tests/fixtures/lua55/native" -maxdepth 1 -name '*.lua' -type f | sort)
 
 passed=0
 for fixture in "${fixtures[@]}"; do

@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 build_dir=$(mktemp -d)
 trap 'rm -rf "$build_dir"' EXIT
 
-cargo build --manifest-path "$repo_root/crates/sol/Cargo.toml" --lib
+cargo build --manifest-path "$repo_root/crate/sol/Cargo.toml" --lib
 
 case "$(uname -s)" in
   Darwin)
@@ -25,13 +25,13 @@ case "$(uname -s)" in
 esac
 
 cc -std=c11 -Wall -Wextra -Werror \
-  -I"$repo_root/crates/sol/include" \
-  "$repo_root/crates/sol/tests/native/embedding_smoke.c" \
+  -I"$repo_root/crate/sol/include" \
+  "$repo_root/crate/sol/tests/native/embedding_smoke.c" \
   -L"$library_dir" -lsol -o "$build_dir/embedding_smoke"
 
 cc -std=c11 -Wall -Wextra -Werror -shared -fPIC \
-  -I"$repo_root/crates/sol/include" \
-  "$repo_root/crates/sol/tests/native/sol_fixture.c" \
+  -I"$repo_root/crate/sol/include" \
+  "$repo_root/crate/sol/tests/native/sol_fixture.c" \
   -L"$library_dir" -lsol -o "$build_dir/sol_fixture.$shared_ext"
 
 if [[ "$(uname -s)" == Darwin ]]; then

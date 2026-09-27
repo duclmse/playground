@@ -47,7 +47,7 @@
 # CLI's one intentional, documented divergence from real Lua's CLI - it
 # echoes its script's return value (mirroring `.sol`'s typed `main` contract,
 # see docs/spec/functions-and-modules.md and
-# crates/sol/tests/lua55.rs's `dynamic_lua_code_can_call_a_natively_typed_helper_function`
+# crate/sol/tests/lua55.rs's `dynamic_lua_code_can_call_a_natively_typed_helper_function`
 # - a deliberate, tested design choice, not a bug) - before diffing; without
 # this every generated case would show a false stdout divergence on that one
 # trailing line. The fixed corpus loop above does not get this treatment: it
