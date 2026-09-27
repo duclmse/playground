@@ -115,6 +115,18 @@ pub struct LuaCoroutine {
     /// `RefCell` borrowed - see `active_hook`'s field doc and
     /// `resume_coroutine`'s swap-in/out of it.
     pub(super) hook: RefCell<Option<Rc<HookState>>>,
+    /// Set when this coroutine was created by `coroutine.wrap` rather than
+    /// `coroutine.create`/`lua_newthread`. Real Lua's `coroutine.wrap`
+    /// returns an opaque callable closure, never a `thread` value - a wrapped
+    /// coroutine's underlying thread is never itself Lua-visible. Sol
+    /// instead gives both call forms the same `HeapObject::Thread`
+    /// representation and lets this flag steer `codec.rs`'s
+    /// `decode_object` between `LuaValue::Thread` and
+    /// `LuaValue::CoroutineWrapper` on every read back out of canonical
+    /// storage (a table, an upvalue cell) - the encode side has nothing to
+    /// distinguish otherwise, since both variants encode to the same
+    /// `Value::object(thread_id)`.
+    pub(super) is_wrapper: Cell<bool>,
 }
 
 impl fmt::Debug for LuaCoroutine {
@@ -126,7 +138,7 @@ impl fmt::Debug for LuaCoroutine {
 impl LuaRuntime {
     pub fn create_global_coroutine(&mut self, name: &str) -> LuaResult<ThreadRef> {
         let f = self.globals.get(self, name);
-        self.new_coroutine(f)
+        self.new_coroutine(f, false)
     }
 
     pub fn resume_coroutine_outcome(
@@ -170,7 +182,7 @@ impl LuaRuntime {
     /// Builds a new coroutine around `f` without starting it. `f` is invoked
     /// lazily on the very first `resume`; see `LuaCoroutine`'s doc comment
     /// for the overall design.
-    pub(super) fn new_coroutine(&mut self, f: LuaValue) -> LuaResult<ThreadRef> {
+    pub(super) fn new_coroutine(&mut self, f: LuaValue, is_wrapper: bool) -> LuaResult<ThreadRef> {
         self.charge_allocation(std::mem::size_of::<LuaCoroutine>(), None)?;
         let coroutine = Rc::new(LuaCoroutine {
             status: Cell::new(CoroutineStatus::Suspended),
@@ -179,6 +191,7 @@ impl LuaRuntime {
             depth_charged: Cell::new(0),
             dead_error: RefCell::new(None),
             hook: RefCell::new(None),
+            is_wrapper: Cell::new(is_wrapper),
         });
         let thread = ThreadRef::alloc(&mut self.canonical_heap.borrow_mut());
         self.coroutine_registry.borrow_mut().insert(thread, coroutine);
@@ -406,6 +419,7 @@ impl LuaCoroutine {
             depth_charged: Cell::new(0),
             dead_error: RefCell::new(None),
             hook: RefCell::new(None),
+            is_wrapper: Cell::new(false),
         })
     }
 }

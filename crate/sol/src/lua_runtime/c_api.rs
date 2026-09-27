@@ -1699,7 +1699,7 @@ pub unsafe extern "C-unwind" fn lua_newthread(state: *mut lua_State) -> *mut lua
     let Some(parent) = (unsafe { state_mut(state) }) else {
         return ptr::null_mut();
     };
-    let thread = match unsafe { parent.runtime() }.new_coroutine(LuaValue::Nil) {
+    let thread = match unsafe { parent.runtime() }.new_coroutine(LuaValue::Nil, false) {
         Ok(thread) => thread,
         Err(error) => api_jump(parent, error),
     };

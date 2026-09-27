@@ -25,7 +25,6 @@ use super::{BridgeScalar, LuaCoroutine, ThreadRef};
 
 pub(super) const LEGACY_STATE_PROVIDER: u32 = u32::MAX;
 pub(super) const GMATCH_ITERATOR_FUNCTION: u32 = 0;
-pub(super) const COROUTINE_WRAPPER_FUNCTION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalAdapterError {

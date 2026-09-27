@@ -356,3 +356,32 @@ fn dynamic_lua_runtime_coroutine_resume_yield_round_trip_correctly_unwinds_depth
     let run = runtime.run(&parse(source)).unwrap();
     assert_eq!(run, LuaValue::Bool(true));
 }
+
+#[test]
+fn dynamic_lua_runtime_coroutine_wrap_keeps_its_identity_through_a_table_round_trip() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // Regression test for a `codec.rs` bug: `LuaValue::CoroutineWrapper` and
+    // `LuaValue::Thread` both wrap the same `HeapObject::Thread`
+    // representation and encode identically, so `decode_object` always
+    // decoded a value read back out of canonical storage (here, a table
+    // entry) as a plain `Thread` - silently turning a `coroutine.wrap`
+    // closure into an uncallable thread value the moment it round-tripped
+    // through a table. `type(t.co)` and calling `t.co(...)` both exercise the
+    // round trip.
+    let source = br#"
+        local t = {}
+        t.co = coroutine.wrap(function(a, b)
+            local c = coroutine.yield(a + b)
+            return c * 2
+        end)
+
+        local type_before_call = type(t.co)
+        local first = t.co(1, 2)
+        local second = t.co(10)
+
+        return type_before_call == "function" and first == 3 and second == 20
+    "#;
+    let run = run_source(source).unwrap();
+    assert_eq!(run.value, LuaValue::Bool(true));
+}

@@ -36,7 +36,7 @@ impl LuaRuntime {
                         f.type_name()
                     )));
                 }
-                let co = self.new_coroutine(f)?;
+                let co = self.new_coroutine(f, false)?;
                 Ok(vec![LuaValue::Thread(co)])
             }
             NativeFunction::CoroutineResume => {
@@ -85,7 +85,7 @@ impl LuaRuntime {
                         f.type_name()
                     )));
                 }
-                let co = self.new_coroutine(f)?;
+                let co = self.new_coroutine(f, true)?;
                 Ok(vec![LuaValue::CoroutineWrapper(co)])
             }
             NativeFunction::CoroutineRunning => match self.coroutine_stack.last() {

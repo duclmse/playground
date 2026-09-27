@@ -3,25 +3,31 @@
 //! upvalue cells, thread stacks) - see
 //! `docs/features/table-closure-coroutine-cutover.md` §2.
 //!
-//! `Table`/`Closure`/`Thread`/`CoroutineWrapper`/`GMatchIterator` already
-//! *are* a `Copy` `ObjectId` newtype, and `String`/`CanonicalTable`/
-//! `Userdata`/`CFunction` already carry one behind an `Rc<CanonicalObjectRoot>`,
-//! so encoding every one of those is a bare `Value::object(id)`. Only
-//! `NativeFunction`, `LightUserdata`, and `RegisteredNative` have no
-//! `ObjectId` of their own; each is allocated onto
-//! `HeapObject::NativeCallable` (and memoized, so repeated encodes of the
-//! same source value keep one canonical identity) the first time it is
-//! encoded. Decoding a bare `ObjectId` recovers which of these three a
-//! `NativeCallable` object represents by its reserved `provider`: `0` for
-//! `NativeFunction`, `LEGACY_STATE_PROVIDER` (disambiguated by `function`)
-//! for `GMatchIterator`/`CoroutineWrapper`, the runtime's own
+//! `Table`/`Closure`/`Thread`/`GMatchIterator` already *are* a `Copy`
+//! `ObjectId` newtype, and `String`/`CanonicalTable`/`Userdata`/`CFunction`
+//! already carry one behind an `Rc<CanonicalObjectRoot>`, so encoding every
+//! one of those is a bare `Value::object(id)`. Only `NativeFunction`,
+//! `LightUserdata`, and `RegisteredNative` have no `ObjectId` of their own;
+//! each is allocated onto `HeapObject::NativeCallable` (and memoized, so
+//! repeated encodes of the same source value keep one canonical identity)
+//! the first time it is encoded. Decoding a bare `ObjectId` recovers which
+//! of these three a `NativeCallable` object represents by its reserved
+//! `provider`: `0` for `NativeFunction`, `LEGACY_STATE_PROVIDER`
+//! (disambiguated by `function`) for `GMatchIterator`, the runtime's own
 //! `light_userdata_provider` for `LightUserdata`, and a
 //! `registered_native_providers`-reserved provider for `RegisteredNative`;
 //! any other provider is an ordinary `CFunction`.
+//!
+//! `CoroutineWrapper` shares `Thread`'s `HeapObject::Thread` representation
+//! and its encoded `Value::object(thread_id)` - there is no separate object
+//! to tag it with, since a `coroutine.wrap` closure has no Lua-visible
+//! identity apart from the thread it drives. `decode_object` instead
+//! recovers the distinction from `LuaCoroutine::is_wrapper`, set once at
+//! creation time (see `coroutine.rs::new_coroutine`).
 
 use sol_core::{HeapObject, NativeCallableId, ObjectId, Value, ValueTag};
 
-use super::canonical::{COROUTINE_WRAPPER_FUNCTION, GMATCH_ITERATOR_FUNCTION, LEGACY_STATE_PROVIDER};
+use super::canonical::{GMATCH_ITERATOR_FUNCTION, LEGACY_STATE_PROVIDER};
 use super::*;
 
 impl LuaRuntime {
@@ -151,7 +157,13 @@ impl LuaRuntime {
             match object {
                 HeapObject::Table(_) => (DecodeKind::Table, None),
                 HeapObject::Closure(_) => (DecodeKind::Closure, None),
-                HeapObject::Thread(_) => (DecodeKind::Thread, None),
+                HeapObject::Thread(_) => {
+                    if self.coroutine(ThreadRef::new(id)).is_wrapper.get() {
+                        (DecodeKind::CoroutineWrapper, None)
+                    } else {
+                        (DecodeKind::Thread, None)
+                    }
+                }
                 HeapObject::String(_) => (DecodeKind::String, None),
                 HeapObject::Userdata(_) => (DecodeKind::Userdata, None),
                 HeapObject::NativeCallable(callable) => (
@@ -169,6 +181,7 @@ impl LuaRuntime {
             DecodeKind::Table => LuaValue::Table(TableRef::new(id)),
             DecodeKind::Closure => LuaValue::Closure(ClosureRef::new(id)),
             DecodeKind::Thread => LuaValue::Thread(ThreadRef::new(id)),
+            DecodeKind::CoroutineWrapper => LuaValue::CoroutineWrapper(ThreadRef::new(id)),
             DecodeKind::String => {
                 LuaValue::String(CanonicalString::root_existing(self.canonical_heap.clone(), id))
             }
@@ -200,7 +213,6 @@ impl LuaRuntime {
         if provider == LEGACY_STATE_PROVIDER {
             return Ok(match function {
                 GMATCH_ITERATOR_FUNCTION => LuaValue::GMatchIterator(GMatchRef::new(id)),
-                COROUTINE_WRAPPER_FUNCTION => LuaValue::CoroutineWrapper(ThreadRef::new(id)),
                 _ => {
                     return Err(LuaError::new(
                         "internal error: unknown legacy-state NativeCallable function id",
@@ -238,6 +250,7 @@ enum DecodeKind {
     Table,
     Closure,
     Thread,
+    CoroutineWrapper,
     String,
     Userdata,
     NativeCallable,
