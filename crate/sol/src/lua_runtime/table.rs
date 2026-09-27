@@ -303,7 +303,23 @@ impl LuaRuntime {
         // - a metatable set *without* `__gc`, or removed later, leaves any
         // already-`Registered` state alone (once registered, always run,
         // matching real Lua's own "`__gc` looked up once" behavior).
-        if self.table_finalizer(table).is_some() {
+        //
+        // Registration only needs *presence* of a non-nil `__gc` field here,
+        // not callability: real Lua's `luaC_checkfinalizer` gates registration
+        // on `fasttm(..., TM_GC)` finding any non-nil metatable value, then
+        // looks the field up *again*, fresh, at actual finalization time
+        // (`run_gc_finalizers` below does this via its own `table_finalizer`
+        // call) - only that later lookup requires callability, so it can
+        // silently no-op a non-function `__gc`. A placeholder like
+        // `setmetatable(u, {__gc = true})` followed later by
+        // `getmetatable(u).__gc = function(...) ... end` (a plain field
+        // write, not another `setmetatable` call) must still mark `u`
+        // to-be-finalized right away - `lua-5.5.1-tests/gc.lua`'s "__gc x
+        // weak tables" section depends on exactly this ordering.
+        if metatable
+            .and_then(|metatable| self.table_get_str_field(metatable, b"__gc"))
+            .is_some()
+        {
             let mut heap = self.canonical_heap.borrow_mut();
             let _ = heap.register_finalizer(table.object_id());
         }

@@ -296,6 +296,31 @@ pub struct Collection {
     pub finalizers: Vec<ObjectId>,
 }
 
+/// Which half of a resumable [`Heap::step_major_with_conditional_roots`]
+/// cycle is in progress. Marking and sweeping never overlap: sweeping only
+/// starts once the mark queue has fully drained and converged (ephemerons
+/// and finalizer-reachability included), mirroring `collect`'s own two-phase
+/// structure but split across calls instead of run to completion in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalPhase {
+    Marking,
+    Sweeping { next_index: usize },
+}
+
+/// Persisted state for a major collection spread across multiple
+/// `collectgarbage("step", ...)` calls. `marked`/`queue` are the same
+/// gray-set/queue a one-shot `collect()` uses locally, just kept alive
+/// between calls instead of living only on the stack of a single call.
+struct IncrementalCycle {
+    kind: CollectionKind,
+    marked: HashSet<ObjectId>,
+    queue: VecDeque<ObjectId>,
+    phase: IncrementalPhase,
+    reclaimed: usize,
+    promoted: usize,
+    finalizers: Vec<ObjectId>,
+}
+
 /// Canonical managed heap. All externally retained objects are addressed by
 /// stable, generation-checked handles; roots are explicit and portable.
 pub struct Heap {
@@ -306,6 +331,7 @@ pub struct Heap {
     interned_strings: HashMap<Vec<u8>, ObjectId>,
     remembered: HashSet<ObjectId>,
     next_native_provider: u32,
+    incremental: Option<IncrementalCycle>,
     pub capabilities: Capabilities,
 }
 
@@ -332,6 +358,7 @@ impl Heap {
             // Provider zero is reserved for sol-core's portable standard
             // library callback namespace.
             next_native_provider: 1,
+            incremental: None,
             capabilities,
         }
     }
@@ -934,6 +961,149 @@ impl Heap {
         self.collect(CollectionKind::Minor, &[], &HashMap::new())
     }
 
+    /// Whether a `step_major_with_conditional_roots` cycle is currently
+    /// in progress (neither finished nor never started).
+    pub fn incremental_cycle_in_progress(&self) -> bool {
+        self.incremental.is_some()
+    }
+
+    /// Performs at most `work` units of major-collection work, resuming any
+    /// cycle already in progress or starting a fresh one seeded from the
+    /// given roots. This is `collect`'s own mark/ephemeron/finalizer/sweep
+    /// algorithm, split into a phase machine that can pause and resume
+    /// across calls instead of always running to completion in one -
+    /// `collectgarbage("step", size)`'s collector-side counterpart.
+    ///
+    /// Returns `(true, collection)` once the whole cycle has completed
+    /// (mark, the ephemeron fixed point, the finalizer-reachability round,
+    /// and a full sweep of every slot), with `collection` holding that
+    /// cycle's totals. Returns `(false, collection)` if more work remains,
+    /// with `collection.reclaimed`/`collection.promoted` still accumulating
+    /// and `collection.finalizers` always empty (finalizers only become
+    /// queued, and only need running, once the cycle actually finishes).
+    ///
+    /// Every call re-marks every current root before doing any bounded
+    /// work, not just the first: raw stack/register roots have no
+    /// write-barrier protection (only heap-object-to-heap-object edges
+    /// do), so a value newly stored into a root since the last step needs
+    /// fresh rescanning to stay visible to the cycle. This rescan only
+    /// happens during the marking phase; once sweeping starts, `alloc`
+    /// itself protects any object born mid-sweep (see its comment) since
+    /// rescanning roots can no longer feed the (already-drained) mark
+    /// queue.
+    pub fn step_major_with_conditional_roots(
+        &mut self,
+        work: usize,
+        frame_roots: &[Value],
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) -> (bool, Collection) {
+        let mut cycle = self.incremental.take().unwrap_or(IncrementalCycle {
+            kind: CollectionKind::Major,
+            marked: HashSet::new(),
+            queue: VecDeque::new(),
+            phase: IncrementalPhase::Marking,
+            reclaimed: 0,
+            promoted: 0,
+            finalizers: Vec::new(),
+        });
+
+        let mut budget = work.max(1);
+
+        if matches!(cycle.phase, IncrementalPhase::Marking) {
+            let roots: Vec<Value> = self.roots.values().copied().collect();
+            for root in roots {
+                mark_value(root, self, &mut cycle.marked, &mut cycle.queue);
+            }
+            for root in frame_roots {
+                mark_value(*root, self, &mut cycle.marked, &mut cycle.queue);
+            }
+
+            while budget > 0 {
+                let Some(id) = cycle.queue.pop_front() else {
+                    break;
+                };
+                self.trace_object(id, &mut cycle.marked, &mut cycle.queue, conditional_roots);
+                budget -= 1;
+            }
+
+            if cycle.queue.is_empty() {
+                // The mark queue converging is the same trigger `collect`
+                // uses to move on to ephemerons and finalizers; neither
+                // sub-pass is itself budgeted, since both are bounded by
+                // the (typically small) count of ephemeron tables or
+                // finalizer-registered objects, not by total heap size.
+                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots);
+                let unreachable_finalizers: Vec<ObjectId> = self
+                    .live_ids()
+                    .filter(|id| {
+                        !cycle.marked.contains(id)
+                            && self.entry(*id).is_ok_and(|entry| {
+                                entry.header.finalizer == FinalizerState::Registered
+                            })
+                    })
+                    .collect();
+                for id in unreachable_finalizers {
+                    if let Ok(entry) = self.entry_mut(id) {
+                        entry.header.finalizer = FinalizerState::Queued;
+                    }
+                    cycle.finalizers.push(id);
+                    mark_id(id, self, &mut cycle.marked, &mut cycle.queue);
+                }
+                self.drain_mark_queue(&mut cycle.marked, &mut cycle.queue, conditional_roots);
+                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots);
+                self.sweep_weak_tables(&mut cycle.marked);
+                cycle.phase = IncrementalPhase::Sweeping { next_index: 0 };
+            }
+        }
+
+        if let IncrementalPhase::Sweeping { next_index } = &mut cycle.phase {
+            let end = (*next_index + budget).min(self.slots.len());
+            for index in *next_index..end {
+                let id = ObjectId::new(index, self.slots[index].generation);
+                if self.slots[index].entry.is_none() {
+                    continue;
+                }
+                if cycle.marked.contains(&id) {
+                    let header = &mut self.slots[index].entry.as_mut().unwrap().header;
+                    if header.generation == GcGeneration::Young {
+                        header.generation = GcGeneration::Old;
+                        cycle.promoted += 1;
+                    }
+                    continue;
+                }
+                self.slots[index].entry = None;
+                self.slots[index].generation = self.slots[index].generation.wrapping_add(1);
+                self.free.push(index);
+                cycle.reclaimed += 1;
+            }
+            *next_index = end;
+            if *next_index >= self.slots.len() {
+                let live_objects: HashSet<ObjectId> = self.live_ids().collect();
+                self.remembered.retain(|id| live_objects.contains(id));
+                self.interned_strings
+                    .retain(|_, id| live_objects.contains(id));
+                return (
+                    true,
+                    Collection {
+                        kind: cycle.kind,
+                        reclaimed: cycle.reclaimed,
+                        promoted: cycle.promoted,
+                        finalizers: cycle.finalizers,
+                    },
+                );
+            }
+        }
+
+        let result = Collection {
+            kind: cycle.kind,
+            reclaimed: cycle.reclaimed,
+            promoted: cycle.promoted,
+            finalizers: Vec::new(),
+        };
+        self.incremental = Some(cycle);
+        (false, result)
+    }
+
     /// Approximates the currently live, heap-managed byte footprint (for
     /// Lua's `collectgarbage("count")`) by summing every live object's fixed
     /// header plus the allocated capacity of its variable-length storage.
@@ -999,7 +1169,7 @@ impl Heap {
             },
             object,
         };
-        if let Some(slot_index) = self.free.pop() {
+        let id = if let Some(slot_index) = self.free.pop() {
             let generation = self.slots[slot_index].generation;
             self.slots[slot_index].entry = Some(entry);
             ObjectId::new(slot_index, generation)
@@ -1010,7 +1180,25 @@ impl Heap {
                 entry: Some(entry),
             });
             ObjectId::new(slot_index, 0)
+        };
+        // An object born while an incremental cycle is mid-sweep has no
+        // chance to be picked up by that cycle's mark phase (already
+        // finished) or by the next step's root rescan (sweeping doesn't
+        // rescan roots - see `step_major_with_conditional_roots`), so
+        // without this it could land in a slot the sweep cursor hasn't
+        // reached yet and get freed out from under its only reference.
+        // Marking it live immediately is the standard "allocate black
+        // during sweep" fix. A birth during the marking phase needs no
+        // such protection: that phase re-marks every root on every step,
+        // so the object is reachable by the time marking converges as
+        // long as it's stored somewhere rooted, exactly like the mutator
+        // invariant an ordinary write barrier upholds mid-mark.
+        if let Some(cycle) = self.incremental.as_mut() {
+            if matches!(cycle.phase, IncrementalPhase::Sweeping { .. }) {
+                cycle.marked.insert(id);
+            }
         }
+        id
     }
 
     fn entry(&self, id: ObjectId) -> Result<&Entry, HeapError> {
@@ -1103,6 +1291,22 @@ impl Heap {
         if owner_old && child_young {
             self.remembered.insert(owner);
         }
+        // Steele/Dijkstra insertion barrier: if an in-progress incremental
+        // mark phase already scanned `owner` (or queued it to be scanned),
+        // storing a new pointer into it can hide `child` from the rest of
+        // the cycle, since nothing will visit `owner` again to discover it.
+        // Re-marking `child` here closes that gap. `owner` not yet marked
+        // needs no help - `trace_object` will see this write when it
+        // eventually scans `owner`'s current fields. Over-marking an
+        // owner that's merely queued (not yet actually scanned) is a
+        // harmless, deliberately conservative superset of the strict
+        // black-owner rule.
+        if let Some(mut cycle) = self.incremental.take() {
+            if matches!(cycle.phase, IncrementalPhase::Marking) && cycle.marked.contains(&owner) {
+                mark_id(child, self, &mut cycle.marked, &mut cycle.queue);
+            }
+            self.incremental = Some(cycle);
+        }
     }
 
     fn collect(
@@ -1111,6 +1315,13 @@ impl Heap {
         frame_roots: &[Value],
         conditional_roots: &HashMap<ObjectId, Vec<Value>>,
     ) -> Collection {
+        // A full, one-shot collection recomputes reachability from
+        // scratch and always finishes what it starts, so any
+        // `step_major_with_conditional_roots` cycle in progress is
+        // superseded rather than merely stale: dropping it here avoids
+        // ever resuming a step cycle against a heap a completed full
+        // sweep has already reshaped.
+        self.incremental = None;
         let mut marked = HashSet::new();
         let mut queue = VecDeque::new();
         let roots: Vec<Value> = self.roots.values().copied().collect();
@@ -1147,7 +1358,7 @@ impl Heap {
         }
         self.drain_mark_queue(&mut marked, &mut queue, conditional_roots);
         self.mark_ephemerons(&mut marked, &mut queue, conditional_roots);
-        self.sweep_weak_tables(&marked);
+        self.sweep_weak_tables(&mut marked);
 
         for index in 0..self.slots.len() {
             let id = ObjectId::new(index, self.slots[index].generation);
@@ -1189,63 +1400,77 @@ impl Heap {
         conditional_roots: &HashMap<ObjectId, Vec<Value>>,
     ) {
         while let Some(id) = queue.pop_front() {
-            let Ok(entry) = self.entry(id) else {
-                continue;
-            };
-            match &entry.object {
-                HeapObject::String(_) => {}
-                HeapObject::Table(table) => {
-                    if let Some(metatable) = table.metatable {
-                        mark_id(metatable, self, marked, queue);
-                    }
-                    if !table.weak_values {
-                        for value in &table.array {
-                            mark_value(*value, self, marked, queue);
-                        }
-                    }
-                    for (key, value) in &table.hash {
-                        if !table.weak_keys {
-                            mark_key(key, self, marked, queue);
-                        }
-                        if !table.weak_values && !table.weak_keys {
-                            mark_value(*value, self, marked, queue);
-                        }
-                    }
+            self.trace_object(id, marked, queue, conditional_roots);
+        }
+    }
+
+    /// Marks every object one gray `id` directly points to - the single
+    /// "process one queue entry" step, shared by `drain_mark_queue`'s
+    /// unbounded drain and `step_major_with_conditional_roots`'s
+    /// budget-bounded incremental drain.
+    fn trace_object(
+        &self,
+        id: ObjectId,
+        marked: &mut HashSet<ObjectId>,
+        queue: &mut VecDeque<ObjectId>,
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) {
+        let Ok(entry) = self.entry(id) else {
+            return;
+        };
+        match &entry.object {
+            HeapObject::String(_) => {}
+            HeapObject::Table(table) => {
+                if let Some(metatable) = table.metatable {
+                    mark_id(metatable, self, marked, queue);
                 }
-                HeapObject::Closure(closure) => {
-                    for upvalue in &closure.upvalues {
-                        mark_id(*upvalue, self, marked, queue);
-                    }
-                }
-                HeapObject::NativeCallable(callable) => {
-                    for value in &callable.captures {
+                if !table.weak_values {
+                    for value in &table.array {
                         mark_value(*value, self, marked, queue);
                     }
                 }
-                HeapObject::Upvalue(upvalue) => mark_value(upvalue.value, self, marked, queue),
-                HeapObject::Thread(thread) => {
-                    for value in thread.stack.iter().chain(&thread.yielded) {
-                        mark_value(*value, self, marked, queue);
+                for (key, value) in &table.hash {
+                    if !table.weak_keys {
+                        mark_key(key, self, marked, queue);
                     }
-                    if let Some(extra) = conditional_roots.get(&id) {
-                        for value in extra {
-                            mark_value(*value, self, marked, queue);
-                        }
-                    }
-                }
-                HeapObject::Userdata(userdata) => {
-                    if let Some(metatable) = userdata.metatable {
-                        mark_id(metatable, self, marked, queue);
-                    }
-                    for value in &userdata.user_values {
+                    if !table.weak_values && !table.weak_keys {
                         mark_value(*value, self, marked, queue);
                     }
                 }
-                HeapObject::Error(error) => {
-                    mark_value(error.value, self, marked, queue);
-                    if let Some(cause) = error.cause {
-                        mark_id(cause, self, marked, queue);
+            }
+            HeapObject::Closure(closure) => {
+                for upvalue in &closure.upvalues {
+                    mark_id(*upvalue, self, marked, queue);
+                }
+            }
+            HeapObject::NativeCallable(callable) => {
+                for value in &callable.captures {
+                    mark_value(*value, self, marked, queue);
+                }
+            }
+            HeapObject::Upvalue(upvalue) => mark_value(upvalue.value, self, marked, queue),
+            HeapObject::Thread(thread) => {
+                for value in thread.stack.iter().chain(&thread.yielded) {
+                    mark_value(*value, self, marked, queue);
+                }
+                if let Some(extra) = conditional_roots.get(&id) {
+                    for value in extra {
+                        mark_value(*value, self, marked, queue);
                     }
+                }
+            }
+            HeapObject::Userdata(userdata) => {
+                if let Some(metatable) = userdata.metatable {
+                    mark_id(metatable, self, marked, queue);
+                }
+                for value in &userdata.user_values {
+                    mark_value(*value, self, marked, queue);
+                }
+            }
+            HeapObject::Error(error) => {
+                mark_value(error.value, self, marked, queue);
+                if let Some(cause) = error.cause {
+                    mark_id(cause, self, marked, queue);
                 }
             }
         }
@@ -1305,7 +1530,29 @@ impl Heap {
         }
     }
 
-    fn sweep_weak_tables(&mut self, marked: &HashSet<ObjectId>) {
+    /// Real Lua never actually drops a string out of a weak-value table
+    /// slot, short or long - confirmed against the pinned 5.5 oracle
+    /// (`a[1] = string.rep('b', 21); collectgarbage(); assert(a[1])`,
+    /// matching `gc.lua`'s own "-- strings are *values*" comment on this
+    /// exact case). Every other collectable kind follows ordinary
+    /// weak-value semantics: nilled once unreachable. (A string used as a
+    /// table *key* needs no equivalent carve-out: `table_key` already
+    /// normalizes a string key to an inline `TableKey::String(Vec<u8>)`,
+    /// never an `ObjectId`, so it was never subject to identity-based
+    /// liveness checking in the first place.)
+    ///
+    /// A survivor exempted this way was never marked reachable during the
+    /// ordinary mark phase (weak-value table slots are never traced as
+    /// out-edges - see `trace_object`'s `Table` arm), so it must be added to
+    /// `marked` right here, not just spared from being nilled out of the
+    /// table: otherwise the caller's own final sweep-by-`marked` pass would
+    /// still free its slot out from under the reference this function just
+    /// decided to keep.
+    fn sweep_weak_tables(&mut self, marked: &mut HashSet<ObjectId>) {
+        let string_ids: HashSet<ObjectId> = self
+            .live_ids()
+            .filter(|id| matches!(self.object(*id), Ok(HeapObject::String(_))))
+            .collect();
         for slot in &mut self.slots {
             let Some(Entry {
                 object: HeapObject::Table(table),
@@ -1317,7 +1564,7 @@ impl Heap {
             if table.weak_values {
                 let mut nilled_within_border = false;
                 for (index, value) in table.array.iter_mut().enumerate() {
-                    if value.as_object().is_some_and(|id| !marked.contains(&id)) {
+                    if !value_survives_weak_value_sweep(*value, &string_ids, marked) {
                         *value = Value::NIL;
                         nilled_within_border |= index < table.array_border;
                     }
@@ -1335,8 +1582,8 @@ impl Heap {
             }
             table.hash.retain(|key, value| {
                 let key_alive = !table.weak_keys || key_is_live(key, marked);
-                let value_alive =
-                    !table.weak_values || value.as_object().is_none_or(|id| marked.contains(&id));
+                let value_alive = !table.weak_values
+                    || value_survives_weak_value_sweep(*value, &string_ids, marked);
                 key_alive && value_alive
             });
         }
@@ -1411,6 +1658,28 @@ fn key_is_live(key: &TableKey, marked: &HashSet<ObjectId>) -> bool {
         TableKey::Object(id) => marked.contains(id),
         _ => true,
     }
+}
+
+/// See `sweep_weak_tables`'s doc comment: a string value survives
+/// unconditionally (and is marked reachable right here, since it was never
+/// traced as an out-edge to begin with), everything else follows ordinary
+/// weak-value liveness.
+fn value_survives_weak_value_sweep(
+    value: Value,
+    string_ids: &HashSet<ObjectId>,
+    marked: &mut HashSet<ObjectId>,
+) -> bool {
+    let Some(id) = value.as_object() else {
+        return true;
+    };
+    if marked.contains(&id) {
+        return true;
+    }
+    if string_ids.contains(&id) {
+        marked.insert(id);
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1969,5 +2238,79 @@ mod tests {
                 frame_len: 3,
             })
         );
+    }
+
+    #[test]
+    fn step_major_with_conditional_roots_needs_fewer_calls_with_a_bigger_budget() {
+        fn steps_to_finish(work: usize, garbage_count: usize) -> (usize, Collection) {
+            let mut heap = Heap::default();
+            let root_table = heap.alloc_table();
+            let root = heap.add_root(Value::object(root_table));
+            for _ in 0..garbage_count {
+                heap.alloc_table();
+            }
+            let mut calls = 0;
+            loop {
+                calls += 1;
+                let (finished, collection) =
+                    heap.step_major_with_conditional_roots(work, &[], &HashMap::new());
+                if finished {
+                    heap.remove_root(root);
+                    return (calls, collection);
+                }
+            }
+        }
+
+        // Mirrors `gc.lua`'s own `dosteps` acceptance test: a smaller
+        // per-call budget must take strictly more calls to finish the same
+        // cycle than a larger one, and either way the unrooted garbage is
+        // fully reclaimed once the cycle actually completes.
+        let (small_budget_calls, small_collection) = steps_to_finish(2, 40);
+        let (large_budget_calls, large_collection) = steps_to_finish(1000, 40);
+        assert!(small_budget_calls > large_budget_calls);
+        assert_eq!(large_budget_calls, 1);
+        assert_eq!(small_collection.reclaimed, 40);
+        assert_eq!(large_collection.reclaimed, 40);
+    }
+
+    #[test]
+    fn step_major_with_conditional_roots_write_barrier_protects_a_late_root_mutation() {
+        let mut heap = Heap::default();
+        let root_table = heap.alloc_table();
+        let root = heap.add_root(Value::object(root_table));
+
+        // A chain long enough that a `work: 1` budget needs several calls
+        // to drain, so `root_table` gets dequeued and fully traced (goes
+        // "black") well before the cycle as a whole converges.
+        let mut previous = root_table;
+        for _ in 0..10 {
+            let next = heap.alloc_table();
+            heap.table_set(previous, Value::integer(1), Value::object(next))
+                .unwrap();
+            previous = next;
+        }
+
+        // Trace `root_table` itself (and only it) this call.
+        let (finished, _) = heap.step_major_with_conditional_roots(1, &[], &HashMap::new());
+        assert!(!finished);
+
+        // With `root_table` already traced, point it at a brand new object
+        // the rest of the (now-detached) chain has no way to discover.
+        // Without the insertion barrier this would be silently swept once
+        // the cycle finishes, even though a live root points straight at
+        // it right now.
+        let late_child = heap.alloc_table();
+        heap.table_set(root_table, Value::integer(1), Value::object(late_child))
+            .unwrap();
+
+        loop {
+            let (finished, _) = heap.step_major_with_conditional_roots(1, &[], &HashMap::new());
+            if finished {
+                break;
+            }
+        }
+
+        assert!(heap.contains(late_child));
+        heap.remove_root(root);
     }
 }

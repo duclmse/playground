@@ -166,28 +166,63 @@ impl LuaRuntime {
             .allocation_remaining
             .saturating_add(reclaimed_bytes)
             .min(self.allocation_budget);
-        if collection.finalizers.is_empty() {
+        self.run_gc_finalizers(collection.finalizers, active_frame);
+    }
+
+    /// `collectgarbage("step", size)`'s actual work: at most `size` units of
+    /// bounded major-collection work via
+    /// `sol_core::Heap::step_major_with_conditional_roots`, resuming
+    /// whatever incremental cycle (if any) a prior `step_garbage` call left
+    /// in progress. Returns whether this call finished the cycle - real
+    /// Lua's own `collectgarbage("step", ...)` return value - crediting
+    /// back the reclaimed byte delta and running any `__gc` finalizers the
+    /// same way `collect_garbage_with` does, once the cycle actually
+    /// finishes (a cycle still in progress never has any: see
+    /// `step_major_with_conditional_roots`'s own doc comment).
+    pub(super) fn step_garbage(&mut self, size: usize, active_frame: Option<&LuaFrame>) -> bool {
+        let (roots, conditional_roots) = self.frame_roots(active_frame);
+        let live_before = self.canonical_heap.borrow().live_bytes();
+        let (finished, collection) = self
+            .canonical_heap
+            .borrow_mut()
+            .step_major_with_conditional_roots(size, &roots, &conditional_roots);
+        let live_after = self.canonical_heap.borrow().live_bytes();
+        let reclaimed_bytes = live_before.saturating_sub(live_after);
+        self.allocation_remaining = self
+            .allocation_remaining
+            .saturating_add(reclaimed_bytes)
+            .min(self.allocation_budget);
+        self.run_gc_finalizers(collection.finalizers, active_frame);
+        finished
+    }
+
+    /// Every `self.call(finalizer, ...)` below drives its own nested
+    /// dispatch loop, whose collections only know about *its* active frame
+    /// and `self.frames` - neither includes `active_frame` here, which (if
+    /// `Some`) is this same outer, still-in-flight call's own popped frame
+    /// (see `pinned_roots`'s doc comment). Pin it for the whole
+    /// finalizer-invocation loop, not just the roots snapshot the caller
+    /// already took, so it survives any collection nested inside a
+    /// finalizer. Shared by `collect_garbage_with` and `step_garbage`, whose
+    /// only difference is how the just-finished `Collection`'s finalizer
+    /// list was produced (a one-shot pass vs. one that finished on this
+    /// particular step call).
+    fn run_gc_finalizers(&mut self, finalizers: Vec<ObjectId>, active_frame: Option<&LuaFrame>) {
+        if finalizers.is_empty() {
             return;
         }
-        // Every `self.call(finalizer, ...)` below drives its own nested
-        // dispatch loop, whose collections only know about *its* active
-        // frame and `self.frames` - neither includes `active_frame` here,
-        // which (if `Some`) is this same outer, still-in-flight call's own
-        // popped frame (see `pinned_roots`'s doc comment). Pin it for the
-        // whole finalizer-invocation loop, not just the roots snapshot
-        // above, so it survives any collection nested inside a finalizer.
         let mut pinned = Vec::new();
         if let Some(frame) = active_frame {
             self.push_lua_frame_roots(frame, &mut pinned);
         }
         self.pinned_roots.push(pinned);
-        for id in collection.finalizers {
+        for id in finalizers {
             // Only tables register a finalizer today (`table_set_metatable`
             // is the sole `register_finalizer` call site) - `CanonicalUserdata`
             // is a separate, permanently-self-rooted tier (see its own doc
-            // comment in `value.rs`) that a `collect_major_with_roots` sweep
-            // never reclaims through this queue in the first place, so no
-            // `Userdata` case belongs here.
+            // comment in `value.rs`) that a collection sweep never reclaims
+            // through this queue in the first place, so no `Userdata` case
+            // belongs here.
             let Ok(LuaValue::Table(table)) = self.decode_value(Value::object(id)) else {
                 let _ = self.canonical_heap.borrow_mut().finish_finalizer(id);
                 continue;

@@ -53,6 +53,55 @@ fn dynamic_lua_runtime_weak_value_tables_do_not_retain_suspended_coroutines() {
 }
 
 #[test]
+fn dynamic_lua_runtime_weak_value_tables_never_prune_string_values() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // Real Lua treats a `__mode = "v"` table's *string*-valued entries as
+    // always alive: strings are interned, not heap-object references, so
+    // `iscleared` exempts them from weak-value collection entirely (see
+    // `lgc.c`'s handling of `LUA_VSHRSTR`/`LUA_VLNGSTR`). A sweep that instead
+    // treats a string like any other heap value would wrongly clear this
+    // entry the moment nothing *else* references the same string content,
+    // which is exactly what a plain sweep-and-prune pass does for
+    // tables/closures/coroutines.
+    let source = br#"
+        local cache = {}
+        setmetatable(cache, { __mode = "v" })
+        cache[1] = string.rep("x", 8)
+        collectgarbage()
+        return cache[1] == "xxxxxxxx"
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_scoped_out_local_does_not_keep_a_weak_value_alive() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // A local's register is only ever *bookkept* as free once its enclosing
+    // scope ends; nothing physically clears the register's runtime content
+    // until some later value reuses it. Since a frame's precise-root scan
+    // roots its entire fixed-size register array, a retired-but-uncleared
+    // register holding `obj` would keep `obj` spuriously reachable for the
+    // rest of the enclosing call, defeating weak-table pruning even though
+    // `obj` is provably unreachable from Lua's own perspective the moment the
+    // `do ... end` block exits. This is the same class of bug
+    // `lua-5.5.1-tests/closure.lua`'s weak-table idioms depend on not
+    // happening.
+    let source = br#"
+        local cache = {}
+        setmetatable(cache, { __mode = "v" })
+        do
+            local obj = {}
+            cache[1] = obj
+        end
+        collectgarbage()
+        return cache[1] == nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_reclaims_reference_cycles_via_collectgarbage() {
     use sol::lua_runtime::LuaRuntime;
 
@@ -249,6 +298,30 @@ fn dynamic_lua_runtime_calls_gc_finalizers_for_collected_cycles() {
 }
 
 #[test]
+fn dynamic_lua_runtime_registers_a_finalizer_from_a_placeholder_gc_field_overwritten_later() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // Real Lua's `luaC_checkfinalizer` marks an object to-be-finalized the
+    // moment `setmetatable` attaches a metatable with *any* non-nil `__gc`
+    // field - callability is only checked later, fresh, at actual
+    // finalization time. So `setmetatable(u, {__gc = true})` (a placeholder,
+    // not a function) already marks `u`; a later plain field write
+    // (`getmetatable(u).__gc = function(...) ... end`, not another
+    // `setmetatable` call) must still take effect as `u`'s real finalizer.
+    // `lua-5.5.1-tests/gc.lua`'s "__gc x weak tables" section depends on
+    // exactly this two-phase ordering.
+    let source = br#"
+        local u = setmetatable({}, { __gc = true })
+        local ran = false
+        getmetatable(u).__gc = function(o) ran = true end
+        u = nil
+        collectgarbage()
+        return ran
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_gc_stress_mode_reclaims_cycles_without_explicit_collectgarbage() {
     use sol::lua_runtime::{LuaRuntime, LuaValue};
 
@@ -334,9 +407,20 @@ fn dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_c
     // Same table+`__gc`-cycle scenario as
     // `dynamic_lua_runtime_calls_gc_finalizers_for_collected_cycles`, but
     // with GC stress mode collecting automatically at every allocation and
-    // instruction instead of the script calling `collectgarbage()` itself -
-    // finalizers must still fire exactly once per reclaimed cycle, and the
-    // still-reachable final iteration's table must not be finalized early.
+    // instruction instead of the script calling `collectgarbage()` itself,
+    // and with no per-iteration `collectgarbage()` call inside the loop
+    // body at all - unlike that test, where the explicit mid-body call
+    // still finds the current iteration's own `t` reachable (its `for`
+    // block hasn't closed yet), here every iteration's `t`, including the
+    // fifth, is already out of scope by the time any hook fires again, so
+    // all five get finalized (confirmed against real Lua 5.5.1: an
+    // otherwise-identical script with one `collectgarbage("collect")` after
+    // the loop instead of stress mode also reports `calls == 5`, since a
+    // local going out of scope - even at a loop's last iteration - is
+    // unreachable before the enclosing function returns, with no need to
+    // wait for the call to actually return).
+    //
+    // Finalizers must still fire exactly once per reclaimed cycle.
     let mut stress = LuaRuntime::with_budgets(1_000_000, 100, 1024 * 1024);
     stress.set_gc_stress(true);
     let result = stress
@@ -356,7 +440,7 @@ fn dynamic_lua_runtime_gc_stress_mode_calls_finalizers_correctly_for_collected_c
     let LuaValue::Integer(calls) = result else {
         panic!("expected an integer result");
     };
-    assert_eq!(calls, 4);
+    assert_eq!(calls, 5);
 }
 
 #[test]

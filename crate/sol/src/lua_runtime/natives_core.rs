@@ -359,13 +359,22 @@ impl LuaRuntime {
                         Ok(vec![LuaValue::Integer(0)])
                     }
                     b"step" => {
-                        self.collect_garbage();
-                        // No real incremental stepping exists - each "step"
-                        // call already runs a full `collect_major_with_roots`
-                        // pass, so it always finishes a collection cycle
-                        // immediately (unlike real Lua, where finishing a
-                        // cycle can take many steps).
-                        Ok(vec![LuaValue::Bool(true)])
+                        // Real Lua's `size` is a KByte-ish work amount; Sol's
+                        // collector counts work in graph nodes/slots instead
+                        // (see `step_garbage`'s doc comment), so `size` is
+                        // used directly as that budget - the two units don't
+                        // need to match, only the property `gc.lua`'s own
+                        // `dosteps` acceptance test relies on: a bigger `size`
+                        // does more work per call and so needs fewer calls to
+                        // finish the same cycle.
+                        let size = args
+                            .get(1)
+                            .map(|value| self.integer(value))
+                            .transpose()?
+                            .unwrap_or(0)
+                            .max(0) as usize;
+                        let finished = self.step_garbage(size, None);
+                        Ok(vec![LuaValue::Bool(finished)])
                     }
                     // No real incremental/generational collector mode
                     // difference exists yet ("collect" and "step" above

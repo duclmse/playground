@@ -416,12 +416,26 @@ impl FuncState {
     /// enclosing label's scope check.
     pub(super) fn pop_scope(&mut self, line: u32) -> Result<(), String> {
         let scope = self.scopes.pop().expect("scope stack underflow");
+        let old_next_reg = self.next_reg;
         self.next_reg = scope
             .saved_next_reg
             .max(self.retired_floor)
             .max(self.loop_reg_floor());
         if scope.close_count > 0 {
             self.emit(Instr::CloseSlots(scope.close_count), line);
+        }
+        // See `Compiler::end_statement`'s doc comment: a register this
+        // scope's locals/temporaries retire here must be made actually nil,
+        // not just bookkept as free, since this VM's GC scans a frame's
+        // whole fixed `regs` array rather than a dynamically shrinking top.
+        // Tagged with `last_line()`, not `line`, for the same reason
+        // `end_statement` is: no source token of its own, so it must not
+        // introduce a spurious extra `debug.sethook` `"line"` transition.
+        if old_next_reg > self.next_reg {
+            let clear_line = self.last_line().unwrap_or(line);
+            for reg in self.next_reg..old_next_reg {
+                self.emit(Instr::LoadNil(reg), clear_line);
+            }
         }
         if self.scopes.last().is_some() {
             for mut pending in scope.unresolved_gotos {

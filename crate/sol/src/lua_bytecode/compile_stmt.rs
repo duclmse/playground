@@ -58,15 +58,39 @@ impl Compiler {
                     None => true,
                 };
             self.compile_stmt(statement, is_last)?;
-            self.end_statement();
+            self.end_statement(stmt_line(statement));
         }
         Ok(())
     }
 
     /// Resets the temp-register cursor back down to "just past the
     /// currently declared locals", so later statements can reuse the
-    /// register numbers this statement's temporaries used.
-    fn end_statement(&mut self) {
+    /// register numbers this statement's temporaries used. Registers this
+    /// statement retires that way (a just-closed loop's own body registers,
+    /// e.g.) are never guaranteed to get overwritten by anything the *next*
+    /// statement compiles - if it needs fewer registers than this one did,
+    /// the gap is left holding whatever object reference was last stored
+    /// there. Real Lua never has this problem: its GC only scans up to the
+    /// dynamically tracked `L->top`, which drops right back down the moment
+    /// a block/loop's locals go out of scope, so a retired register is
+    /// simply invisible to the collector from then on, physical stale
+    /// content notwithstanding. This VM instead always scans a frame's
+    /// entire fixed `regs` array (see `push_lua_frame_roots`), so an
+    /// equivalent register has to be made *actually* nil, not just
+    /// bookkept as free - otherwise a table used only as a weak-table
+    /// key/value inside a loop body (`gc.lua`'s `for i=1,lim do local
+    /// t={}; a[t]=t end`) is kept spuriously reachable by this leftover
+    /// register until something else happens to reuse that exact slot.
+    ///
+    /// These clears are compiler-synthesized with no source token of their
+    /// own, so - like the `else`-skipping `Instr::Jump` `last_line` already
+    /// documents - they're tagged with the line of the last real instruction
+    /// emitted so far rather than `line` (the statement that just *finished*
+    /// compiling), so `debug.sethook`'s `"line"` hook never sees a spurious
+    /// extra line transition for them; `line` is only a fallback for the
+    /// (unreachable in practice) case of clearing before anything at all has
+    /// been emitted yet.
+    fn end_statement(&mut self, line: u32) {
         let level = self.level();
         let state = &mut self.stack[level];
         let floor = state
@@ -80,7 +104,15 @@ impl Compiler {
                     .unwrap_or(scope.saved_next_reg)
             })
             .unwrap_or(0);
-        state.next_reg = floor.max(state.retired_floor).max(state.loop_reg_floor());
+        let new_next_reg = floor.max(state.retired_floor).max(state.loop_reg_floor());
+        let old_next_reg = state.next_reg;
+        if old_next_reg > new_next_reg {
+            let clear_line = state.last_line().unwrap_or(line);
+            for reg in new_next_reg..old_next_reg {
+                state.emit(Instr::LoadNil(reg), clear_line);
+            }
+        }
+        state.next_reg = new_next_reg;
     }
 
     fn compile_stmt(&mut self, statement: &Stmt, is_last: bool) -> Result<(), String> {
@@ -316,6 +348,7 @@ impl Compiler {
                 else_block,
                 line,
             } => {
+                let cond_before = self.stack[level].next_reg;
                 let cond_reg = self.compile_expr(cond)?;
                 let test_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
                 let jump_to_else = self
@@ -323,8 +356,38 @@ impl Compiler {
                     .last_mut()
                     .unwrap()
                     .emit(Instr::JumpIfFalse(cond_reg, 0), test_line);
+                // Whatever the condition left allocated above `cond_before`
+                // (`cond_reg` itself, plus e.g. a call's argument-marshaling
+                // scratch that a `Call` never reclaims down to just its own
+                // result register) must be dropped right here, on *both*
+                // the branch this `JumpIfFalse` falls through to and the one
+                // it jumps to - not left for the shared, once-only
+                // `end_statement` call after the whole `if`/`else`
+                // compiles. That call fires at the control-flow *join
+                // point* both branches share, where the only available
+                // compile-time line (`last_line()`) always reflects
+                // whichever branch was textually compiled *last* (the
+                // `else` block) - producing a spurious `debug.sethook`
+                // `"line"` event on any run that actually took the *other*
+                // branch. Tagging both copies with `test_line` (this very
+                // `JumpIfFalse`'s own line) is safe on both paths: it's
+                // already the current hook line the instant either branch
+                // is entered, so neither copy causes a line transition.
+                // Dropping `next_reg` back to `cond_before` immediately
+                // (instead of `free_reg`, which only reclaims a single,
+                // strictly-topmost register) means the outer
+                // `end_statement` sees no leftover delta to (mis-)clear on
+                // its own once this statement finishes.
+                let leaked_top = self.stack[level].next_reg;
+                let needs_clear = leaked_top > cond_before;
+                if needs_clear {
+                    for reg in cond_before..leaked_top {
+                        self.stack.last_mut().unwrap().emit(Instr::LoadNil(reg), test_line);
+                    }
+                    self.stack.last_mut().unwrap().next_reg = cond_before;
+                }
                 self.compile_block(then_block)?;
-                if let Some(else_block) = else_block {
+                if else_block.is_some() || needs_clear {
                     let skip_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
                     let jump_to_end = self
                         .stack
@@ -336,7 +399,17 @@ impl Compiler {
                         .last_mut()
                         .unwrap()
                         .patch_jump(jump_to_else, else_start as i32);
-                    self.compile_block(else_block)?;
+                    if needs_clear {
+                        for reg in cond_before..leaked_top {
+                            self.stack
+                                .last_mut()
+                                .unwrap()
+                                .emit(Instr::LoadNil(reg), test_line);
+                        }
+                    }
+                    if let Some(else_block) = else_block {
+                        self.compile_block(else_block)?;
+                    }
                     let end = self.stack.last_mut().unwrap().here();
                     self.stack
                         .last_mut()
@@ -361,31 +434,51 @@ impl Compiler {
                     .last_mut()
                     .unwrap()
                     .emit(Instr::JumpIfFalse(cond_reg, 0), cond_line);
-                // If the condition compiled to a genuinely fresh temporary
-                // (register allocation is stack-disciplined, so `cond_reg`
-                // can only alias a pre-existing local/upvalue-as-local if it
-                // is below the watermark captured before compiling `cond` -
-                // e.g. `while flag do` returns `flag`'s own register, which
-                // must never be touched here), drop it immediately after
-                // `JumpIfFalse` consumes it, on the "condition held, entering
-                // the body" fallthrough path. Real Lua's tracing collector
-                // never even sees this stale reference: a temporary test
-                // value like `x[1]` in `while x[1] do ... end` lives only
-                // above the stack's `top`, which recedes right after the
-                // test. Without this, this runtime's Rc-refcounting model
-                // would keep leaving the last iteration's test value sitting
-                // in this register uncleared for the rest of the loop body's
-                // execution, holding a phantom strong reference that defeats
+                // Whatever the condition left allocated above `cond_before`
+                // (register allocation is stack-disciplined, so a bare
+                // local/upvalue-as-local condition like `while flag do`
+                // returns `flag`'s own register, always below this
+                // watermark, and is correctly left untouched) must be
+                // dropped immediately, on *both* paths this `JumpIfFalse`
+                // can take - not left for the shared, once-only
+                // `end_statement` call after the whole `while` statement
+                // compiles. Real Lua's tracing collector never even sees
+                // this stale reference: a temporary test value like `x[1]`
+                // in `while x[1] do ... end` lives only above the stack's
+                // `top`, which recedes right after the test. Without this,
+                // this runtime's Rc-refcounting model would keep leaving the
+                // last iteration's test value sitting in this register
+                // uncleared for the rest of the loop body's execution,
+                // holding a phantom strong reference that defeats
                 // weak-table pruning/cycle collection for a reference-typed
                 // condition - exactly the idiom
                 // `lua-5.5.1-tests/closure.lua` uses (`while x[1] do ... end`
                 // waiting for automatic GC to clear a weak-valued entry)
                 // to force a collection.
-                if cond_reg >= cond_before {
-                    self.stack
-                        .last_mut()
-                        .unwrap()
-                        .emit(Instr::LoadNil(cond_reg), *line);
+                //
+                // Both copies are tagged `cond_line` (this very
+                // `JumpIfFalse`'s own line): on the "enter/re-enter the
+                // body" path it's already current (the test just ran); on
+                // the "loop exits" path it's *still* current even after
+                // many iterations, because every back-edge re-executes the
+                // test and re-fires the hook for `cond_line` right before
+                // falling out - unlike `last_line()` (what the outer,
+                // shared `end_statement` would otherwise use), which is the
+                // *body*'s last line, a line that's no longer "current" by
+                // the time the loop actually exits. Reducing `next_reg`
+                // back to `cond_before` immediately means that outer call
+                // sees no leftover delta to (mis-)clear on its own either
+                // way.
+                let leaked_top = self.stack[level].next_reg;
+                let needs_clear = leaked_top > cond_before;
+                if needs_clear {
+                    for reg in cond_before..leaked_top {
+                        self.stack
+                            .last_mut()
+                            .unwrap()
+                            .emit(Instr::LoadNil(reg), cond_line);
+                    }
+                    self.stack.last_mut().unwrap().next_reg = cond_before;
                 }
                 let scope_depth = self.stack[level].scopes.len();
                 self.stack.last_mut().unwrap().loops.push(LoopCtx {
@@ -409,6 +502,14 @@ impl Compiler {
                     .last_mut()
                     .unwrap()
                     .patch_jump(exit_jump, end as i32);
+                if needs_clear {
+                    for reg in cond_before..leaked_top {
+                        self.stack
+                            .last_mut()
+                            .unwrap()
+                            .emit(Instr::LoadNil(reg), cond_line);
+                    }
+                }
                 let ctx = self.stack.last_mut().unwrap().loops.pop().unwrap();
                 if let Some(parent) = self.stack.last_mut().unwrap().loops.last_mut() {
                     parent.reg_floor = parent.reg_floor.max(ctx.reg_floor);

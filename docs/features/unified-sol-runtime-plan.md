@@ -1,7 +1,7 @@
 # Final-goal plan: one Lua-compatible Sol runtime, typed specialization, and integrated tooling
 
 > Status: accepted convergence roadmap; U0 and U1 completed 2026-09-15; U3,
-> U4, and U5 completed 2026-09-16; U2's production-object migration remains in progress. This document
+> U4, and U5 completed 2026-09-16; U2 completed 2026-09-26. This document
 > defines the intended end state and the order for future work. It does not change the current language
 > contract by itself; `docs/spec/` and executable tests remain the description
 > of released behavior until each milestone below lands.
@@ -581,7 +581,7 @@ The former Sol-only `{ ... }` statement block was removed because it is
 syntactically indistinguishable from Lua's newline-insensitive `callee { ... }`
 call sugar. Scoped statement blocks use Lua's equivalent `do ... end` form.
 
-### U2 — Canonical runtime object model and GC foundation — **in progress**
+### U2 — Canonical runtime object model and GC foundation — **completed 2026-09-26**
 
 **Purpose:** establish one identity/reachability domain before merging execution
 tiers.
@@ -592,11 +592,16 @@ Deliverables:
   tables, closures, upvalues, threads, userdata, errors, and capabilities;
 - [x] replace dedicated globals with `_ENV` table/upvalue semantics;
 - [x] define root registration and stack-map interfaces before optimizing layouts;
-- [ ] migrate dynamic libraries and metatables onto the canonical objects;
+- [x] migrate dynamic libraries and metatables onto the canonical objects
+  (metatables ride along with the table object migration below;
+  `package.loadlib`'s raw `dlopen` handles carry no `LuaValue`/GC identity at
+  all and were never owned by either collector, so there was nothing to
+  migrate there - see the reconciliation below);
 - [x] add precise tracing, barriers, weak/ephemeron rules, finalizer queues, and
   coroutine roots;
 - [x] provide temporary adapters for existing `LuaValue` and typed heap objects so
-  migration can proceed without a flag day.
+  migration can proceed without a flag day (superseded once the flip below
+  removed everything the adapter had left to snapshot; see below).
 
 Exit gate: identity, weak reference, finalization, coroutine, and mixed-adapter
 stress tests pass under forced collection; no production object is owned by two
@@ -646,31 +651,38 @@ strand or reorder entries out from under `pairs`/`next`-style traversal, and
 to pull in `indexmap` for its own table object. Covered by a new regression
 test proving overwrite-in-place and tombstone-in-place ordering.
 
-U2 remains in progress because the production Lua interpreter and typed runtime
-still own objects in their existing `Rc` and arena collectors. The adapter is a
-migration seam, not a second production owner: imported canonical graphs are
-snapshots and must not be mutated concurrently with legacy graphs. Re-auditing
-the remaining categories directly against the current source (rather than
-trusting this document's earlier list) found two entries that don't actually
-describe outstanding object-migration work: `LuaValue::Userdata` is already
-`CanonicalUserdata`, a precisely-rooted `sol_core::ObjectId` handle with no
-other representation left to migrate, and "dynamic libraries" names
-`package.loadlib`'s raw `dlopen` handles (`c_api::NativeLibrary`), which carry
-no `LuaValue`/GC identity at all and were never owned by either collector.
-Strings have since migrated too: `LuaValue::String`/`LuaKey::String` now hold
-a `CanonicalString` handle into `sol_core::Heap` instead of `Rc<Vec<u8>>`.
-Strings are a leaf value with no outgoing references, so this slice landed
-independently, ahead of the rest. The genuinely remaining work is tables
-(including metatables; the production global environment is just a table and
-needs no separate step), closures, and coroutine frames — each still
-`Rc`-owned (`lua_runtime::value::LuaTable`/`LuaClosure`,
-`lua_runtime::coroutine::LuaCoroutine`). Unlike strings, these three cannot be
-verified one at a time under realistic programs: closures capture
-table-holding values and coroutine frames hold both, so the useful unit of
-"done" is when all three are canonical, not a single monolithic patch — see
-[table-closure-coroutine-cutover.md](table-closure-coroutine-cutover.md) for
-the target representation, root/safepoint discipline, and sequencing this
-converges on. See also [canonical-runtime-foundation.md](canonical-runtime-foundation.md).
+U2 took longer than U0/U1/U3–U5 because the production Lua interpreter and
+typed runtime kept owning objects in their existing `Rc` and arena collectors
+well after `sol-core` itself was ready. Re-auditing the remaining categories
+directly against the current source (rather than trusting this document's
+earlier list) found two entries that never actually described outstanding
+object-migration work: `LuaValue::Userdata` was already `CanonicalUserdata`, a
+precisely-rooted `sol_core::ObjectId` handle with no other representation to
+migrate, and "dynamic libraries" names `package.loadlib`'s raw `dlopen`
+handles (`c_api::NativeLibrary`), which carry no `LuaValue`/GC identity at all
+and were never owned by either collector. Strings migrated first and
+independently, ahead of tables/closures/coroutines: `LuaValue::String`/
+`LuaKey::String` hold a `CanonicalString` handle into `sol_core::Heap` instead
+of `Rc<Vec<u8>>`, and, being a leaf value with no outgoing references, needed
+no coordination with the rest.
+
+Tables (including metatables; the production global environment is just a
+table and needed no separate step), closures, and coroutine frames could not
+be migrated one at a time under realistic programs the way strings were:
+closures capture table-holding values and coroutine frames hold both, so the
+useful unit of "done" was when all three went canonical together, not a
+single monolithic patch. That coordinated flip, its follow-on safepoint and
+collector cleanup, and the coroutine conditional-rooting hook that closed the
+last known leak are complete — see
+[table-closure-coroutine-cutover.md](table-closure-coroutine-cutover.md) §§9–11
+for the implementation history (including bugs the flip's own stress testing
+found and fixed) and §10 for the exit audit (identity, weak-reference,
+finalizer, and coroutine stress tests under forced collection, confirming no
+production object is owned by two independent collectors). `lua_runtime::
+value::LuaTable`/`LuaClosure` and the old `Rc`-refcounting trial-deletion
+cycle collector are deleted; `sol_core::Heap`'s tracing collector is the only
+one left. See also
+[canonical-runtime-foundation.md](canonical-runtime-foundation.md).
 
 ### U3 — Unified bytecode, frames, and semantic call ABI — **completed 2026-09-16**
 
@@ -811,9 +823,12 @@ compare repeated `require` identity, a diamond dependency contains one module
 body, contract violations fail at the adapter, and an unused dynamic function
 leaves a proven `main`'s bytecode and constants byte-for-byte unchanged. The
 typed IR regression script continues to reject boxing/dynamic calls in hot
-benchmark functions. This does not complete U2: generic Lua tables/closures
-still have transitional `Rc` ownership even though mixed calls share the U3
-semantic ABI and module identity.
+benchmark functions. At the time this section was written, this did not
+complete U2: generic Lua tables/closures still had transitional `Rc`
+ownership even though mixed calls shared the U3 semantic ABI and module
+identity. U2 has since completed independently (see its own section above);
+mixed calls now share canonical table/closure/coroutine identity too, not
+just the semantic ABI and module cache described here.
 
 ### U6 — Lua 5.5 compatibility completion
 
@@ -833,20 +848,51 @@ Exit gate: the compatibility gates in section 6.2 pass for the declared full
 runtime profile. If the embedding profile remains incomplete, public wording
 must remain source-compatible rather than fully runtime-compatible.
 
-#### U6 exit ledger (2026-09-21)
+#### U6 exit ledger (2026-09-27)
 
 The manifest is the release ledger, not a substitute for this gate. It
 currently reports 11/34 unchanged upstream cases as oracle-backed passes, with
-8 implementation-pending rows, 10 rows that require the declared native host
-profile, and 5 documented divergences. U6 is complete only when all of the
-following are delivered and the corresponding unchanged rows compare cleanly:
+5 implementation-pending rows, 10 rows that require the declared native host
+profile, and 8 documented divergences (as of 2026-09-21, the pending/diverges
+split was 8/5; three rows moved from `pending` to `diverges` since, meaning
+their language-level assertions now match the oracle and what remains is a
+non-language cosmetic difference, e.g. the CLI's trailing implicit-chunk-return
+print - see the manifest for each row's specifics). U6 is complete only when
+all of the following are delivered and the corresponding unchanged rows
+compare cleanly:
 
 - portable runtime: arbitrary/debug-visible `_ENV` upvalues, full debug
   metadata and hooks, exact diagnostic/chunk-name formatting, remaining
   grammar and `string.pack` coverage, and default-budget behavior for bounded
   corpus programs;
 - GC/runtime identity: tracing-style observable collection and finalization
-  semantics rather than the transitional `Rc`/cycle-collector approximation;
+  semantics. U2's tables/closures/coroutines cutover (completed 2026-09-26)
+  delivered the tracing collector itself and confirmed real Lua's lazy-sweep
+  timing for ordinary garbage (`tests/lua55/manifest.toml`'s `gc.lua` row was
+  re-verified against it). Genuine incremental/bounded step-wise collection is
+  now also delivered: `collectgarbage("step", size)` resumes a bounded,
+  budget-proportional partial major-collection phase across calls
+  (`sol_core::Heap`'s `IncrementalPhase`/`IncrementalCycle` state) instead of
+  always running one full collection regardless of `size`. That fix, plus a
+  weak-value sweep exemption for interned strings and a general
+  register-retirement GC-root leak fix in the Lua-mode bytecode compiler
+  (stale, not-yet-recycled registers were kept rooted by
+  `push_lua_frame_roots`), together let `gc.lua` run through the entire
+  weak-tables section. A further `__gc`-finalizer registration gap (a
+  finalizer attached via a non-callable placeholder later overwritten with
+  the real function was never registered, since registration incorrectly
+  required callability instead of mere field presence at `setmetatable`
+  time, matching real Lua's `luaC_checkfinalizer`) is also fixed
+  (`table_set_metatable`, `lua_runtime/table.rs`), letting `gc.lua` run
+  through `__gc x weak tables` too. What remains open at line 477 is not a
+  leak (both ~4MB long strings are confirmed reclaimed once unreachable) but
+  a representational memory-accounting mismatch: `sol_core::TableObject`
+  sizes its byte footprint from `Vec`/`HashMap` capacity, which never
+  shrinks after deletions the way real Lua's own array/hash table layout
+  does, overshooting the pinned test's tight `collectgarbage("count")`
+  tolerance by about a kilobyte - deferred as disproportionate to fix for
+  one assertion (see the manifest note for the full repro), plus
+  `gengc.lua`/`tracegc.lua` themselves, both unattempted;
 - native profile: filesystem/locale/stdio behavior, Lua binary chunks, the
   embedding/C API decision, and native module loading/tests;
 - intentional divergences: replace invocation/model representations with the
@@ -879,9 +925,15 @@ exactly at the most-negative-integer boundary (`"-9223372036854775808"`) now
 converts to that exact integer instead of an imprecise float, mirroring real
 Lua's unsigned-accumulate-then-negate string-to-integer conversion. The
 unchanged `bwcoercion.lua`, `utf8.lua`, `pm.lua`, and `vararg.lua` cases all
-match the pinned Lua 5.5.1 oracle, giving four promoted rows; `math.lua` is
-close but still blocked on hex-float parsing for very long numerals; the
-remaining U6 rows stay pending at their next observed blocker.
+match the pinned Lua 5.5.1 oracle, giving four promoted rows. `math.lua` has
+since promoted too, after fixing the hex-float mantissa overflow this
+paragraph originally flagged as its blocker plus a chain of further
+differential bugs the fix exposed (float `%`'s precision loss, coercion-error
+wording, `math.tointeger`/`math.max`/`math.min` edge cases, and float-to-string
+formatting - see the manifest's own `math.lua` note for the full chain). The
+remaining U6 rows stay pending or diverging at their own most recently
+observed blocker; see `tests/lua55/manifest.toml` per row rather than this
+paragraph, which reflects the snapshot at the time it was written.
 
 The unchanged `coroutine.lua` case now also matches the pinned Lua 5.5.1
 oracle. Weak-value tables no longer retain a suspended `coroutine.wrap`

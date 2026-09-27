@@ -500,18 +500,49 @@ oracle; every omitted library entry has a documented capability status.
       the benchmark harness (see the exit gate below) — memory-checker
       integration (ASan/valgrind) is also not wired into these fixtures, only
       Sol's own budget accounting.
-- [ ] Run `gc`, `gengc`, and `tracegc` in their own capability category; map
+- [~] Run `gc`, `gengc`, and `tracegc` in their own capability category; map
       their implementation-dependent expectations to semantic invariants and
       retain exact upstream assertions where Sol claims identical behavior.
+      `gc.lua` no longer stops on the earlier `debug`-library/native-module
+      gaps: `collectgarbage`'s mode/pause/stepmul bookkeeping, genuinely
+      bounded incremental `"step"` stepping (`sol_core::Heap`'s resumable
+      major-collection phase), the weak-value-string sweep exemption, and a
+      general register-retirement GC-root leak in the Lua-mode bytecode
+      compiler (stale, not-yet-recycled registers were kept rooted by
+      `push_lua_frame_roots`, defeating weak-table pruning for a
+      reference-typed condition/temporary) are all fixed — see
+      `tests/lua55/manifest.toml`'s `gc.lua` case note for the fix-by-fix
+      detail. A further `__gc`-finalizer-registration gap at line 457 (a
+      finalizer attached via a non-function placeholder later overwritten
+      with the real function, `setmetatable(u, {__gc = true})` then
+      `getmetatable(u).__gc = function...`, never ran — real Lua registers
+      on mere field *presence* at `setmetatable` time, deferring the
+      callability check to actual finalization) is also fixed
+      (`table_set_metatable` in `lua_runtime/table.rs`). The file now runs
+      through the entire weak-tables section, including `__gc x weak
+      tables`, and stops at line 477: `collectgarbage("count")` (live heap
+      KB) does not settle back to its pre-allocation baseline after two
+      ~4MB long-string weak-table keys become unreachable. Root-caused as a
+      non-leak: both strings are correctly reclaimed once unreachable: the
+      small (~1 KB) overshoot comes from `sol_core::TableObject`'s byte
+      footprint tracking `Vec`/`HashMap` *capacity*, which (like Rust's std
+      collections generally) never shrinks back down after entries are
+      deleted, unlike real Lua's own shrink-on-delete array/hash table
+      layout. Matching that byte-for-byte would need a representational
+      change disproportionate to one memory-accounting assertion — deferred,
+      same class as `constructs.lua`'s quadratic-heap gap. `gengc.lua`/
+      `tracegc.lua` remain unattempted.
 
 **Exit gate:** dynamic stress fixtures have no dangling references or missed
 roots (done — see the stress-mode checklist item above), collector
 statistics are exposed to the benchmark harness (**not done**), and every
 supported GC observable has a reference-backed test (done for weak tables,
 cycle collection, and finalizers, both under normal and stress-mode
-collection; `gc`/`gengc`/`tracegc` themselves remain blocked on the
-unrelated debug-library/native-module gaps tracked in
-`tests/lua55/manifest.toml`).
+collection; `gc.lua` itself now runs past the previous debug-library/
+native-module and `__gc`-registration gaps and is blocked only on the
+line-477 table-capacity memory-accounting gap above, a deferred
+representational mismatch rather than a functional bug, tracked in
+`tests/lua55/manifest.toml`; `gengc`/`tracegc` remain unattempted).
 
 ## L7 — Coroutines and resumable execution
 
