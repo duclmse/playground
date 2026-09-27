@@ -716,12 +716,18 @@ impl Heap {
     }
 
     pub fn table_get(&self, table: ObjectId, key: Value) -> Result<Value, HeapError> {
-        let table = self.table(table)?;
+        // A positive integer key doesn't always live in the array part - see
+        // `should_grow_array` on `table_set` - so a key beyond the array's
+        // current length must still be looked up in the hash part rather
+        // than assumed absent.
         if let Some(index) = positive_array_index(key) {
-            return Ok(table.array.get(index - 1).copied().unwrap_or(Value::NIL));
+            let object = self.table(table)?;
+            if index <= object.array.len() {
+                return Ok(object.array.get(index - 1).copied().unwrap_or(Value::NIL));
+            }
         }
         let key = self.table_key(key)?;
-        Ok(table.hash.get(&key).copied().unwrap_or(Value::NIL))
+        Ok(self.table(table)?.hash.get(&key).copied().unwrap_or(Value::NIL))
     }
 
     /// The `#` operator: the table's cached array border (see
@@ -779,10 +785,10 @@ impl Heap {
     /// table's iteration order (array part in index order, then the hash
     /// part in insertion order), skipping tombstoned (nil-valued) entries,
     /// or `None` once iteration is exhausted. `key == Value::NIL` starts
-    /// from the beginning. A key that was live when last returned by `next`
-    /// - and has since been set to nil, which real Lua explicitly permits
-    /// mid-traversal - can still be located to resume from; any other
-    /// unrecognized key is `HeapError::InvalidNextKey`. Mirrors
+    /// from the beginning. A key that was live when last returned by
+    /// `next` - and has since been set to nil, which real Lua explicitly
+    /// permits mid-traversal - can still be located to resume from; any
+    /// other unrecognized key is `HeapError::InvalidNextKey`. Mirrors
     /// `sol::lua_runtime::dispatch::LuaRuntime::next`'s tombstone-tolerant
     /// resume behavior over `LuaTable::entries_with_tombstones`.
     pub fn table_next(
@@ -843,7 +849,16 @@ impl Heap {
         key: Value,
         value: Value,
     ) -> Result<(), HeapError> {
-        let array_index = positive_array_index(key);
+        // A positive integer key only takes the array-part fast path when
+        // doing so wouldn't require growing the array far beyond its
+        // current length - see `should_grow_array`. A sparse/huge key (e.g.
+        // `t[math.maxinteger] = v`) instead falls to the hash branch below,
+        // exactly like any other non-array-eligible key; `table_get` and
+        // `table_next` already know to check the hash part for a positive
+        // integer key beyond the array's current length.
+        let current_array_len = self.table(table)?.array.len();
+        let array_index =
+            positive_array_index(key).filter(|&index| should_grow_array(current_array_len, index));
         let hash_key = if array_index.is_none() {
             Some(self.table_key(key)?)
         } else {
@@ -1599,6 +1614,23 @@ fn positive_array_index(value: Value) -> Option<usize> {
     (integer > 0).then_some(integer as usize)
 }
 
+/// Whether `table_set` should place 1-based array-eligible key `key` in the
+/// array part given the array's `current_len`, versus the hash part.
+///
+/// Real Lua's `luaH_newkey`/`computesizes` only ever folds a key into the
+/// array part when doing so keeps the array more than half full; matching
+/// that exactly isn't needed for correctness here (a positive integer key
+/// beyond the array's length is still found via the hash part - see
+/// `table_get`/`table_next`), only for avoiding pathological array growth.
+/// This uses a simpler doubling bound instead: an append (or a moderate
+/// out-of-order write, e.g. into a gap the array will plausibly grow to fill)
+/// stays in the array, while a sparse/huge key (e.g. `t[math.maxinteger] =
+/// v`, real Lua 5.5 test suite behavior exercised by `attrib.lua`) falls to
+/// the hash part rather than resizing the array to fit it.
+fn should_grow_array(current_len: usize, key: usize) -> bool {
+    key <= current_len.max(4).saturating_mul(2)
+}
+
 fn exact_integer(value: f64) -> Option<i64> {
     const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
     if value.is_finite()
@@ -1793,6 +1825,62 @@ mod tests {
         heap.table_set(table, Value::integer(3), Value::NIL)
             .unwrap();
         assert_eq!(heap.table_len(table).unwrap(), 2);
+    }
+
+    #[test]
+    fn table_set_routes_a_sparse_huge_integer_key_to_the_hash_part_instead_of_the_array() {
+        // Real Lua 5.5's own test suite does exactly this (`attrib.lua`'s
+        // "test of large float/integer indices"): a positive integer key far
+        // beyond the array's current length must not force the array to grow
+        // to fit it (that used to try to allocate a `Vec` with room for
+        // `i64::MAX` elements and crash) - it lives in the hash part instead,
+        // with no user-observable difference in `table_get`/`#t`/`next`.
+        let mut heap = Heap::default();
+        let table = heap.alloc_table();
+        heap.table_set(table, Value::integer(1), Value::integer(11))
+            .unwrap();
+        heap.table_set(table, Value::integer(2), Value::integer(22))
+            .unwrap();
+
+        heap.table_set(table, Value::integer(1_000_000_000_000), Value::integer(33))
+            .unwrap();
+        assert_eq!(heap.table_len(table).unwrap(), 2);
+        assert_eq!(
+            heap.table_get(table, Value::integer(1_000_000_000_000))
+                .unwrap()
+                .as_integer(),
+            Some(33)
+        );
+        assert_eq!(
+            heap.table_get(table, Value::integer(1)).unwrap().as_integer(),
+            Some(11)
+        );
+        assert_eq!(
+            heap.table_get(table, Value::integer(2)).unwrap().as_integer(),
+            Some(22)
+        );
+
+        // `i64::MAX` (real Lua's `math.maxinteger`): the same key, one past
+        // the largest value a `Vec<Value>` index/capacity could represent.
+        heap.table_set(table, Value::integer(i64::MAX), Value::integer(44))
+            .unwrap();
+        assert_eq!(heap.table_len(table).unwrap(), 2);
+        assert_eq!(
+            heap.table_get(table, Value::integer(i64::MAX))
+                .unwrap()
+                .as_integer(),
+            Some(44)
+        );
+
+        // Overwriting a hash-resident huge key stays in the hash part too.
+        heap.table_set(table, Value::integer(1_000_000_000_000), Value::integer(55))
+            .unwrap();
+        assert_eq!(
+            heap.table_get(table, Value::integer(1_000_000_000_000))
+                .unwrap()
+                .as_integer(),
+            Some(55)
+        );
     }
 
     #[test]
