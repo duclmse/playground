@@ -251,8 +251,7 @@ impl LuaRuntime {
         &self,
         active_frame: Option<&LuaFrame>,
     ) -> (Vec<Value>, HashMap<ObjectId, Vec<Value>>) {
-        let mut roots = Vec::new();
-        roots.push(self.encode_value(&self.globals.as_value()).unwrap_or(Value::NIL));
+        let mut roots = vec![self.encode_value(&self.globals.as_value()).unwrap_or(Value::NIL)];
         // `require`/`package.searchpath` close over these two directly
         // (see `package_table`'s field doc), independent of whatever the
         // reassignable `package` global currently points to - and likewise

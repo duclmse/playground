@@ -428,7 +428,7 @@ impl LuaRuntime {
         if !interested {
             return Ok(());
         }
-        let mut args = vec![LuaValue::String(self.intern_str(event.as_bytes().to_vec()))];
+        let mut args = vec![LuaValue::String(self.intern_str(event.as_bytes()))];
         if let Some(line) = line {
             args.push(LuaValue::Integer(line));
         }
@@ -756,7 +756,7 @@ impl LuaRuntime {
                 unreachable!("values_table always returns a table")
             };
             let named_varargs = *named_varargs;
-            let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+            let n_key = LuaValue::String(self.intern_str(b"n"));
             self.table_set(named_varargs, n_key, LuaValue::Integer(varargs.len() as i64))?;
             reg_set(self, &mut regs, &cells, vararg_reg as usize, table);
         }
@@ -1591,7 +1591,7 @@ impl LuaRuntime {
                 // again for its own error, it synthesizes this fixed message.
                 Ok(CallStep::Done(vec![
                     LuaValue::Bool(false),
-                    LuaValue::String(self.intern_str(b"error in error handling".to_vec())),
+                    LuaValue::String(self.intern_str(b"error in error handling")),
                 ]))
             }
             NativeCont::Once => {
@@ -2065,7 +2065,7 @@ impl LuaRuntime {
         let Some(metatable) = metatable else {
             return Ok(None);
         };
-        let value = self.table_get(metatable, &LuaValue::String(self.intern_str(name.to_vec())))?;
+        let value = self.table_get(metatable, &LuaValue::String(self.intern_str(name)))?;
         Ok((value != LuaValue::Nil).then_some(value))
     }
 

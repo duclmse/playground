@@ -199,7 +199,7 @@ impl LuaRuntime {
     /// already-loaded check (which runs before the capability gate) resolve
     /// these without touching the loader at all.
     fn preload(&self, name: &[u8], value: LuaValue) {
-        let key = LuaValue::String(self.intern_str(name.to_vec()));
+        let key = LuaValue::String(self.intern_str(name));
         self.table_set(self.package_loaded, key, value).unwrap();
     }
 
@@ -350,7 +350,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 string,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -359,7 +359,7 @@ impl LuaRuntime {
         self.preload(b"string", LuaValue::Table(string));
         self.table_set(
             self.string_metatable,
-            LuaValue::String(self.intern_str(b"__index".to_vec())),
+            LuaValue::String(self.intern_str(b"__index")),
             LuaValue::Table(string),
         )
         .unwrap();
@@ -377,7 +377,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 table,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -415,7 +415,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 math,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -428,7 +428,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 math,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 value,
             )
             .unwrap();
@@ -446,7 +446,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 utf8,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -456,8 +456,8 @@ impl LuaRuntime {
         // Lua string data even though they are not valid Rust UTF-8 text.
         self.table_set(
             utf8,
-            LuaValue::String(self.intern_str(b"charpattern".to_vec())),
-            LuaValue::String(self.intern_str(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*".to_vec())),
+            LuaValue::String(self.intern_str(b"charpattern")),
+            LuaValue::String(self.intern_str(b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*")),
         )
         .unwrap();
         globals.define(self, "utf8", LuaValue::Table(utf8), true);
@@ -467,14 +467,14 @@ impl LuaRuntime {
         {
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"loaded".to_vec())),
+                LuaValue::String(self.intern_str(b"loaded")),
                 LuaValue::Table(self.package_loaded),
             )
             .unwrap();
             let preload_table = self.new_table(None)?;
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"preload".to_vec())),
+                LuaValue::String(self.intern_str(b"preload")),
                 LuaValue::Table(preload_table),
             )
             .unwrap();
@@ -485,8 +485,8 @@ impl LuaRuntime {
             // after its compiled-in install-prefix ones.
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"path".to_vec())),
-                LuaValue::String(self.intern_str(b"./?.lua;./?/init.lua".to_vec())),
+                LuaValue::String(self.intern_str(b"path")),
+                LuaValue::String(self.intern_str(b"./?.lua;./?/init.lua")),
             )
             .unwrap();
             // Kept empty by default so sandboxed states never advertise a
@@ -494,25 +494,25 @@ impl LuaRuntime {
             // opting into `Capabilities::native_modules`.
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"cpath".to_vec())),
+                LuaValue::String(self.intern_str(b"cpath")),
                 LuaValue::String(self.intern_str(Vec::new())),
             )
             .unwrap();
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"config".to_vec())),
+                LuaValue::String(self.intern_str(b"config")),
                 LuaValue::String(self.intern_str(package_config_bytes())),
             )
             .unwrap();
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"searchpath".to_vec())),
+                LuaValue::String(self.intern_str(b"searchpath")),
                 LuaValue::NativeFunction(NativeFunction::PackageSearchPath),
             )
             .unwrap();
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"loadlib".to_vec())),
+                LuaValue::String(self.intern_str(b"loadlib")),
                 LuaValue::NativeFunction(NativeFunction::PackageLoadLib),
             )
             .unwrap();
@@ -538,7 +538,7 @@ impl LuaRuntime {
             }
             self.table_set(
                 package,
-                LuaValue::String(self.intern_str(b"searchers".to_vec())),
+                LuaValue::String(self.intern_str(b"searchers")),
                 LuaValue::Table(searchers),
             )
             .unwrap();
@@ -573,7 +573,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 os,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -591,44 +591,44 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 io,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
         }
         self.table_set(
             self.io_stdout,
-            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::String(self.intern_str(b"write")),
             LuaValue::NativeFunction(NativeFunction::FileWrite),
         )
         .unwrap();
         self.table_set(
             self.io_stdout,
-            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::String(self.intern_str(b"close")),
             LuaValue::NativeFunction(NativeFunction::FileClose),
         )
         .unwrap();
         self.table_set(
             io,
-            LuaValue::String(self.intern_str(b"stdout".to_vec())),
+            LuaValue::String(self.intern_str(b"stdout")),
             LuaValue::Table(self.io_stdout),
         )
         .unwrap();
         self.table_set(
             self.io_stderr,
-            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::String(self.intern_str(b"write")),
             LuaValue::NativeFunction(NativeFunction::FileWrite),
         )
         .unwrap();
         self.table_set(
             self.io_stderr,
-            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::String(self.intern_str(b"close")),
             LuaValue::NativeFunction(NativeFunction::FileClose),
         )
         .unwrap();
         self.table_set(
             io,
-            LuaValue::String(self.intern_str(b"stderr".to_vec())),
+            LuaValue::String(self.intern_str(b"stderr")),
             LuaValue::Table(self.io_stderr),
         )
         .unwrap();
@@ -679,7 +679,7 @@ impl LuaRuntime {
         }
         self.table_set(
             io,
-            LuaValue::String(self.intern_str(b"stdin".to_vec())),
+            LuaValue::String(self.intern_str(b"stdin")),
             stdin,
         )
         .unwrap();
@@ -696,7 +696,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 coroutine,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -723,7 +723,7 @@ impl LuaRuntime {
         ] {
             self.table_set(
                 debug,
-                LuaValue::String(self.intern_str(name.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(name.as_bytes())),
                 LuaValue::NativeFunction(function),
             )
             .unwrap();
@@ -806,7 +806,7 @@ impl LuaRuntime {
             }
             self.table_set(
                 table,
-                LuaValue::String(self.intern_str(export.as_bytes().to_vec())),
+                LuaValue::String(self.intern_str(export.as_bytes())),
                 value,
             )?;
         }

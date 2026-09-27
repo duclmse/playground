@@ -112,7 +112,7 @@ fn invoke_c_hook(runtime: &mut LuaRuntime, event: c_int, current_line: c_int) ->
     let mut debug: LuaDebug = unsafe { std::mem::zeroed() };
     debug.event = event;
     debug.currentline = current_line;
-    debug.i_ci = 1usize as *mut c_void;
+    debug.i_ci = std::ptr::dangling_mut::<c_void>();
     state.hook_running = true;
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         hook(state_pointer, &mut debug)
@@ -323,7 +323,7 @@ impl lua_State {
     fn owned(allocator: LuaAlloc, allocator_data: *mut c_void) -> Box<Self> {
         let mut runtime = Box::new(LuaRuntime::new());
         let runtime_ptr = runtime.as_mut() as *mut LuaRuntime;
-        let thread = runtime.main_coroutine.clone();
+        let thread = runtime.main_coroutine;
         Box::new(Self {
             runtime: runtime_ptr,
             _owned_runtime: Some(runtime),
@@ -350,7 +350,7 @@ impl lua_State {
             .coroutine_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| runtime.main_coroutine.clone());
+            .unwrap_or(runtime.main_coroutine);
         Self {
             runtime,
             _owned_runtime: None,
@@ -424,10 +424,14 @@ impl lua_State {
         LUA_ERRRUN
     }
 
+    // Named to mirror `lua_to_canonical`/`canonical_to_lua` below, not the
+    // Rust `to_*`/`from_*` self-type conventions clippy expects here.
+    #[allow(clippy::wrong_self_convention)]
     fn to_canonical(&mut self, value: &LuaValue) -> LuaResult<sol_core::Value> {
         lua_to_canonical(unsafe { self.runtime() }, value)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_canonical(&mut self, value: sol_core::Value) -> LuaResult<LuaValue> {
         canonical_to_lua(unsafe { self.runtime() }, value)
     }

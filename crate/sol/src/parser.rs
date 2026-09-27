@@ -412,8 +412,7 @@ impl Parser {
                     span.expect("advanced token must have a span"),
                     format!("expected {:?}, found {:?}", expected, t),
                 )
-                .with_code("EPARSE001")
-                .to_string(),
+                .with_code("EPARSE001"),
                 self.lua_near_suffix(lexeme.as_deref())
             )),
             None => Err(format!(
@@ -435,8 +434,7 @@ impl Parser {
                     span.expect("advanced token must have a span"),
                     format!("expected identifier, found {:?}", t),
                 )
-                .with_code("EPARSE001")
-                .to_string(),
+                .with_code("EPARSE001"),
                 self.lua_near_suffix(lexeme.as_deref())
             )),
             None => Err(format!(

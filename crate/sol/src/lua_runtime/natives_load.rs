@@ -67,14 +67,14 @@ impl LuaRuntime {
             NativeFunction::PackageSearcherPreload => {
                 let name = self.string(&required(0)?)?.to_vec();
                 let key = LuaValue::String(self.intern_str(name.clone()));
-                let preload_key = LuaValue::String(self.intern_str(b"preload".to_vec()));
+                let preload_key = LuaValue::String(self.intern_str(b"preload"));
                 let preload = self.table_get(self.package_table, &preload_key)?;
                 if let LuaValue::Table(preload_table) = preload {
                     let loader = self.table_get(preload_table, &key)?;
                     if loader != LuaValue::Nil {
                         return Ok(vec![
                             loader,
-                            LuaValue::String(self.intern_str(b":preload:".to_vec())),
+                            LuaValue::String(self.intern_str(b":preload:")),
                         ]);
                     }
                 }
@@ -125,8 +125,8 @@ impl LuaRuntime {
                 if !self.capabilities.native_modules {
                     return Ok(vec![
                         LuaValue::Nil,
-                        LuaValue::String(self.intern_str(b"native module capability is disabled".to_vec())),
-                        LuaValue::String(self.intern_str(b"absent".to_vec())),
+                        LuaValue::String(self.intern_str(b"native module capability is disabled")),
+                        LuaValue::String(self.intern_str(b"absent")),
                     ]);
                 }
                 if symbol == b"*" {
@@ -138,7 +138,7 @@ impl LuaRuntime {
                         Err(error) => Ok(vec![
                             LuaValue::Nil,
                             LuaValue::String(self.fresh_str(error.into_bytes())),
-                            LuaValue::String(self.intern_str(b"open".to_vec())),
+                            LuaValue::String(self.intern_str(b"open")),
                         ]),
                     };
                 }
@@ -238,7 +238,7 @@ impl LuaRuntime {
                                     return Ok(vec![
                                         LuaValue::Nil,
                                         LuaValue::String(self.intern_str(
-                                            b"reader function must return a string".to_vec(),
+                                            b"reader function must return a string",
                                         )),
                                     ]);
                                 }
@@ -586,7 +586,7 @@ impl LuaRuntime {
     }
 
     fn require_search(&mut self, name: Vec<u8>, key: LuaValue) -> LuaResult<Vec<LuaValue>> {
-        let searchers_key = LuaValue::String(self.intern_str(b"searchers".to_vec()));
+        let searchers_key = LuaValue::String(self.intern_str(b"searchers"));
         let searchers = self.table_get(self.package_table, &searchers_key)?;
         let LuaValue::Table(searchers) = searchers else {
             return Err(LuaError::new("'package.searchers' must be a table"));
@@ -665,7 +665,7 @@ impl LuaRuntime {
         name: &[u8],
         field: &[u8],
     ) -> LuaResult<Result<Vec<u8>, Vec<u8>>> {
-        let field_key = LuaValue::String(self.intern_str(field.to_vec()));
+        let field_key = LuaValue::String(self.intern_str(field));
         let value = self.table_get(self.package_table, &field_key)?;
         let path = match value {
             LuaValue::String(bytes) => bytes,

@@ -26,7 +26,7 @@ impl LuaRuntime {
             if let Some(metatable) = self.table_metatable(*table) {
                 if let Ok(LuaValue::String(name)) = self.table_get(
                     metatable,
-                    &LuaValue::String(self.intern_str(b"__name".to_vec())),
+                    &LuaValue::String(self.intern_str(b"__name")),
                 ) {
                     return String::from_utf8_lossy(name.as_bytes()).into_owned();
                 }

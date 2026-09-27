@@ -514,7 +514,7 @@ pub(super) fn float_for_limit(limit: f64, ascending: bool) -> Option<i64> {
     };
     const MIN_F: f64 = -9223372036854775808.0; // i64::MIN, exact in f64
     const BOUND_F: f64 = 9223372036854775808.0; // one past i64::MAX, exact in f64
-    if rounded >= MIN_F && rounded < BOUND_F {
+    if (MIN_F..BOUND_F).contains(&rounded) {
         Some(rounded as i64)
     } else if limit > 0.0 {
         if ascending {

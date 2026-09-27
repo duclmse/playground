@@ -20,7 +20,7 @@ impl LuaRuntime {
         let LuaValue::Table(io) = self.globals.get(self, "io") else {
             return LuaValue::Nil;
         };
-        self.table_get(io, &LuaValue::String(self.intern_str(b"stdin".to_vec())))
+        self.table_get(io, &LuaValue::String(self.intern_str(b"stdin")))
             .unwrap_or(LuaValue::Nil)
     }
 
@@ -92,7 +92,7 @@ impl LuaRuntime {
                         ("yday", LuaValue::Integer(yday as i64)),
                         ("isdst", LuaValue::Bool(false)),
                     ] {
-                        self.table_set(table, LuaValue::String(self.intern_str(key.as_bytes().to_vec())), value)
+                        self.table_set(table, LuaValue::String(self.intern_str(key.as_bytes())), value)
                             .unwrap();
                     }
                     return Ok(vec![LuaValue::Table(table)]);
@@ -278,7 +278,7 @@ impl LuaRuntime {
                     ))]),
                     Some(name) if name.is_empty() || name == b"C" => {
                         self.current_locale = "C".to_string();
-                        Ok(vec![LuaValue::String(self.intern_str(b"C".to_vec()))])
+                        Ok(vec![LuaValue::String(self.intern_str(b"C"))])
                     }
                     Some(_) => Ok(vec![LuaValue::Nil]),
                 }
@@ -452,13 +452,13 @@ impl LuaRuntime {
         let handle = self.new_table(None)?;
         self.table_set(
             handle,
-            LuaValue::String(self.intern_str(b"write".to_vec())),
+            LuaValue::String(self.intern_str(b"write")),
             LuaValue::NativeFunction(NativeFunction::FileWrite),
         )
         .unwrap();
         self.table_set(
             handle,
-            LuaValue::String(self.intern_str(b"close".to_vec())),
+            LuaValue::String(self.intern_str(b"close")),
             LuaValue::NativeFunction(NativeFunction::FileClose),
         )
         .unwrap();

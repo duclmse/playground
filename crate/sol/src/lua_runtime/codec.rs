@@ -5,8 +5,8 @@
 //!
 //! `Table`/`Closure`/`Thread`/`CoroutineWrapper`/`GMatchIterator` already
 //! *are* a `Copy` `ObjectId` newtype, and `String`/`CanonicalTable`/
-//! `Userdata`/`CFunction` already carry one behind an `Rc<CanonicalObjectRoot>`
-//! - encoding every one of those is a bare `Value::object(id)`. Only
+//! `Userdata`/`CFunction` already carry one behind an `Rc<CanonicalObjectRoot>`,
+//! so encoding every one of those is a bare `Value::object(id)`. Only
 //! `NativeFunction`, `LightUserdata`, and `RegisteredNative` have no
 //! `ObjectId` of their own; each is allocated onto
 //! `HeapObject::NativeCallable` (and memoized, so repeated encodes of the

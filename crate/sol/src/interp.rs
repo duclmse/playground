@@ -89,11 +89,11 @@ pub struct SpeculativeConfig<'a> {
     pub promote: Box<dyn Fn(u8) -> PromoteResult + 'a>,
 }
 
-/// Owns every function's current tier and call counters, and drives promotion
-/// - shared by the top-level caller and nested `Op::Call`s so a hot function
-/// promotes no matter how deep it's called from. Generic over `H: Hooks`
-/// (default `()`, the no-op) so `sol run`'s normal path never carries
-/// debug/profile instrumentation in its own compiled code.
+/// Owns every function's current tier and call counters, and drives
+/// promotion, shared by the top-level caller and nested `Op::Call`s so a hot
+/// function promotes no matter how deep it's called from. Generic over
+/// `H: Hooks` (default `()`, the no-op) so `sol run`'s normal path never
+/// carries debug/profile instrumentation in its own compiled code.
 pub struct Runtime<'a, H: Hooks = ()> {
     hooks: H,
     slots: Vec<RefCell<Slot>>,
@@ -103,9 +103,9 @@ pub struct Runtime<'a, H: Hooks = ()> {
     /// Compiles `func_id` to native, returning its wrapper pointer plus any
     /// dependency functions also compiled. `None` = keep interpreting.
     promote: Box<dyn Fn(u8) -> PromoteResult + 'a>,
-    /// Per-`(func_id, stmt_index)` loop-backedge counts, separate from `counts`
-    /// - a function called once (e.g. `main`) can still spend its whole runtime
-    /// in one hot loop, which needs OSR to ever promote.
+    /// Per-`(func_id, stmt_index)` loop-backedge counts, separate from
+    /// `counts`: a function called once (e.g. `main`) can still spend its
+    /// whole runtime in one hot loop, which needs OSR to ever promote.
     osr_counts: RefCell<HashMap<(u8, usize), u32>>,
     osr_threshold: u32,
     /// Compiles an OSR entry for `(func_id, stmt_index)`; result is used once,
@@ -742,7 +742,7 @@ mod tests {
                 .iter()
                 .map(|value| crate::lua_runtime::LuaValue::Integer(*value as i64))
                 .collect();
-            let handle = coroutine.borrow().as_ref().unwrap().clone();
+            let handle = *coroutine.borrow().as_ref().unwrap();
             match runtime.resume_coroutine_outcome(handle, arguments) {
                 sol_core::CallOutcome::Returned(values) => {
                     match values

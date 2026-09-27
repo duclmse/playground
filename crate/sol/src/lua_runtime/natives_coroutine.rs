@@ -73,7 +73,7 @@ impl LuaRuntime {
             NativeFunction::CoroutineStatus => {
                 let co = Self::expect_coroutine(&required(0)?)?;
                 Ok(vec![LuaValue::String(self.intern_str(
-                    self.coroutine(co).status.get().as_str().as_bytes().to_vec(),
+                    self.coroutine(co).status.get().as_str().as_bytes(),
                 ))])
             }
             NativeFunction::CoroutineWrap => {
@@ -89,9 +89,9 @@ impl LuaRuntime {
                 Ok(vec![LuaValue::CoroutineWrapper(co)])
             }
             NativeFunction::CoroutineRunning => match self.coroutine_stack.last() {
-                Some(co) => Ok(vec![LuaValue::Thread(co.clone()), LuaValue::Bool(false)]),
+                Some(co) => Ok(vec![LuaValue::Thread(*co), LuaValue::Bool(false)]),
                 None => Ok(vec![
-                    LuaValue::Thread(self.main_coroutine.clone()),
+                    LuaValue::Thread(self.main_coroutine),
                     LuaValue::Bool(true),
                 ]),
             },
@@ -145,7 +145,7 @@ impl LuaRuntime {
                     // `Normal`, reported by the generic "normal coroutine"
                     // message below.
                     CoroutineStatus::Running if co == self.main_coroutine => {
-                        return Err(LuaError::new("cannot close main thread"));
+                        Err(LuaError::new("cannot close main thread"))
                     }
                     CoroutineStatus::Running => {
                         // Self-close: real Lua's `luaB_close` calls
@@ -156,13 +156,13 @@ impl LuaRuntime {
                         // ordinary catchable error - see the `uncatchable`
                         // field doc on `LuaError` and its handling in
                         // `resume_coroutine`.
-                        return Err(LuaError::new(
+                        Err(LuaError::new(
                             "coroutine.close: self-close (internal control-flow signal, must never reach user code)",
                         )
-                        .make_uncatchable());
+                        .make_uncatchable())
                     }
                     CoroutineStatus::Normal => {
-                        return Err(LuaError::new("cannot close a normal coroutine"));
+                        Err(LuaError::new("cannot close a normal coroutine"))
                     }
                     CoroutineStatus::Dead => {
                         // A coroutine that died from an uncaught error

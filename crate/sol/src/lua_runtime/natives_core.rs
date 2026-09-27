@@ -73,7 +73,7 @@ impl LuaRuntime {
                         Some(LuaValue::Nil) => {
                             let text: &[u8] = b"<no error object>";
                             LuaError::raised(
-                                LuaValue::String(self.intern_str(text.to_vec())),
+                                LuaValue::String(self.intern_str(text)),
                                 "<no error object>",
                             )
                         }
@@ -93,7 +93,7 @@ impl LuaRuntime {
                 }
             }
             NativeFunction::Type => Ok(vec![LuaValue::String(self.intern_str(
-                required(0)?.type_name().as_bytes().to_vec(),
+                required(0)?.type_name().as_bytes(),
             ))]),
             NativeFunction::ToString => {
                 let value = required(0)?;
@@ -160,20 +160,17 @@ impl LuaRuntime {
                         .table_metatable(table)
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
-                    LuaValue::String(_) => Ok(vec![LuaValue::Table(self.string_metatable.clone())]),
+                    LuaValue::String(_) => Ok(vec![LuaValue::Table(self.string_metatable)]),
                     LuaValue::Integer(_) | LuaValue::Float(_) => Ok(vec![self
                         .number_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
                     LuaValue::Bool(_) => Ok(vec![self
                         .boolean_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
                     LuaValue::Nil => Ok(vec![self
                         .nil_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil)]),
                     LuaValue::Userdata(userdata) => {
@@ -236,7 +233,7 @@ impl LuaRuntime {
                     LuaValue::Nil => {
                         let text: &[u8] = b"<no error object>";
                         LuaError::raised(
-                            LuaValue::String(self.intern_str(text.to_vec())),
+                            LuaValue::String(self.intern_str(text)),
                             "<no error object>",
                         )
                     }
@@ -292,7 +289,7 @@ impl LuaRuntime {
             }
             NativeFunction::Select => {
                 let selector = required(0)?;
-                if selector == LuaValue::String(self.intern_str(b"#".to_vec())) {
+                if selector == LuaValue::String(self.intern_str(b"#")) {
                     return Ok(vec![LuaValue::Integer(args.len().saturating_sub(1) as i64)]);
                 }
                 let index = self.integer(&selector)?;
@@ -391,7 +388,7 @@ impl LuaRuntime {
                             "generational"
                         };
                         Ok(vec![LuaValue::String(self.intern_str(
-                            previous.as_bytes().to_vec(),
+                            previous.as_bytes(),
                         ))])
                     }
                     b"stop" => {
@@ -405,7 +402,7 @@ impl LuaRuntime {
                     b"isrunning" => Ok(vec![LuaValue::Bool(self.gc_running)]),
                     b"param" => {
                         let param = args.get(1).map(|value| self.string(value)).transpose()?;
-                        let is_pause = match param.as_deref() {
+                        let is_pause = match param {
                             Some(b"pause") => true,
                             Some(b"stepmul") => false,
                             // Other real Lua GC params ("stepsize",
@@ -460,7 +457,7 @@ impl LuaRuntime {
             if let Some(metatable) = metatable {
                 let name = self.table_get(
                     metatable,
-                    &LuaValue::String(self.intern_str(b"__name".to_vec())),
+                    &LuaValue::String(self.intern_str(b"__name")),
                 )?;
                 if let LuaValue::String(name) = name {
                     return Ok(format!(

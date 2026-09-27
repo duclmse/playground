@@ -19,6 +19,9 @@ use super::canonical::{GMATCH_ITERATOR_FUNCTION, LEGACY_STATE_PROVIDER};
 use super::frame::*;
 use super::*;
 
+/// `gmatch_read`'s `(source bytes, pattern bytes, position, last_end)`.
+type GMatchState = (Vec<u8>, Vec<u8>, usize, Option<usize>);
+
 /// Approximate `size_of::<sol_core::TableObject>()`'s empty-table baseline
 /// (an empty `Vec`/`IndexMap` plus the metatable/weak-mode fields) - the old
 /// `std::mem::size_of::<LuaTable>()` charge this replaces was itself only
@@ -408,7 +411,7 @@ impl LuaRuntime {
     /// Reads an iterator's `(source bytes, pattern bytes, position,
     /// last_end)` off its `captures`, decoding the two string object ids
     /// back into owned byte buffers.
-    pub(super) fn gmatch_read(&self, state: GMatchRef) -> LuaResult<(Vec<u8>, Vec<u8>, usize, Option<usize>)> {
+    pub(super) fn gmatch_read(&self, state: GMatchRef) -> LuaResult<GMatchState> {
         let heap = self.canonical_heap.borrow();
         let captures = match heap.object(state.object_id()) {
             Ok(HeapObject::NativeCallable(object)) => &object.captures,

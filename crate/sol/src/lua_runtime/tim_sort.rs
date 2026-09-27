@@ -100,14 +100,6 @@ impl<T: Clone> TimSort<T> {
         &self.values
     }
 
-    /// Values copied into an in-progress merge buffer remain GC roots even
-    /// after their original slots have been overwritten.
-    pub(super) fn merge_roots(&self) -> impl Iterator<Item = &T> {
-        self.merge
-            .iter()
-            .flat_map(|merge| merge.left.iter().chain(&merge.right))
-    }
-
     /// Advance until another comparison is required or sorting is complete.
     /// `comparison` is the result requested by the preceding call.
     pub(super) fn step(
@@ -416,7 +408,7 @@ mod tests {
     #[test]
     fn sorts_multiple_natural_runs() {
         let values = (0..160)
-            .map(|index| ((index * 37 + 11) % 53) as i32)
+            .map(|index| (index * 37 + 11) % 53)
             .collect::<Vec<_>>();
         let mut expected = values.clone();
         expected.sort();

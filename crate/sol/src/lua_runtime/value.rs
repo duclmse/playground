@@ -387,7 +387,7 @@ impl std::hash::Hash for CanonicalString {
 
 impl PartialOrd for CanonicalString {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.as_bytes().cmp(other.as_bytes()))
+        Some(self.cmp(other))
     }
 }
 

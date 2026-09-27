@@ -105,8 +105,8 @@ impl LuaRuntime {
                 }])
             }
             NativeFunction::MathType => Ok(vec![match required(0)? {
-                LuaValue::Integer(_) => LuaValue::String(self.intern_str(b"integer".to_vec())),
-                LuaValue::Float(_) => LuaValue::String(self.intern_str(b"float".to_vec())),
+                LuaValue::Integer(_) => LuaValue::String(self.intern_str(b"integer")),
+                LuaValue::Float(_) => LuaValue::String(self.intern_str(b"float")),
                 _ => LuaValue::Nil,
             }]),
             NativeFunction::MathSqrt

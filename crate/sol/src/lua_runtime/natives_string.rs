@@ -428,7 +428,7 @@ impl LuaRuntime {
     ) -> Vec<LuaValue> {
         if captures.is_empty() {
             if whole_if_empty {
-                vec![LuaValue::String(self.fresh_str(source[whole.0..whole.1].to_vec()))]
+                vec![LuaValue::String(self.fresh_str(&source[whole.0..whole.1]))]
             } else {
                 Vec::new()
             }
@@ -437,7 +437,7 @@ impl LuaRuntime {
                 .iter()
                 .map(|capture| match capture {
                     crate::lua_pattern::Capture::Str(start, end) => {
-                        LuaValue::String(self.fresh_str(source[*start..*end].to_vec()))
+                        LuaValue::String(self.fresh_str(&source[*start..*end]))
                     }
                     crate::lua_pattern::Capture::Position(position) => {
                         LuaValue::Integer(*position as i64)
@@ -467,7 +467,7 @@ impl LuaRuntime {
                     .into_iter()
                     .next()
                     .unwrap_or(LuaValue::Nil);
-                let value = match self.index_resolve(LuaValue::Table(table.clone()), key)? {
+                let value = match self.index_resolve(LuaValue::Table(*table), key)? {
                     IndexResolution::Value(value) => value,
                     IndexResolution::Call { method, args } => self
                         .call(method, args)?

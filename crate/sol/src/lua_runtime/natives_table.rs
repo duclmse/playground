@@ -158,7 +158,7 @@ impl LuaRuntime {
                     unreachable!()
                 };
                 let table = *table;
-                let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+                let n_key = LuaValue::String(self.intern_str(b"n"));
                 self.table_set(table, n_key, LuaValue::Integer(args.len() as i64))?;
                 Ok(vec![value])
             }
@@ -302,7 +302,7 @@ impl LuaRuntime {
                     let count = (e as i128) - (f as i128) + 1;
                     // Real Lua: `luaL_argcheck(L, t <= LUA_MAXINTEGER - n + 1,
                     // 4, "destination wrap around");`
-                    if !((t as i128) <= (i64::MAX as i128) - count + 1) {
+                    if (t as i128) > (i64::MAX as i128) - count + 1 {
                         return Err(LuaError::new(
                             "bad argument #4 to 'move' (destination wrap around)",
                         ));

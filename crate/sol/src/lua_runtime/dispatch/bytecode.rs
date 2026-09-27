@@ -178,7 +178,7 @@ impl LuaRuntime {
                         let value = frame.globals.get(self, name);
                         reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                     } else {
-                        let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
+                        let key = LuaValue::String(self.intern_str(name.as_bytes()));
                         match self.index_resolve(frame.globals.as_value(), key)? {
                             IndexResolution::Value(value) => {
                                 reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
@@ -204,7 +204,7 @@ impl LuaRuntime {
                         frame.globals.assign(self, name, value)?;
                     } else {
                         frame.globals.check_writable(name)?;
-                        let key = LuaValue::String(self.intern_str(name.as_bytes().to_vec()));
+                        let key = LuaValue::String(self.intern_str(name.as_bytes()));
                         match self.set_index_resolve(frame.globals.as_value(), key, value, Some(&*frame))? {
                             SetIndexResolution::Done => {}
                             SetIndexResolution::Call { method, args } => {
@@ -639,7 +639,7 @@ impl LuaRuntime {
                         else {
                             return Err(LuaError::new("named vararg pack is not a table"));
                         };
-                        let n_key = LuaValue::String(self.intern_str(b"n".to_vec()));
+                        let n_key = LuaValue::String(self.intern_str(b"n"));
                         let length = match self.table_get(table, &n_key)? {
                             LuaValue::Integer(length)
                                 if (0..=u16::MAX as i64).contains(&length) =>

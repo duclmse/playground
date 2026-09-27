@@ -154,12 +154,12 @@ pub struct LuaRuntime {
     /// would otherwise spin in this runtime until the instruction budget ran
     /// out, since nothing but an explicit `collectgarbage()` or the far too
     /// slow `gc_stress` mode ever swept a weak table. `tick` increments this
-    /// and triggers a pass every `AUTO_GC_INSTRUCTION_INTERVAL` instructions
-    /// - instruction count, rather than real Lua's allocated-byte debt, is
-    /// the pacing signal because it's the resource this runtime already
-    /// meters on every dispatched instruction, so no extra accounting is
-    /// needed for a production-cheap approximation of "collection happens
-    /// without being asked".
+    /// and triggers a pass every `AUTO_GC_INSTRUCTION_INTERVAL` instructions.
+    /// Instruction count, rather than real Lua's allocated-byte debt, is the
+    /// pacing signal because it's the resource this runtime already meters
+    /// on every dispatched instruction, so no extra accounting is needed
+    /// for a production-cheap approximation of "collection happens without
+    /// being asked".
     instructions_since_gc: u64,
     /// Free lists of previously-used register/cell frames, keyed by nothing
     /// (LIFO, just like the Rust call stack `run_proto` recurses on) -

@@ -285,7 +285,7 @@ pub unsafe extern "C-unwind" fn lua_getinfo(
             _ => return 0,
         }
     } else {
-        let level = (debug.i_ci as usize).checked_sub(1).unwrap_or(0);
+        let level = (debug.i_ci as usize).saturating_sub(1);
         let active = {
             let runtime = unsafe { state.runtime() };
             runtime

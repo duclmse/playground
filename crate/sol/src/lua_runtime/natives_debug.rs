@@ -86,7 +86,7 @@ impl LuaRuntime {
                         Some(&cell) => self.upvalue_get(cell)?,
                         None => LuaValue::Nil,
                     };
-                    return Ok(vec![LuaValue::String(self.intern_str(name.to_vec())), value]);
+                    return Ok(vec![LuaValue::String(self.intern_str(name)), value]);
                 }
                 // The current bytecode keeps its implicit `_ENV` in the
                 // shared `Globals` scope rather than in `LuaClosure.upvals`.
@@ -95,7 +95,7 @@ impl LuaRuntime {
                 // compiler migrates to a physical implicit capture.
                 if index == proto.upvals.len() && has_implicit_environment(&proto) {
                     Ok(vec![
-                        LuaValue::String(self.intern_str(b"_ENV".to_vec())),
+                        LuaValue::String(self.intern_str(b"_ENV")),
                         globals.as_value(),
                     ])
                 } else {
@@ -222,13 +222,13 @@ impl LuaRuntime {
                         .get(index)
                         .map(String::as_bytes)
                         .unwrap_or(b"?");
-                    Ok(vec![LuaValue::String(self.intern_str(name.to_vec()))])
+                    Ok(vec![LuaValue::String(self.intern_str(name))])
                 } else if index == proto.upvals.len() && has_implicit_environment(&proto) {
                     // See `DebugGetupvalue`: `_ENV` is represented by the
                     // shared scope cell during the transition. It is already
                     // the caller's default environment in the only binary
                     // chunk shape this compatibility path exposes.
-                    Ok(vec![LuaValue::String(self.intern_str(b"_ENV".to_vec()))])
+                    Ok(vec![LuaValue::String(self.intern_str(b"_ENV"))])
                 } else {
                     Ok(vec![LuaValue::Nil])
                 }
@@ -286,7 +286,7 @@ impl LuaRuntime {
                 }
                 let info = self.new_table(None)?;
                 let mut set = |key: &[u8], value: LuaValue| {
-                    self.table_set(info, LuaValue::String(self.intern_str(key.to_vec())), value)
+                    self.table_set(info, LuaValue::String(self.intern_str(key)), value)
                         .unwrap();
                 };
                 match &arg0 {
@@ -372,13 +372,13 @@ impl LuaRuntime {
                                 if let Some((namewhat, name)) = self.call_site_name(level) {
                                     set(
                                         b"namewhat",
-                                        LuaValue::String(self.intern_str(namewhat.as_bytes().to_vec())),
+                                        LuaValue::String(self.intern_str(namewhat.as_bytes())),
                                     );
                                     set(b"name", LuaValue::String(self.intern_str(name.into_bytes())));
                                 } else if let Some(name) = Self::declared_lua_name(&lua_frame.proto)
                                 {
-                                    set(b"namewhat", LuaValue::String(self.intern_str(b"local".to_vec())));
-                                    set(b"name", LuaValue::String(self.intern_str(name.to_vec())));
+                                    set(b"namewhat", LuaValue::String(self.intern_str(b"local")));
+                                    set(b"name", LuaValue::String(self.intern_str(name)));
                                 }
                                 set(b"nups", LuaValue::Integer(lua_frame.upvals.len() as i64));
                             }
@@ -408,20 +408,17 @@ impl LuaRuntime {
                         .table_metatable(table)
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil),
-                    LuaValue::String(_) => LuaValue::Table(self.string_metatable.clone()),
+                    LuaValue::String(_) => LuaValue::Table(self.string_metatable),
                     LuaValue::Integer(_) | LuaValue::Float(_) => self
                         .number_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil),
                     LuaValue::Bool(_) => self
                         .boolean_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil),
                     LuaValue::Nil => self
                         .nil_metatable
-                        .clone()
                         .map(LuaValue::Table)
                         .unwrap_or(LuaValue::Nil),
                     _ => LuaValue::Nil,
@@ -509,7 +506,7 @@ impl LuaRuntime {
                     self.coroutine_stack
                         .last()
                         .cloned()
-                        .unwrap_or_else(|| self.main_coroutine.clone())
+                        .unwrap_or(self.main_coroutine)
                 };
                 let hook = args.get(index).cloned().unwrap_or(LuaValue::Nil);
                 let target_co = self.coroutine(target);
@@ -550,7 +547,7 @@ impl LuaRuntime {
                     .coroutine_stack
                     .last()
                     .cloned()
-                    .unwrap_or_else(|| self.main_coroutine.clone());
+                    .unwrap_or(self.main_coroutine);
                 if target == running {
                     self.active_hook = target_co.hook.borrow().clone();
                     // `fire_line_and_count_hooks` only updates
@@ -594,7 +591,7 @@ impl LuaRuntime {
                     self.coroutine_stack
                         .last()
                         .cloned()
-                        .unwrap_or_else(|| self.main_coroutine.clone())
+                        .unwrap_or(self.main_coroutine)
                 };
                 let hook_state = self.coroutine(target).hook.borrow().clone();
                 match hook_state {
@@ -668,7 +665,7 @@ impl LuaRuntime {
         } else {
             b"Lua"
         };
-        set(b"what", LuaValue::String(self.intern_str(what.to_vec())));
+        set(b"what", LuaValue::String(self.intern_str(what)));
         set(b"namewhat", LuaValue::String(self.intern_str(Vec::new())));
         set(b"name", LuaValue::Nil);
         if let Some(source) = self.chunk_sources.get(&(Rc::as_ptr(proto) as usize)) {
