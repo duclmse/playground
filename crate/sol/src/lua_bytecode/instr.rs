@@ -26,6 +26,21 @@ pub enum UpvalSource {
     ParentUpval(u16),
 }
 
+/// One source-level local binding and the bytecode range during which it is
+/// visible.  This is deliberately separate from register allocation: a
+/// register may later be recycled for a temporary or a different lexical
+/// binding, while Lua's debug API must expose only the binding live at the
+/// suspended instruction.
+#[derive(Debug, Clone)]
+pub struct LocalDebug {
+    pub name: String,
+    pub register: Reg,
+    /// Inclusive bytecode program counter where the binding becomes live.
+    pub start_pc: u32,
+    /// Exclusive bytecode program counter where the binding leaves scope.
+    pub end_pc: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum Instr {
     LoadConst(Reg, u32),
@@ -201,6 +216,11 @@ pub struct Proto {
     /// lets it do so anyway, mirroring real Lua's `locvars` (scaled down to
     /// just the one case Sol's bytecode can't otherwise reconstruct).
     pub param_names: Vec<String>,
+    /// Lexical local-variable lifetime information for `debug.getlocal` and
+    /// `debug.setlocal`.  Parameters are entries beginning at PC zero;
+    /// ordinary locals begin at their `NewLocal` instruction and end when
+    /// their enclosing compiler scope closes.
+    pub locals: Vec<LocalDebug>,
     pub vararg_name: Option<Reg>,
     pub nested: Vec<Rc<Proto>>,
     /// `captured_registers[i]` is true iff register `i` is ever captured as

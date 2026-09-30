@@ -398,11 +398,13 @@ impl LuaRuntime {
         let mut heap = self.canonical_heap.borrow_mut();
         let source_id = heap.alloc_string_fresh(source);
         let pattern_id = heap.alloc_string_fresh(pattern);
+        let position_userdata = heap.alloc_userdata_bytes(0);
         let captures = vec![
             Value::object(source_id),
             Value::object(pattern_id),
             Value::integer(position as i64),
             Value::integer(-1),
+            Value::object(position_userdata),
         ];
         let object = heap.alloc_native_callable(LEGACY_STATE_PROVIDER, GMATCH_ITERATOR_FUNCTION, captures);
         Ok(GMatchRef::new(object))

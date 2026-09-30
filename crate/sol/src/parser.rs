@@ -8,6 +8,17 @@ use std::collections::HashSet;
 
 type ParamList = (Vec<(String, TypeName)>, Vec<bool>, bool, Option<String>);
 
+/// Parse-time counterpart to Lua's `FuncState::nactvar`: one entry per
+/// function being parsed, with a local count for each still-open block. The
+/// bytecode compiler enforces the same limit for a completed AST, but Lua
+/// itself reports `MAXVARS` while parsing. Keeping this small amount of
+/// parser state preserves that diagnostic precedence for an incomplete
+/// function body too.
+struct LuaLocalScopes {
+    function_line: u32,
+    blocks: Vec<usize>,
+}
+
 pub fn parse(tokens: Vec<Spanned>) -> Result<Program, String> {
     parse_with_config(tokens, LanguageConfig::SOL)
 }
@@ -81,6 +92,10 @@ pub fn parse_with_config(tokens: Vec<Spanned>, config: LanguageConfig) -> Result
         known_structs: HashSet::new(),
         imported_modules: HashSet::new(),
         depth: 0,
+        lua_local_scopes: vec![LuaLocalScopes {
+            function_line: 1,
+            blocks: vec![0],
+        }],
     }
     .parse_program()
 }
@@ -285,6 +300,9 @@ struct Parser {
     /// gracefully with a parse error the way real Lua's `LUAI_MAXCCALLS`
     /// limit does.
     depth: u32,
+    /// Lua's parse-time live-local accounting. Optional typed Sol source is
+    /// deliberately not constrained by Lua's compatibility resource limit.
+    lua_local_scopes: Vec<LuaLocalScopes>,
 }
 
 /// Real Lua's default `LUAI_MAXCCALLS` (`luaconf.h`). The exact number is
@@ -295,6 +313,88 @@ struct Parser {
 const MAX_PARSE_DEPTH: u32 = 200;
 
 impl Parser {
+    const LUA_MAXVARS: usize = 200;
+
+    fn has_lua_local_limit(&self) -> bool {
+        !self.config.sol_extensions
+    }
+
+    fn enter_lua_function_scope(
+        &mut self,
+        function_line: u32,
+        parameters: usize,
+    ) -> Result<(), String> {
+        if !self.has_lua_local_limit() {
+            return Ok(());
+        }
+        self.lua_local_scopes.push(LuaLocalScopes {
+            function_line,
+            blocks: vec![parameters],
+        });
+        let result = self.check_lua_local_limit(function_line);
+        if result.is_err() {
+            self.lua_local_scopes.pop();
+        }
+        result
+    }
+
+    fn leave_lua_function_scope(&mut self) {
+        if self.has_lua_local_limit() {
+            self.lua_local_scopes.pop();
+        }
+    }
+
+    fn enter_lua_block_scope(&mut self) {
+        if !self.has_lua_local_limit() {
+            return;
+        }
+        self.lua_local_scopes
+            .last_mut()
+            .expect("Lua parser always has a current function scope")
+            .blocks
+            .push(0);
+    }
+
+    fn leave_lua_block_scope(&mut self) {
+        if self.has_lua_local_limit() {
+            self.lua_local_scopes
+                .last_mut()
+                .expect("Lua parser always has a current function scope")
+                .blocks
+                .pop();
+        }
+    }
+
+    fn declare_lua_locals(&mut self, count: usize, line: u32) -> Result<(), String> {
+        if !self.has_lua_local_limit() {
+            return Ok(());
+        }
+        let scope = self
+            .lua_local_scopes
+            .last_mut()
+            .expect("Lua parser always has a current function scope");
+        *scope
+            .blocks
+            .last_mut()
+            .expect("Lua parser always has a current block scope") += count;
+        self.check_lua_local_limit(line)
+    }
+
+    fn check_lua_local_limit(&self, line: u32) -> Result<(), String> {
+        let scope = self
+            .lua_local_scopes
+            .last()
+            .expect("Lua parser always has a current function scope");
+        if scope.blocks.iter().sum::<usize>() > Self::LUA_MAXVARS {
+            return Err(format!(
+                "line {line}: too many local variables (limit is {}) in function at line {}",
+                Self::LUA_MAXVARS,
+                scope.function_line,
+            ));
+        }
+        Ok(())
+    }
+
     /// Real Lua's `enterlevel` (`lparser.c`), which reuses the VM's own
     /// `luaE_incCstack` C-call-depth guard - raising a bare `"C stack
     /// overflow"` with no `chunkname:line:` position prefix, unlike every
@@ -704,6 +804,7 @@ impl Parser {
             }
             functions.push(Function {
                 name: "main".into(),
+                is_chunk: true,
                 source_file: None,
                 params: vec![],
                 param_annotations: vec![],
@@ -804,10 +905,15 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_function_body(vararg)?;
+        let body = self.parse_function_body_with_locals(
+            vararg,
+            params.len() + usize::from(vararg_name.is_some()),
+            line,
+        )?;
         let end = self.previous_span();
         Ok(Function {
             name,
+            is_chunk: false,
             source_file: None,
             params,
             param_annotations,
@@ -888,6 +994,18 @@ impl Parser {
         let body = body?;
         self.expect(&Token::End)?;
         Ok(body)
+    }
+
+    fn parse_function_body_with_locals(
+        &mut self,
+        vararg: bool,
+        parameter_count: usize,
+        function_line: u32,
+    ) -> Result<Block, String> {
+        self.enter_lua_function_scope(function_line, parameter_count)?;
+        let result = self.parse_function_body(vararg);
+        self.leave_lua_function_scope();
+        result
     }
 
     fn parse_type(&mut self) -> Result<TypeName, String> {
@@ -990,26 +1108,45 @@ impl Parser {
 
     /// Parses statements until (not consuming) one of `terminators`.
     fn parse_block(&mut self, terminators: &[Token]) -> Result<Block, String> {
+        self.enter_lua_block_scope();
         let mut stmts = Vec::new();
-        while !terminators.iter().any(|t| self.check(t)) {
-            if self.peek().is_none() {
-                return Err("unexpected end of input inside a block".to_string());
-            }
-            let stmt = self.parse_stmt()?;
-            let is_return = matches!(stmt, Stmt::Return { .. } | Stmt::MultiReturn { .. });
-            stmts.push(stmt);
-            if is_return {
-                // Lua's grammar allows `return` only as a block's very last
-                // statement, optionally followed by one `;` - not another
-                // statement or a second `;` (`return;;` is a syntax error).
-                self.eat(&Token::Semi);
-                if !terminators.iter().any(|t| self.check(t)) {
-                    return Err(self.error("'return' must be the last statement in a block"));
+        let result = (|| {
+            while !terminators.iter().any(|t| self.check(t)) {
+                if self.peek().is_none() {
+                    return Err("unexpected end of input inside a block".to_string());
                 }
-                break;
+                let stmt = self.parse_stmt()?;
+                let is_return = matches!(stmt, Stmt::Return { .. } | Stmt::MultiReturn { .. });
+                stmts.push(stmt);
+                if is_return {
+                    // Lua's grammar allows `return` only as a block's very last
+                    // statement, optionally followed by one `;` - not another
+                    // statement or a second `;` (`return;;` is a syntax error).
+                    self.eat(&Token::Semi);
+                    if !terminators.iter().any(|t| self.check(t)) {
+                        return Err(self.error("'return' must be the last statement in a block"));
+                    }
+                    break;
+                }
             }
-        }
-        Ok(stmts)
+            Ok(stmts)
+        })();
+        self.leave_lua_block_scope();
+        result
+    }
+
+    fn parse_block_with_lua_locals(
+        &mut self,
+        terminators: &[Token],
+        local_count: usize,
+        line: u32,
+    ) -> Result<Block, String> {
+        self.enter_lua_block_scope();
+        let result = self
+            .declare_lua_locals(local_count, line)
+            .and_then(|()| self.parse_block(terminators));
+        self.leave_lua_block_scope();
+        result
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
@@ -1060,6 +1197,7 @@ impl Parser {
                 self.advance();
                 if self.eat_function_keyword() {
                     let start = self.previous_span();
+                    self.declare_lua_locals(1, line)?;
                     return Ok(Stmt::LocalFunction(
                         self.parse_function_after_keyword(line, start)?,
                     ));
@@ -1082,6 +1220,7 @@ impl Parser {
                         None
                     };
                     names.push((name, ty, constant, close));
+                    self.declare_lua_locals(1, line)?;
                     if !self.eat(&Token::Comma) {
                         break;
                     }
@@ -1121,7 +1260,17 @@ impl Parser {
                     })
                 }
             }
-            Some(Token::Global) => self.parse_global(),
+            // Lua's optional `global` declaration extension is contextual:
+            // stock Lua accepts `global = 1` and `return global`.  Keep the
+            // declaration grammar when it is not followed by assignment;
+            // ordinary assignment/expression parsing handles the soft-keyword
+            // cases.
+            Some(Token::Ident(name))
+                if name == "global"
+                    && !matches!(self.tokens.get(self.pos + 1).map(|token| &token.token), Some(Token::Eq)) =>
+            {
+                self.parse_global()
+            }
             Some(Token::If) => self.parse_if(),
             Some(Token::While) => {
                 self.advance();
@@ -1142,7 +1291,8 @@ impl Parser {
                     self.expect(&Token::In)?;
                     let iterators = self.parse_values()?;
                     self.expect(&Token::Do)?;
-                    let body = self.parse_block(&[Token::End])?;
+                    let body =
+                        self.parse_block_with_lua_locals(&[Token::End], vars.len(), line)?;
                     self.expect(&Token::End)?;
                     return Ok(Stmt::GenericFor {
                         vars,
@@ -1161,7 +1311,7 @@ impl Parser {
                     None
                 };
                 self.expect(&Token::Do)?;
-                let body = self.parse_block(&[Token::End])?;
+                let body = self.parse_block_with_lua_locals(&[Token::End], 1, line)?;
                 self.expect(&Token::End)?;
                 Ok(Stmt::NumericFor {
                     var,
@@ -1227,7 +1377,10 @@ impl Parser {
 
     fn parse_global(&mut self) -> Result<Stmt, String> {
         let line = self.line();
-        self.expect(&Token::Global)?;
+        match self.advance() {
+            Some(Token::Ident(name)) if name == "global" => {}
+            other => return Err(self.error(format!("expected global declaration, got {other:?}"))),
+        }
         let prefix_attr = self.parse_global_attribute()?;
         if self.eat(&Token::Function) {
             if prefix_attr {
@@ -1664,11 +1817,16 @@ impl Parser {
         match self.advance() {
             Some(Token::Function) => {
                 let (params, param_annotations, vararg, vararg_name) = self.parse_param_list()?;
-                let body = self.parse_function_body(vararg)?;
+                let body = self.parse_function_body_with_locals(
+                    vararg,
+                    params.len() + usize::from(vararg_name.is_some()),
+                    line,
+                )?;
                 let end = self.previous_span();
                 Ok(Expr {
                     kind: ExprKind::Function(Box::new(Function {
                         name: format!("<anonymous@{line}>"),
+                        is_chunk: false,
                         source_file: None,
                         params,
                         param_annotations,

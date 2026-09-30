@@ -1203,6 +1203,49 @@ fn bad_argument_errors_on_a_method_calls_self_argument_use_reals_calling_on_bad_
     assert!(String::from_utf8_lossy(&output.stdout).contains("bad self argcheck ok"));
 }
 
+/// A non-callable generic-`for` iterator expression (`for k,v in 3 do end`)
+/// gets real Lua's `(for iterator 'for iterator')` name annotation on its
+/// "attempt to call a ... value" error, matching `funcnamefromcode`
+/// (`ldebug.c`)'s `OP_TFORCALL` case, which hardcodes `namewhat`/`name` to
+/// the literal "for iterator" rather than tracing the callee register's
+/// origin. Added alongside a `Pending::TForCall { base, .. }` arm in
+/// `drive_result`'s `call_base` resolution (`dispatch.rs`) so
+/// `annotate_call_error` runs for this call site the same way it already
+/// does for `Pending::Call`/`Pending::TailCall`; the position prefix here
+/// was already correct (`runtime_error_prefix` applies independent of
+/// `call_base`).
+#[test]
+fn a_non_callable_generic_for_iterator_names_itself_for_iterator() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_tforcall_iterator_name_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = pcall(function()
+            for k, v in 3 do end
+        end)
+        assert(not ok, "iterating a number should fail")
+        assert(string.find(msg, "attempt to call a number value", 1, true), msg)
+        assert(string.find(msg, "(for iterator 'for iterator')", 1, true), msg)
+        print("tforcall iterator name ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tforcall iterator name ok"));
+}
+
 /// Real Lua's `luaO_chunkid` (`lobject.c`) is the single function that
 /// formats a chunk name for display, shared by `debug.getinfo`'s `short_src`
 /// and `lua_load`'s syntax-error position prefix. It reserves
@@ -1893,6 +1936,43 @@ A = 3
 ]], {2, 3, 2, 4, 5, 6})
         _G.A = nil
 
+        -- while + break, condition a function call (a leaked temporary):
+        -- `break` must redo the loop's leaked-register clear itself,
+        -- tagged with its own line, and jump *past* the shared exit-path
+        -- clear rather than landing on it - otherwise a spurious extra
+        -- `cond_line` event fires between the `break` and the statement
+        -- that follows (db.lua line 171).
+        test([[while math.sin(1) do
+  if math.sin(1)
+  then break
+  end
+end
+a=1]], {1, 2, 3, 6})
+
+        -- numeric for whose whole body sits on the loop's own line: the
+        -- interpreter's `hook_last_pc` bookkeeping must advance on every
+        -- instruction dispatched (not only the ones that actually fire a
+        -- "line" event), or the first iteration's fire pins it at an
+        -- early `pc` that every later iteration's back-edge then reads as
+        -- "still forward of", silently swallowing every repeat event
+        -- after the first (db.lua line 188).
+        test([[for i=1,4 do a=1 end]], {1, 1, 1, 1})
+
+        -- Lua emits the left operand only after it has scanned the binary
+        -- operator, so source-map entries for that operand use the operator
+        -- line. The final global store uses the right operand's final line.
+        -- `db.lua` repeats this exact shape with many blank-line gaps.
+        test([[local b = {10}
+a = b[1]
+
+
++
+
+
+
+b[1]
+b = 4]], {1, 5, 9, 5, 9, 10})
+
         print("sethook lastline ok")
     "#,
     )
@@ -2112,6 +2192,37 @@ fn a_function_with_too_many_local_variables_fails_to_compile() {
     std::fs::remove_file(&path).ok();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("too many locals rejected"));
+}
+
+#[test]
+fn lua_parser_reports_maxvars_before_an_incomplete_function_body() {
+    // Lua checks MAXVARS while it consumes each local name. The corpus's
+    // final `errors.lua` case deliberately omits the closing `end`; the
+    // resource-limit diagnostic must therefore win over the later
+    // unterminated-block error, and cite the function declaration line.
+    let source = format!("\nfunction foo ()\n  local a{}\n", ", a".repeat(200));
+    let error =
+        sol::parser::parse_lua(sol::lexer::lex_bytes(source.as_bytes()).unwrap()).unwrap_err();
+    assert!(error.contains("too many local variables"), "{error}");
+    assert!(error.contains("line 2"), "{error}");
+
+    // Exercise `load()`'s chunk-diagnostic wrapper too. Its leading parse
+    // position is intentionally separate from the function-definition line;
+    // the latter must survive formatting as `in function at line 2` for the
+    // corpus's `checkerr` helper.
+    let wrapper = br#"
+        local source = "\nfunction foo ()\n  local a" .. string.rep(", a", 200) .. "\n"
+        local chunk, message = load(source)
+        return chunk == nil and
+            string.find(message, "too many local variables", 1, true) ~= nil and
+            string.find(message, "in function at line 2", 1, true) ~= nil
+    "#;
+    let program = sol::parser::parse_lua(sol::lexer::lex_bytes(wrapper).unwrap()).unwrap();
+    let mut runtime = sol::lua_runtime::LuaRuntime::new();
+    assert_eq!(
+        runtime.run(&program).unwrap(),
+        sol::lua_runtime::LuaValue::Bool(true)
+    );
 }
 
 #[test]

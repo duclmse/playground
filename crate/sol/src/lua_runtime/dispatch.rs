@@ -39,7 +39,7 @@ mod bytecode;
 /// conservative for multi-result/range-writing instructions (treats the
 /// whole plausible range as written) so `describe_register`'s backward scan
 /// never walks past a write it can't fully account for.
-fn instr_writes(instr: &Instr, reg: Reg) -> bool {
+pub(super) fn instr_writes(instr: &Instr, reg: Reg) -> bool {
     use Instr::*;
     match instr {
         LoadConst(dst, _)
@@ -173,6 +173,14 @@ fn annotate_index_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg)
 /// call retains its useful source name even when the callee is a non-function.
 fn annotate_call_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg) {
     if err.message.starts_with("attempt to call a ") && err.message.ends_with(" value") {
+        // Real Lua's `funcnamefromcode` (`ldebug.c`) hardcodes `namewhat`/
+        // `name` to the literal "for iterator" for `OP_TFORCALL` rather than
+        // tracing the callee register's origin - the generic-`for` iterator
+        // slot is a fixed calling-convention position, not a named variable.
+        if matches!(proto.instrs.get(pc), Some(Instr::TForCall(b, _)) if *b == base) {
+            err.message = format!("{} (for iterator 'for iterator')", err.message);
+            return;
+        }
         if let Some((kind, name)) = describe_register(proto, pc, base) {
             err.message = format!("{} ({kind} '{name}')", err.message);
         }
@@ -358,9 +366,33 @@ impl LuaRuntime {
                 | LuaValue::CoroutineWrapper(_)
                 | LuaValue::Closure(_)
         );
+        let hook_callee = fires_hook.then(|| value.clone());
+        let hook_args = fires_hook.then(|| args.clone());
         let result = (|| -> LuaResult<Vec<LuaValue>> {
             if fires_hook {
-                self.fire_hook("call", None)?;
+                let mut roots = Vec::with_capacity(args.len() + 1);
+                roots.push(self.encode_value(&value)?);
+                for arg in &args {
+                    roots.push(self.encode_value(arg)?);
+                }
+                self.pinned_roots.push(roots);
+                let previous_callee = if self.running_hook {
+                    None
+                } else {
+                    std::mem::replace(&mut self.hook_event_callee, Some(value.clone()))
+                };
+                let previous_transfer = self.hook_transfer.replace(HookTransfer {
+                    first: 1,
+                    values: args.clone(),
+                    temporary_name: b"(C temporary)",
+                });
+                let hook_result = self.fire_hook("call", None);
+                self.hook_transfer = previous_transfer;
+                if !self.running_hook {
+                    self.hook_event_callee = previous_callee;
+                }
+                self.pinned_roots.pop();
+                hook_result?;
             }
             let result = match value {
                 LuaValue::NativeFunction(function) => self.call_native(function, args),
@@ -375,7 +407,7 @@ impl LuaRuntime {
                 LuaValue::Closure(closure) => {
                     let (proto, upvals, globals) = self.closure_parts(closure)?;
                     let name = proto.metadata.name.clone();
-                    self.call_closure(proto, upvals, globals, args)
+                    self.call_closure(closure, proto, upvals, globals, args)
                         .map_err(|error| error.at(&name))
                 }
                 other => {
@@ -391,8 +423,37 @@ impl LuaRuntime {
                     }
                 }
             };
-            if fires_hook && result.is_ok() {
-                self.fire_hook("return", None)?;
+            if fires_hook {
+                if let Ok(values) = &result {
+                    let roots = values
+                        .iter()
+                        .map(|value| self.encode_value(value))
+                        .collect::<LuaResult<Vec<_>>>()?;
+                    self.pinned_roots.push(roots);
+                    let previous_callee = std::mem::replace(
+                        &mut self.hook_event_callee,
+                        hook_callee.clone(),
+                    );
+                    let first = match (&hook_callee, &hook_args) {
+                        (Some(LuaValue::NativeFunction(NativeFunction::Select)), Some(args))
+                            if !values.is_empty() && values.len() <= args.len() =>
+                        {
+                            args.len() - values.len() + 1
+                        }
+                        (_, Some(args)) => args.len() + 1,
+                        _ => 1,
+                    };
+                    let previous_transfer = self.hook_transfer.replace(HookTransfer {
+                        first,
+                        values: values.clone(),
+                        temporary_name: b"(C temporary)",
+                    });
+                    let hook_result = self.fire_hook("return", None);
+                    self.hook_transfer = previous_transfer;
+                    self.hook_event_callee = previous_callee;
+                    self.pinned_roots.pop();
+                    hook_result?;
+                }
             }
             result
         })();
@@ -428,14 +489,97 @@ impl LuaRuntime {
         if !interested {
             return Ok(());
         }
+        let inferred_transfer = if matches!(event, "call" | "tail call") && self.hook_transfer.is_none()
+            && self.hook_event_callee.is_none()
+        {
+            match self.frames.last() {
+                Some(Frame::Lua(frame)) => Some(HookTransfer {
+                    first: 1,
+                    values: (0..frame.proto.metadata.arity.parameters as usize)
+                        .map(|index| frame.regs.get(index).cloned().unwrap_or(LuaValue::Nil))
+                        .collect(),
+                    temporary_name: b"",
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let previous_transfer = inferred_transfer
+            .map(|transfer| self.hook_transfer.replace(transfer));
         let mut args = vec![LuaValue::String(self.intern_str(event.as_bytes()))];
         if let Some(line) = line {
             args.push(LuaValue::Integer(line));
         }
         self.running_hook = true;
+        self.hook_callback_frame = Some(self.frames.len());
         let result = self.call(hook.callback.clone(), args);
+        if let Some(previous) = previous_transfer {
+            self.hook_transfer = previous;
+        }
+        self.hook_callback_frame = None;
         self.running_hook = false;
         result.map(|_| ())
+    }
+
+    /// Runs a debug-hook callback while `frame` is temporarily absent from
+    /// `self.frames`. `drive_result` pops a Lua frame before dispatching an
+    /// instruction, so a hook invoked from that instruction can itself call
+    /// `collectgarbage()` while every value reachable only from the
+    /// interrupted frame would otherwise look dead. Pin the same precise
+    /// roots `frame_roots` would have found had the frame remained on the
+    /// stack for the callback's complete dynamic extent.
+    fn fire_hook_for_active_frame(
+        &mut self,
+        event: &'static str,
+        line: Option<i64>,
+        frame: &LuaFrame,
+        returned: Option<&[LuaValue]>,
+    ) -> LuaResult<()> {
+        let mut roots = Vec::new();
+        self.push_lua_frame_roots(frame, &mut roots);
+        self.pinned_roots.push(roots);
+        let interrupted = frame
+            .proto
+            .source_map
+            .location(frame.header.pc)
+            .map(|location| {
+                let source = self.traceback_frame_label(&frame.proto, location.line);
+                if frame.proto.line_defined == 0 {
+                    format!("{source} in main chunk")
+                } else {
+                    format!("{source} in function <{}>", frame.proto.line_defined)
+                }
+            });
+        let previous = std::mem::replace(&mut self.hook_interrupted_frame, interrupted);
+        let current_line = frame.proto.source_map.location(frame.header.pc)
+            .map_or(-1, |location| location.line as i64);
+        let previous_info = self.hook_interrupted_info.replace((
+            frame.proto.clone(), frame.closure, current_line,
+        ));
+        let previous_locals = self.hook_interrupted_locals.replace(frame.clone());
+        let previous_transfer = returned.map(|values| {
+            let first = match frame.proto.instrs.get(frame.header.pc as usize) {
+                Some(Instr::Return(base, _)) => {
+                    *base as usize + 1 + usize::from(frame.proto.metadata.arity.variadic)
+                }
+                _ => 1,
+            };
+            self.hook_transfer.replace(HookTransfer {
+                first,
+                values: values.to_vec(),
+                temporary_name: b"(temporary)",
+            })
+        });
+        let result = self.fire_hook(event, line);
+        if let Some(previous) = previous_transfer {
+            self.hook_transfer = previous;
+        }
+        self.hook_interrupted_locals = previous_locals;
+        self.hook_interrupted_info = previous_info;
+        self.hook_interrupted_frame = previous;
+        self.pinned_roots.pop();
+        result
     }
 
     /// Per-instruction `line`/`count` hook check, called from `dispatch_step`'s
@@ -446,6 +590,14 @@ impl LuaRuntime {
     /// Lua's `hookcount`/line-change checks are independent of each other.
     fn fire_line_and_count_hooks(&mut self, frame: &mut LuaFrame, pc: usize) -> LuaResult<()> {
         c_api::fire_c_instruction_hooks(self, frame, pc)?;
+        // Lua disables all debug-hook accounting while executing the hook
+        // callback itself.  In particular, a count hook must not consume its
+        // own callback's instructions; otherwise a callback such as
+        // `function () a = a + 1 end` makes every count interval collapse to
+        // one VM instruction.
+        if self.running_hook {
+            return Ok(());
+        }
         let Some(hook) = self.active_hook.clone() else {
             return Ok(());
         };
@@ -453,7 +605,7 @@ impl LuaRuntime {
             let remaining = hook.count_remaining.get() - 1;
             if remaining <= 0 {
                 hook.count_remaining.set(hook.count);
-                self.fire_hook("count", None)?;
+                self.fire_hook_for_active_frame("count", None, frame, None)?;
             } else {
                 hook.count_remaining.set(remaining);
             }
@@ -463,17 +615,38 @@ impl LuaRuntime {
                 let line = location.line as i64;
                 let pc = pc as i64;
                 // Fires again whenever the source line actually changes, or
-                // whenever `pc` jumps back to (or before) where the last
-                // line-hook fired - a loop's back-edge re-executing an earlier,
-                // possibly identical, line. Tracked per-frame
-                // (`frame.hook_last_pc`/`hook_last_line`), since each call
-                // frame has its own independent notion of "have I already
-                // hooked this line".
+                // whenever `pc` jumps back to (or before) the *immediately
+                // preceding* instruction this frame examined - a loop's
+                // back-edge re-executing an earlier, possibly identical,
+                // line. That comparison point (`frame.hook_last_pc`) has to
+                // be updated on every instruction this function sees, not
+                // only the ones that actually fire a "line" event - real
+                // Lua's own equivalent (`oldpc` in `luaG_traceexec`) runs
+                // unconditionally the same way. Otherwise, inside a loop
+                // whose whole body sits on one source line (so only the
+                // *first* instruction of the first iteration ever changes
+                // `frame.hook_last_line` and thus updates this watermark),
+                // every later iteration's back-edge would land on a `pc`
+                // *greater* than that stale, early watermark and never
+                // register as "backward" - silently swallowing every
+                // repeat-iteration line event after the first. Only
+                // `frame.hook_last_line` stays scoped to actual fires, since
+                // it exists purely to dedupe consecutive same-line, non-
+                // backward instructions within one logical line.
                 if line != frame.hook_last_line || pc <= frame.hook_last_pc {
                     frame.hook_last_line = line;
-                    frame.hook_last_pc = pc;
-                    self.fire_hook("line", Some(line))?;
+                    self.fire_hook_for_active_frame("line", Some(line), frame, None)?;
                 }
+                frame.hook_last_pc = pc;
+            } else if frame.proto.source_map.is_empty() && pc == 0 {
+                // A stripped Lua prototype retains its executable code but
+                // has no line-info record for its first instruction.  Lua
+                // still delivers that initial line-hook boundary, with a
+                // nil line argument (the behavior exercised by db.lua's
+                // stripped-function probe), rather than silently omitting
+                // the event altogether.
+                frame.hook_last_pc = pc as i64;
+                self.fire_hook_for_active_frame("line", None, frame, None)?;
             }
         }
         Ok(())
@@ -676,6 +849,7 @@ impl LuaRuntime {
     /// `drive` directly instead, so it can treat `Yielded` as legitimate.
     fn call_closure(
         &mut self,
+        closure: ClosureRef,
         proto: Rc<Proto>,
         upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
@@ -692,7 +866,11 @@ impl LuaRuntime {
         // untrampolined path, distinct from the trampolined
         // `step_result_for_call` path this crate's `debug.getinfo` support
         // was verified against.
-        let frame = self.new_lua_frame(proto, upvals, globals, args, 0)?;
+        let mut frame = self.new_lua_frame(closure, proto, upvals, globals, args, 0)?;
+        // `call_closure` is also used by runtime-originated calls such as a
+        // table finalizer.  Those do not pass through `drive_result`'s
+        // `PushClosure` arm, which normally consumes this label.
+        frame.entry_label = self.pending_frame_label.take();
         self.frames.push(Frame::Lua(frame));
         let mut depth_charged: usize = 0;
         match self.drive(base_depth, &mut depth_charged, None) {
@@ -719,6 +897,7 @@ impl LuaRuntime {
     /// binding, vararg collection) before entering its dispatch loop.
     fn new_lua_frame(
         &mut self,
+        closure: ClosureRef,
         proto: Rc<Proto>,
         upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
@@ -728,10 +907,13 @@ impl LuaRuntime {
         let function = self.prototype_id(&proto)?;
         let register_count = proto.metadata.registers as usize;
         let parameter_count = proto.metadata.arity.parameters as usize;
-        self.charge_allocation(
+        self.pinned_roots.push(vec![sol_core::Value::object(closure.object_id())]);
+        let charge = self.charge_allocation(
             (register_count + proto.captured_cell_count) * std::mem::size_of::<LuaValue>(),
             None,
-        )?;
+        );
+        self.pinned_roots.pop();
+        charge?;
         let mut regs = self.take_regs_buffer(register_count);
         let cells = self.take_cells_buffer(&proto.captured_registers);
         for i in 0..parameter_count.min(register_count) {
@@ -762,6 +944,7 @@ impl LuaRuntime {
         }
         Ok(LuaFrame {
             header: FrameHeader::new(function, 0, 0),
+            closure,
             proto,
             upvals,
             globals,
@@ -769,6 +952,7 @@ impl LuaRuntime {
             cells,
             varargs,
             call_chain_hops,
+            is_tail_call: false,
             pending: Pending::None,
             to_close: Vec::new(),
             entry_label: None,
@@ -863,14 +1047,20 @@ impl LuaRuntime {
                             // `resolve_call`, never through `self.call()`.
                             let is_base_frame = self.frames.len() == base_depth;
                             if !is_base_frame {
-                                self.fire_hook("return", None)?;
+                                self.fire_hook_for_active_frame("return", None, &frame, Some(&values))?;
                             }
+                            self.recycle_frame_buffers(
+                                std::mem::take(&mut frame.regs),
+                                std::mem::take(&mut frame.cells),
+                            );
+                            self.recycle_values_buffer(std::mem::take(&mut frame.varargs));
                             if self.finish_frame(base_depth, depth_charged) {
                                 return Ok(DriveOutcome::Returned(values));
                             }
                             incoming = Some(values);
                         }
                         Ok(StepResult::PushClosure {
+                            closure,
                             proto,
                             upvals,
                             globals,
@@ -908,6 +1098,7 @@ impl LuaRuntime {
                                 *depth_charged += 1;
                                 self.frames.push(Frame::Lua(frame));
                                 let mut child = self.new_lua_frame(
+                                    closure,
                                     proto,
                                     upvals,
                                     globals,
@@ -920,6 +1111,7 @@ impl LuaRuntime {
                             }
                         }
                         Ok(StepResult::TailClosure {
+                            closure,
                             proto,
                             upvals,
                             globals,
@@ -932,9 +1124,11 @@ impl LuaRuntime {
                                 std::mem::take(&mut frame.cells),
                             );
                             self.recycle_values_buffer(std::mem::take(&mut frame.varargs));
-                            let replacement =
-                                self.new_lua_frame(proto, upvals, globals, args, call_chain_hops)?;
+                            let mut replacement =
+                                self.new_lua_frame(closure, proto, upvals, globals, args, call_chain_hops)?;
+                            replacement.is_tail_call = true;
                             self.frames.push(Frame::Lua(replacement));
+                            self.fire_hook("tail call", None)?;
                         }
                         Ok(StepResult::CallLeaf { callee, args }) => {
                             let call_proto = frame.proto.clone();
@@ -945,6 +1139,7 @@ impl LuaRuntime {
                                     Some(Instr::TailCall(base, _)) => Some(*base),
                                     _ => None,
                                 },
+                                Pending::TForCall { base, .. } => Some(base as Reg),
                                 // Native continuations can issue a leaf call
                                 // while the Lua frame is not suspended at an
                                 // `Instr::Call`; such a call has no bytecode
@@ -1323,6 +1518,7 @@ impl LuaRuntime {
     ) -> LuaResult<CallStep> {
         match self.step_result_for_call(callee, args) {
             Ok(StepResult::PushClosure {
+                closure,
                 proto,
                 upvals,
                 globals,
@@ -1338,7 +1534,7 @@ impl LuaRuntime {
                 }
                 self.call_depth += 1;
                 *depth_charged += 1;
-                let child = self.new_lua_frame(proto, upvals, globals, args, call_chain_hops)?;
+                let child = self.new_lua_frame(closure, proto, upvals, globals, args, call_chain_hops)?;
                 self.frames.push(Frame::Lua(child));
                 self.fire_hook("call", None)?;
                 Ok(CallStep::Pending)
@@ -2542,6 +2738,7 @@ impl LuaRuntime {
             if let LuaValue::Closure(closure) = &resolved {
                 let (proto, upvals, globals) = self.closure_parts(*closure)?;
                 return Ok(StepResult::PushClosure {
+                    closure: *closure,
                     proto,
                     upvals,
                     globals,

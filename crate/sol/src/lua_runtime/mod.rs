@@ -411,6 +411,20 @@ pub struct LuaRuntime {
     /// itself executes Lua code from recursing into itself forever. See
     /// `fire_hook`.
     running_hook: bool,
+    /// Absolute index in `frames` where the active Lua hook callback is
+    /// installed. The hook dispatcher calls it directly, so it has no
+    /// bytecode call site from which `debug.getinfo` could infer its name.
+    hook_callback_frame: Option<usize>,
+    /// Traceback line for a bytecode frame temporarily removed from
+    /// `frames` while its line/count hook executes.
+    hook_interrupted_frame: Option<String>,
+    /// Active Lua frame omitted from `frames` while its line/count hook runs.
+    hook_interrupted_info: Option<(Rc<crate::lua_bytecode::Proto>, ClosureRef, i64)>,
+    hook_interrupted_locals: Option<frame::LuaFrame>,
+    hook_transfer: Option<frame::HookTransfer>,
+    /// Callee of a call hook fired from the blocking native call bridge.
+    /// Such leaf calls have no `Frame::Native` entry on the explicit stack.
+    hook_event_callee: Option<LuaValue>,
 }
 
 impl Default for LuaRuntime {

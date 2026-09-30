@@ -228,7 +228,16 @@ impl LuaRuntime {
                 continue;
             };
             if let Some(finalizer) = self.table_finalizer(table) {
+                // This is a blocking runtime-to-Lua call rather than a
+                // bytecode `Call` step, so tag the frame before
+                // `call_closure` installs it.  `debug.getinfo(1)` in a
+                // finalizer must identify the `__gc` metamethod itself.
+                self.pending_frame_label = Some("__gc");
                 let _ = self.call(finalizer, vec![LuaValue::Table(table)]);
+                // A host-provided finalizer may be native and therefore not
+                // enter `call_closure`; do not let its label escape to a
+                // later, unrelated direct Lua call.
+                self.pending_frame_label = None;
             }
             let _ = self.canonical_heap.borrow_mut().finish_finalizer(id);
         }
@@ -296,9 +305,22 @@ impl LuaRuntime {
         // and §11); this loop only needs to cover `main_coroutine` and
         // whichever coroutine is currently innermost (already `self.frames`).
         for &thread in std::iter::once(&self.main_coroutine).chain(&self.coroutine_stack) {
+            // The active thread object itself is live too. In particular,
+            // debug's `_HOOKKEY` registry table has weak thread keys: its
+            // callback entry must not disappear merely because the main
+            // thread has no ordinary Lua value pointing back to itself.
+            roots.push(Value::object(thread.object_id()));
             let coroutine = self.coroutine(thread);
             if let Some(body) = coroutine.body.borrow().as_ref() {
                 roots.push(self.encode_value(body).unwrap_or(Value::NIL));
+            }
+            // A debug hook is an executable Lua value retained by the
+            // coroutine's Rust-side `HookState`, not by a heap edge. Keep it
+            // alive just like a suspended coroutine body: a collection may
+            // run after `debug.sethook` returns but before the next event,
+            // and the installed hook is still observable then.
+            if let Some(hook) = coroutine.hook.borrow().as_ref() {
+                roots.push(self.encode_value(&hook.callback).unwrap_or(Value::NIL));
             }
             self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut roots);
         }
@@ -330,6 +352,9 @@ impl LuaRuntime {
             if let Some(body) = coroutine.body.borrow().as_ref() {
                 extra.push(self.encode_value(body).unwrap_or(Value::NIL));
             }
+            if let Some(hook) = coroutine.hook.borrow().as_ref() {
+                extra.push(self.encode_value(&hook.callback).unwrap_or(Value::NIL));
+            }
             self.push_frame_stack_roots(&coroutine.frames.borrow(), &mut extra);
             conditional_roots.insert(id, extra);
         }
@@ -357,7 +382,8 @@ impl LuaRuntime {
         }
     }
 
-    fn push_lua_frame_roots(&self, frame: &LuaFrame, roots: &mut Vec<Value>) {
+    pub(super) fn push_lua_frame_roots(&self, frame: &LuaFrame, roots: &mut Vec<Value>) {
+        roots.push(Value::object(frame.closure.object_id()));
         for value in &frame.regs {
             roots.push(self.encode_value(value).unwrap_or(Value::NIL));
         }

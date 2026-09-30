@@ -21,6 +21,7 @@ use super::*;
 /// concat-bitwise metamethods/`__len` via the blocking `LuaRuntime::call`
 /// bridge; now each records just enough to finish the instruction once the
 /// (possibly `PushClosure`d) metamethod call's result comes back.
+#[derive(Clone)]
 pub(super) enum Pending {
     None,
     Call {
@@ -129,8 +130,13 @@ pub(super) enum BinaryResolution {
 /// indefinitely (across separate `dispatch_step` calls) without holding any
 /// Rust call stack, which is what lets `Instr::Call` chains be driven
 /// iteratively instead of recursively.
+#[derive(Clone)]
 pub(super) struct LuaFrame {
     pub(super) header: FrameHeader,
+    /// The exact closure invoked for this activation. Multiple closures can
+    /// share a prototype, so `debug.getinfo(level, "f")` cannot reconstruct
+    /// this identity from `proto` and `upvals` after the call begins.
+    pub(super) closure: ClosureRef,
     pub(super) proto: Rc<Proto>,
     pub(super) upvals: Vec<sol_core::ObjectId>,
     pub(super) globals: Globals,
@@ -149,6 +155,10 @@ pub(super) struct LuaFrame {
     /// confirmed against the real `lua5.5.1` oracle and `ldebug.c`'s
     /// `auxgetinfo`'s `'t'` case.
     pub(super) call_chain_hops: usize,
+    /// This activation replaced its caller through `Instr::TailCall`.
+    /// Lua preserves that fact for `debug.getinfo(..., "t")` even though the
+    /// physical caller frame is no longer present.
+    pub(super) is_tail_call: bool,
     pub(super) pending: Pending,
     /// Lua 5.4+ `<close>` support: values pushed by `Instr::MarkClose`, one
     /// per currently-open to-be-closed local (or a generic-for's implicit
@@ -190,6 +200,17 @@ pub(super) struct LuaFrame {
 pub(super) enum Frame {
     Lua(LuaFrame),
     Native(NativeCont),
+}
+
+/// Values exposed by `debug.getinfo(..., "r")` and `debug.getlocal` during a
+/// call/return hook. `first` is Lua's one-based transfer slot, not a register
+/// index; native functions may return an existing argument slot (`select`).
+#[derive(Clone)]
+pub(super) struct HookTransfer {
+    pub(super) first: usize,
+    pub(super) values: Vec<LuaValue>,
+    /// Empty for Lua call parameters, whose normal lexical names remain visible.
+    pub(super) temporary_name: &'static [u8],
 }
 
 /// Resume state for a reentrant native builtin whose Lua call has been
@@ -323,6 +344,7 @@ pub(super) enum StepResult {
     /// push a fresh `LuaFrame` for it onto `LuaRuntime::frames` and drive
     /// that instead, with no new native Rust call frame.
     PushClosure {
+        closure: ClosureRef,
         proto: Rc<Proto>,
         upvals: Vec<sol_core::ObjectId>,
         globals: Globals,
@@ -333,6 +355,7 @@ pub(super) enum StepResult {
     /// Proper tail call against a Lua closure. The driver replaces the
     /// current frame without increasing semantic call depth.
     TailClosure {
+        closure: ClosureRef,
         proto: Rc<Proto>,
         upvals: Vec<sol_core::ObjectId>,
         globals: Globals,

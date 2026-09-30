@@ -74,16 +74,16 @@ impl LuaRuntime {
                     for i in 0..nvars {
                         let value = results.get(i).cloned().unwrap_or(LuaValue::Nil);
                         let dst = base + 3 + i;
-                        if frame
+                        let captured = frame
                             .proto
                             .captured_registers
                             .get(dst)
                             .copied()
-                            .unwrap_or(false)
-                        {
+                            .unwrap_or(false);
+                        if captured {
                             self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                         }
-                        reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value);
+                        reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value, captured);
                     }
                 }
                 Pending::None => {
@@ -128,10 +128,25 @@ impl LuaRuntime {
                 Instr::NewLocal(dst, src, _) => {
                     let dst = *dst as usize;
                     let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
-                    if proto.captured_registers.get(dst).copied().unwrap_or(false) {
+                    let captured = proto.captured_registers.get(dst).copied().unwrap_or(false);
+                    if captured {
                         self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                     }
-                    reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value);
+                    reg_set_fresh(self, &mut frame.regs, &mut frame.cells, dst, value, captured);
+                }
+                Instr::DetachCell(reg) => {
+                    // Clears this register's aliasing to whatever cell it
+                    // currently points to (typically a stale one from a
+                    // previous loop iteration or scope, still referenced by
+                    // an earlier closure's upvalue) *before* the code that
+                    // computes a new local's initializer writes into this
+                    // same register number. Without this, that write would
+                    // go through `reg_set` and silently mutate the old,
+                    // still-captured cell in place instead of leaving it
+                    // alone for the following `NewLocal` to replace with a
+                    // real fresh one. Harmless no-op on an uncaptured
+                    // register, whose cell is already `None`.
+                    frame.cells[*reg as usize] = None;
                 }
                 Instr::GetUpval(dst, idx) => {
                     let id = frame.upvals[*idx as usize];
@@ -371,6 +386,7 @@ impl LuaRuntime {
                             reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         LenResolution::Call { method, args } => {
+                            self.pending_frame_label = Some("len");
                             frame.header.pc = pc as u32;
                             frame.header.stack_top = top as u32;
                             frame.header.state = FrameState::Suspended;
@@ -406,6 +422,7 @@ impl LuaRuntime {
                             reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         Ok(UnaryResolution::Call { method, args }) => {
+                            self.pending_frame_label = Some("unm");
                             frame.header.pc = pc as u32;
                             frame.header.stack_top = top as u32;
                             frame.header.state = FrameState::Suspended;
@@ -423,6 +440,7 @@ impl LuaRuntime {
                             reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, result);
                         }
                         UnaryResolution::Call { method, args } => {
+                            self.pending_frame_label = Some("bnot");
                             frame.header.pc = pc as u32;
                             frame.header.stack_top = top as u32;
                             frame.header.state = FrameState::Suspended;
@@ -612,12 +630,14 @@ impl LuaRuntime {
                     frame.pending = Pending::TailCall;
                     return match self.step_result_for_call(callee, call_args)? {
                         StepResult::PushClosure {
+                            closure,
                             proto,
                             upvals,
                             globals,
                             args,
                             call_chain_hops,
                         } => Ok(StepResult::TailClosure {
+                            closure,
                             proto,
                             upvals,
                             globals,
@@ -693,11 +713,6 @@ impl LuaRuntime {
                             }));
                         }
                     }
-                    self.recycle_frame_buffers(
-                        std::mem::take(&mut frame.regs),
-                        std::mem::take(&mut frame.cells),
-                    );
-                    self.recycle_values_buffer(std::mem::take(&mut frame.varargs));
                     frame.header.pc = pc as u32;
                     frame.header.stack_top = top as u32;
                     frame.header.state = FrameState::Returned;
@@ -750,18 +765,19 @@ impl LuaRuntime {
                                 base + 1,
                                 LuaValue::Integer(stop),
                             );
-                            if proto
+                            let captured = proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
-                                .unwrap_or(false)
-                            {
+                                .unwrap_or(false);
+                            if captured {
                                 self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
                             reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Integer(start),
+                                captured,
                             );
                         } else {
                             pc = (pc as i32 + delta) as usize;
@@ -806,18 +822,19 @@ impl LuaRuntime {
                             start >= stop
                         };
                         if cont {
-                            if proto
+                            let captured = proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
-                                .unwrap_or(false)
-                            {
+                                .unwrap_or(false);
+                            if captured {
                                 self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
                             reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Float(start),
+                                captured,
                             );
                         } else {
                             pc = (pc as i32 + delta) as usize;
@@ -839,18 +856,19 @@ impl LuaRuntime {
                         };
                         if cont {
                             reg_set(self, &mut frame.regs, &frame.cells, base, LuaValue::Float(next));
-                            if proto
+                            let captured = proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
-                                .unwrap_or(false)
-                            {
+                                .unwrap_or(false);
+                            if captured {
                                 self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
                             reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Float(next),
+                                captured,
                             );
                             pc = (pc as i32 + delta) as usize;
                             continue 'exec;
@@ -872,18 +890,19 @@ impl LuaRuntime {
                             );
                         if let (true, Some(next)) = (cont, next) {
                             reg_set(self, &mut frame.regs, &frame.cells, base, LuaValue::Integer(next));
-                            if proto
+                            let captured = proto
                                 .captured_registers
                                 .get(base + 3)
                                 .copied()
-                                .unwrap_or(false)
-                            {
+                                .unwrap_or(false);
+                            if captured {
                                 self.charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))?;
                             }
                             reg_set_fresh(self, &mut frame.regs,
                                 &mut frame.cells,
                                 base + 3,
                                 LuaValue::Integer(next),
+                                captured,
                             );
                             pc = (pc as i32 + delta) as usize;
                             continue 'exec;

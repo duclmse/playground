@@ -147,9 +147,7 @@ impl LuaRuntime {
                 let proto = self.closure_prototype(closure)?;
                 let strip = args.get(1).map(|value| value.truthy()).unwrap_or(false);
                 let dumped_proto = if strip {
-                    let mut stripped = (*proto).clone();
-                    stripped.source_map = sol_core::SourceMap::new(Vec::new());
-                    Rc::new(stripped)
+                    Self::strip_proto_debug(&proto)
                 } else {
                     proto.clone()
                 };
@@ -157,13 +155,22 @@ impl LuaRuntime {
                 self.dumped_protos.insert(key, dumped_proto);
                 let mut payload = Vec::new();
                 let source_key = Rc::as_ptr(&proto) as usize;
-                if let Some(source) = self.chunk_sources.get(&source_key) {
+                let source_len = if !strip {
+                    self.chunk_sources
+                        .get(&source_key)
+                        .map_or(0, |source| source.len())
+                } else {
+                    0
+                };
+                if source_len != 0 {
+                    let source = self.chunk_sources.get(&source_key).expect("source length came from map");
                     payload.extend_from_slice(source);
                 }
                 append_dump_constants(&proto, &mut payload);
                 let mut bytes = super::natives_load::lua55_binary_chunk_header();
                 bytes.extend_from_slice(super::natives_load::SOL_DUMP_MAGIC);
                 bytes.extend_from_slice(&(key as u64).to_le_bytes());
+                bytes.extend_from_slice(&(source_len as u64).to_le_bytes());
                 bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(&payload);
                 Ok(vec![LuaValue::String(self.fresh_str(bytes))])
@@ -400,6 +407,21 @@ impl LuaRuntime {
             }
             _ => unreachable!("call_native_string received a non-string NativeFunction"),
         }
+    }
+
+    /// `string.dump(function, true)` strips debug records from the entire
+    /// prototype tree, not merely the outer function.  Nested functions are
+    /// created later by `NewClosure`, so leaving their metadata attached
+    /// would make a stripped chunk regain local/upvalue names and line data
+    /// as soon as it creates one.
+    fn strip_proto_debug(proto: &Rc<crate::lua_bytecode::Proto>) -> Rc<crate::lua_bytecode::Proto> {
+        let mut stripped = (**proto).clone();
+        stripped.source_map = sol_core::SourceMap::new(Vec::new());
+        stripped.locals.clear();
+        stripped.param_names.clear();
+        stripped.upval_names.clear();
+        stripped.nested = proto.nested.iter().map(Self::strip_proto_debug).collect();
+        Rc::new(stripped)
     }
 
     pub(super) fn call_gmatch_iterator(&mut self, state: GMatchRef) -> LuaResult<Vec<LuaValue>> {

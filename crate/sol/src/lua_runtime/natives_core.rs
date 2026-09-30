@@ -583,9 +583,12 @@ impl LuaRuntime {
         let Frame::Lua(caller) = found? else {
             return None;
         };
-        let Pending::Call { base, .. } = caller.pending else {
-            return None;
-        };
-        describe_register(&caller.proto, caller.header.pc as usize, base as Reg)
+        match caller.pending {
+            Pending::Call { base, .. } => {
+                describe_register(&caller.proto, caller.header.pc as usize, base as Reg)
+            }
+            Pending::TForCall { .. } => Some(("for iterator", "for iterator".to_owned())),
+            _ => None,
+        }
     }
 }

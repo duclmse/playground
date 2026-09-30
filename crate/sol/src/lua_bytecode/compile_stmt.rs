@@ -7,6 +7,7 @@ use sol_core::ValueCount;
 use crate::ast::{self, AssignTarget, Stmt};
 
 use super::compile_calls::is_multi_expr;
+use super::compile_expr::expression_last_line;
 use super::func_state::{GlobalScanState, LoopCtx};
 use super::{value_count, Compiler, Const, Instr, Reg, Resolved};
 
@@ -124,8 +125,8 @@ impl Compiler {
             | Stmt::MultiReturn { .. } => self.compile_stmt_ext(statement, is_last),
             Stmt::Block(body) => self.compile_block(body),
             Stmt::Break { line } => {
-                let scope_depth = match self.stack[level].loops.last() {
-                    Some(ctx) => ctx.scope_depth,
+                let (scope_depth, cond_clear) = match self.stack[level].loops.last() {
+                    Some(ctx) => (ctx.scope_depth, ctx.cond_clear),
                     None => return Err(format!("line {line}: break outside a loop")),
                 };
                 let to_close: u16 = self.stack[level].scopes[scope_depth..]
@@ -134,6 +135,15 @@ impl Compiler {
                     .sum();
                 if to_close > 0 {
                     self.stack[level].emit(Instr::CloseSlots(to_close), *line);
+                }
+                // This loop's condition test leaks a temporary that the
+                // natural exit path clears inline (see `LoopCtx::cond_clear`
+                // 's doc) - `break` skips past that shared copy (retargeted
+                // to land after it, not on it), so it must redo the same
+                // clear here itself, tagged with `break`'s own line rather
+                // than the condition's, to stay line-hook-transparent.
+                if let Some((from, to)) = cond_clear {
+                    self.stack[level].clear_retired_registers(from, to, *line);
                 }
                 let target = self.stack[level].emit(Instr::Jump(0), *line);
                 self.stack[level]
@@ -181,16 +191,15 @@ impl Compiler {
                 self.compile_into(value, dst)?;
                 let name_const = self.stack[level].push_name_const(name);
                 self.stack[level].emit(Instr::NewLocal(dst, dst, name_const), *line);
-                self.stack
-                    .last_mut()
-                    .unwrap()
-                    .scopes
-                    .last_mut()
-                    .unwrap()
-                    .locals
-                    // Lua's to-be-closed locals are immutable after their
-                    // initializer, even without an explicit `<const>`.
-                    .push((name.clone(), dst, *constant || *close));
+                let start_pc = self.stack[level].here() - 1;
+                // Lua's to-be-closed locals are immutable after their
+                // initializer, even without an explicit `<const>`.
+                self.stack[level].declare_existing_local(
+                    name,
+                    dst,
+                    *constant || *close,
+                    start_pc,
+                );
                 self.stack[level].check_local_variable_limit(*line)?;
                 if *close {
                     let name_const = self.stack[level].push_name_const(name);
@@ -273,16 +282,15 @@ impl Compiler {
                     let dst = base + index as u16;
                     let name_const = self.stack[level].push_name_const(name);
                     self.stack[level].emit(Instr::NewLocal(dst, dst, name_const), *line);
-                    self.stack
-                        .last_mut()
-                        .unwrap()
-                        .scopes
-                        .last_mut()
-                        .unwrap()
-                        .locals
-                        // Lua's to-be-closed locals are immutable after their
-                        // initializer, even without an explicit `<const>`.
-                        .push((name.clone(), dst, *constant || *close));
+                    let start_pc = self.stack[level].here() - 1;
+                    // Lua's to-be-closed locals are immutable after their
+                    // initializer, even without an explicit `<const>`.
+                    self.stack[level].declare_existing_local(
+                        name,
+                        dst,
+                        *constant || *close,
+                        start_pc,
+                    );
                     self.stack[level].check_local_variable_limit(*line)?;
                     if *close {
                         let name_const = self.stack[level].push_name_const(name);
@@ -305,16 +313,22 @@ impl Compiler {
                 if matches!(target, AssignTarget::Name(_)) {
                     let prepared = self.prepare_assign_target(target, *line)?;
                     let value_reg = self.compile_expr(value)?;
-                    return self.commit_prepared_target(&prepared, value_reg, *line);
+                    return self.commit_prepared_target(
+                        &prepared,
+                        value_reg,
+                        *line,
+                        expression_last_line(value),
+                    );
                 }
                 let value_reg = self.compile_expr(value)?;
-                self.compile_assign(target, value_reg, *line)
+                self.compile_assign(target, value_reg, *line, expression_last_line(value))
             }
             Stmt::MultiAssign {
                 targets,
                 values,
                 line,
             } => {
+                let emit_line = values.last().map(expression_last_line).unwrap_or(*line);
                 // Lua evaluates all RHS values before performing any
                 // assignment (`a, b = b, a` swaps). `compile_expr_list`
                 // may return a simple name's own register unchanged, which
@@ -325,7 +339,7 @@ impl Compiler {
                     .iter()
                     .map(|&r| {
                         let dst = self.stack[level].alloc_reg();
-                        self.stack[level].emit(Instr::Move(dst, r), *line);
+                        self.stack[level].emit(Instr::Move(dst, r), emit_line);
                         dst
                     })
                     .collect();
@@ -349,7 +363,7 @@ impl Compiler {
                     .map(|target| self.prepare_assign_target(target, *line))
                     .collect::<Result<_, _>>()?;
                 for (index, target) in prepared.iter().enumerate() {
-                    self.commit_prepared_target(target, regs[index], *line)?;
+                    self.commit_prepared_target(target, regs[index], *line, emit_line)?;
                 }
                 Ok(())
             }
@@ -502,6 +516,7 @@ impl Compiler {
                     break_patches: Vec::new(),
                     scope_depth,
                     reg_floor: leaked_top,
+                    cond_clear: needs_clear.then_some((cond_before, leaked_top)),
                 });
                 self.compile_block(body)?;
                 let back_line = self.stack.last().unwrap().last_line().unwrap_or(*line);
@@ -529,8 +544,30 @@ impl Compiler {
                 if let Some(parent) = self.stack.last_mut().unwrap().loops.last_mut() {
                     parent.reg_floor = parent.reg_floor.max(ctx.reg_floor);
                 }
+                // Normally the caller's own `end_statement` call (once this
+                // whole `Stmt::While` arm returns) is what actually retires
+                // `next_reg` back down past `leaked_top`, appending its own
+                // blanket clear tagged with whatever `last_line()` resolves
+                // to - here, that's still `cond_line` (the last real tag
+                // emitted above), so it's contiguous and hook-invisible on
+                // the natural exit path. Running that same retirement here
+                // instead, before computing `after_clear`, makes that later
+                // call a no-op (nothing left to clear) and - critically -
+                // means nothing at all sits between `after_clear` and the
+                // statement that follows. A `break` (see `Stmt::Break`)
+                // already redid an equivalent clear itself, tagged with its
+                // own line, immediately before jumping here; without this,
+                // it would land on this blanket clear's stray `cond_line`
+                // tag and fire a spurious extra line-hook transition anyway,
+                // even though it no longer lands on the shared exit-path
+                // clear directly above.
+                self.end_statement(cond_line);
+                let after_clear = self.stack.last_mut().unwrap().here();
                 for patch in ctx.break_patches {
-                    self.stack.last_mut().unwrap().patch_jump(patch, end as i32);
+                    self.stack
+                        .last_mut()
+                        .unwrap()
+                        .patch_jump(patch, after_clear as i32);
                 }
                 Ok(())
             }
@@ -541,6 +578,7 @@ impl Compiler {
                     break_patches: Vec::new(),
                     scope_depth,
                     reg_floor: 0,
+                    cond_clear: None,
                 });
                 // `until` can see locals declared in the body, so both
                 // share one scope (matching the tree-walker's
@@ -611,16 +649,14 @@ impl Compiler {
                 let prep = self.stack[level].emit(Instr::ForPrep(ctrl_base, 0), *line);
                 let scope_depth = self.stack[level].scopes.len();
                 self.stack[level].push_scope();
-                self.stack[level].scopes.last_mut().unwrap().locals.push((
-                    var.clone(),
-                    var_reg,
-                    true,
-                ));
+                let start_pc = self.stack[level].here();
+                self.stack[level].declare_existing_local(var, var_reg, true, start_pc);
                 self.stack[level].check_local_variable_limit(*line)?;
                 self.stack[level].loops.push(LoopCtx {
                     break_patches: Vec::new(),
                     scope_depth,
                     reg_floor: 0,
+                    cond_clear: None,
                 });
                 let body_start = self.stack[level].here();
                 let result = self.compile_statements(body, true);
@@ -681,6 +717,7 @@ impl Compiler {
                     break_patches: Vec::new(),
                     scope_depth,
                     reg_floor: 0,
+                    cond_clear: None,
                 });
                 let init_jump = self.stack[level].emit(Instr::Jump(0), *line);
                 let body_start = self.stack[level].here();
@@ -698,11 +735,12 @@ impl Compiler {
                     // reassignable locals (see `nextvar.lua`'s `load
                     // "for v, k in pairs{} do v = 10 end"` check, which only
                     // rejects reassigning the first variable).
-                    self.stack[level].scopes.last_mut().unwrap().locals.push((
-                        name.clone(),
+                    self.stack[level].declare_existing_local(
+                        name,
                         *reg,
                         index == 0,
-                    ));
+                        body_start,
+                    );
                     self.stack[level].check_local_variable_limit(*line)?;
                 }
                 debug_assert_eq!(var_regs.first().copied(), Some(base + 3));
@@ -921,11 +959,13 @@ impl Compiler {
                 let slot = self.stack[level].alloc_reg();
                 let name_const = self.stack[level].push_name_const(&function.name);
                 self.stack[level].emit(Instr::NewLocal(slot, nil, name_const), function.end_line);
-                self.stack[level].scopes.last_mut().unwrap().locals.push((
-                    function.name.clone(),
+                let start_pc = self.stack[level].here() - 1;
+                self.stack[level].declare_existing_local(
+                    &function.name,
                     slot,
                     false,
-                ));
+                    start_pc,
+                );
                 self.stack[level].check_local_variable_limit(function.end_line)?;
                 let proto = self.compile_function(function)?;
                 let level = self.level();
@@ -991,7 +1031,8 @@ impl Compiler {
         &mut self,
         target: &AssignTarget,
         value_reg: Reg,
-        line: u32,
+        diagnostic_line: u32,
+        emit_line: u32,
     ) -> Result<(), String> {
         let level = self.level();
         match target {
@@ -999,37 +1040,37 @@ impl Compiler {
                 Resolved::Local(reg, constant) => {
                     if constant {
                         return Err(format!(
-                            "line {line}: attempt to assign to const variable '{name}'"
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                         ));
                     }
                     self.stack
                         .last_mut()
                         .unwrap()
-                        .emit(Instr::Move(reg, value_reg), line);
+                        .emit(Instr::Move(reg, value_reg), emit_line);
                     Ok(())
                 }
                 Resolved::Upval(idx, constant) => {
                     if constant {
                         return Err(format!(
-                            "line {line}: attempt to assign to const variable '{name}'"
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                         ));
                     }
                     self.stack
                         .last_mut()
                         .unwrap()
-                        .emit(Instr::SetUpval(idx, value_reg), line);
+                        .emit(Instr::SetUpval(idx, value_reg), emit_line);
                     Ok(())
                 }
                 Resolved::Global => {
-                    self.check_global_access(name, line)?;
+                    self.check_global_access(name, diagnostic_line)?;
                     let collective_const =
                         matches!(self.resolve_global_decl(name), GlobalScanState::Found(true));
                     if self.stack[level].environment_constants.contains(name) || collective_const {
                         return Err(format!(
-                            "line {line}: attempt to assign to const variable '{name}'"
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                         ));
                     }
-                    self.emit_environment_set(level, name, value_reg, false, false, line);
+                    self.emit_environment_set(level, name, value_reg, false, false, emit_line);
                     Ok(())
                 }
             },
@@ -1039,7 +1080,7 @@ impl Compiler {
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::SetIndex(base_reg, index_reg, value_reg), line);
+                    .emit(Instr::SetIndex(base_reg, index_reg, value_reg), emit_line);
                 Ok(())
             }
             AssignTarget::Field(base, field) => {
@@ -1052,7 +1093,7 @@ impl Compiler {
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::SetField(base_reg, name, value_reg), line);
+                    .emit(Instr::SetField(base_reg, name, value_reg), emit_line);
                 Ok(())
             }
         }
@@ -1108,58 +1149,59 @@ impl Compiler {
         &mut self,
         target: &PreparedTarget,
         value_reg: Reg,
-        line: u32,
+        diagnostic_line: u32,
+        emit_line: u32,
     ) -> Result<(), String> {
         let level = self.level();
         match target {
             PreparedTarget::Local(reg, constant, name) => {
                 if *constant {
-                    return Err(format!(
-                        "line {line}: attempt to assign to const variable '{name}'"
+                        return Err(format!(
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                     ));
                 }
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::Move(*reg, value_reg), line);
+                    .emit(Instr::Move(*reg, value_reg), emit_line);
                 Ok(())
             }
             PreparedTarget::Upval(idx, constant, name) => {
                 if *constant {
-                    return Err(format!(
-                        "line {line}: attempt to assign to const variable '{name}'"
+                        return Err(format!(
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                     ));
                 }
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::SetUpval(*idx, value_reg), line);
+                    .emit(Instr::SetUpval(*idx, value_reg), emit_line);
                 Ok(())
             }
             PreparedTarget::Global(name) => {
-                self.check_global_access(name, line)?;
+                self.check_global_access(name, diagnostic_line)?;
                 let collective_const =
                     matches!(self.resolve_global_decl(name), GlobalScanState::Found(true));
                 if self.stack[level].environment_constants.contains(name) || collective_const {
-                    return Err(format!(
-                        "line {line}: attempt to assign to const variable '{name}'"
+                        return Err(format!(
+                            "line {diagnostic_line}: attempt to assign to const variable '{name}'"
                     ));
                 }
-                self.emit_environment_set(level, name, value_reg, false, false, line);
+                self.emit_environment_set(level, name, value_reg, false, false, emit_line);
                 Ok(())
             }
             PreparedTarget::Index(base_reg, index_reg) => {
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::SetIndex(*base_reg, *index_reg, value_reg), line);
+                    .emit(Instr::SetIndex(*base_reg, *index_reg, value_reg), emit_line);
                 Ok(())
             }
             PreparedTarget::Field(base_reg, name_const) => {
                 self.stack
                     .last_mut()
                     .unwrap()
-                    .emit(Instr::SetField(*base_reg, *name_const, value_reg), line);
+                    .emit(Instr::SetField(*base_reg, *name_const, value_reg), emit_line);
                 Ok(())
             }
         }
@@ -1188,7 +1230,12 @@ impl Compiler {
         }
         segments.push(rest);
         if segments.len() == 1 {
-            return self.compile_assign(&AssignTarget::Name(name.to_string()), value_reg, line);
+            return self.compile_assign(
+                &AssignTarget::Name(name.to_string()),
+                value_reg,
+                line,
+                line,
+            );
         }
         let base = self.stack[level].alloc_reg();
         self.compile_name_into(segments[0], base, line)?;

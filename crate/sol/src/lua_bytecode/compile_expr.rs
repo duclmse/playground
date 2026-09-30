@@ -186,7 +186,17 @@ impl Compiler {
                     return Ok(dst);
                 }
                 let entry = self.stack[level].next_reg;
-                let left_reg = self.compile_expr(left)?;
+                // Lua parses and emits the left operand only after it has
+                // scanned the binary operator.  Its line table therefore
+                // records the operator's line for *all* code needed to
+                // materialize that operand.  Our AST-first compiler already
+                // has the left operand available before this point, so carry
+                // the operator's line explicitly while compiling it.  This
+                // matters for `debug.sethook("l")` when an operator is split
+                // from its left operand by newlines (db.lua's line-info
+                // stress test), not merely for diagnostic cosmetics.
+                let left_at_operator = with_line(left, line);
+                let left_reg = self.compile_expr(&left_at_operator)?;
                 let right_reg = self.compile_expr(right)?;
                 self.stack.last_mut().unwrap().free_reg(right_reg, entry);
                 self.stack.last_mut().unwrap().free_reg(left_reg, entry);
@@ -243,4 +253,120 @@ impl Compiler {
             ),
         }
     }
+}
+
+/// Returns an expression whose executable subexpressions carry `line` in
+/// bytecode debug metadata.  Nested function bodies deliberately retain their
+/// own source lines: only creating the closure belongs to the outer
+/// expression, and `compile_expr` already attributes that to its closing
+/// `end` like Lua does.
+fn with_line(expr: &Expr, line: u32) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Table(fields) => ExprKind::Table(
+            fields
+                .iter()
+                .map(|field| match field {
+                    TableField::Value(value) => TableField::Value(with_line(value, line)),
+                    TableField::Named(name, value) => {
+                        TableField::Named(name.clone(), with_line(value, line))
+                    }
+                    TableField::Key(key, value) => {
+                        TableField::Key(with_line(key, line), with_line(value, line))
+                    }
+                })
+                .collect(),
+        ),
+        ExprKind::Function(function) => ExprKind::Function(function.clone()),
+        ExprKind::Unary(op, value) => ExprKind::Unary(*op, Box::new(with_line(value, line))),
+        ExprKind::Binary(op, left, right) => ExprKind::Binary(
+            *op,
+            Box::new(with_line(left, line)),
+            Box::new(with_line(right, line)),
+        ),
+        ExprKind::Call(name, args) => ExprKind::Call(
+            name.clone(),
+            args.iter().map(|arg| with_line(arg, line)).collect(),
+        ),
+        ExprKind::CallExpr(callee, args) => ExprKind::CallExpr(
+            Box::new(with_line(callee, line)),
+            args.iter().map(|arg| with_line(arg, line)).collect(),
+        ),
+        ExprKind::MethodCall(receiver, method, args) => ExprKind::MethodCall(
+            Box::new(with_line(receiver, line)),
+            method.clone(),
+            args.iter().map(|arg| with_line(arg, line)).collect(),
+        ),
+        ExprKind::Index(base, index) => ExprKind::Index(
+            Box::new(with_line(base, line)),
+            Box::new(with_line(index, line)),
+        ),
+        ExprKind::Len(value) => ExprKind::Len(Box::new(with_line(value, line))),
+        ExprKind::StructLiteral(name, fields) => ExprKind::StructLiteral(
+            name.clone(),
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), with_line(value, line)))
+                .collect(),
+        ),
+        ExprKind::Field(base, field) => {
+            ExprKind::Field(Box::new(with_line(base, line)), field.clone())
+        }
+        ExprKind::TypeTest(value, ty) => {
+            ExprKind::TypeTest(Box::new(with_line(value, line)), ty.clone())
+        }
+        ExprKind::Cast(value, ty) => ExprKind::Cast(Box::new(with_line(value, line)), ty.clone()),
+        ExprKind::Paren(value) => ExprKind::Paren(Box::new(with_line(value, line))),
+        ExprKind::StringLit(value) => ExprKind::StringLit(value.clone()),
+        ExprKind::NilLit => ExprKind::NilLit,
+        ExprKind::IntLit(value) => ExprKind::IntLit(*value),
+        ExprKind::FloatLit(value) => ExprKind::FloatLit(*value),
+        ExprKind::BoolLit(value) => ExprKind::BoolLit(*value),
+        ExprKind::Name(name) => ExprKind::Name(name.clone()),
+        ExprKind::Vararg => ExprKind::Vararg,
+    };
+    Expr { kind, line }
+}
+
+/// The latest source line represented by an expression.  Lua uses its lexer
+/// cursor's `lastline` for assignment stores, which is normally the final
+/// token of the right-hand expression rather than the line where the
+/// assignment target started.  The AST does not retain every delimiter span,
+/// but its rightmost executable node is the relevant line for bytecode line
+/// hooks (and is exact for the indexed/binary shape exercised by db.lua).
+pub(super) fn expression_last_line(expr: &Expr) -> u32 {
+    let child_line = match &expr.kind {
+        ExprKind::Table(fields) => fields
+            .iter()
+            .map(|field| match field {
+                TableField::Value(value) | TableField::Named(_, value) => {
+                    expression_last_line(value)
+                }
+                TableField::Key(_, value) => expression_last_line(value),
+            })
+            .max(),
+        ExprKind::Function(function) => Some(function.end_line),
+        ExprKind::Unary(_, value)
+        | ExprKind::Len(value)
+        | ExprKind::Paren(value)
+        | ExprKind::TypeTest(value, _)
+        | ExprKind::Cast(value, _) => Some(expression_last_line(value)),
+        ExprKind::Binary(_, _, right) => Some(expression_last_line(right)),
+        ExprKind::Call(_, args) => args.last().map(expression_last_line),
+        ExprKind::CallExpr(_, args) | ExprKind::MethodCall(_, _, args) => {
+            args.last().map(expression_last_line)
+        }
+        ExprKind::Index(_, index) => Some(expression_last_line(index)),
+        ExprKind::StructLiteral(_, fields) => {
+            fields.last().map(|(_, value)| expression_last_line(value))
+        }
+        ExprKind::Field(base, _) => Some(expression_last_line(base)),
+        ExprKind::StringLit(_)
+        | ExprKind::NilLit
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Name(_)
+        | ExprKind::Vararg => None,
+    };
+    child_line.unwrap_or(expr.line).max(expr.line)
 }

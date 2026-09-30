@@ -84,14 +84,23 @@ pub(super) fn reg_set(
 /// aliasing to protect against). Used for `NewLocal`/loop-variable
 /// materialization, where a new "declaration" of a local must not retroactively
 /// change what an earlier closure captured.
+///
+/// `should_capture` (the proto's own `captured_registers[i]`, precomputed
+/// once for the whole function) - not `cells[i].is_some()` - decides whether
+/// a cell is (re)created: a register a caller has just detached (see
+/// `Instr::DetachCell`) has `cells[i] == None` even though it's captured, and
+/// must still get a fresh cell here rather than silently falling back to the
+/// plain slot and leaving a later `NewClosure` capturing this register with
+/// nothing to find.
 pub(super) fn reg_set_fresh(
     runtime: &LuaRuntime,
     regs: &mut [LuaValue],
     cells: &mut [Option<sol_core::ObjectId>],
     i: usize,
     value: LuaValue,
+    should_capture: bool,
 ) {
-    if cells[i].is_some() {
+    if should_capture {
         let encoded = runtime
             .encode_value(&value)
             .expect("a value already resident in a register must encode cleanly");

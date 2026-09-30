@@ -421,6 +421,7 @@ impl LuaRuntime {
         }
         let body = main_function.unwrap_or_else(|| Function {
             name: "main".into(),
+            is_chunk: true,
             source_file: None,
             params: Vec::new(),
             param_annotations: Vec::new(),
@@ -459,7 +460,7 @@ impl LuaRuntime {
         let envelope_len = header
             .len()
             .checked_add(SOL_DUMP_MAGIC.len())
-            .and_then(|len| len.checked_add(std::mem::size_of::<u64>() * 2))
+            .and_then(|len| len.checked_add(std::mem::size_of::<u64>() * 3))
             .expect("fixed dump envelope fits in usize");
         if source.len() < envelope_len {
             return Err("truncated binary chunk".to_string());
@@ -473,7 +474,14 @@ impl LuaRuntime {
             .and_then(|bytes| bytes.try_into().ok())
             .map(u64::from_le_bytes)
             .ok_or_else(|| "bad header in precompiled chunk".to_string())?;
-        let payload_len_offset = key_offset + std::mem::size_of::<u64>();
+        let source_len_offset = key_offset + std::mem::size_of::<u64>();
+        let source_len = source
+            .get(source_len_offset..source_len_offset + std::mem::size_of::<u64>())
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| "bad binary chunk source size".to_string())?;
+        let payload_len_offset = source_len_offset + std::mem::size_of::<u64>();
         let payload_len = source
             .get(payload_len_offset..payload_len_offset + std::mem::size_of::<u64>())
             .and_then(|bytes| bytes.try_into().ok())
@@ -488,12 +496,19 @@ impl LuaRuntime {
         if source.len() != expected_len {
             return Err("bad binary chunk size".to_string());
         }
+        if source_len > usize::try_from(payload_len).map_err(|_| "bad binary chunk size")? {
+            return Err("bad binary chunk source size".to_string());
+        }
         let proto = self
             .dumped_protos
             .get(&(key as usize))
             .cloned()
             .ok_or_else(|| "bad header in precompiled chunk".to_string())?;
-        if let Some(chunkname) = &chunkname {
+        if source_len != 0 {
+            let source_start = envelope_len;
+            let source_end = source_start + source_len;
+            self.register_chunk_source(&proto, &Rc::new(source[source_start..source_end].to_vec()));
+        } else if let Some(chunkname) = &chunkname {
             self.register_chunk_source(&proto, chunkname);
         }
         let chunk_globals = match env {

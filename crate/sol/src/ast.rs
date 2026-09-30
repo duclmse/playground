@@ -69,6 +69,12 @@ pub struct StructDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
+    /// True for the synthetic function that represents a top-level chunk.
+    /// It is distinct from an ordinary Lua function coincidentally named
+    /// `main`: Lua debug information reports zero definition lines for a
+    /// chunk, but reports the declaration and closing `end` lines for the
+    /// latter.
+    pub is_chunk: bool,
     pub source_file: Option<String>,
     pub params: Vec<(String, TypeName)>,
     /// Parallel to `params`: distinguishes an explicit contract (including

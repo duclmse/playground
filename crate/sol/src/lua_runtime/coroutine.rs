@@ -109,6 +109,9 @@ pub struct LuaCoroutine {
     /// clears it so a second `close` call reports `(true, nil)` like real
     /// Lua's idempotent close-of-an-already-closed-thread behavior.
     pub(super) dead_error: RefCell<Option<LuaValue>>,
+    /// Snapshot retained solely for `debug.traceback(dead_coroutine)` after
+    /// an uncaught error has unwound and closed its executable frames.
+    pub(super) dead_trace: RefCell<Vec<String>>,
     /// This coroutine's own `debug.sethook` state, `None` when no hook is
     /// installed. `Rc` so `LuaRuntime::active_hook` can hold a cheap clone of
     /// whichever coroutine is currently running without keeping this
@@ -190,6 +193,7 @@ impl LuaRuntime {
             frames: RefCell::new(Vec::new()),
             depth_charged: Cell::new(0),
             dead_error: RefCell::new(None),
+            dead_trace: RefCell::new(Vec::new()),
             hook: RefCell::new(None),
             is_wrapper: Cell::new(is_wrapper),
         });
@@ -345,6 +349,21 @@ impl LuaRuntime {
         // resumed again, a partially-unwound frame stack must never be left
         // somewhere a later resume could find it.
         let outcome = if let DriveOutcome::Raised(error) = outcome {
+            let mut trace = vec!["[C]: in global 'error'".to_owned()];
+            for frame in self.frames.iter().rev() {
+                if let Frame::Lua(frame) = frame {
+                    let line = frame.proto.source_map.location(frame.header.pc)
+                        .map_or(0, |location| location.line);
+                    let label = self.traceback_frame_label(&frame.proto, line);
+                    let name = &frame.proto.metadata.name;
+                    if name.is_empty() || name.starts_with("<anonymous@") {
+                        trace.push(format!("{label} in function <{label}>"));
+                    } else {
+                        trace.push(format!("{label} in function '{name}'"));
+                    }
+                }
+            }
+            *co.dead_trace.borrow_mut() = trace;
             self.call_depth -= depth_charged;
             depth_charged = 0;
             if error.uncatchable {
@@ -418,6 +437,7 @@ impl LuaCoroutine {
             frames: RefCell::new(Vec::new()),
             depth_charged: Cell::new(0),
             dead_error: RefCell::new(None),
+            dead_trace: RefCell::new(Vec::new()),
             hook: RefCell::new(None),
             is_wrapper: Cell::new(false),
         })

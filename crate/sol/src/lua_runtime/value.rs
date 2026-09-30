@@ -681,6 +681,12 @@ pub enum NativeFunction {
     DebugSethook,
     DebugGethook,
     DebugSetuservalue,
+    // Appended to preserve the canonical numeric identities of the native
+    // functions above (they are persisted in `NativeCallable` objects).
+    DebugGetlocal,
+    DebugSetlocal,
+    DebugGetregistry,
+    DebugGetuservalue,
 }
 
 impl NativeFunction {
@@ -805,6 +811,10 @@ impl NativeFunction {
             Self::DebugUpvalueid => "upvalueid",
             Self::DebugUpvaluejoin => "upvaluejoin",
             Self::DebugSetupvalue => "setupvalue",
+            Self::DebugGetlocal => "getlocal",
+            Self::DebugSetlocal => "setlocal",
+            Self::DebugGetregistry => "getregistry",
+            Self::DebugGetuservalue => "getuservalue",
             Self::DebugGetinfo => "getinfo",
             Self::DebugGetmetatable => "getmetatable",
             Self::DebugSetmetatable => "setmetatable",
@@ -943,6 +953,10 @@ impl NativeFunction {
             118 => Self::DebugSethook,
             119 => Self::DebugGethook,
             120 => Self::DebugSetuservalue,
+            121 => Self::DebugGetlocal,
+            122 => Self::DebugSetlocal,
+            123 => Self::DebugGetregistry,
+            124 => Self::DebugGetuservalue,
             _ => return None,
         })
     }

@@ -71,7 +71,7 @@ mod instr;
 #[cfg(test)]
 mod tests;
 
-pub use instr::{Const, Instr, Proto, UpvalSource};
+pub use instr::{Const, Instr, LocalDebug, Proto, UpvalSource};
 
 use func_state::{FuncState, GlobalScanState, LocalOrGlobal};
 
@@ -296,12 +296,22 @@ impl Compiler {
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
+            locals: std::mem::take(&mut state.locals),
             vararg_name: state.vararg_name,
             captured_registers,
             captured_cell_count,
             nested: std::mem::take(&mut state.nested),
-            line_defined: function.line,
-            last_line_defined: function.end_line,
+            // `debug.getinfo` reports both definition lines as zero for a
+            // top-level chunk, even though its source map still uses the
+            // source's real executable line numbers. An ordinary function
+            // named `main` must retain its own declaration/end lines, hence
+            // the explicit AST distinction rather than a name check.
+            line_defined: if function.is_chunk { 0 } else { function.line },
+            last_line_defined: if function.is_chunk {
+                0
+            } else {
+                function.end_line
+            },
         }))
     }
 

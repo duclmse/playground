@@ -69,6 +69,12 @@ impl LuaRuntime {
             frames: Vec::new(),
             pinned_roots: Vec::new(),
             pending_frame_label: None,
+            hook_callback_frame: None,
+            hook_interrupted_frame: None,
+            hook_interrupted_info: None,
+            hook_interrupted_locals: None,
+            hook_transfer: None,
+            hook_event_callee: None,
             pending_error_stack: None,
             prototype_ids: HashMap::new(),
             chunk_sources: HashMap::new(),
@@ -707,12 +713,34 @@ impl LuaRuntime {
         globals.define(self, "io", LuaValue::Table(io), true);
         self.preload(b"io", LuaValue::Table(io));
 
+        // Lua's debug library keeps hook callbacks in a weak-keyed registry
+        // table. Create it during bootstrap, while allocation is unmetered,
+        // and root it through the already-rooted C API registry.
+        let registry = TableRef::new(self.c_registry);
+        let hook_table = self.new_table(None)?;
+        self.table_set(
+            registry,
+            LuaValue::String(self.intern_str(b"_HOOKKEY")),
+            LuaValue::Table(hook_table),
+        )?;
+        let hook_metatable = self.new_table(None)?;
+        self.table_set(
+            hook_metatable,
+            LuaValue::String(self.intern_str(b"__mode")),
+            LuaValue::String(self.intern_str(b"k")),
+        )?;
+        self.table_set_metatable(hook_table, Some(hook_metatable))?;
+
         let debug = self.new_table(None)?;
         for (name, function) in [
             ("getupvalue", NativeFunction::DebugGetupvalue),
             ("upvalueid", NativeFunction::DebugUpvalueid),
             ("upvaluejoin", NativeFunction::DebugUpvaluejoin),
             ("setupvalue", NativeFunction::DebugSetupvalue),
+            ("getlocal", NativeFunction::DebugGetlocal),
+            ("setlocal", NativeFunction::DebugSetlocal),
+            ("getregistry", NativeFunction::DebugGetregistry),
+            ("getuservalue", NativeFunction::DebugGetuservalue),
             ("getinfo", NativeFunction::DebugGetinfo),
             ("getmetatable", NativeFunction::DebugGetmetatable),
             ("setmetatable", NativeFunction::DebugSetmetatable),

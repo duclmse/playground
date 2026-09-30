@@ -570,7 +570,11 @@ impl Scanner<'_> {
                     "nil" => Token::Nil,
                     "goto" => Token::Goto,
                     "in" => Token::In,
-                    "global" => Token::Global,
+                    // `global` is a Lua 5.5 test-library extension, not a
+                    // reserved word in ordinary Lua source.  The parser
+                    // recognizes its declaration-only positions
+                    // contextually; elsewhere it remains a normal name.
+                    "global" => Token::Ident(name.into()),
                     _ => Token::Ident(name.into()),
                 }
             } else if b.is_ascii_digit()

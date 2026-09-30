@@ -42,6 +42,10 @@ impl LuaRuntime {
             | NativeFunction::DebugUpvalueid
             | NativeFunction::DebugUpvaluejoin
             | NativeFunction::DebugSetupvalue
+            | NativeFunction::DebugGetlocal
+            | NativeFunction::DebugSetlocal
+            | NativeFunction::DebugGetregistry
+            | NativeFunction::DebugGetuservalue
             | NativeFunction::DebugGetinfo
             | NativeFunction::DebugGetmetatable
             | NativeFunction::DebugSetmetatable
@@ -166,6 +170,10 @@ impl LuaRuntime {
             | NativeFunction::DebugUpvalueid
             | NativeFunction::DebugUpvaluejoin
             | NativeFunction::DebugSetupvalue
+            | NativeFunction::DebugGetlocal
+            | NativeFunction::DebugSetlocal
+            | NativeFunction::DebugGetregistry
+            | NativeFunction::DebugGetuservalue
             | NativeFunction::DebugGetinfo
             | NativeFunction::DebugGetmetatable
             | NativeFunction::DebugSetmetatable

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::{Const, Instr, Proto, Reg, UpvalSource};
+use super::{Const, Instr, LocalDebug, Proto, Reg, UpvalSource};
 
 /// A label's recorded offset plus the function-wide count of active locals
 /// (`nactive`) at the point it's considered declared, and its source line
@@ -99,6 +99,10 @@ pub(super) enum LocalOrGlobal {
 
 pub(super) struct BlockScope {
     pub(super) locals: Vec<(String, Reg, bool)>,
+    /// Indices into `FuncState::locals` for bindings owned by this lexical
+    /// scope.  Kept apart from semantic lookup entries so debug lifetimes can
+    /// close exactly when the scope does.
+    debug_locals: Vec<usize>,
     /// `global` declarations made directly in this scope, in declaration
     /// order. Each still occupies a slot in the live active-variable count
     /// (see `active_local_count`) and is discarded when this scope closes,
@@ -150,6 +154,22 @@ pub(super) struct LoopCtx {
     /// register only becomes a captured local's slot if nothing earlier in
     /// the loop body ever touched it first.
     pub(super) reg_floor: Reg,
+    /// `Some((cond_before, leaked_top))` when this loop's condition test
+    /// leaks a temporary above `cond_before` that the natural (false-
+    /// condition) exit path clears inline, tagged with the condition's own
+    /// line - see `Stmt::While`'s `needs_clear`. A `break` jumps past that
+    /// shared exit-path clear (it lands after it, not on it - see
+    /// `Stmt::While`'s `break_patches` target), so it must redo an
+    /// equivalent clear itself, tagged with its *own* line, or the leaked
+    /// temporary would live on uncleared. Tagging the shared clear with
+    /// `cond_line` is only hook-transparent for the natural exit path (whose
+    /// immediately preceding `JumpIfFalse` already fired that same line); a
+    /// `break` jumping onto it would fire a spurious extra
+    /// `debug.sethook("l", ...)` line-hook transition for a line the
+    /// program never otherwise passes through at that point. `None` for
+    /// loops with no such leaked condition temporary (numeric/generic `for`,
+    /// `repeat`, or a `while` whose condition is a bare local/upvalue).
+    pub(super) cond_clear: Option<(Reg, Reg)>,
 }
 
 pub(super) struct FuncState {
@@ -158,6 +178,7 @@ pub(super) struct FuncState {
     pub(super) consts: Vec<Const>,
     pub(super) upvals: Vec<UpvalSource>,
     pub(super) upval_names: Vec<String>,
+    pub(super) locals: Vec<LocalDebug>,
     upval_constants: Vec<bool>,
     pub(super) nested: Vec<Rc<Proto>>,
     pub(super) scopes: Vec<BlockScope>,
@@ -192,6 +213,7 @@ impl FuncState {
             consts: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
+            locals: Vec::new(),
             upval_constants: Vec::new(),
             nested: Vec::new(),
             scopes: Vec::new(),
@@ -391,6 +413,13 @@ impl FuncState {
             .sum()
     }
 
+    /// `global` declarations participate in goto-scope visibility but do
+    /// not allocate a local register.  Lua's `MAXVARS` limit is therefore
+    /// a limit on actual locals only, not on those declaration markers.
+    fn active_real_local_count(&self) -> usize {
+        self.scopes.iter().map(|scope| scope.locals.len()).sum()
+    }
+
     /// Real Lua caps a function's live local-variable count at `MAXVARS`
     /// (200, `lparser.c`), checked once per variable as it enters scope
     /// (`adjustlocalvars`'s `luaY_checklimit`) - so a single `local
@@ -403,7 +432,7 @@ impl FuncState {
     /// substring `errors.lua`'s `checkerr`-style helpers match on.
     pub(super) fn check_local_variable_limit(&self, line: u32) -> Result<(), String> {
         const MAXVARS: usize = 200;
-        if self.active_local_count() > MAXVARS {
+        if self.active_real_local_count() > MAXVARS {
             Err(format!(
                 "line {line}: too many local variables (limit is {MAXVARS})"
             ))
@@ -438,6 +467,7 @@ impl FuncState {
     pub(super) fn push_scope(&mut self) {
         self.scopes.push(BlockScope {
             locals: Vec::new(),
+            debug_locals: Vec::new(),
             global_decls: Vec::new(),
             known_labels: HashMap::new(),
             unresolved_gotos: Vec::new(),
@@ -461,6 +491,13 @@ impl FuncState {
     /// enclosing label's scope check.
     pub(super) fn pop_scope(&mut self, line: u32) -> Result<(), String> {
         let scope = self.scopes.pop().expect("scope stack underflow");
+        // A local is no longer visible as soon as control reaches the scope
+        // epilogue.  The epilogue can still emit CloseSlots/clear-register
+        // instructions, but those are cleanup, not source-level local use.
+        let end_pc = self.here() as u32;
+        for local in scope.debug_locals {
+            self.locals[local].end_pc = end_pc;
+        }
         let old_next_reg = self.next_reg;
         self.next_reg = scope
             .saved_next_reg
@@ -629,12 +666,32 @@ impl FuncState {
 
     pub(super) fn declare_local(&mut self, name: &str, constant: bool) -> Reg {
         let reg = self.alloc_reg();
-        self.scopes
-            .last_mut()
-            .expect("declare_local outside any scope")
-            .locals
-            .push((name.to_string(), reg, constant));
+        self.declare_existing_local(name, reg, constant, self.here());
         reg
+    }
+
+    /// Records a local whose register was allocated by a structured bytecode
+    /// instruction (loops and `NewLocal`) rather than `declare_local`.
+    /// `start_pc` is supplied by that instruction's emission site so a hook
+    /// paused before the declaration still sees a temporary rather than the
+    /// not-yet-active name.
+    pub(super) fn declare_existing_local(
+        &mut self,
+        name: &str,
+        reg: Reg,
+        constant: bool,
+        start_pc: usize,
+    ) {
+        let local = self.locals.len();
+        self.locals.push(LocalDebug {
+            name: name.to_string(),
+            register: reg,
+            start_pc: start_pc as u32,
+            end_pc: u32::MAX,
+        });
+        let scope = self.scopes.last_mut().expect("declare_local outside any scope");
+        scope.locals.push((name.to_string(), reg, constant));
+        scope.debug_locals.push(local);
     }
 
     /// `declare_local`, but callable from a `Result<_, String>` context that
