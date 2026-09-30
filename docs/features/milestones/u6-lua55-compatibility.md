@@ -7,7 +7,7 @@
 ## Current compatibility ledger
 
 `tests/lua55/manifest.toml` is the release ledger. Its current classifications
-are **11 pass, 6 pending, 10 host-required, and 7 divergences**. The older
+are **12 pass, 5 pending, 10 host-required, and 7 divergences**. The older
 summary in the historical roadmap is stale; do not use it for a release claim.
 Rows become `pass` only after an unchanged pinned-oracle comparison.
 
@@ -15,14 +15,13 @@ Rows become `pass` only after an unchanged pinned-oracle comparison.
 
 - [~] Complete portable grammar, coercion, `_ENV`, goto/scope, `<close>`,
       metamethod, iteration, coroutine, and error semantics.
-  - Remaining corpus blocker: resource diagnostics in `errors.lua`, currently
-    its RK-limit method-versus-field-name assertion.
+  - Remaining corpus blocker: callback-native provenance in `errors.lua`,
+    currently `table.sort`'s comparator-name assertion.
 - [x] Complete portable debug-library behavior exercised by `db.lua`.
   - The unchanged corpus now matches the pinned Lua 5.5.1 oracle end to end,
     including hook transfer metadata, stripped-code line hooks, nested dump
-    metadata, and finalizer/traceback provenance.
-    String identity still differs for long strings (`strings.lua`); named
-    vararg tables still allocate (`vararg.lua`).
+    metadata, and finalizer/traceback provenance. `strings.lua` is also
+    oracle-backed; named vararg tables remain pending (`vararg.lua`).
 - [~] Complete GC-observable collection and finalization semantics.
   - `gc.lua` retains table backing capacity in `collectgarbage("count")`.
   - `gengc.lua` needs a true young-generation minor collection and aging/
@@ -34,7 +33,7 @@ Rows become `pass` only after an unchanged pinned-oracle comparison.
 - [ ] Decide and implement the embedding/C API boundary, including native
       module tests.
 - [~] Promote rows only through unchanged reference comparisons.
-  - Eleven rows are oracle-backed; seven divergences need either a compatible
+  - Twelve rows are oracle-backed; seven divergences need either a compatible
     invocation/output path or an explicit retained profile decision.
 
 `constructs.lua` is also pending because its large live-heap stress case is

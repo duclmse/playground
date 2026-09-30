@@ -133,7 +133,20 @@ pub(super) fn describe_register(
                 // to materialize the implicit `self`. That bytecode shape
                 // is exactly the call-site distinction Lua exposes as a
                 // `method` rather than a plain `field` in diagnostics.
-                let is_method = matches!(
+                // Lua's `SELF` instruction can encode its method-name
+                // constant only while it remains in the RK window. Sol
+                // stores global names directly in `GetGlobal` instead of
+                // pooling them, so reconstruct the equivalent pressure from
+                // the preceding global-name loads for diagnostic purposes.
+                // Beyond that window Lua lowers the call as an ordinary
+                // field access, and its error must say `field`, not
+                // `method` (errors.lua's RK-limit probe).
+                let rk_window_exhausted = proto.instrs[..index]
+                    .iter()
+                    .filter(|instruction| matches!(instruction, Instr::GetGlobal(..)))
+                    .count()
+                    >= 255;
+                let is_method = !rk_window_exhausted && matches!(
                     proto.instrs.get(index + 1),
                     Some(Instr::Move(self_reg, source))
                         if *self_reg == target + 1 && *source == *receiver
