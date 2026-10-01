@@ -46,3 +46,40 @@ fn forcing_the_promotion_threshold_to_one_triggers_a_promotion_attempt_with_no_b
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, promoted.stdout);
 }
+
+/// Item 3 (leaf-instruction lowering): a call-free, capture-free numeric
+/// loop (`ForPrep`/`ForLoop`/`Binary`/`Return`, no table/global/upvalue
+/// access) is eligible for real promotion - forcing
+/// `SOL_LUA_PROMOTE_THRESHOLD=1` must actually compile it to native code
+/// (not just attempt-and-reject, as `dynjit_promote.lua`'s `Binary`-only
+/// body still does in the previous test above) and produce byte-identical
+/// output to the fully interpreted run.
+#[test]
+fn a_call_free_numeric_loop_is_promoted_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_loop_sum.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "5050\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'loop_sum' promoted to native code"),
+        "expected 'loop_sum' to actually compile under item 3's eligible \
+         instruction set, not just attempt-and-reject:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}

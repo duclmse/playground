@@ -43,6 +43,11 @@ use super::LuaRuntime;
 // `dynjit::NativeStatus` without reaching across module boundaries.
 pub use crate::lua_bytecode::NativeStatus;
 
+// `abi::NativeFn` is `LuaRuntime::run_native`'s (`lua_runtime/dispatch.rs`)
+// only reader outside this module; re-exported here for the same reason as
+// `NativeStatus` above.
+pub(super) use abi::NativeFn;
+
 /// Reads `SOL_LUA_PROMOTE_THRESHOLD` (distinct from the typed tier's own
 /// `SOL_PROMOTE_THRESHOLD` - see the plan's "Hot-function counter design"
 /// section for why these are deliberately separate env vars), falling back
@@ -68,18 +73,16 @@ fn jit_log_enabled() -> bool {
 }
 
 pub struct DynJit {
-    // `module`/`builder_ctx`/`next_id` aren't read anywhere yet - real
-    // lowering (`promote`'s actual body) lands in item 3 and is the first
-    // real reader of all three.
-    #[allow(dead_code)]
     module: JITModule,
-    #[allow(dead_code)]
     builder_ctx: FunctionBuilderContext,
+    /// Every stub's `FuncId`, declared once here and reused via
+    /// `declare_func_in_func` by every `lower_proto` call - see
+    /// `stubs::StubFuncs`'s own doc.
+    stub_funcs: stubs::StubFuncs,
     /// Disambiguates declared function names across distinct `Proto`s -
     /// `cranelift_module::Module::declare_function` requires a unique name
     /// per function, and two `Proto`s can share a `metadata.name` (e.g. two
     /// anonymous functions, or recursive reloads of the same chunk).
-    #[allow(dead_code)]
     next_id: u64,
     /// Traces promotion attempts/failures to stderr as they happen, mirroring
     /// the typed tier's `SOL_JIT_LOG`.
@@ -89,8 +92,7 @@ pub struct DynJit {
 impl DynJit {
     /// Builds the module and registers every stub symbol it can ever call
     /// (`stubs::register`) up front, mirroring `crate::jit::Jit::new`'s own
-    /// shape - even though, at this point in the milestone, `stubs::register`
-    /// has nothing to register yet.
+    /// shape.
     pub fn new() -> Result<Self, String> {
         let mut builder = JITBuilder::with_flags(
             &[("opt_level", "speed")],
@@ -98,10 +100,12 @@ impl DynJit {
         )
         .map_err(|e| e.to_string())?;
         stubs::register(&mut builder);
-        let module = JITModule::new(builder);
+        let mut module = JITModule::new(builder);
+        let stub_funcs = stubs::declare(&mut module)?;
         Ok(DynJit {
             module,
             builder_ctx: FunctionBuilderContext::new(),
+            stub_funcs,
             next_id: 0,
             jit_log: jit_log_enabled(),
         })
@@ -109,28 +113,51 @@ impl DynJit {
 
     /// Compiles `proto`'s body to native code and returns its entry point.
     ///
-    /// Not yet implemented: `lower.rs`'s per-`Instr` lowering pass lands in
-    /// item 3 of the plan (leaf-instruction lowering), extended through item
-    /// 5 (calls). Until then this always fails, and callers
-    /// (`LuaRuntime::try_promote` below) must treat that as "stay
-    /// interpreted," not a hard error - a `Proto` this JIT can't yet (or can
-    /// never, for a compile failure) handle natively is always safe to keep
-    /// running in the existing interpreter.
+    /// Restricted to item 3's eligible instruction set (`lower::is_eligible`)
+    /// - anything outside it (calls, table/global/upvalue access, captured
+    /// registers) fails here, and callers (`LuaRuntime::try_promote` below)
+    /// must treat that as "stay interpreted," not a hard error. Extended
+    /// through item 5 to lift that restriction entirely.
     pub fn promote(&mut self, proto: &Rc<Proto>) -> Result<*const u8, String> {
         if self.jit_log {
             eprintln!(
-                "[dynjit] promotion requested for '{}' (line {}) - lowering not yet implemented",
+                "[dynjit] promotion requested for '{}' (line {})",
                 proto.metadata.name, proto.line_defined
             );
         }
-        Err("dynamic JIT lowering not yet implemented".to_string())
+        if !lower::is_eligible(proto) {
+            if self.jit_log {
+                eprintln!(
+                    "[dynjit] '{}' is not eligible for item-3 lowering (calls, captured \
+                     registers, table/global access, or an out-of-range Return)",
+                    proto.metadata.name
+                );
+            }
+            return Err("not eligible for leaf-instruction lowering".to_string());
+        }
+        let name = self.fresh_name(proto);
+        let func_id = lower::lower_proto(
+            &mut self.module,
+            &mut self.builder_ctx,
+            &self.stub_funcs,
+            proto,
+            &name,
+        )?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| e.to_string())?;
+        let ptr = self.module.get_finalized_function(func_id);
+        if self.jit_log {
+            eprintln!(
+                "[dynjit] '{}' promoted to native code as '{name}'",
+                proto.metadata.name
+            );
+        }
+        Ok(ptr)
     }
 
     /// Reserves and returns a name guaranteed unique across every function
     /// this `DynJit` instance ever declares - see `next_id`'s doc comment.
-    /// First real caller lands in item 3, once `promote` actually declares
-    /// functions on `self.module`.
-    #[allow(dead_code)]
     fn fresh_name(&mut self, proto: &Proto) -> String {
         let id = self.next_id;
         self.next_id += 1;

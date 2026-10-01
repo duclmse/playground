@@ -11,7 +11,7 @@ use std::rc::Rc;
 use sol_core::{FrameHeader, FrameState, FunctionId, ValueCount};
 
 use crate::ast::{BinaryOp, UnaryOp};
-use crate::lua_bytecode::{Instr, Proto, Reg, UpvalSource};
+use crate::lua_bytecode::{Instr, NativeStatus, Proto, Reg, UpvalSource};
 
 use super::frame::*;
 use super::util::*;
@@ -1116,6 +1116,57 @@ impl LuaRuntime {
         Ok(function)
     }
 
+    /// Runs `frame` through its already-promoted native code
+    /// (`frame.proto.native_status`'s `Native(ptr)`), then decodes the
+    /// result back through the same register layout the interpreter itself
+    /// would have left behind - see `dynjit`'s module doc and
+    /// `dynjit::NativeFn`'s own doc for the exact calling convention this
+    /// mirrors. Only ever called from `drive_result`'s dispatch-selection
+    /// guard, which has already confirmed `frame.header.pc == 0` (native
+    /// entry is always from a fresh activation - item 3's lowering has no
+    /// call protocol to resume mid-function from) and that no debug hook
+    /// could fire (native code cannot check `active_hook`/C instruction
+    /// hooks per-instruction the way the interpreter does).
+    fn run_native(&mut self, frame: &mut LuaFrame) -> LuaResult<StepResult> {
+        let ptr = match frame.proto.native_status.get() {
+            NativeStatus::Native(ptr) => ptr,
+            _ => unreachable!("run_native only called when NativeStatus::Native"),
+        };
+        let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
+
+        let mut regs: Vec<sol_core::Value> = Vec::with_capacity(frame.regs.len());
+        for value in &frame.regs {
+            regs.push(self.encode_value(value)?);
+        }
+
+        let mut out_pc: i64 = 0;
+        let mut out_base: i64 = 0;
+        let mut out_count: i64 = 0;
+        let rt_ptr: *mut LuaRuntime = self;
+        let frame_ptr: *mut LuaFrame = frame;
+        let outcome = native_fn(
+            rt_ptr,
+            frame_ptr,
+            regs.as_mut_ptr(),
+            &mut out_pc,
+            &mut out_base,
+            &mut out_count,
+        );
+
+        for (slot, value) in frame.regs.iter_mut().zip(regs) {
+            *slot = self.decode_value(value)?;
+        }
+
+        if outcome == 1 {
+            let base = out_base as usize;
+            let count = out_count as usize;
+            Ok(StepResult::Done(frame.regs[base..base + count].to_vec()))
+        } else {
+            frame.header.pc = out_pc as u32;
+            self.dispatch_step(frame, None)
+        }
+    }
+
     /// Drives `LuaRuntime::frames` from its current top down to (but not
     /// including) `base_depth`, returning either the result values of the
     /// frame that was sitting at `base_depth` when it finishes
@@ -1170,7 +1221,22 @@ impl LuaRuntime {
         loop {
             match self.frames.pop() {
                 Some(Frame::Lua(mut frame)) => {
-                    let step = self.dispatch_step(&mut frame, incoming.take());
+                    // Native entry is only ever a fresh activation (`pc ==
+                    // 0`, no pending `incoming` from a just-returned nested
+                    // call - item 3's lowering has no call protocol to
+                    // resume mid-function from) with no debug hook that
+                    // could need to fire per-instruction (native code can't
+                    // check those the way `dispatch_step` does).
+                    let use_native = incoming.is_none()
+                        && frame.header.pc == 0
+                        && matches!(frame.proto.native_status.get(), NativeStatus::Native(_))
+                        && self.active_hook.is_none()
+                        && !c_api::c_instruction_hooks_active(self);
+                    let step = if use_native {
+                        self.run_native(&mut frame)
+                    } else {
+                        self.dispatch_step(&mut frame, incoming.take())
+                    };
                     // Only ever `Some` immediately after a dispatch step that
                     // just decided to call a `__index`/`__newindex` metamethod
                     // - see `pending_frame_label`'s field doc. Always taken

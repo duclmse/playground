@@ -151,6 +151,18 @@ pub(super) fn fire_c_hook(
     Ok(())
 }
 
+/// Whether a C-API line/count hook is armed for the currently active
+/// coroutine - the dynamic JIT (`dynjit`) must not run native code for a
+/// frame while this is true, since native execution has no equivalent of
+/// `fire_c_instruction_hooks`'s per-instruction line/count firing and would
+/// silently skip it, an observable-behavior break `debug.sethook`-style C
+/// hooks must never see. Mirrors exactly the two mask bits
+/// `fire_c_instruction_hooks` itself reads (`1 << 2` for line, `1 << 3` for
+/// count).
+pub(super) fn c_instruction_hooks_active(runtime: &LuaRuntime) -> bool {
+    active_c_state(runtime).is_some_and(|state| unsafe { (&*state).hook_mask & 0b1100 != 0 })
+}
+
 pub(super) fn fire_c_instruction_hooks(
     runtime: &mut LuaRuntime,
     frame: &mut LuaFrame,
