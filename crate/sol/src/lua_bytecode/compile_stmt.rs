@@ -580,6 +580,7 @@ impl Compiler {
                     reg_floor: 0,
                     cond_clear: None,
                 });
+                let scope_start = self.stack[level].next_reg;
                 // `until` can see locals declared in the body, so both
                 // share one scope (matching the tree-walker's
                 // `exec_statements` call over body+cond together).
@@ -588,6 +589,59 @@ impl Compiler {
                     let cond_reg = self.compile_expr(cond)?;
                     let cl = self.level();
                     let cond_line = self.stack[cl].last_line().unwrap_or(*line);
+                    let leaked_top = self.stack[cl].next_reg;
+                    // Every iteration that keeps looping jumps straight back
+                    // to `start` via the `JumpIfFalse` below, bypassing
+                    // `pop_scope`'s own shrink-clear entirely - that only
+                    // runs once, after this whole `and_then` closure
+                    // returns, on the path where the loop has already
+                    // exited (see `Stmt::While`'s matching fix, which this
+                    // mirrors). Left alone, the body's own locals (and any
+                    // closure that captured one of their registers as an
+                    // upvalue, e.g. `repeat local i; u = function () return
+                    // i end until finish`) stay reachable through this
+                    // frame's raw register slot for every later iteration
+                    // instead of just the one that declared them, defeating
+                    // GC-hygiene for anything only that captured value was
+                    // keeping alive - `gc.lua`'s `GC1` exercises exactly
+                    // this idiom, waiting on a `__gc` finalizer that only
+                    // fires once the *previous* iteration's value is truly
+                    // unreachable.
+                    //
+                    // Unlike `While`, `Repeat` evaluates its condition once
+                    // per iteration *after* the body, right before deciding
+                    // whether to continue or exit, so a single clear placed
+                    // here - before the branch, tagged with the condition's
+                    // own now-current line - covers both outcomes instead of
+                    // needing a copy on each side of the jump. `cond_reg`
+                    // itself must survive past this point (the
+                    // `JumpIfFalse` below still reads it), so it's carved
+                    // out of the cleared range rather than being clobbered
+                    // along with the rest.
+                    if leaked_top > scope_start {
+                        if cond_reg >= scope_start && cond_reg < leaked_top {
+                            if cond_reg > scope_start {
+                                self.stack[cl].clear_retired_registers(
+                                    scope_start,
+                                    cond_reg,
+                                    cond_line,
+                                );
+                            }
+                            if cond_reg + 1 < leaked_top {
+                                self.stack[cl].clear_retired_registers(
+                                    cond_reg + 1,
+                                    leaked_top,
+                                    cond_line,
+                                );
+                            }
+                        } else {
+                            self.stack[cl].clear_retired_registers(
+                                scope_start,
+                                leaked_top,
+                                cond_line,
+                            );
+                        }
+                    }
                     let here = self.stack[cl].here();
                     self.stack[cl].emit(
                         Instr::JumpIfFalse(cond_reg, start as i32 - here as i32),
@@ -750,11 +804,17 @@ impl Compiler {
                 result?;
                 let test = self.stack[cl].here();
                 self.stack[cl].patch_jump(init_jump, test as i32);
-                self.stack[cl].emit(Instr::TForCall(base, vars.len() as u16), *line);
+                // Real Lua attributes a failed iterator call (e.g. "attempt
+                // to call a number value (for iterator 'for iterator')") to
+                // the line of the iterator expression list, not the `for`
+                // keyword's line - the two can differ when the header spans
+                // multiple lines.
+                let iter_line = iterators.last().map(|e| e.line).unwrap_or(*line);
+                self.stack[cl].emit(Instr::TForCall(base, vars.len() as u16), iter_line);
                 let here = self.stack[cl].here();
                 self.stack[cl].emit(
                     Instr::TForLoop(base, body_start as i32 - here as i32),
-                    *line,
+                    iter_line,
                 );
                 // `TForLoop` falls through exactly here when the iterator
                 // signals completion (its first result was nil) - this is

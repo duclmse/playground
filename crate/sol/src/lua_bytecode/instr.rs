@@ -109,6 +109,21 @@ pub enum Instr {
     SetField(Reg, u32, Reg),
     GetIndex(Reg, Reg, Reg),
     SetIndex(Reg, Reg, Reg),
+    /// Lazy named-vararg-view fast path (see `Proto::vararg_lazy`): an
+    /// index/field access whose `base` was statically proven (by
+    /// `try_lower_vararg_to_lazy_view`) to always be this function's named
+    /// vararg parameter register and nothing else, so `base` itself is
+    /// implicit rather than an operand. As long as that register hasn't
+    /// been materialized into a real `Table` yet (still `Nil`), the VM
+    /// answers directly from the frame's `varargs` - a `table.pack`-shaped
+    /// read/write with no allocation. `GetIndex`/`SetIndex`'s dynamic `key`
+    /// register counterparts:
+    VarargIndexGet(Reg, Reg),
+    VarargIndexSet(Reg, Reg),
+    /// `GetField`/`SetField`'s compile-time-constant-name counterparts (the
+    /// `u32` is a `Proto::consts` index, always a `Const::Str`).
+    VarargFieldGet(Reg, u32),
+    VarargFieldSet(u32, Reg),
     /// `table[index] = value` for a compile-time-known array position.
     SetArrayItem(Reg, i64, Reg),
     /// Consumes the open multi-value region starting at `from` (produced by
@@ -222,6 +237,12 @@ pub struct Proto {
     /// their enclosing compiler scope closes.
     pub locals: Vec<LocalDebug>,
     pub vararg_name: Option<Reg>,
+    /// Whether `vararg_name`'s register was statically proven safe to leave
+    /// as a lazy view over `LuaFrame::varargs` instead of eagerly building a
+    /// real `Table` at call time - see `try_lower_vararg_to_lazy_view` and
+    /// the `Instr::Vararg{Index,Field}{Get,Set}` opcodes it emits. Always
+    /// `false` when `vararg_name.is_none()`.
+    pub vararg_lazy: bool,
     pub nested: Vec<Rc<Proto>>,
     /// `captured_registers[i]` is true iff register `i` is ever captured as
     /// a `ParentLocal` upvalue by some nested closure. The VM only needs a

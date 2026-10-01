@@ -355,6 +355,114 @@ impl LuaRuntime {
                         }
                     }
                 }
+                Instr::VarargIndexGet(dst, key) => {
+                    let vararg_reg = proto
+                        .vararg_name
+                        .expect("VarargIndexGet only emitted for a named vararg parameter")
+                        as usize;
+                    let current = reg_get(self, &frame.regs, &frame.cells, vararg_reg);
+                    let key_value = reg_get(self, &frame.regs, &frame.cells, *key as usize);
+                    let value = if let LuaValue::Table(table) = current {
+                        match self.index_resolve(LuaValue::Table(table), key_value) {
+                            Ok(IndexResolution::Value(value)) => value,
+                            Ok(IndexResolution::Call { method, args }) => {
+                                frame.header.pc = pc as u32;
+                                frame.header.stack_top = top as u32;
+                                frame.header.state = FrameState::Suspended;
+                                frame.pending = Pending::Index {
+                                    dest: *dst as usize,
+                                };
+                                self.pending_frame_label = Some("index");
+                                return self.step_result_for_call(method, args);
+                            }
+                            Err(mut err) => {
+                                annotate_index_error(&mut err, &proto, pc, vararg_reg as u16);
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        vararg_view_get(&frame.varargs, &key_value)
+                    };
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
+                }
+                Instr::VarargIndexSet(key, src) => {
+                    let vararg_reg = proto
+                        .vararg_name
+                        .expect("VarargIndexSet only emitted for a named vararg parameter")
+                        as usize;
+                    let current = reg_get(self, &frame.regs, &frame.cells, vararg_reg);
+                    let key_value = reg_get(self, &frame.regs, &frame.cells, *key as usize);
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    if let LuaValue::Table(table) = current {
+                        match self.set_index_resolve(
+                            LuaValue::Table(table),
+                            key_value,
+                            value,
+                            Some(&*frame),
+                        ) {
+                            Ok(SetIndexResolution::Done) => {}
+                            Ok(SetIndexResolution::Call { method, args }) => {
+                                frame.header.pc = pc as u32;
+                                frame.header.stack_top = top as u32;
+                                frame.header.state = FrameState::Suspended;
+                                frame.pending = Pending::SetIndex;
+                                self.pending_frame_label = Some("newindex");
+                                return self.step_result_for_call(method, args);
+                            }
+                            Err(mut err) => {
+                                annotate_index_error(&mut err, &proto, pc, vararg_reg as u16);
+                                return Err(err);
+                            }
+                        }
+                    } else if let Some(index) =
+                        vararg_in_range_index(&key_value, frame.varargs.len())
+                    {
+                        frame.varargs[index - 1] = value;
+                    } else {
+                        let table = self.materialize_vararg_view(frame)?;
+                        self.table_set(table, key_value, value)?;
+                    }
+                }
+                Instr::VarargFieldGet(dst, name) => {
+                    let vararg_reg = proto
+                        .vararg_name
+                        .expect("VarargFieldGet only emitted for a named vararg parameter")
+                        as usize;
+                    let current = reg_get(self, &frame.regs, &frame.cells, vararg_reg);
+                    let value = if let LuaValue::Table(table) = current {
+                        let key =
+                            LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
+                        match self.index_resolve(LuaValue::Table(table), key) {
+                            Ok(IndexResolution::Value(value)) => value,
+                            Ok(IndexResolution::Call { method, args }) => {
+                                frame.header.pc = pc as u32;
+                                frame.header.stack_top = top as u32;
+                                frame.header.state = FrameState::Suspended;
+                                frame.pending = Pending::Index {
+                                    dest: *dst as usize,
+                                };
+                                self.pending_frame_label = Some("index");
+                                return self.step_result_for_call(method, args);
+                            }
+                            Err(mut err) => {
+                                annotate_index_error(&mut err, &proto, pc, vararg_reg as u16);
+                                return Err(err);
+                            }
+                        }
+                    } else if name_const(&proto, *name).as_slice() == b"n" {
+                        LuaValue::Integer(frame.varargs.len() as i64)
+                    } else {
+                        LuaValue::Nil
+                    };
+                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
+                }
+                Instr::VarargFieldSet(name, src) => {
+                    let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
+                    let table = self.materialize_vararg_view(frame)?;
+                    let key =
+                        LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
+                    self.table_set(table, key, value)?;
+                }
                 Instr::SetArrayItem(base, array_index, src) => {
                     let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
                     let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
@@ -654,25 +762,38 @@ impl LuaRuntime {
                     // (using its current `n`) rather than the immutable input
                     // vector captured when the frame was created.
                     let named_varargs = if let Some(vararg_reg) = frame.proto.vararg_name {
-                        let LuaValue::Table(table) =
-                            reg_get(self, &frame.regs, &frame.cells, vararg_reg as usize)
-                        else {
-                            return Err(LuaError::new("named vararg pack is not a table"));
-                        };
-                        let n_key = LuaValue::String(self.intern_str(b"n"));
-                        let length = match self.table_get(table, &n_key)? {
-                            LuaValue::Integer(length)
-                                if (0..=u16::MAX as i64).contains(&length) =>
-                            {
-                                length as usize
+                        match reg_get(self, &frame.regs, &frame.cells, vararg_reg as usize) {
+                            LuaValue::Table(table) => {
+                                let n_key = LuaValue::String(self.intern_str(b"n"));
+                                let length = match self.table_get(table, &n_key)? {
+                                    LuaValue::Integer(length)
+                                        if (0..=u16::MAX as i64).contains(&length) =>
+                                    {
+                                        length as usize
+                                    }
+                                    _ => {
+                                        return Err(LuaError::new(
+                                            "no proper 'n' in named vararg pack",
+                                        ))
+                                    }
+                                };
+                                let mut values = Vec::with_capacity(length);
+                                for index in 1..=length {
+                                    values.push(
+                                        self.table_get(table, &LuaValue::Integer(index as i64))?,
+                                    );
+                                }
+                                Some(values)
                             }
-                            _ => return Err(LuaError::new("no proper 'n' in named vararg pack")),
-                        };
-                        let mut values = Vec::with_capacity(length);
-                        for index in 1..=length {
-                            values.push(self.table_get(table, &LuaValue::Integer(index as i64))?);
+                            // The lazy view (see `Proto::vararg_lazy`) hasn't
+                            // been materialized into a real table by any
+                            // access yet, so it can't have diverged from the
+                            // frame's own `varargs` - falling through to that
+                            // below is exactly equivalent to reading a
+                            // freshly-`table.pack`-built, unmutated pack.
+                            LuaValue::Nil if frame.proto.vararg_lazy => None,
+                            _ => return Err(LuaError::new("named vararg pack is not a table")),
                         }
-                        Some(values)
                     } else {
                         None
                     };

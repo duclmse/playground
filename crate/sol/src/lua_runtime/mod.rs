@@ -88,6 +88,53 @@ pub struct LuaRuntime {
     instructions_remaining: u64,
     call_depth: usize,
     max_call_depth: usize,
+    /// Depth of calls dispatched synchronously through `call()` - the one
+    /// entry point every genuinely Rust-stack-recursive call goes through
+    /// (a native builtin, a metamethod, a finalizer, a module loader), as
+    /// opposed to a plain bytecode `Instr::Call` to a Lua closure (or an
+    /// `xpcall`/`pcall` protected call), which the `drive`/`resolve_call`
+    /// trampoline executes iteratively via the explicit `frames` stack with
+    /// no added Rust recursion at all. Mirrors real Lua's `nCcalls`
+    /// (`ldo.c`): bounded by the much smaller, fixed `MAX_NATIVE_CALL_DEPTH`
+    /// rather than the larger, embedder-configurable `max_call_depth`
+    /// budget, and reported as `"C stack overflow"` - real Lua's own wording
+    /// for exactly this condition - never the general `"stack overflow
+    /// (...)"` message. See `call()`'s own check.
+    ///
+    /// Deliberately *not* charged for a trampolined `xpcall` message-handler
+    /// retry (`xcall_retry_depth` tracks that instead): unlike a genuine
+    /// nested `call()` invocation, a handler retry does not recurse the Rust
+    /// stack at all, so an ordinary leaf native call made from inside the
+    /// handler's own body (`type(n)`, say) must not be blocked just because
+    /// many retries have accumulated.
+    native_call_depth: usize,
+    /// Depth of `xpcall` message-handler *retries* specifically - real
+    /// Lua's `luaG_errormsg` re-invokes the handler on the handler's own
+    /// error, unboundedly, and this is the separate budget that stands in
+    /// for `nCcalls` in exactly that one scenario (see `XCallStage`'s doc
+    /// and `unwind_error_to_marker`'s `Xpcall` arms). Kept apart from
+    /// `native_call_depth` for the reason documented on that field.
+    xcall_retry_depth: usize,
+    /// Whether `call_depth` has already hit `max_call_depth` once since the
+    /// value stack was last shrunk back down. Real Lua's `luaD_growstack`
+    /// reallocates the stack to a larger `ERRORSTACKSIZE` the first time it
+    /// overflows, specifically to give a message handler room to run in -
+    /// but that larger allocation persists (no synchronous shrink) until
+    /// `luaD_pcall` catches a non-`LUA_OK` status, at which point it
+    /// unconditionally calls `luaD_shrinkstack`. So a *second* overflow
+    /// while still sitting at that inflated size (e.g. a message handler
+    /// that itself calls something deep enough to overflow again) hits
+    /// `luaD_growstack`'s immediate-`LUA_ERRERR` path instead of raising
+    /// another catchable `"stack overflow"` and invoking the handler again -
+    /// see every `call_depth >= max_call_depth` check site - while an
+    /// unrelated, later deep recursion, reached only after some enclosing
+    /// `pcall`/`xpcall` already caught and cleared this flag (see
+    /// `reset_call_depth_overflow`, called at every point one terminally
+    /// resolves a caught error), still gets its own fresh, catchable first
+    /// overflow. `release_call_depth` clears it too, as a fallback, once
+    /// `call_depth` drains all the way back to `0` outside any protected
+    /// call at all.
+    call_depth_overflowed_once: bool,
     allocation_remaining: usize,
     /// The fixed cap `allocation_remaining` is reset toward after every
     /// collection (`gc.rs`'s `collect_garbage_with`), crediting back
@@ -345,6 +392,13 @@ pub struct LuaRuntime {
     /// `collectgarbage()` is called), so this flag is pure bookkeeping for
     /// `collectgarbage("isrunning")` - it does not actually gate anything.
     gc_running: bool,
+    /// Set for the duration of `run_gc_finalizers`'s `__gc` invocation loop.
+    /// Real Lua's collector is not reentrant: a finalizer that itself calls
+    /// `collectgarbage("collect"/"step")` must not trigger a nested
+    /// collection pass (`lua-5.5.1-tests/gc.lua`'s "check that the collector
+    /// is not reentrant in incremental mode" test asserts the reentrant call
+    /// returns `false` instead of doing any work).
+    gc_finalizing: bool,
     /// Bookkeeping-only `collectgarbage("param", "pause"|"stepmul", ...)`
     /// values. Sol has no incremental step-size heuristics to tune, so
     /// these are stored and returned as-is purely so scripts that read back

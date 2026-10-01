@@ -259,12 +259,33 @@ pub(super) enum NativeCont {
 pub(super) enum XCallStage {
     /// Waiting on `f`. Carries `handler` so an error raised by `f` (or
     /// anything `f` calls) can be redirected into calling `handler` instead
-    /// of propagating past this marker.
-    Function { handler: LuaValue },
-    /// Waiting on `handler`, called because `f` raised an error. A second
-    /// error here is real Lua's `xpcall` (no handler protects the handler
-    /// itself) - `unwind_error_to_marker` never matches this stage.
-    Handler,
+    /// of propagating past this marker. `entry_retry_depth` is
+    /// `xcall_retry_depth` as of this marker's creation - real Lua's
+    /// `luaD_pcall` saves `nCcalls` the same way (`oldnCcalls`) and restores
+    /// it, unconditionally, whenever this protected call's error is finally
+    /// caught (see `unwind_error_to_marker`'s `Xpcall` arms and `drive`'s own
+    /// success arms for the two places that restore point is reached) -
+    /// otherwise every message-handler retry below would permanently inflate
+    /// the budget for calls made after this `xpcall` returns.
+    Function {
+        handler: LuaValue,
+        entry_retry_depth: usize,
+    },
+    /// Waiting on `handler`, called because `f` (or a previous retry of
+    /// `handler` itself) raised an error. Real Lua's `luaG_errormsg`
+    /// unconditionally re-invokes `L->errfunc` for an error raised while
+    /// already running it, bounded only by a hard cutoff
+    /// (`lstate.c`'s `luaE_checkcstack`, `LUAI_MAXCCALLS/10*11`) past which
+    /// it gives up with `"error in error handling"` instead of retrying -
+    /// see `unwind_error_to_marker`'s matching arm. Carries `handler` again
+    /// so a retry has it to call, and the same `entry_retry_depth` as the
+    /// originating `Function` stage, threaded through unchanged by every
+    /// retry (it is a single save point for this whole `xpcall`, not
+    /// re-captured per retry).
+    Handler {
+        handler: LuaValue,
+        entry_retry_depth: usize,
+    },
 }
 
 /// Resume state for an in-progress `table.sort` TimSort, driven one

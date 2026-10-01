@@ -273,6 +273,18 @@ impl Compiler {
             captured_registers[reg as usize] = true;
         }
         let captured_cell_count = captured_registers.iter().filter(|&&c| c).count();
+        // Named-vararg lazy-view optimization (vararg.lua's `notab`/`foo`
+        // zero-allocation contract): only eligible when the register is
+        // never captured as an upvalue (a nested closure could stash the
+        // raw cell somewhere a flat scan of this function's own `instrs`
+        // can't see) - everything else is decided by the exhaustive
+        // operand scan in `try_lower_vararg_to_lazy_view`.
+        let vararg_lazy = match state.vararg_name {
+            Some(vararg_reg) if !captured_registers[vararg_reg as usize] => {
+                try_lower_vararg_to_lazy_view(&mut state.instrs, vararg_reg)
+            }
+            _ => false,
+        };
         Ok(Rc::new(Proto {
             metadata: PrototypeMetadata::new(
                 state.name,
@@ -298,6 +310,7 @@ impl Compiler {
                 .collect(),
             locals: std::mem::take(&mut state.locals),
             vararg_name: state.vararg_name,
+            vararg_lazy,
             captured_registers,
             captured_cell_count,
             nested: std::mem::take(&mut state.nested),
@@ -372,4 +385,218 @@ enum Resolved {
     Local(Reg, bool),
     Upval(u16, bool),
     Global,
+}
+
+/// Attempts to lower a named vararg parameter's register (`vararg_reg`) to
+/// the zero-allocation lazy view described on `Instr::VarargIndexGet` and
+/// friends, rewriting `instrs` in place. Returns `true` (having rewritten
+/// every direct index/field access against `vararg_reg` into the matching
+/// `Vararg*` opcode) iff a whole-function scan proves `vararg_reg` is never
+/// used any other way - e.g. moved into another register, passed as a call
+/// argument or return value, used as a key/value against some *other*
+/// table, or as the subject of `...`/numeric/generic `for`'s open register
+/// range. Any other shape falls back to `false`, leaving `instrs`
+/// unchanged, so the caller keeps today's already-correct eager-table
+/// behavior.
+///
+/// Callers must separately confirm `vararg_reg` isn't in
+/// `captured_registers` first - a register captured as an upvalue by some
+/// nested closure is never eligible regardless of what this scan finds,
+/// since a nested closure can only reach it through the capture (opaque to
+/// a scan of this function's own flat `instrs`), never as a direct operand
+/// here.
+fn try_lower_vararg_to_lazy_view(instrs: &mut [Instr], vararg_reg: Reg) -> bool {
+    // Every function body ends with an unconditional implicit
+    // `Return(0, ValueCount::ZERO)` followed by that outer scope's
+    // exit cleanup (`DetachCell`/`LoadNil` for each of its locals,
+    // including the vararg parameter's own register) - dead code whenever
+    // the body already returned earlier, but still present in `instrs` and,
+    // scanned unconditionally, would disqualify nearly every real function.
+    // Skip disqualification (but still lower, harmlessly, since it never
+    // runs) for any instruction that a straight-line/jump-target reachability
+    // pass can prove unreachable from the function's entry.
+    let reachable = compute_reachable(instrs);
+    if instrs
+        .iter()
+        .enumerate()
+        .any(|(idx, instr)| reachable[idx] && vararg_register_disqualifies(instr, vararg_reg))
+    {
+        return false;
+    }
+    for instr in instrs.iter_mut() {
+        let replacement = match instr {
+            Instr::GetIndex(dst, base, key) if *base == vararg_reg => {
+                Some(Instr::VarargIndexGet(*dst, *key))
+            }
+            Instr::SetIndex(base, key, value) if *base == vararg_reg => {
+                Some(Instr::VarargIndexSet(*key, *value))
+            }
+            Instr::GetField(dst, base, name) if *base == vararg_reg => {
+                Some(Instr::VarargFieldGet(*dst, *name))
+            }
+            Instr::SetField(base, name, value) if *base == vararg_reg => {
+                Some(Instr::VarargFieldSet(*name, *value))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *instr = replacement;
+        }
+    }
+    true
+}
+
+/// A conservative reachability pass over one function's flat `instrs`: which
+/// indices can actually execute, starting from entry (index 0) and following
+/// fallthrough plus every `Jump`/`JumpIfFalse`/`JumpIfTrue`/`ForPrep`/
+/// `ForLoop`/`TForLoop` target (computed the same way `dispatch_step` resolves
+/// them: `target = pc as i32 + delta`). `Return`/`TailCall`/unconditional
+/// `Jump` end fallthrough into the next index; every other instruction
+/// (including the conditional jumps, which may or may not branch) preserves
+/// it. An index reachable only via a jump from an instruction this same pass
+/// has already deemed unreachable is still marked reachable - jump targets
+/// are collected from every instruction up front, not gated on that
+/// instruction's own liveness - so this never *under*-approximates
+/// reachability, only ever over-approximates it (the only direction that's
+/// safe for `try_lower_vararg_to_lazy_view`'s disqualification scan to err
+/// in).
+fn compute_reachable(instrs: &[Instr]) -> Vec<bool> {
+    let len = instrs.len();
+    let mut jump_targets = vec![false; len];
+    for (i, instr) in instrs.iter().enumerate() {
+        let delta = match instr {
+            Instr::Jump(delta)
+            | Instr::JumpIfFalse(_, delta)
+            | Instr::JumpIfTrue(_, delta)
+            | Instr::ForPrep(_, delta)
+            | Instr::ForLoop(_, delta)
+            | Instr::TForLoop(_, delta) => Some(*delta),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            let target = i as i64 + delta as i64;
+            if target >= 0 && (target as usize) < len {
+                jump_targets[target as usize] = true;
+            }
+        }
+    }
+    let mut reachable = vec![false; len];
+    let mut alive = true;
+    for i in 0..len {
+        if jump_targets[i] {
+            alive = true;
+        }
+        reachable[i] = alive;
+        alive &= !matches!(instrs[i], Instr::Jump(_) | Instr::Return(_, _) | Instr::TailCall(_, _));
+    }
+    reachable
+}
+
+/// The per-instruction half of `try_lower_vararg_to_lazy_view`'s safety
+/// scan. Exhaustive over `Instr` by construction (no wildcard arm), so
+/// adding a new opcode forces this match to be revisited rather than
+/// silently defaulting to "safe". `GetIndex`/`SetIndex`/`GetField`/
+/// `SetField` are the only variants where `reg` appearing as the table
+/// operand (`base`) alone doesn't disqualify; every other operand position
+/// on those four, and every operand position on every other variant,
+/// disqualifies unconditionally. `ForPrep`/`ForLoop`/`TForCall`/`TForLoop`
+/// address an open-ended register range starting at their `base` operand;
+/// this compiler's stack discipline guarantees a persistent local's register
+/// never coincides with a temporary allocated after it for the local's
+/// lifetime, so `reg >= base` conservatively (and soundly) disqualifies
+/// without needing each instruction's precise upper bound.
+///
+/// `Call`/`TailCall`/`Return`/`Vararg` instead carry an explicit
+/// `ValueCount`, so their touched range is checked precisely via
+/// `value_count_range_hits` rather than the open-ended `reg >= base`: a
+/// `Fixed(0)` count (e.g. the synthetic `Return(0, ValueCount::ZERO)` every
+/// function body ends with as a fallback "return nothing", regardless of how
+/// many registers the function actually uses) touches no registers at all,
+/// and treating its `base` as a real lower bound would wrongly disqualify
+/// any function whose vararg register is anything other than 0.
+fn vararg_register_disqualifies(instr: &Instr, reg: Reg) -> bool {
+    match instr {
+        Instr::GetIndex(dst, base, key) if *base == reg => *dst == reg || *key == reg,
+        Instr::SetIndex(base, key, value) if *base == reg => *key == reg || *value == reg,
+        Instr::GetField(dst, base, _) if *base == reg => *dst == reg,
+        Instr::SetField(base, _, value) if *base == reg => *value == reg,
+
+        // `base` (the callee) is always read regardless of `arguments`.
+        Instr::Call(base, arguments, results) => {
+            reg == *base
+                || value_count_range_hits(reg, *base + 1, *arguments)
+                || value_count_range_hits(reg, *base, *results)
+        }
+        Instr::TailCall(base, arguments) => {
+            reg == *base || value_count_range_hits(reg, *base + 1, *arguments)
+        }
+        Instr::Return(base, count) => value_count_range_hits(reg, *base, *count),
+        Instr::Vararg(base, count) => value_count_range_hits(reg, *base, *count),
+        Instr::ForPrep(base, _) => reg >= *base,
+        Instr::ForLoop(base, _) => reg >= *base,
+        Instr::TForCall(base, _) => reg >= *base,
+        Instr::TForLoop(base, _) => reg >= *base,
+
+        Instr::LoadConst(dst, _) => *dst == reg,
+        Instr::LoadNil(dst) => *dst == reg,
+        Instr::LoadBool(dst, _) => *dst == reg,
+        Instr::Move(dst, src) => *dst == reg || *src == reg,
+        Instr::NewLocal(dst, src, _) => *dst == reg || *src == reg,
+        Instr::DetachCell(dst) => *dst == reg,
+        Instr::GetUpval(dst, _) => *dst == reg,
+        Instr::SetUpval(_, src) => *src == reg,
+        Instr::GetEnvironment(dst) => *dst == reg,
+        Instr::SetEnvironment(src) => *src == reg,
+        Instr::GetGlobal(dst, _) => *dst == reg,
+        Instr::SetGlobal(_, src, _, _) => *src == reg,
+        Instr::ErrorIfGlobalDefined(src, _) => *src == reg,
+        Instr::NewTable(dst) => *dst == reg,
+        Instr::NewClosure(dst, _) => *dst == reg,
+        // Reached only when the guarded arms above didn't match (i.e.
+        // `base != reg`), so any occurrence here is `reg` used in an
+        // operand position this optimization never rewrites on some
+        // *other* table's access (e.g. `reg` is the key, or the dst of an
+        // unrelated lookup) - disqualifying.
+        Instr::GetField(dst, base, _) => *dst == reg || *base == reg,
+        Instr::SetField(base, _, value) => *base == reg || *value == reg,
+        Instr::GetIndex(dst, base, key) => *dst == reg || *base == reg || *key == reg,
+        Instr::SetIndex(base, key, value) => *base == reg || *key == reg || *value == reg,
+        Instr::SetArrayItem(base, _, src) => *base == reg || *src == reg,
+        Instr::SetArrayMulti(base, _, src) => *base == reg || *src == reg,
+        Instr::Len(dst, src) => *dst == reg || *src == reg,
+        Instr::Not(dst, src) => *dst == reg || *src == reg,
+        Instr::Neg(dst, src) => *dst == reg || *src == reg,
+        Instr::BitNot(dst, src) => *dst == reg || *src == reg,
+        Instr::Binary(_, dst, lhs, rhs) => *dst == reg || *lhs == reg || *rhs == reg,
+        Instr::IntegerBinary(_, dst, lhs, rhs) => *dst == reg || *lhs == reg || *rhs == reg,
+        Instr::Jump(_) => false,
+        Instr::JumpIfFalse(src, _) => *src == reg,
+        Instr::JumpIfTrue(src, _) => *src == reg,
+        Instr::MarkClose(src, _) => *src == reg,
+        Instr::CloseSlots(_) => false,
+        // These 4 are only ever produced BY this same pass - never present
+        // in `state.instrs` when the scan runs - but matched exhaustively
+        // rather than wildcarded away, in case a future caller ever runs
+        // this scan a second time over already-lowered instructions.
+        Instr::VarargIndexGet(dst, key) => *dst == reg || *key == reg,
+        Instr::VarargIndexSet(key, value) => *key == reg || *value == reg,
+        Instr::VarargFieldGet(dst, _) => *dst == reg,
+        Instr::VarargFieldSet(_, value) => *value == reg,
+    }
+}
+
+/// Whether `reg` falls inside the register range a `ValueCount`-carrying
+/// operand touches, starting at `start` (already offset past any leading
+/// fixed operand, e.g. `Call`'s callee slot). `Open` means "up to the
+/// frame's current top", which isn't known statically, so it conservatively
+/// matches every register at or above `start`; `Fixed(n)` matches exactly
+/// the `n` registers `[start, start + n)`, including the empty range when
+/// `n == 0`.
+fn value_count_range_hits(reg: Reg, start: Reg, count: ValueCount) -> bool {
+    let reg = reg as u32;
+    let start = start as u32;
+    match count {
+        ValueCount::Fixed(n) => reg >= start && reg < start + n,
+        ValueCount::Open => reg >= start,
+    }
 }

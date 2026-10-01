@@ -102,6 +102,38 @@ fn dynamic_lua_runtime_scoped_out_local_does_not_keep_a_weak_value_alive() {
 }
 
 #[test]
+fn dynamic_lua_runtime_repeat_loop_clears_prior_iterations_local_on_the_back_edge() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // Unlike `while`/`for`, `repeat ... until cond` loops back to the top on
+    // every continuing iteration via the `until` check's own conditional
+    // jump, never running `pop_scope`'s shrink-clear until the whole loop
+    // has already exited. Without an explicit clear on that back-edge, a
+    // body local's register keeps holding the *previous* iteration's value
+    // (still rooted, since a frame's precise-root scan covers its entire
+    // fixed register array) for as long as the loop keeps running, even
+    // though that value is provably unreachable from Lua's own perspective
+    // the moment the next iteration's `local obj = {}` shadows it.
+    let source = br#"
+        local cache = {}
+        setmetatable(cache, { __mode = "v" })
+        local n = 0
+        local cleared_on_back_edge
+        repeat
+            local obj = {}
+            cache[n] = obj
+            n = n + 1
+            if n == 2 then
+                collectgarbage()
+                cleared_on_back_edge = (cache[0] == nil)
+            end
+        until n >= 2
+        return cleared_on_back_edge
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_reclaims_reference_cycles_via_collectgarbage() {
     use sol::lua_runtime::LuaRuntime;
 
@@ -637,6 +669,74 @@ fn dynamic_lua_runtime_call_chain_resolves_in_order_with_no_metatable_cycle_hang
         end
         local ok, msg = pcall(a)
         return ok == false and string.find(msg, "too long") ~= nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_generational_mode_clears_weak_entries_in_a_single_step() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // `lua-5.5.1-tests/gengc.lua`'s "bug introduced in commit 9cf3299fa"
+    // case: under `collectgarbage("generational")`, a weak-value table entry
+    // pointing at newly-dead young garbage must clear on the very next
+    // `collectgarbage("step")` call - real Lua's generational minor
+    // collection covers the whole young generation in one cheap pass, unlike
+    // the default incremental/major path, which only makes bounded progress
+    // per step and can take dozens of calls to reach the same object. This
+    // exercises `step_garbage`'s `self.gc_mode == "generational"` branch
+    // (`sol_core::Heap::collect_minor_with_conditional_roots`).
+    let source = br#"
+        collectgarbage("generational")
+        local cache = {}
+        setmetatable(cache, { __mode = "v" })
+        local function stash_unreachable()
+            local obj = {}
+            cache[1] = obj
+        end
+        stash_unreachable()
+        collectgarbage("step", 1)
+        return cache[1] == nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_minor_collection_traces_remembered_old_objects_unreachable_from_roots() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // `lua-5.5.1-tests/gengc.lua`'s "another bug in 5.4.0" case (block 3,
+    // the `gcf` finalizer test): an `Old` object can become unreachable from
+    // any current root (its only local went out of scope) yet still survive
+    // every minor collection unconditionally (`should_trace_during_minor`
+    // never re-evaluates `Old` reachability), waiting for the next major
+    // collection to decide its fate via the finalizer-resurrection path. A
+    // minor collection's *mark* phase must still trace such an object's
+    // `remembered` write-barrier edges even though it was never reached via
+    // a root this round - otherwise a `Young` child it alone references
+    // (like its own metatable) is incorrectly swept as garbage, leaving a
+    // dangling `ObjectId` for the finalizer to dereference once the object
+    // is genuinely resurrected and run. This regressed when the minor
+    // collector's `remembered` set gated *tracing through* an already-
+    // enqueued id but never seeded the mark queue with `remembered` members
+    // themselves, so an unreachable-but-surviving `Old` object was simply
+    // never enqueued in the first place.
+    let source = br#"
+        collectgarbage("generational")
+        local anchor = {}
+        local function witness(obj)
+            anchor.result = getmetatable(obj).x
+        end
+        collectgarbage()   -- make 'anchor' old
+        do
+            local obj = {}
+            collectgarbage("step")   -- promote 'obj' to old
+            setmetatable(obj, { __gc = witness, x = "marker" })   -- young metatable, remembered edge
+            obj = nil   -- drop the only root reference
+        end
+        collectgarbage("step")   -- minor: must not drop the remembered metatable
+        collectgarbage()         -- major: resurrects 'obj', runs its finalizer
+        return anchor.result == "marker"
     "#;
     assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
 }

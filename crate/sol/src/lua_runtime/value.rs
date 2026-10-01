@@ -1004,6 +1004,17 @@ pub struct LuaError {
     /// error) into an ordinary successful zero-value return instead of an
     /// error, matching `resume` returning `(true)` with no extra values.
     pub(super) uncatchable: bool,
+    /// Set only when `call_depth` overflows `max_call_depth` a *second* time
+    /// while still sitting at that inflated depth (see
+    /// `call_depth_overflowed_once`'s doc on `LuaRuntime`) - real Lua's
+    /// `luaD_growstack` hitting this same condition throws `LUA_ERRERR`
+    /// directly, bypassing `luaG_errormsg` entirely, so no message handler
+    /// ever sees this error: `unwind_error_to_marker` stops at the nearest
+    /// `pcall`/`xpcall` marker as usual, but resolves straight to
+    /// `false, "error in error handling"` for every `NativeCont` variant
+    /// without invoking `f`'s handler (if any), unlike an ordinary error
+    /// reaching an `Xpcall` marker.
+    pub(super) double_fault: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1021,6 +1032,7 @@ impl LuaError {
             operand_hint: None,
             output: Vec::new(),
             uncatchable: false,
+            double_fault: false,
         }
     }
 
@@ -1040,6 +1052,15 @@ impl LuaError {
         self
     }
 
+    /// Marks this error as a double stack-fault - see the `double_fault`
+    /// field doc. Only the `call_depth >= max_call_depth` check sites
+    /// construct one of these, and only when `call_depth_overflowed_once`
+    /// is already set.
+    pub(super) fn make_double_fault(mut self) -> Self {
+        self.double_fault = true;
+        self
+    }
+
     /// Builds an error from an explicit Lua value (`error(v)`/`assert(c, v)`),
     /// keeping `v` itself available via `value` while `message` gets a
     /// human-readable fallback for contexts that only have text (this
@@ -1054,6 +1075,7 @@ impl LuaError {
             operand_hint: None,
             output: Vec::new(),
             uncatchable: false,
+            double_fault: false,
         }
     }
 
@@ -1415,10 +1437,19 @@ impl LuaValue {
     pub(super) fn identity_address(&self) -> Option<usize> {
         match self {
             Self::String(value) => {
-                // The canonical heap interns every string by content (real
-                // Lua only interns short strings), so `%p`-style identity is
-                // already content-stable and object-identical here.
-                Some(value.object_id().raw() as usize | 1)
+                // `CanonicalString::intern`/`fresh` give every distinct
+                // string object its own `ObjectId` slot in the same shared
+                // heap arena tables/closures/etc. use, so the bare raw id is
+                // already a unique, content-stable identity - matching real
+                // Lua's short-string interning for `intern`-allocated values
+                // and per-allocation identity for `fresh`-allocated ones. Do
+                // not `| 1` this like `RegisteredNative`'s unrelated
+                // content-hash below: that masking previously papered over a
+                // real content-hash's low bit and was carried over here by
+                // mistake when strings moved onto `ObjectId`, where it instead
+                // collapses two adjacent, genuinely distinct object slots
+                // into the same reported address.
+                Some(value.object_id().raw() as usize)
             }
             Self::Table(value) => Some(value.object_id().raw() as usize),
             Self::CanonicalTable(value) => Some(value.object_id().raw() as usize),

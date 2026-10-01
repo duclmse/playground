@@ -188,7 +188,17 @@ impl LuaRuntime {
                                 error = self.close_pending(&mut lua_frame, count, error);
                             }
                         }
-                        self.call_depth -= coroutine.depth_charged.take();
+                        // A suspended coroutine's `depth_charged` is already
+                        // parked *outside* `self.call_depth` - it was
+                        // released from the shared counter back when this
+                        // coroutine last yielded (see `resume_coroutine`'s
+                        // `Yielded` arm in `coroutine.rs`), leaving only
+                        // `co.depth_charged` holding the number for the next
+                        // `resume` to restore. Subtracting it from
+                        // `self.call_depth` here again would double-release
+                        // a charge that isn't actually present in the shared
+                        // counter, eventually underflowing it.
+                        coroutine.depth_charged.set(0);
                         coroutine.status.set(CoroutineStatus::Dead);
                         match error {
                             Some(e) => Ok(vec![

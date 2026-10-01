@@ -1180,7 +1180,7 @@ fn bad_argument_errors_on_a_method_calls_self_argument_use_reals_calling_on_bad_
 
         local ok2, msg2 = pcall(string.sub, 'a', {})
         assert(not ok2, "string.sub('a', {}) should fail")
-        assert(string.find(msg2, "bad argument #2 to 'sub'", 1, true), msg2)
+        assert(string.find(msg2, "bad argument #2 to 'string.sub'", 1, true), msg2)
 
         local ok3, msg3 = pcall(function() return ('a'):sub{} end)
         assert(not ok3, "('a'):sub{} should fail")
@@ -2516,4 +2516,167 @@ fn a_function_with_too_many_upvalues_fails_to_compile() {
     std::fs::remove_file(&path).ok();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("too many upvalues rejected"));
+}
+
+/// A generic `for k,v in explist do ... end` loop's `TForCall`/`TForLoop`
+/// instructions used to be stamped with the whole `Stmt::GenericFor`'s own
+/// `line` field - captured once at the `for` keyword, before the iterator
+/// expression list is even parsed - instead of the iterator list's own line.
+/// Real Lua's `forlist()` (`lparser.c`) captures `ls->linenumber` right after
+/// consuming `TK_IN`, already pointing at the first iterator expression, so a
+/// loop header that spans multiple lines attributes a failed iterator-call
+/// error to the iterator list's line, not the `for` keyword's line. Surfaced
+/// by `lua-5.5.1-tests/errors.lua`'s `lineerror` helper (line 432).
+#[test]
+fn a_generic_for_iterator_call_error_is_attributed_to_the_iterator_lists_own_line() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_tforcall_iterator_line_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local ok, msg = pcall(function()
+            for k, v in
+              3
+            do end
+        end)
+        assert(not ok, "iterating a number should fail")
+        assert(string.find(msg, ":4:", 1, true), msg)
+        print("tforcall iterator line ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tforcall iterator line ok"));
+}
+
+/// Real Lua's `ldo.c` distinguishes two tiers of value-stack overflow:
+/// `luaD_growstack` reallocates once up to the padded `ERRORSTACKSIZE` and
+/// raises an ordinary, catchable `"stack overflow"`, but a *second* overflow
+/// while still at that inflated size throws `LUA_ERRERR` directly via
+/// `luaD_throw`, bypassing `luaG_errormsg`/any message handler entirely -
+/// this becomes `"error in error handling"` at whichever `pcall`/`xpcall`
+/// boundary catches it. Modeled by `LuaRuntime::call_depth_overflowed_once`
+/// and `LuaError::double_fault`. Surfaced by `lua-5.5.1-tests/errors.lua`
+/// (line 613): a stack overflow inside an `xpcall` message handler that is
+/// itself already running because of a first, distinct overflow must bypass
+/// the handler and resolve directly to "error in error handling", while an
+/// entirely separate, later top-level overflow (line 559-562, not nested
+/// inside any still-running handler) must still get the ordinary catchable
+/// message - i.e. the flag must reset once the first overflow is caught,
+/// mirroring real Lua's unconditional `luaD_shrinkstack` on every
+/// `luaD_pcall` catch, not merely the very first overflow in the process.
+#[test]
+fn a_stack_overflow_raised_from_within_an_already_overflowing_handler_is_error_in_error_handling() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_double_stack_fault_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        local function loop(x) return 1 + loop(x) end
+
+        local res, msg = xpcall(loop, function(m)
+          assert(string.find(m, "stack overflow"))
+          local ok2, err2 = pcall(loop)
+          assert(not ok2)
+          assert(string.find(err2, "error in error handling"), err2)
+          return 15
+        end)
+        assert(res == false and msg == 15, tostring(msg))
+
+        -- An independent, later overflow must still get the ordinary,
+        -- catchable message - the double-fault flag must not stick around.
+        local ok3, err3 = pcall(loop)
+        assert(not ok3)
+        assert(string.find(err3, "stack overflow"), err3)
+        assert(not string.find(err3, "error in error handling"), err3)
+
+        print("double stack fault ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("double stack fault ok"));
+}
+
+/// A suspended coroutine's `call_depth` charge is released from the shared
+/// `LuaRuntime::call_depth` counter and parked solely in its own
+/// `depth_charged` field as soon as it yields (`resume_coroutine`'s
+/// `Yielded` arm in `coroutine.rs`) - by the time `coroutine.close()` runs on
+/// a *suspended* coroutine, that charge no longer exists in the shared
+/// counter at all. `coroutine.close()` used to re-subtract
+/// `coroutine.depth_charged.take()` from `self.call_depth` anyway, double-
+/// releasing the charge; repeating this enough times underflowed the shared
+/// `usize` counter and panicked with "attempt to subtract with overflow"
+/// (surfaced by `lua-5.5.1-tests/coroutine.lua`'s `<close>`/`coroutine.close`
+/// sections). Fixed by having `close()` just clear the parked value.
+#[test]
+fn closing_a_suspended_coroutine_repeatedly_does_not_underflow_call_depth() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_close_suspended_depth_charged_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        br#"
+        for i = 1, 20 do
+            local co = coroutine.create(function()
+                local function deep(n)
+                    if n <= 0 then
+                        coroutine.yield()
+                        return
+                    end
+                    return 1 + deep(n - 1)
+                end
+                deep(50)
+            end)
+            assert(coroutine.resume(co))
+            assert(coroutine.status(co) == "suspended")
+            assert(coroutine.close(co))
+        end
+
+        -- Budget accounting must still be intact: an unrelated, later deep
+        -- recursion must still overflow at the same point real Lua would,
+        -- not early (from a corrupted/too-low counter) and not by crashing.
+        local function loop(x) return 1 + loop(x) end
+        local ok, err = pcall(loop)
+        assert(not ok)
+        assert(string.find(err, "stack overflow"), err)
+
+        print("close suspended depth_charged ok")
+    "#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("close suspended depth_charged ok"));
 }

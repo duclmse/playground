@@ -299,6 +299,13 @@ impl LuaRuntime {
         // afterward. See `active_hook`'s field doc on `LuaRuntime`.
         let caller_hook = std::mem::replace(&mut self.active_hook, co.hook.borrow().clone());
         let mut depth_charged = co.depth_charged.take();
+        // A suspended coroutine's own pending frames were released from
+        // `call_depth` when it last yielded (see the `Yielded` arm below) -
+        // restore that charge now, for the duration of this resume, so the
+        // budget check inside `drive`/`resolve_call` still sees this
+        // coroutine's own accumulated depth on top of whatever it pushes
+        // next, exactly as if it had never stopped running.
+        self.call_depth += depth_charged;
         let base_depth = 0;
 
         let outcome = if self.frames.is_empty() {
@@ -308,6 +315,12 @@ impl LuaRuntime {
                 .take()
                 .expect("resume_coroutine: body missing on a coroutine with empty frames");
             self.frames.push(Frame::Native(NativeCont::Once));
+            // A coroutine's body is invoked by this resume machinery, never
+            // by a bytecode `Instr::Call`, so it needs the same
+            // `pushglobalfuncname`-style qualified naming as `pcall`'s
+            // function or `table.sort`'s comparator (confirmed against the
+            // pinned oracle: `coroutine.resume(coroutine.create(table.sort))`
+            // reports `bad argument #1 to 'table.sort' (...)`, not `'sort'`).
             match self.resolve_call(body, args, base_depth, &mut depth_charged) {
                 // `Pending`/`Done` both still need the `Once` marker just
                 // pushed to be popped and finished (`finish_frame`'s
@@ -400,6 +413,21 @@ impl LuaRuntime {
         match outcome {
             DriveOutcome::Yielded(values) => {
                 co.status.set(CoroutineStatus::Suspended);
+                // Control is returning to the resumer; this coroutine's own
+                // pending frames are no longer part of the currently active
+                // call chain, so release their charge (parked instead in
+                // `co.depth_charged`, just set above, and restored on the
+                // next resume). Otherwise every merely-suspended coroutine -
+                // not just a genuinely deep, still-nested one - would go on
+                // occupying the one shared `call_depth` budget for as long as
+                // it exists, so a program that keeps many simultaneously
+                // idle coroutines alive (`lua-5.5.1-tests/gc.lua`'s
+                // self-referenced-threads stress test creates a thousand)
+                // would exhaust it through sheer coroutine count rather than
+                // actual recursion - unlike real Lua, where an idle
+                // coroutine's own stack costs nothing until it is resumed
+                // again.
+                self.call_depth -= depth_charged;
                 Ok(values)
             }
             DriveOutcome::Returned(values) => {

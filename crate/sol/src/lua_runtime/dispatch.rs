@@ -33,6 +33,18 @@ const MAX_METATABLE_CHAIN: usize = 2000;
 /// too long" case (line ~223), which exercises exactly that boundary.
 const MAX_CALL_CHAIN: usize = 15;
 
+/// Bound on `LuaRuntime::native_call_depth` - real Lua's fixed
+/// `LUAI_MAXCCALLS` (`luaconf.h`), confirmed against the pinned `lua5.5`
+/// oracle: recursive `coroutine.create`/`coroutine.resume` (each resume
+/// dispatches the coroutine's `NativeFunction` through `call()`, then
+/// synchronously re-enters the interpreter to run its body, so the whole
+/// chain is genuinely Rust-stack-recursive through `call()`) and a
+/// recursively-erroring `xpcall` message handler (invoked via `call()` from
+/// `natives_core.rs`) both raise exactly `"C stack overflow"` at 200 levels
+/// deep, not the much larger `max_call_depth` budget - see
+/// `lua-5.5.1-tests/errors.lua`'s two `"C stack overflow"` assertions.
+const MAX_NATIVE_CALL_DEPTH: usize = 200;
+
 mod bytecode;
 
 /// Whether `instr` writes `reg` as one of its destination registers -
@@ -54,6 +66,8 @@ pub(super) fn instr_writes(instr: &Instr, reg: Reg) -> bool {
         | NewClosure(dst, _)
         | GetField(dst, _, _)
         | GetIndex(dst, _, _)
+        | VarargIndexGet(dst, _)
+        | VarargFieldGet(dst, _)
         | Len(dst, _)
         | Not(dst, _)
         | Neg(dst, _)
@@ -154,6 +168,16 @@ pub(super) fn describe_register(
                 let kind = if is_method { "method" } else { "field" };
                 return Some((kind, name));
             }
+            // A named-vararg parameter's `t.xx` field read lowers to this
+            // dedicated instruction instead of `GetField` (see
+            // `vararg_in_range_index`/`materialize_vararg_view`'s lazy
+            // view), but real Lua's `getobjname` has no such distinction -
+            // the vararg table is materialized already, and a field read
+            // off it is exactly the `field 'xx'` shape `GetField` reports.
+            Instr::VarargFieldGet(dst, name_idx) if *dst == target => {
+                let name = String::from_utf8_lossy(&name_const(proto, *name_idx)).into_owned();
+                return Some(("field", name));
+            }
             other if instr_writes(other, target) => return None,
             _ => {}
         }
@@ -179,6 +203,51 @@ fn annotate_index_error(err: &mut LuaError, proto: &Proto, pc: usize, base: Reg)
             err.message = format!("{} ({kind} '{name}')", err.message);
         }
     }
+}
+
+/// Mirrors `sol_core::heap`'s private float-table-key normalization (a
+/// float with no fractional part, in `i64` range, becomes that integer) -
+/// duplicated here since it's `sol-core`-private and the lazy vararg
+/// view's fast path needs it before ever reaching the canonical heap's own
+/// key encoding (see `vararg_in_range_index`).
+fn exact_integer(value: f64) -> Option<i64> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_finite() && value.fract() == 0.0 && value >= i64::MIN as f64 && value < I64_UPPER_EXCLUSIVE
+    {
+        Some(value as i64)
+    } else {
+        None
+    }
+}
+
+/// Whether `key` normalizes (exactly like a real table key would) to a
+/// 1-based index within `len` (the lazy named-vararg view's current
+/// `#varargs`) - the only key shape `Instr::VarargIndexGet`/
+/// `VarargIndexSet`'s fast path answers without materializing a real
+/// `Table`. Returns the 1-based index itself (so callers can subtract 1
+/// for `varargs`'s 0-based storage).
+fn vararg_in_range_index(key: &LuaValue, len: usize) -> Option<usize> {
+    let integer = match key {
+        LuaValue::Integer(i) => *i,
+        LuaValue::Float(f) => exact_integer(*f)?,
+        _ => return None,
+    };
+    (integer >= 1 && (integer as usize) <= len).then_some(integer as usize)
+}
+
+/// `Instr::VarargIndexGet`'s unmaterialized fast path: exactly what a real
+/// `table.pack`-shaped table would return for `key` - the `i`'th vararg for
+/// an in-range positive integer, the vararg count for the string key
+/// `"n"`, `Nil` for everything else (including out-of-range/non-integral
+/// keys, `0`/negative integers, and unrelated types) - without allocating.
+fn vararg_view_get(varargs: &[LuaValue], key: &LuaValue) -> LuaValue {
+    if let Some(index) = vararg_in_range_index(key, varargs.len()) {
+        return varargs[index - 1].clone();
+    }
+    if matches!(key, LuaValue::String(s) if s.as_bytes() == b"n") {
+        return LuaValue::Integer(varargs.len() as i64);
+    }
+    LuaValue::Nil
 }
 
 /// The call counterpart of `annotate_index_error`. Lua's debug-name lookup
@@ -348,6 +417,14 @@ impl LuaRuntime {
         value: LuaValue,
         args: Vec<LuaValue>,
     ) -> LuaResult<Vec<LuaValue>> {
+        if self.native_call_depth >= MAX_NATIVE_CALL_DEPTH {
+            // See `MAX_NATIVE_CALL_DEPTH`'s doc - this check must come
+            // before the general `call_depth` budget below and its message
+            // must stay exactly `"C stack overflow"` (no position prefix,
+            // no `(...)` suffix): `errors.lua` asserts `msg == "C stack
+            // overflow"` verbatim for the recursive-message-handler case.
+            return Err(LuaError::new("C stack overflow"));
+        }
         if self.call_depth >= self.max_call_depth {
             // Real Lua's own message for this condition is the plain
             // string "stack overflow" (`ldo.c`'s `luaD_growstack`/
@@ -356,12 +433,13 @@ impl LuaRuntime {
             // assert on `string.find(msg, "stack overflow")` after a deep
             // recursion. Keep the budget wording (which env-var docs and
             // other diagnostics reference) but include the substring real
-            // scripts actually search for.
-            return Err(LuaError::new(
-                "stack overflow (Lua call-depth budget exhausted)",
-            ));
+            // scripts actually search for. See `call_depth_overflow_error`
+            // for the second-overflow-in-a-row ("error in error handling")
+            // case.
+            return Err(self.call_depth_overflow_error());
         }
         self.call_depth += 1;
+        self.native_call_depth += 1;
         // Hooks fire once per actual callable dispatched here, not for the
         // `__call` metamethod's receiver (the `other` arm below) - that's not
         // really "a function being called" in real Lua's model, and it
@@ -470,7 +548,8 @@ impl LuaRuntime {
             }
             result
         })();
-        self.call_depth -= 1;
+        self.release_call_depth(1);
+        self.native_call_depth -= 1;
         result
     }
 
@@ -891,12 +970,12 @@ impl LuaRuntime {
             DriveOutcome::Yielded(_) => {
                 let error = LuaError::new("attempt to yield across a C-call boundary");
                 let error = self.close_frames_above(base_depth, error);
-                self.call_depth -= depth_charged;
+                self.release_call_depth(depth_charged);
                 Err(error)
             }
             DriveOutcome::Raised(error) => {
                 let error = self.close_frames_above(base_depth, error);
-                self.call_depth -= depth_charged;
+                self.release_call_depth(depth_charged);
                 Err(error)
             }
             DriveOutcome::TailCall(_) => {
@@ -945,15 +1024,22 @@ impl LuaRuntime {
             self.recycle_values_buffer(args);
             Vec::new()
         };
+        // `vararg_lazy`: the register is left at its default `Nil` and
+        // answered directly out of `varargs` by the `Vararg*` opcodes (see
+        // `materialize_vararg_view` and `dispatch/bytecode.rs`) - no table
+        // allocation unless some rare shape (an out-of-range/non-integer
+        // write) forces materialization later.
         if let Some(vararg_reg) = proto.vararg_name {
-            let table = self.values_table(&varargs)?;
-            let LuaValue::Table(named_varargs) = &table else {
-                unreachable!("values_table always returns a table")
-            };
-            let named_varargs = *named_varargs;
-            let n_key = LuaValue::String(self.intern_str(b"n"));
-            self.table_set(named_varargs, n_key, LuaValue::Integer(varargs.len() as i64))?;
-            reg_set(self, &mut regs, &cells, vararg_reg as usize, table);
+            if !proto.vararg_lazy {
+                let table = self.values_table(&varargs)?;
+                let LuaValue::Table(named_varargs) = &table else {
+                    unreachable!("values_table always returns a table")
+                };
+                let named_varargs = *named_varargs;
+                let n_key = LuaValue::String(self.intern_str(b"n"));
+                self.table_set(named_varargs, n_key, LuaValue::Integer(varargs.len() as i64))?;
+                reg_set(self, &mut regs, &cells, vararg_reg as usize, table);
+            }
         }
         Ok(LuaFrame {
             header: FrameHeader::new(function, 0, 0),
@@ -974,6 +1060,34 @@ impl LuaRuntime {
             c_hook_last_pc: -1,
             c_hook_last_line: -1,
         })
+    }
+
+    /// Builds the lazy named-vararg view's real backing `Table` on demand -
+    /// the same `values_table`+`table_set("n", ...)` construction
+    /// `new_lua_frame` runs eagerly for a non-lazy `Proto`, but run lazily
+    /// here only when some rare access (an out-of-range/non-integer-key
+    /// write, or a `VarargFieldSet`) actually needs full table semantics.
+    /// Writes the new table into the vararg register and returns it; a
+    /// no-op (just returning the existing table) if some earlier access
+    /// already materialized it.
+    fn materialize_vararg_view(&mut self, frame: &mut LuaFrame) -> LuaResult<TableRef> {
+        let vararg_reg = frame
+            .proto
+            .vararg_name
+            .expect("materialize_vararg_view only called for a named vararg parameter")
+            as usize;
+        if let LuaValue::Table(table) = reg_get(self, &frame.regs, &frame.cells, vararg_reg) {
+            return Ok(table);
+        }
+        let table = self.values_table(&frame.varargs)?;
+        let LuaValue::Table(named_varargs) = &table else {
+            unreachable!("values_table always returns a table")
+        };
+        let named_varargs = *named_varargs;
+        let n_key = LuaValue::String(self.intern_str(b"n"));
+        self.table_set(named_varargs, n_key, LuaValue::Integer(frame.varargs.len() as i64))?;
+        reg_set(self, &mut frame.regs, &frame.cells, vararg_reg, table);
+        Ok(named_varargs)
     }
 
     fn prototype_id(&mut self, prototype: &Rc<Proto>) -> LuaResult<FunctionId> {
@@ -1088,12 +1202,16 @@ impl LuaRuntime {
                                 // records its position - adding it again
                                 // here would duplicate the entry.
                                 self.frames.push(Frame::Lua(frame));
-                                let error = LuaError::new(
-                                    "stack overflow (Lua call-depth budget exhausted)",
-                                );
-                                let error = match entry_label {
-                                    Some(label) => error.at(&format!("in metamethod '{label}'")),
-                                    None => error,
+                                let error = self.call_depth_overflow_error();
+                                let error = if error.double_fault {
+                                    error
+                                } else {
+                                    match entry_label {
+                                        Some(label) => {
+                                            error.at(&format!("in metamethod '{label}'"))
+                                        }
+                                        None => error,
+                                    }
                                 };
                                 match self.unwind_error_to_marker(
                                     error,
@@ -1307,7 +1425,7 @@ impl LuaRuntime {
                             // an ancestor's pcall/xpcall silently leaks one
                             // `call_depth` unit per occurrence.
                             if self.frames.len() > base_depth {
-                                self.call_depth -= 1;
+                                self.release_call_depth(1);
                                 *depth_charged -= 1;
                             }
                             // `frame` was popped above and never pushed back
@@ -1331,7 +1449,7 @@ impl LuaRuntime {
                         "drive: a Frame::Native marker is only ever resumed with a pending result",
                     );
                     match cont {
-                        NativeCont::Pcall | NativeCont::Xpcall(XCallStage::Function { .. }) => {
+                        NativeCont::Pcall => {
                             self.fire_hook("return", None)?;
                             let mut wrapped = vec![LuaValue::Bool(true)];
                             wrapped.extend(values);
@@ -1340,7 +1458,32 @@ impl LuaRuntime {
                             }
                             incoming = Some(wrapped);
                         }
-                        NativeCont::Xpcall(XCallStage::Handler) => {
+                        NativeCont::Xpcall(XCallStage::Function { entry_retry_depth, .. }) => {
+                            // `f` returned normally - this protected call is
+                            // done, so restore the `nCcalls`-equivalent save
+                            // point exactly as if it had never been charged
+                            // (see `XCallStage::Function`'s doc).
+                            self.xcall_retry_depth = entry_retry_depth;
+                            self.fire_hook("return", None)?;
+                            let mut wrapped = vec![LuaValue::Bool(true)];
+                            wrapped.extend(values);
+                            if self.finish_frame(base_depth, depth_charged) {
+                                return Ok(DriveOutcome::Returned(wrapped));
+                            }
+                            incoming = Some(wrapped);
+                        }
+                        NativeCont::Xpcall(XCallStage::Handler { entry_retry_depth, .. }) => {
+                            // The message handler itself returned normally
+                            // (no further error) - this `xpcall` is done,
+                            // same restore as the `Function` arm above. `f`
+                            // (or a retry of the handler) *did* error for
+                            // this stage to be reached at all, so - unlike
+                            // that arm - this is also one of the points real
+                            // Lua's `luaD_pcall` shrinks the stack back down
+                            // after catching a non-OK status; see
+                            // `reset_call_depth_overflow`'s doc.
+                            self.xcall_retry_depth = entry_retry_depth;
+                            self.reset_call_depth_overflow();
                             let wrapped = vec![
                                 LuaValue::Bool(false),
                                 values.into_iter().next().unwrap_or(LuaValue::Nil),
@@ -1368,24 +1511,17 @@ impl LuaRuntime {
                                 }
                                 Ok(SortOutcome::NeedsCall { callee, args }) => {
                                     self.frames.push(Frame::Native(NativeCont::Sort(state)));
-                                    match self.resolve_call(callee, args, base_depth, depth_charged)
-                                    {
-                                        Ok(CallStep::Done(values)) => incoming = Some(values),
-                                        Ok(CallStep::Pending) => {}
-                                        Ok(CallStep::Yielded(values)) => {
+                                    match self.resolve_call(
+                                        callee,
+                                        args,
+                                        base_depth,
+                                        depth_charged,
+                                    )? {
+                                        CallStep::Pending => {}
+                                        CallStep::Done(values) => incoming = Some(values),
+                                        CallStep::Yielded(values) => {
                                             return Ok(DriveOutcome::Yielded(values));
                                         }
-                                        Err(error) => match self.unwind_error_to_marker(
-                                            error,
-                                            base_depth,
-                                            depth_charged,
-                                        )? {
-                                            CallStep::Pending => {}
-                                            CallStep::Done(values) => incoming = Some(values),
-                                            CallStep::Yielded(values) => {
-                                                return Ok(DriveOutcome::Yielded(values));
-                                            }
-                                        },
                                     }
                                 }
                                 Err(error) => match self.unwind_error_to_marker(
@@ -1415,24 +1551,17 @@ impl LuaRuntime {
                                 }
                                 Ok(GsubOutcome::NeedsCall { callee, args }) => {
                                     self.frames.push(Frame::Native(NativeCont::Gsub(state)));
-                                    match self.resolve_call(callee, args, base_depth, depth_charged)
-                                    {
-                                        Ok(CallStep::Done(values)) => incoming = Some(values),
-                                        Ok(CallStep::Pending) => {}
-                                        Ok(CallStep::Yielded(values)) => {
+                                    match self.resolve_call(
+                                        callee,
+                                        args,
+                                        base_depth,
+                                        depth_charged,
+                                    )? {
+                                        CallStep::Pending => {}
+                                        CallStep::Done(values) => incoming = Some(values),
+                                        CallStep::Yielded(values) => {
                                             return Ok(DriveOutcome::Yielded(values));
                                         }
-                                        Err(error) => match self.unwind_error_to_marker(
-                                            error,
-                                            base_depth,
-                                            depth_charged,
-                                        )? {
-                                            CallStep::Pending => {}
-                                            CallStep::Done(values) => incoming = Some(values),
-                                            CallStep::Yielded(values) => {
-                                                return Ok(DriveOutcome::Yielded(values));
-                                            }
-                                        },
                                     }
                                 }
                                 Err(error) => match self.unwind_error_to_marker(
@@ -1464,10 +1593,49 @@ impl LuaRuntime {
     /// result rather than deliver it as `incoming` to whatever is now on top.
     fn finish_frame(&mut self, base_depth: usize, depth_charged: &mut usize) -> bool {
         if self.frames.len() > base_depth {
-            self.call_depth -= 1;
+            self.release_call_depth(1);
             *depth_charged -= 1;
         }
         self.frames.len() == base_depth
+    }
+
+    /// Releases `n` `call_depth` units, clearing `call_depth_overflowed_once`
+    /// once the whole call stack has drained back to empty - see that
+    /// field's doc for why the flag isn't cleared on every unwind.
+    fn release_call_depth(&mut self, n: usize) {
+        self.call_depth -= n;
+        if self.call_depth == 0 {
+            self.call_depth_overflowed_once = false;
+        }
+    }
+
+    /// Builds the error for a `call_depth >= max_call_depth` check site (see
+    /// `call_depth_overflowed_once`'s doc on `LuaRuntime`): the first crossing
+    /// gets an ordinary, catchable `"stack overflow (...)"` error and arms
+    /// the flag; hitting the check again before the stack has drained back
+    /// to `call_depth == 0` gets a `double_fault` error instead, matching
+    /// real Lua's `luaD_growstack` throwing `LUA_ERRERR` directly the second
+    /// time round rather than raising another catchable overflow.
+    fn call_depth_overflow_error(&mut self) -> LuaError {
+        if self.call_depth_overflowed_once {
+            LuaError::new("error in error handling").make_double_fault()
+        } else {
+            self.call_depth_overflowed_once = true;
+            LuaError::new("stack overflow (Lua call-depth budget exhausted)")
+        }
+    }
+
+    /// Clears `call_depth_overflowed_once`. Called at every point a
+    /// `pcall`/`xpcall` marker finally, terminally resolves an error it
+    /// caught (as opposed to an `xpcall` message-handler retry routing back
+    /// into the *same* marker, or a protected call returning with no error
+    /// at all) - real Lua's `luaD_pcall` unconditionally runs
+    /// `luaD_shrinkstack` whenever it catches a non-`LUA_OK` status from its
+    /// protected call, regardless of what that status was, which is what
+    /// lets an unrelated, later deep recursion get its own fresh, catchable
+    /// first overflow instead of an immediate `"error in error handling"`.
+    fn reset_call_depth_overflow(&mut self) {
+        self.call_depth_overflowed_once = false;
     }
 
     /// Pushes `cont` as a `Frame::Native` marker, charging one `call_depth`
@@ -1486,11 +1654,19 @@ impl LuaRuntime {
         depth_charged: &mut usize,
     ) -> LuaResult<CallStep> {
         if self.call_depth >= self.max_call_depth {
-            return self.unwind_error_to_marker(
-                LuaError::new("stack overflow (Lua call-depth budget exhausted)"),
-                base_depth,
-                depth_charged,
-            );
+            let error = self.call_depth_overflow_error();
+            return self.unwind_error_to_marker(error, base_depth, depth_charged);
+        }
+        // Only `xpcall`'s own protected-call/message-handler dispatch
+        // mirrors real Lua's `nCcalls` budget here (see `XCallStage`'s doc) -
+        // `Pcall`/`Once`/`Sort`/`Gsub` markers never retry themselves the way
+        // an `xpcall` message handler can, so they can never accumulate this
+        // charge unboundedly and don't need to be charged for it at all. The
+        // budget ceiling itself is enforced by the caller
+        // (`unwind_error_to_marker`'s `XCallStage::Handler` arm), which is
+        // the only place a retry is ever decided, not here.
+        if matches!(cont, NativeCont::Xpcall(_)) {
+            self.xcall_retry_depth += 1;
         }
         self.call_depth += 1;
         *depth_charged += 1;
@@ -1502,6 +1678,14 @@ impl LuaRuntime {
         if fires_hook {
             self.fire_hook("call", None)?;
         }
+        // `callee` here is always a callback native code is about to invoke
+        // on the Lua-visible function's behalf (`pcall`/`xpcall`'s protected
+        // function, `table.sort`'s comparator, `string.gsub`'s replacement) -
+        // never the wrapping native itself, which the bytecode `Instr::Call`
+        // (or a nested reentrant native call) already named at its own call
+        // site. It therefore never has a bytecode call site of its own, so
+        // real Lua's `pushglobalfuncname` fallback naming applies uniformly
+        // here, matching `resolve_call`'s callers.
         self.resolve_call(callee, args, base_depth, depth_charged)
     }
 
@@ -1519,9 +1703,24 @@ impl LuaRuntime {
     /// caught by the very marker the caller just pushed (or a still-earlier
     /// one), matching real Lua's protected-call semantics. Shared by
     /// `push_native_call` (which pushes a freshly-charged marker before calling
-    /// this) and by `drive`'s `NativeCont::Sort`/`NativeCont::Gsub` resume arms
+    /// this), `drive`'s `NativeCont::Sort`/`NativeCont::Gsub` resume arms
     /// (which push an *uncharged* continuation marker - the same logical call
-    /// as before, not a new one - before calling this).
+    /// as before, not a new one - before calling this), and
+    /// `resume_coroutine` (a coroutine body's first call). Every caller's
+    /// `callee` is, by construction, a callback native code is invoking on
+    /// the Lua-visible function's behalf - `pcall`/`xpcall`'s protected
+    /// function, `table.sort`'s comparator, `string.gsub`'s replacement, a
+    /// coroutine's body - never something reached through a bytecode
+    /// `Instr::Call` (that path uses `annotate_call_error`/
+    /// `annotate_bad_argument_error` instead, over on the `CallLeaf`
+    /// dispatch). Such a callee never has a bytecode call site of its own,
+    /// so a "bad argument" error from it is named using real Lua's
+    /// `pushglobalfuncname` fallback (`qualify_callback_argument_error`),
+    /// confirmed against the pinned Lua 5.5.1 oracle: `table.sort({1,2,3},
+    /// table.sort)` and `coroutine.resume(coroutine.create(table.sort))`
+    /// both report `bad argument #1 to 'table.sort' (...)` (qualified),
+    /// while `table.sort({1,2,3}, 5)` - an ordinary bytecode-issued call -
+    /// reports bare `'sort'`.
     pub(super) fn resolve_call(
         &mut self,
         callee: LuaValue,
@@ -1529,6 +1728,7 @@ impl LuaRuntime {
         base_depth: usize,
         depth_charged: &mut usize,
     ) -> LuaResult<CallStep> {
+        let callee_for_naming = callee.clone();
         match self.step_result_for_call(callee, args) {
             Ok(StepResult::PushClosure {
                 closure,
@@ -1539,11 +1739,8 @@ impl LuaRuntime {
                 call_chain_hops,
             }) => {
                 if self.call_depth >= self.max_call_depth {
-                    return self.unwind_error_to_marker(
-                        LuaError::new("stack overflow (Lua call-depth budget exhausted)"),
-                        base_depth,
-                        depth_charged,
-                    );
+                    let error = self.call_depth_overflow_error();
+                    return self.unwind_error_to_marker(error, base_depth, depth_charged);
                 }
                 self.call_depth += 1;
                 *depth_charged += 1;
@@ -1557,7 +1754,10 @@ impl LuaRuntime {
             }
             Ok(StepResult::CallLeaf { callee, args }) => match self.call(callee, args) {
                 Ok(values) => Ok(CallStep::Done(values)),
-                Err(error) => self.unwind_error_to_marker(error, base_depth, depth_charged),
+                Err(mut error) => {
+                    self.qualify_callback_argument_error(&mut error, &callee_for_naming);
+                    self.unwind_error_to_marker(error, base_depth, depth_charged)
+                }
             },
             Ok(StepResult::CallNative { cont, callee, args }) => {
                 self.push_native_call(cont, callee, args, base_depth, depth_charged)
@@ -1565,7 +1765,10 @@ impl LuaRuntime {
             Ok(StepResult::Resolved(values)) => Ok(CallStep::Done(values)),
             Ok(StepResult::Yield(values)) => Ok(CallStep::Yielded(values)),
             Ok(StepResult::Done(_)) => unreachable!("step_result_for_call never returns Done"),
-            Err(error) => self.unwind_error_to_marker(error, base_depth, depth_charged),
+            Err(mut error) => {
+                self.qualify_callback_argument_error(&mut error, &callee_for_naming);
+                self.unwind_error_to_marker(error, base_depth, depth_charged)
+            }
         }
     }
 
@@ -1711,7 +1914,7 @@ impl LuaRuntime {
                     frame,
                     Frame::Native(NativeCont::Pcall)
                         | Frame::Native(NativeCont::Xpcall(XCallStage::Function { .. }))
-                        | Frame::Native(NativeCont::Xpcall(XCallStage::Handler))
+                        | Frame::Native(NativeCont::Xpcall(XCallStage::Handler { .. }))
                 )
             })
         };
@@ -1768,14 +1971,40 @@ impl LuaRuntime {
                 unreachable!("unwind_error_to_marker: marker_index must point at a Frame::Native")
             }
         };
-        self.call_depth -= removed;
+        self.release_call_depth(removed);
         *depth_charged -= removed;
-        match cont {
-            NativeCont::Pcall => Ok(CallStep::Done(vec![
+        if error.double_fault {
+            // Real Lua's `LUA_ERRERR` (see `double_fault`'s doc) bypasses
+            // every message handler entirely - it never calls `f`'s handler
+            // again, it resolves straight to this fixed message at whichever
+            // `pcall`/`xpcall` marker is nearest, exactly like the ordinary
+            // success/give-up paths below restoring this xpcall's `nCcalls`
+            // save point.
+            if let NativeCont::Xpcall(
+                XCallStage::Function { entry_retry_depth, .. }
+                | XCallStage::Handler { entry_retry_depth, .. },
+            ) = cont
+            {
+                self.xcall_retry_depth = entry_retry_depth;
+            }
+            self.reset_call_depth_overflow();
+            return Ok(CallStep::Done(vec![
                 LuaValue::Bool(false),
-                error.into_lua_value(&self.canonical_heap),
-            ])),
-            NativeCont::Xpcall(XCallStage::Function { handler }) => {
+                LuaValue::String(self.intern_str(b"error in error handling")),
+            ]));
+        }
+        match cont {
+            NativeCont::Pcall => {
+                self.reset_call_depth_overflow();
+                Ok(CallStep::Done(vec![
+                    LuaValue::Bool(false),
+                    error.into_lua_value(&self.canonical_heap),
+                ]))
+            }
+            NativeCont::Xpcall(XCallStage::Function {
+                handler,
+                entry_retry_depth,
+            }) => {
                 // Stashed for `debug.traceback` to pick up if `handler` is (or
                 // calls) it: real Lua's message handler runs with the erroring
                 // stack still in place, but this trampoline has already unwound
@@ -1785,23 +2014,69 @@ impl LuaRuntime {
                 self.pending_error_stack = Some(error.stack.clone());
                 let error_value = error.into_lua_value(&self.canonical_heap);
                 self.push_native_call(
-                    NativeCont::Xpcall(XCallStage::Handler),
+                    NativeCont::Xpcall(XCallStage::Handler {
+                        handler: handler.clone(),
+                        entry_retry_depth,
+                    }),
                     handler,
                     vec![error_value],
                     base_depth,
                     depth_charged,
                 )
             }
-            NativeCont::Xpcall(XCallStage::Handler) => {
-                // The message handler itself raised while running (real Lua's
-                // "error in error handling" double fault, e.g. a  handler that
-                // recurses past the call-depth budget the same way the original
-                // error did) - real Lua does not attempt to invoke the handler
-                // again for its own error, it synthesizes this fixed message.
-                Ok(CallStep::Done(vec![
-                    LuaValue::Bool(false),
-                    LuaValue::String(self.intern_str(b"error in error handling")),
-                ]))
+            NativeCont::Xpcall(XCallStage::Handler {
+                handler,
+                entry_retry_depth,
+            }) => {
+                // The message handler itself raised while running. Real
+                // Lua's `luaG_errormsg` re-invokes `L->errfunc` again on
+                // this very error, completely unconditionally (confirmed
+                // against the pinned oracle: `xpcall(error, err, 300)`
+                // retries a self-recursing handler ~300 times and still
+                // surfaces the handler's own eventual `"C stack overflow"`
+                // return value, not a synthesized double-fault) - it only
+                // gives up with the fixed `"error in error handling"`
+                // message past a hard cutoff a bit above the ordinary
+                // native-call budget (`lstate.c`'s `luaE_checkcstack`,
+                // `LUAI_MAXCCALLS/10*11`), to stop a handler that never
+                // terminates (e.g. `xpcall(error, error)`, whose handler
+                // keeps re-raising `nil` forever) from genuinely recursing
+                // without bound.
+                if self.xcall_retry_depth >= MAX_NATIVE_CALL_DEPTH * 11 / 10 {
+                    self.xcall_retry_depth = entry_retry_depth;
+                    self.reset_call_depth_overflow();
+                    Ok(CallStep::Done(vec![
+                        LuaValue::Bool(false),
+                        LuaValue::String(self.intern_str(b"error in error handling")),
+                    ]))
+                } else {
+                    self.pending_error_stack = Some(error.stack.clone());
+                    // At (or past) the budget itself, real Lua's own
+                    // `luaE_checkcstack` synthesizes exactly this message as
+                    // a fresh runtime error and routes it through the same
+                    // `luaG_errormsg` handler dispatch as any other error,
+                    // rather than ending the retry loop outright - it is
+                    // still just another value for `handler` to see (and,
+                    // for a handler that recognizes it like this corpus's
+                    // `err`, to return unchanged, which is what ends the
+                    // loop on the *next* iteration via the ordinary success
+                    // path instead of this cutoff).
+                    let error_value = if self.xcall_retry_depth >= MAX_NATIVE_CALL_DEPTH {
+                        LuaValue::String(self.intern_str(b"C stack overflow"))
+                    } else {
+                        error.into_lua_value(&self.canonical_heap)
+                    };
+                    self.push_native_call(
+                        NativeCont::Xpcall(XCallStage::Handler {
+                            handler: handler.clone(),
+                            entry_retry_depth,
+                        }),
+                        handler,
+                        vec![error_value],
+                        base_depth,
+                        depth_charged,
+                    )
+                }
             }
             NativeCont::Once => {
                 unreachable!("unwind_error_to_marker: marker search never matches SingleCall")
@@ -2177,6 +2452,91 @@ impl LuaRuntime {
         }
     }
 
+    /// Real Lua's `pushglobalfuncname` (`lauxlib.c`), the fallback
+    /// `luaL_argerror` uses whenever the erroring call has no nameable Lua
+    /// call site - a native function invoked directly by another native's
+    /// own Rust code (e.g. `table.sort`'s comparator call, `string.gsub`'s
+    /// replacement-function call), rather than reached through a bytecode
+    /// `Call` instruction that `describe_register`/`annotate_bad_argument_error`
+    /// can name. Searches the globals table itself, then one level into each
+    /// of its nested library tables, for the exact callee value, and reports
+    /// the qualified `modname.name` when found nested (or the bare name when
+    /// found directly at the top level, matching `pushglobalfuncname`'s own
+    /// `_G`-stripping behavior) - this is what turns a bad-argument error
+    /// raised from inside `table.sort(..., table.sort)`'s own comparator call
+    /// into `'table.sort'` instead of the ambiguous bare `'sort'`.
+    pub(super) fn global_function_name(&self, value: &LuaValue) -> Option<String> {
+        let LuaValue::Table(globals_table) = self.globals.as_value() else {
+            return None;
+        };
+        let entries = self.table_entries(globals_table).ok()?;
+        let as_name = |key: &LuaValue| match key {
+            LuaValue::String(name) => Some(String::from_utf8_lossy(name.as_bytes()).into_owned()),
+            _ => None,
+        };
+        for (key, entry_value) in &entries {
+            if entry_value == value {
+                if let Some(name) = as_name(key) {
+                    return Some(name);
+                }
+            }
+        }
+        for (outer_key, entry_value) in &entries {
+            let LuaValue::Table(inner_table) = entry_value else {
+                continue;
+            };
+            let Some(outer_name) = as_name(outer_key) else {
+                continue;
+            };
+            let inner_entries = self.table_entries(*inner_table).ok()?;
+            for (inner_key, inner_value) in &inner_entries {
+                if inner_value == value {
+                    if let Some(inner_name) = as_name(inner_key) {
+                        return Some(format!("{outer_name}.{inner_name}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Applied only at callback-invocation sites that have no bytecode call
+    /// site of their own (`table.sort`'s comparator, `string.gsub`'s
+    /// replacement function): if `error` carries the `"bad argument #N to
+    /// '<name>'"` shape a native function's own argument check produces, and
+    /// `callee`'s bare name can be resolved to a more specific qualified
+    /// global name (see `global_function_name`), rewrite the message to use
+    /// it - mirroring real Lua's `pushglobalfuncname` fallback exactly.
+    /// A bytecode-issued call never reaches this: its own call-site name
+    /// (already bare, and already correct - real Lua's `getobjname` also
+    /// reports a bare field name for a direct `table.sort(...)` call) is
+    /// handled separately by `annotate_bad_argument_error`.
+    pub(super) fn qualify_callback_argument_error(&self, error: &mut LuaError, callee: &LuaValue) {
+        let LuaValue::NativeFunction(native) = callee else {
+            return;
+        };
+        let bare = native.name();
+        let Some(qualified) = self.global_function_name(callee) else {
+            return;
+        };
+        if qualified == bare {
+            return;
+        }
+        let Some(rest) = error.message.strip_prefix("bad argument #") else {
+            return;
+        };
+        let Some((digits, rest)) = rest.split_once(" to '") else {
+            return;
+        };
+        if digits.parse::<u32>().is_err() {
+            return;
+        }
+        let Some(rest) = rest.strip_prefix(&format!("{bare}' (")) else {
+            return;
+        };
+        error.message = format!("bad argument #{digits} to '{qualified}' ({rest}");
+    }
+
     pub(super) fn raw_index(&self, value: LuaValue, key: LuaValue) -> LuaResult<LuaValue> {
         let table = self.expect_table(&value)?;
         self.table_get(table, &key)
@@ -2498,7 +2858,10 @@ impl LuaRuntime {
                 let function = args[0].clone();
                 let extra_args = args.split_off(2);
                 return Ok(StepResult::CallNative {
-                    cont: NativeCont::Xpcall(XCallStage::Function { handler }),
+                    cont: NativeCont::Xpcall(XCallStage::Function {
+                        handler,
+                        entry_retry_depth: self.xcall_retry_depth,
+                    }),
                     callee: function,
                     args: extra_args,
                 });
@@ -2592,7 +2955,12 @@ impl LuaRuntime {
                         ))
                     }
                 };
-                self.expect_table(&table_value)?;
+                if let Err(error) = self.expect_table(&table_value) {
+                    return Err(LuaError::new(format!(
+                        "bad argument #1 to 'sort' ({})",
+                        error.message
+                    )));
+                }
                 // See the blocking `call_native` arm: an explicit `nil`
                 // comparator must fall back to the default `<` order, not be
                 // called as if it were a function.

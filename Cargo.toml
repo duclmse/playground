@@ -1,10 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crate/dap-server",
     "crate/decompiler",
+    "crate/ebnf",
     "crate/sol",
     "crate/sol-core",
     "crate/sol-lsp",
 ]
-exclude = ["crates/vm", "crates/lua-vm", "crates/dap-server"]
+# crate/lua-vm and its DAP consumer (crate/dap-server) stay outside the
+# canonical workspace as migration history until the sol-core WASM adapter
+# replaces their browser-facing interfaces (docs/features/unified-sol-runtime-plan.md §3.1).
+exclude = ["crate/lua-vm", "crate/dap-server"]

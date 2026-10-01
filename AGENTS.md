@@ -8,16 +8,22 @@ playground, and editor tooling. The authoritative future roadmap is
 The current implementation still contains two runtime efforts during that
 migration:
 
-- `crates/lua-vm` is the current browser runtime, built on the vendored
-  `crates/vm` (a patched Piccolo fork) and compiled to WebAssembly for
-  `apps/web`. It is a migration oracle/fallback, not the final production
-  engine.
+- `crate/lua-vm` was the prior browser runtime, built on the vendored Piccolo
+  fork `crates/vm`. That fork has been retired (deleted, not just excluded)
+  and `crate/lua-vm`'s own source was never updated to match, so it and its
+  DAP consumer (`crate/dap-server`) no longer compile; both stay outside the
+  root Cargo workspace as migration history until the `sol-core` WASM adapter
+  replaces their browser-facing interfaces (see
+  `docs/features/unified-sol-runtime-plan.md` §3.1). Do not port them back
+  onto a resurrected `vm` without checking that plan first.
 - `crates/sol` contains the native compiler/JIT and the in-progress Lua 5.5
   runtime that will become canonical. Its implementation status is in
   `docs/features/` and its current language contract is in `docs/spec/`.
 - `crates/sol-core` is the portable, host-independent foundation for the
-  canonical value/object model, precise roots, and tracing collector. U2 is
-  migrating production objects onto it incrementally.
+  canonical value/object model, precise roots, and tracing collector.
+  Production tables/closures/coroutines finished migrating onto it (U2,
+  completed 2026-09-26; see `docs/features/unified-sol-runtime-plan.md` and
+  `docs/features/table-closure-coroutine-cutover.md`).
 - `crates/decompiler` is an independent recovery-oriented decompiler for
   raw Sol instruction words and version-matched Lua binary chunks.
 
@@ -31,11 +37,11 @@ runtime by file extension.
 - `apps/web` — Vite + React + TypeScript playground UI.
 - `packages/lua-runtime` — wasm-bindgen package consumed by the web app;
   generated `pkg/` contents come from `scripts/build-wasm.sh`.
-- `crates/lua-vm` — WASM-facing runtime, debugger session, conformance tests.
-- `crates/vm` — vendored Piccolo fork and path dependency, intentionally
-  excluded from the root Cargo workspace. Preserve fork-marker comments and
-  read `crates/vm/README.md` before changing its debugger-facing internals.
-- `crates/dap-server` — native Debug Adapter Protocol server using `lua-vm`.
+- `crate/lua-vm` — former WASM-facing runtime/debugger session; retired
+  along with `crates/vm` (see the migration note above) and excluded from the
+  root Cargo workspace. Does not currently compile.
+- `crate/dap-server` — native Debug Adapter Protocol server that depended on
+  `lua-vm`; excluded from the root Cargo workspace for the same reason.
 - `crates/sol` — standalone Cargo crate with compiler, interpreter, JIT, AOT,
   and Lua-compatibility fixtures.
 - `crates/sol-core` — portable canonical runtime value/heap/GC foundation; no
@@ -49,17 +55,16 @@ runtime by file extension.
 
 ## Commands
 
-The root Cargo workspace covers first-party crates and excludes the vendored
-`crates/vm` fork. Use it for cross-crate validation, or run commands against a
-specific manifest for focused work:
+The root Cargo workspace covers first-party crates and excludes `crate/lua-vm`
+and `crate/dap-server` (retired migration history, see above). Use it for
+cross-crate validation, or run commands against a specific manifest for
+focused work:
 
 ```sh
 cargo test --workspace
-cargo test --manifest-path crates/lua-vm/Cargo.toml
 cargo test --manifest-path crates/sol-core/Cargo.toml
 cargo test --manifest-path crates/sol/Cargo.toml
 cargo test --manifest-path crates/decompiler/Cargo.toml
-cargo test --manifest-path crates/dap-server/Cargo.toml
 cargo build --manifest-path crates/sol-lsp/Cargo.toml
 ```
 
@@ -107,8 +112,8 @@ system Lua executable as its oracle.
   copy a file into `tests/` temporarily if you need it to actually run.
 - Preserve byte-oriented Lua source handling in Sol; do not require source or
   string-literal bytes to be valid UTF-8.
-- Avoid modifying generated output, lockfiles, vendored `crates/vm`, or broad
-  documentation rewrites unless the task calls for them.
+- Avoid modifying generated output, lockfiles, or broad documentation
+  rewrites unless the task calls for them.
 - The worktree may contain user changes. Inspect `git status` first and do not
   revert, reformat, or overwrite unrelated edits.
 

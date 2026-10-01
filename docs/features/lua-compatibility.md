@@ -147,8 +147,14 @@ report can tell a missing Sol feature from an unavailable host facility.
 - [x] Parse local, nested, anonymous, and named-vararg (`...name`) functions;
       reject a vararg expression outside its enclosing vararg function.
 - [x] Parse Lua labels/gotos, generic `for` loops, and multi-value returns.
-      Same-block labels/gotos and general iterator triples now execute; complete
-      goto scope-entry validation remains open.
+      Same-block labels/gotos and general iterator triples now execute; goto
+      scope-entry validation is complete (`FuncState` tracks a live
+      active-local count per scope mirroring real Lua's `fs->nactvar`,
+      clamped on a bubbled-out pending goto to match `movegotosout`, and
+      `check_goto_scope` rejects both duplicate labels and a `goto` that jumps
+      into a local's or `global`-pseudo-local's scope with real Lua's own
+      message) - `goto.lua`'s unmodified corpus file now runs end to end and
+      is promoted to `pass` (`tests/lua55/manifest.toml`).
 - [x] Parse Lua 5.5 `global` declarations in `.lua` only, including attributes
       and const diagnostics. Reject the same spelling in `.sol` with a useful
       source span and migration suggestion.
@@ -186,18 +192,25 @@ represented by the current scalar-only `any` box.
       coercion at all (`"2" + "3"` errors; real Lua coerces numeral strings
       in arithmetic contexts) — open.
 
-      Known, deliberate divergence: `LuaValue::identity_address`
-      (`lua_runtime/value.rs`) derives a string's `%p` identity from its
-      canonical heap `ObjectId`, and Sol's canonical heap interns every string
-      by content regardless of length, where real Lua's `lstring.c` only
-      interns short strings (<= `LUAI_MAXSHORTLEN`, 40 bytes) - long strings
-      each get their own allocation/address on every call. This makes
+      Fixed, previously described here as a permanent divergence: Sol's
+      canonical heap already splits short-string interning from long-string
+      allocation at real Lua's `lstring.c` boundary (`Heap::alloc_string` vs.
+      `Heap::alloc_string_fresh`/`Heap::MAX_SHORT_STRING_LEN`, <=
+      `LUAI_MAXSHORTLEN`/40 bytes; landed with the U2 canonical-heap
+      migration), so long strings already get their own allocation on every
+      call. The actual bug was one level up: `LuaValue::identity_address`
+      (`lua_runtime/value.rs`)'s `String` arm was `| 1`-masking its already-
+      unique `ObjectId`, a leftover from an older content-hash-based scheme
+      that, on the `ObjectId` slot encoding, collapsed two adjacent long
+      strings' reported `%p` addresses together. This made
       `lua-5.5.1-tests/strings.lua`'s "long strings aren't internalized"
       assertion (`topointer(s1) ~= topointer(s2)` for two content-identical
-      300-byte strings) permanently false without a short/long split in the
-      string heap's interning policy - a representational change, not a local
-      fix. Tracked as `pending` in `tests/lua55/manifest.toml`'s
-      `strings.lua` entry.
+      300-byte strings) fail non-deterministically depending on heap-slot
+      adjacency. Fixed by removing the mask; covered by
+      `dynamic_lua_runtime_two_separately_computed_long_strings_never_share_identity`
+      and `dynamic_lua_runtime_long_strings_from_different_sources_share_one_table_key`
+      (`lua55_dynamic_runtime_string.rs`). `strings.lua` now runs end-to-end
+      and is `pass` in `tests/lua55/manifest.toml`.
 - [x] Add Lua bytecode registers, constants, upvalue descriptors, and source
       spans. Interpret dynamic code through this VM; do not force it through
       typed Cranelift lowering. `lua_bytecode.rs` compiles each Lua function
@@ -292,22 +305,23 @@ typed top-level function values.
       `while`-condition cleanup site's own re-tested register, for as long as
       that loop is being compiled. See `tests/lua55/manifest.toml`'s
       `closure.lua` entry.
-- [~] Implement Lua call frames, recursive calls, proper vararg packs, and
+- [x] Implement Lua call frames, recursive calls, proper vararg packs, and
       multi-result propagation through call, return, assignment, table
       construction, and parenthesized-expression truncation sites.
 
-      Known gap: a named vararg parameter (`function f(...v)`) is supposed to
-      bind `v` to the call's varargs without allocating any table/object (real
-      Lua 5.5 semantics; see `lua-5.5.1-tests/vararg.lua`'s `notab` case,
-      which asserts `collectgarbage"count"` is unchanged across two identical
-      calls). Sol's `lua_runtime/dispatch.rs::call_closure` frame-construction
-      code instead unconditionally allocates a fresh `Table` via
-      `self.values_table(&varargs)` for every call with a named vararg
-      parameter. Matching real Lua would need a lazy/virtual vararg-table view
-      sharing the frame's own `varargs: Vec<LuaValue>` storage directly rather
-      than copying into a separate heap `Table` - a new indexing/dispatch/
-      GC-root-scanning primitive, not a local fix. Tracked as `pending` in
-      `tests/lua55/manifest.toml`'s `vararg.lua` entry.
+      A named vararg parameter (`function f(...v)`) binds `v` to the call's
+      varargs without allocating any table/object as long as it's accessed
+      only through dynamic indexing (real Lua 5.5 semantics; see
+      `lua-5.5.1-tests/vararg.lua`'s `notab` case, which asserts
+      `collectgarbage"count"` is unchanged across two identical calls).
+      `lua_bytecode/mod.rs`'s `try_lower_vararg_to_lazy_view` proves, per
+      function, that the vararg register is never captured and never used
+      except as the `base` of an index/field access, rewriting those accesses
+      to 4 dedicated opcodes (`VarargIndexGet`/`VarargIndexSet`/
+      `VarargFieldGet`/`VarargFieldSet`) that read/write the frame's own
+      `varargs: Vec<LuaValue>` directly and only materialize a real `Table`
+      on demand (an out-of-range or non-integer-keyed write). See
+      `tests/lua55/manifest.toml`'s `vararg.lua` entry (`pass`).
 - [x] Implement `pcall`, `xpcall`, `error`, `assert`, and `select`, preserving
       error values and a bounded, useful stack trace. Add recursion/instruction
       budgets before host-exposed sandbox use. Recursion, instruction/backedge,
@@ -335,6 +349,42 @@ typed top-level function values.
       display text still uses non-metamethod-aware `display_bytes()`, matching
       real Lua's `error()`/`assert()`, which don't invoke `__tostring` (only
       `lua.c`'s top-level `msghandler` does).
+      A callee invoked by native Rust code rather than by a bytecode
+      `Instr::Call` - `pcall`/`xpcall`'s protected function, `table.sort`'s
+      comparator, `string.gsub`'s replacement, a coroutine's body - never has
+      a bytecode call site to name, so `LuaRuntime::resolve_call`
+      (`dispatch.rs`) now applies real Lua's `pushglobalfuncname` fallback
+      (`global_function_name`/`qualify_callback_argument_error`, searching
+      `_G`/loaded library tables for a value-identity match) to a "bad
+      argument" error from any such call, matching the pinned oracle for
+      `table.sort({1,2,3}, table.sort)` (`'table.sort'`),
+      `pcall(string.sub, 'a', {})` (`'string.sub'`), and
+      `coroutine.resume(coroutine.create(table.sort))` (`'table.sort'`),
+      while an ordinary bytecode-issued `table.sort({1,2,3}, 5)` keeps the
+      bare `'sort'` name from its own call site. See the `errors.lua` note in
+      `tests/lua55/manifest.toml` for the fix's full detail. `errors.lua` is
+      now `pass`: `MAX_NATIVE_CALL_DEPTH` already distinguishes real Lua's
+      "C stack overflow" wording for a runaway `coroutine.create`/`resume`
+      recursion from the ordinary call-depth-budget "stack overflow", a
+      generic-`for` iterator-call error is attributed to the iterator
+      expression list's own line rather than the `for` keyword's line, and a
+      second, unrelated value-stack overflow raised from within an
+      already-running `xpcall` message handler now bypasses the handler and
+      resolves directly to "error in error handling"
+      (`LuaRuntime::call_depth_overflowed_once`/`LuaError::double_fault`),
+      matching real Lua's `ldo.c` double-fault/`luaD_pcall`-shrinkstack-on-catch
+      semantics. That double-fault accounting change had two ripple effects on
+      other previously-`pass` rows, both since fixed: `calls.lua` needed a
+      raised instruction `budget` (its C-stack-overflow-in-handler test costs
+      more instructions under the more precise accounting; behavior is
+      unchanged and still oracle-exact), and `coroutine.lua` surfaced a
+      genuine `call_depth` double-release bug in `coroutine.close()`'s
+      `Suspended` branch (it re-subtracted a suspended coroutine's parked
+      `depth_charged` even though `resume_coroutine`'s `Yielded` arm had
+      already released that charge back out of the shared counter when the
+      coroutine yielded), now fixed by having `close()` simply clear the
+      parked value instead of subtracting it again. See both files' notes in
+      `tests/lua55/manifest.toml` for full detail.
 - [x] Specify and implement tail-call behavior. The generic compiler emits an
       explicit semantic tail call for a sole returned call expression. Lua
       closure calls replace the active trampoline frame without increasing the
@@ -468,9 +518,17 @@ upvalues and final-expression result expansion.
       work and return the same handle, matching real Lua's default-output-file
       chaining; this is not a full file-handle implementation (no `close`/
       `seek`/`lines`/real `io.open`/`io.stderr` — there is still only one
-      process-wide output sink, `LuaRuntime::output`). Filesystem, locale,
-      `debug`, and native-module authorities still gate no implemented host
-      provider, so the profile split remains partial.
+      process-wide output sink, `LuaRuntime::output`). Filesystem (`io.open`/
+      `io.output(path)`/`os.remove`/`os.tmpname`), `debug` (the `debug`
+      library's introspection/hook natives), and native-module authority
+      (`package.loadlib`/the C searcher's real `dlopen`-based loading,
+      `c_api.rs`) each gate a real implemented provider, denial-tested the
+      same way. Locale is the one field that still gates no real backend
+      (`os.setlocale` is bookkeeping-only; Sol has no timezone/locale
+      database), so the profile split is complete except for that one field.
+      See `docs/features/host-native-boundary.md` for the full capability
+      matrix, including the Lua 5.5 C API/native-module-loading embedding
+      surface this capability set gates access to from Lua scripts.
 - [~] Implement `load`/`loadstring`/`dofile` (compile a Lua string/registered
       module into a callable closure at runtime). `load`/`loadstring` compile
       arbitrary source and return `(nil, error_string)` on failure, matching
@@ -543,46 +601,75 @@ oracle; every omitted library entry has a documented capability status.
 - [~] Run `gc`, `gengc`, and `tracegc` in their own capability category; map
       their implementation-dependent expectations to semantic invariants and
       retain exact upstream assertions where Sol claims identical behavior.
-      `gc.lua` no longer stops on the earlier `debug`-library/native-module
-      gaps: `collectgarbage`'s mode/pause/stepmul bookkeeping, genuinely
-      bounded incremental `"step"` stepping (`sol_core::Heap`'s resumable
-      major-collection phase), the weak-value-string sweep exemption, and a
-      general register-retirement GC-root leak in the Lua-mode bytecode
-      compiler (stale, not-yet-recycled registers were kept rooted by
-      `push_lua_frame_roots`, defeating weak-table pruning for a
-      reference-typed condition/temporary) are all fixed — see
-      `tests/lua55/manifest.toml`'s `gc.lua` case note for the fix-by-fix
-      detail. A further `__gc`-finalizer-registration gap at line 457 (a
-      finalizer attached via a non-function placeholder later overwritten
-      with the real function, `setmetatable(u, {__gc = true})` then
-      `getmetatable(u).__gc = function...`, never ran — real Lua registers
-      on mere field *presence* at `setmetatable` time, deferring the
-      callability check to actual finalization) is also fixed
-      (`table_set_metatable` in `lua_runtime/table.rs`). The file now runs
-      through the entire weak-tables section, including `__gc x weak
-      tables`, and stops at line 477: `collectgarbage("count")` (live heap
-      KB) does not settle back to its pre-allocation baseline after two
-      ~4MB long-string weak-table keys become unreachable. Root-caused as a
-      non-leak: both strings are correctly reclaimed once unreachable: the
-      small (~1 KB) overshoot comes from `sol_core::TableObject`'s byte
-      footprint tracking `Vec`/`HashMap` *capacity*, which (like Rust's std
-      collections generally) never shrinks back down after entries are
-      deleted, unlike real Lua's own shrink-on-delete array/hash table
-      layout. Matching that byte-for-byte would need a representational
-      change disproportionate to one memory-accounting assertion — deferred,
-      same class as `constructs.lua`'s quadratic-heap gap. `gengc.lua`/
-      `tracegc.lua` remain unattempted.
+      `gc.lua` is now oracle-backed end to end (`tests/lua55/manifest.toml`
+      status `pass`, under a raised `budget`/`alloc_budget`): beyond the
+      earlier-fixed `debug`-library/native-module gaps, mode/pause/stepmul
+      bookkeeping, bounded incremental `"step"` stepping, the weak-value-
+      string sweep exemption, the register-retirement GC-root leak, and the
+      `__gc`-registration presence-vs-callability gap (all already noted
+      above), three further bugs surfaced and are now fixed. (1) The former
+      line-477 `collectgarbage("count")` overshoot was misdiagnosed here
+      previously as `TableObject` capacity retention; the actual cause was
+      `sol_core::object_byte_footprint`'s `String` arm charging every
+      string's fixed baseline as `size_of::<HeapObject>()` — the whole enum,
+      sized to its largest variant (`TableObject`) — instead of `String`'s
+      own natural size (`Vec<u8>`), inflating every live string's counted
+      cost by that gap; fixed by charging `size_of::<Vec<u8>>()` instead,
+      matching every other arm's own-variant-size convention. (2) A line-540
+      spurious "stack overflow (Lua call-depth budget exhausted)" on an
+      ordinary, shallow `coroutine.resume`: the single global `call_depth`
+      counter was never released for a merely-*suspended* (not dead, not
+      resumed-to-completion) coroutine, so the "self-referenced threads"
+      stress section's 1000 simultaneously idle-but-alive coroutines
+      exhausted the shared recursion budget through sheer count — unlike
+      real Lua, where an idle coroutine's own stack costs nothing until
+      resumed again; fixed in `resume_coroutine`
+      (`lua_runtime/coroutine.rs`) by releasing the charge on every yield and
+      restoring it on the next resume. (3) A line-704 "collector is not
+      reentrant" assertion: a `__gc` finalizer calling `collectgarbage()` had
+      no reentrancy guard and attempted a genuine nested collection instead
+      of returning `false`; fixed via a new `gc_finalizing` flag on
+      `LuaRuntime`, checked by `CollectGarbage`'s `"collect"`/`"step"` arms.
+      See `tests/lua55/manifest.toml`'s `gc.lua` case note for the full
+      fix-by-fix detail. `gengc.lua` is now also oracle-backed end to end
+      (`tests/lua55/manifest.toml` status `pass`, default budgets): `sol_core`
+      gained a genuine young-generation-only minor collector
+      (`Heap::collect_minor_with_conditional_roots`, per-object
+      `GcGeneration::Young`/`Old` tracking, a write-barrier-maintained
+      `remembered` set, and `should_trace_during_minor`'s remembered-or-young
+      trace gate), and `collectgarbage("step")` now dispatches to it directly
+      under `collectgarbage("generational")` mode instead of always stepping
+      the incremental major cycle — closing the previously-recorded ~148-call
+      latency gap for clearing a weak-value entry pointing at now-garbage
+      young data (real Lua clears it in one call). Validating against the
+      real pinned corpus file surfaced and fixed two further regressions in
+      the new minor-collection path itself: a suspended coroutine's
+      `conditional_roots` frame contents could be silently dropped when its
+      `ThreadObject` was `Old` and unremembered, and — more fundamentally — a
+      minor collection's mark phase never seeded its queue from
+      `self.remembered` itself, so an `Old` object unreachable from any
+      current root that round (but still correctly spared from reclamation,
+      since minor sweeps never reclaim `Old` objects) never had its
+      remembered edges to `Young` children walked, letting a still-referenced
+      child (e.g. the object's own metatable) be swept out from under it.
+      Fixed by seeding the minor mark queue with every `remembered` member up
+      front, the same way real Lua's generational GC treats its remembered
+      list as additional roots for a minor cycle. See
+      `tests/lua55/manifest.toml`'s `gengc.lua` case note for the full
+      fix-by-fix detail and
+      `crates/sol/tests/lua55_dynamic_runtime_gc.rs`'s
+      `dynamic_lua_runtime_generational_mode_clears_weak_entries_in_a_single_step`/
+      `dynamic_lua_runtime_minor_collection_traces_remembered_old_objects_unreachable_from_roots`
+      for focused regression coverage. `tracegc.lua` remains unattempted.
 
 **Exit gate:** dynamic stress fixtures have no dangling references or missed
 roots (done — see the stress-mode checklist item above), collector
 statistics are exposed to the benchmark harness (**not done**), and every
 supported GC observable has a reference-backed test (done for weak tables,
 cycle collection, and finalizers, both under normal and stress-mode
-collection; `gc.lua` itself now runs past the previous debug-library/
-native-module and `__gc`-registration gaps and is blocked only on the
-line-477 table-capacity memory-accounting gap above, a deferred
-representational mismatch rather than a functional bug, tracked in
-`tests/lua55/manifest.toml`; `gengc`/`tracegc` remain unattempted).
+collection, and now also for `gc.lua`'s and `gengc.lua`'s full corpus
+scenarios, which both run to completion and match the pinned oracle;
+`tracegc` remains unattempted).
 
 ## L7 — Coroutines and resumable execution
 

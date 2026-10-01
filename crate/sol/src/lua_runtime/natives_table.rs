@@ -201,7 +201,12 @@ impl LuaRuntime {
             }
             NativeFunction::TableSort => {
                 let table_value = required(0)?;
-                self.expect_table(&table_value)?;
+                if let Err(error) = self.expect_table(&table_value) {
+                    return Err(LuaError::new(format!(
+                        "bad argument #1 to 'sort' ({})",
+                        error.message
+                    )));
+                }
                 // An explicit `nil` comparator (as opposed to omitting the
                 // argument entirely) must fall back to the default `<`
                 // order, exactly like omitting it - `args.get(1)` alone
@@ -403,7 +408,11 @@ impl LuaRuntime {
     ) -> LuaResult<bool> {
         if let Some(comparator) = comparator {
             Ok(self
-                .call(comparator.clone(), vec![a, b])?
+                .call(comparator.clone(), vec![a, b])
+                .map_err(|mut error| {
+                    self.qualify_callback_argument_error(&mut error, comparator);
+                    error
+                })?
                 .into_iter()
                 .next()
                 .unwrap_or(LuaValue::Nil)

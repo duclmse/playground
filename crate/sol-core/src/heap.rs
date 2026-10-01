@@ -968,12 +968,34 @@ impl Heap {
         self.collect(CollectionKind::Major, frame_roots, conditional_roots)
     }
 
-    /// The initial U2 collector shares the precise full tracing algorithm for
-    /// minor and major collections. The remembered set and generations are
-    /// already maintained, allowing a later performance-only change to limit
-    /// minor tracing without changing object semantics.
+    /// A genuine young-generation-only collection: see
+    /// [`collect_minor_with_conditional_roots`](Self::collect_minor_with_conditional_roots).
     pub fn collect_minor(&mut self) -> Collection {
         self.collect(CollectionKind::Minor, &[], &HashMap::new())
+    }
+
+    /// `collectgarbage("step")`'s generational-mode counterpart to
+    /// [`step_major_with_conditional_roots`](Self::step_major_with_conditional_roots):
+    /// one complete, cheap young-generation-only mark/sweep pass, run to
+    /// completion in a single call rather than resumed across several - real
+    /// Lua's own minor collections are similarly single-shot, since the
+    /// young generation is kept small by design, so there's no need to
+    /// bound and resume the work the way a much larger major cycle does.
+    ///
+    /// Tracing only descends into an `Old` object when it's in
+    /// `remembered` (see `should_trace_during_minor`); an `Old` object
+    /// reached but not descended into is still presumed alive (never
+    /// reclaimed, never has a weak table entry pointing at it cleared) -
+    /// only the next major collection re-derives `Old` reachability from
+    /// scratch. This is what makes a minor collection cheap: it examines
+    /// only the young generation plus whatever `Old` objects the
+    /// write-barrier-maintained `remembered` set says might reference it.
+    pub fn collect_minor_with_conditional_roots(
+        &mut self,
+        frame_roots: &[Value],
+        conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+    ) -> Collection {
+        self.collect(CollectionKind::Minor, frame_roots, conditional_roots)
     }
 
     /// Whether a `step_major_with_conditional_roots` cycle is currently
@@ -1047,7 +1069,7 @@ impl Heap {
                 // sub-pass is itself budgeted, since both are bounded by
                 // the (typically small) count of ephemeron tables or
                 // finalizer-registered objects, not by total heap size.
-                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots);
+                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots, false);
                 let unreachable_finalizers: Vec<ObjectId> = self
                     .live_ids()
                     .filter(|id| {
@@ -1064,9 +1086,9 @@ impl Heap {
                     cycle.finalizers.push(id);
                     mark_id(id, self, &mut cycle.marked, &mut cycle.queue);
                 }
-                self.drain_mark_queue(&mut cycle.marked, &mut cycle.queue, conditional_roots);
-                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots);
-                self.sweep_weak_tables(&mut cycle.marked);
+                self.drain_mark_queue(&mut cycle.marked, &mut cycle.queue, conditional_roots, false);
+                self.mark_ephemerons(&mut cycle.marked, &mut cycle.queue, conditional_roots, false);
+                self.sweep_weak_tables(&mut cycle.marked, false);
                 cycle.phase = IncrementalPhase::Sweeping { next_index: 0 };
             }
         }
@@ -1137,11 +1159,29 @@ impl Heap {
 
     fn object_byte_footprint(object: &HeapObject) -> usize {
         match object {
-            HeapObject::String(bytes) => std::mem::size_of::<HeapObject>() + bytes.capacity(),
+            HeapObject::String(bytes) => {
+                // `size_of::<HeapObject>()` is the whole enum, sized to its
+                // largest variant (`TableObject`, currently); charging that
+                // as every string's fixed overhead - rather than a string
+                // object's own natural size - inflates `collectgarbage
+                // ("count")` by the gap between a string and whatever the
+                // biggest heap object variant happens to be, and that gap
+                // grows every time an unrelated variant gains a field.
+                // `Vec<u8>`'s own header is the right fixed cost here, same
+                // as every other arm below charging its own struct's size
+                // rather than the enum's.
+                std::mem::size_of::<Vec<u8>>() + bytes.capacity()
+            }
             HeapObject::Table(table) => {
                 std::mem::size_of::<TableObject>()
-                    + table.array.capacity() * std::mem::size_of::<Value>()
-                    + table.hash.capacity()
+                    // `collectgarbage("count")` reports logical retained
+                    // table payload. Rust's Vec/IndexMap capacity is an
+                    // implementation high-water mark and can survive after
+                    // weak sweeping has removed every entry; charging it
+                    // makes a dead weak table look like it still owns the
+                    // storage of its former keys/values.
+                    + table.array.len() * std::mem::size_of::<Value>()
+                    + table.hash.len()
                         * (std::mem::size_of::<TableKey>() + std::mem::size_of::<Value>())
             }
             HeapObject::Closure(closure) => {
@@ -1337,6 +1377,7 @@ impl Heap {
         // ever resuming a step cycle against a heap a completed full
         // sweep has already reshaped.
         self.incremental = None;
+        let minor = matches!(kind, CollectionKind::Minor);
         let mut marked = HashSet::new();
         let mut queue = VecDeque::new();
         let roots: Vec<Value> = self.roots.values().copied().collect();
@@ -1346,8 +1387,27 @@ impl Heap {
         for root in frame_roots {
             mark_value(*root, self, &mut marked, &mut queue);
         }
-        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots);
-        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots);
+        if minor {
+            // A minor collection never retraces an `Old` object's fields
+            // unless it gets dequeued and `should_trace_during_minor` lets
+            // it through (remembered-or-young) - but an `Old` object that
+            // is itself unreachable from any current root this round (its
+            // owning local went out of scope, say) never gets enqueued at
+            // all otherwise, so its `remembered` write-barrier edge to a
+            // Young child is never walked and that child is (wrongly)
+            // swept as garbage even though the `Old` parent is still very
+            // much alive - a minor sweep leaves every `Old` object standing
+            // regardless of reachability (see the sweep loop below), so the
+            // remembered set itself must seed the mark queue here, the same
+            // way real Lua's generational GC treats its remembered/"gray
+            // again" list as additional roots for a minor cycle.
+            let remembered: Vec<ObjectId> = self.remembered.iter().copied().collect();
+            for id in remembered {
+                mark_id(id, self, &mut marked, &mut queue);
+            }
+        }
+        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots, minor);
+        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots, minor);
 
         let mut result = Collection {
             kind,
@@ -1355,10 +1415,16 @@ impl Heap {
             promoted: 0,
             finalizers: Vec::new(),
         };
+        // A minor collection only ever examines the young generation - see
+        // `should_trace_during_minor` - so an `Old` registered-finalizer
+        // object left unmarked here (never traced into at all) must not be
+        // mistaken for unreachable; only a major collection re-derives
+        // `Old` reachability from scratch and can safely finalize it.
         let unreachable_finalizers: Vec<ObjectId> = self
             .live_ids()
             .filter(|id| {
                 !marked.contains(id)
+                    && (!minor || self.is_young(*id))
                     && self
                         .entry(*id)
                         .is_ok_and(|entry| entry.header.finalizer == FinalizerState::Registered)
@@ -1371,19 +1437,25 @@ impl Heap {
             result.finalizers.push(id);
             mark_id(id, self, &mut marked, &mut queue);
         }
-        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots);
-        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots);
-        self.sweep_weak_tables(&mut marked);
+        self.drain_mark_queue(&mut marked, &mut queue, conditional_roots, minor);
+        self.mark_ephemerons(&mut marked, &mut queue, conditional_roots, minor);
+        self.sweep_weak_tables(&mut marked, minor);
 
         for index in 0..self.slots.len() {
             let id = ObjectId::new(index, self.slots[index].generation);
-            if self.slots[index].entry.is_none() {
+            let Some(generation) = self.slots[index].entry.as_ref().map(|entry| entry.header.generation)
+            else {
+                continue;
+            };
+            if minor && generation == GcGeneration::Old {
+                // Never evaluated for reachability above (see
+                // `should_trace_during_minor`), so never reclaimed here -
+                // only the next major collection gets to decide its fate.
                 continue;
             }
             if marked.contains(&id) {
-                let header = &mut self.slots[index].entry.as_mut().unwrap().header;
-                if header.generation == GcGeneration::Young {
-                    header.generation = GcGeneration::Old;
+                if generation == GcGeneration::Young {
+                    self.slots[index].entry.as_mut().unwrap().header.generation = GcGeneration::Old;
                     result.promoted += 1;
                 }
                 continue;
@@ -1413,10 +1485,48 @@ impl Heap {
         marked: &mut HashSet<ObjectId>,
         queue: &mut VecDeque<ObjectId>,
         conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+        minor: bool,
     ) {
         while let Some(id) = queue.pop_front() {
+            // `conditional_roots` entries are proxy roots living in the
+            // host's own Rust state (a suspended coroutine's frame
+            // contents - see `frame_roots`'s doc comment in
+            // `lua_runtime/gc.rs`), not real object-graph edges a
+            // write-barriered mutation would ever register `id` into
+            // `remembered` for. `trace_object` is the only place that
+            // consults them, so `id` must still be traced once it's
+            // reached even when the young/remembered generational skip
+            // would otherwise apply - an `Old`, unremembered coroutine
+            // object stays *reached* the same way a root does, and
+            // skipping its trace here would silently drop its pinned
+            // frame contents from this collection instead.
+            if minor && !conditional_roots.contains_key(&id) && !self.should_trace_during_minor(id)
+            {
+                continue;
+            }
             self.trace_object(id, marked, queue, conditional_roots);
         }
+    }
+
+    fn is_young(&self, id: ObjectId) -> bool {
+        self.header(id)
+            .is_ok_and(|header| header.generation == GcGeneration::Young)
+    }
+
+    /// Whether a minor collection should descend into `id`'s own fields to
+    /// discover further edges (reached, but not yet dequeued/visited).
+    /// `write_barrier` maintains the invariant this relies on: an `Old`
+    /// object can only come to point at a `Young` one through a mutation,
+    /// and every mutation site adds the mutated owner to `remembered` when
+    /// that happens, so an `Old`, *not*-remembered object's own fields are
+    /// guaranteed to point only at other `Old` objects, unchanged since the
+    /// last time anything traced them - safe to skip re-visiting, which is
+    /// what keeps a minor collection cheap (proportional to the young
+    /// generation's size plus `remembered`'s, not the whole heap). `Young`
+    /// objects (not yet proven stable) and any `remembered` `Old` object
+    /// are always traced.
+    fn should_trace_during_minor(&self, id: ObjectId) -> bool {
+        self.remembered.contains(&id) || self.is_young(id)
     }
 
     /// Marks every object one gray `id` directly points to - the single
@@ -1496,6 +1606,7 @@ impl Heap {
         marked: &mut HashSet<ObjectId>,
         queue: &mut VecDeque<ObjectId>,
         conditional_roots: &HashMap<ObjectId, Vec<Value>>,
+        minor: bool,
     ) {
         // Which objects are weak-key (non-weak-value) tables is a structural
         // property of the heap that doesn't change during collection, so
@@ -1529,7 +1640,14 @@ impl Heap {
                     continue;
                 };
                 for (key, value) in &table.hash {
-                    if key_is_live(key, marked) {
+                    // A minor collection never re-derives an `Old` key's
+                    // true reachability (see `should_trace_during_minor`),
+                    // so it's presumed live here regardless of `marked` -
+                    // only the next major collection may decide otherwise.
+                    let key_alive = key_is_live(key, marked)
+                        || (minor
+                            && matches!(key, TableKey::Object(id) if self.header(*id).is_ok_and(|h| h.generation == GcGeneration::Old)));
+                    if key_alive {
                         mark_value(*value, self, marked, queue);
                     }
                 }
@@ -1538,7 +1656,7 @@ impl Heap {
                     mark_value(*value, self, marked, queue);
                 }
             }
-            self.drain_mark_queue(marked, queue, conditional_roots);
+            self.drain_mark_queue(marked, queue, conditional_roots, minor);
             if marked.len() == before {
                 break;
             }
@@ -1563,11 +1681,20 @@ impl Heap {
     /// table: otherwise the caller's own final sweep-by-`marked` pass would
     /// still free its slot out from under the reference this function just
     /// decided to keep.
-    fn sweep_weak_tables(&mut self, marked: &mut HashSet<ObjectId>) {
+    fn sweep_weak_tables(&mut self, marked: &mut HashSet<ObjectId>, minor: bool) {
         let string_ids: HashSet<ObjectId> = self
             .live_ids()
             .filter(|id| matches!(self.object(*id), Ok(HeapObject::String(_))))
             .collect();
+        // A minor collection never re-derives an `Old` object's true
+        // reachability (see `should_trace_during_minor`), so a weak table
+        // entry pointing at one must not be nilled out here on the strength
+        // of incomplete (young-only) mark info - presume every live `Old`
+        // id "survives" a minor sweep instead. Nothing is ever incorrectly
+        // reclaimed this way, only left for the next major collection to
+        // decide for real.
+        let old_ids: Option<HashSet<ObjectId>> =
+            minor.then(|| self.live_ids().filter(|id| !self.is_young(*id)).collect());
         for slot in &mut self.slots {
             let Some(Entry {
                 object: HeapObject::Table(table),
@@ -1579,7 +1706,8 @@ impl Heap {
             if table.weak_values {
                 let mut nilled_within_border = false;
                 for (index, value) in table.array.iter_mut().enumerate() {
-                    if !value_survives_weak_value_sweep(*value, &string_ids, marked) {
+                    if !value_survives_weak_value_sweep(*value, &string_ids, marked, old_ids.as_ref())
+                    {
                         *value = Value::NIL;
                         nilled_within_border |= index < table.array_border;
                     }
@@ -1596,9 +1724,13 @@ impl Heap {
                 }
             }
             table.hash.retain(|key, value| {
-                let key_alive = !table.weak_keys || key_is_live(key, marked);
+                let key_alive = !table.weak_keys
+                    || key_is_live(key, marked)
+                    || old_ids.as_ref().is_some_and(
+                        |set| matches!(key, TableKey::Object(id) if set.contains(id)),
+                    );
                 let value_alive = !table.weak_values
-                    || value_survives_weak_value_sweep(*value, &string_ids, marked);
+                    || value_survives_weak_value_sweep(*value, &string_ids, marked, old_ids.as_ref());
                 key_alive && value_alive
             });
         }
@@ -1694,16 +1826,22 @@ fn key_is_live(key: &TableKey, marked: &HashSet<ObjectId>) -> bool {
 
 /// See `sweep_weak_tables`'s doc comment: a string value survives
 /// unconditionally (and is marked reachable right here, since it was never
-/// traced as an out-edge to begin with), everything else follows ordinary
-/// weak-value liveness.
+/// traced as an out-edge to begin with); `old_ids` (only `Some` during a
+/// minor collection) makes any other live `Old` id survive too, since a
+/// minor collection never re-derives `Old` reachability; everything else
+/// follows ordinary weak-value liveness.
 fn value_survives_weak_value_sweep(
     value: Value,
     string_ids: &HashSet<ObjectId>,
     marked: &mut HashSet<ObjectId>,
+    old_ids: Option<&HashSet<ObjectId>>,
 ) -> bool {
     let Some(id) = value.as_object() else {
         return true;
     };
+    if old_ids.is_some_and(|set| set.contains(&id)) {
+        return true;
+    }
     if marked.contains(&id) {
         return true;
     }

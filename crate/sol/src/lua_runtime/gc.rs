@@ -167,25 +167,68 @@ impl LuaRuntime {
             .saturating_add(reclaimed_bytes)
             .min(self.allocation_budget);
         self.run_gc_finalizers(collection.finalizers, active_frame);
+        self.prune_dead_coroutines();
     }
 
-    /// `collectgarbage("step", size)`'s actual work: at most `size` units of
-    /// bounded major-collection work via
-    /// `sol_core::Heap::step_major_with_conditional_roots`, resuming
-    /// whatever incremental cycle (if any) a prior `step_garbage` call left
-    /// in progress. Returns whether this call finished the cycle - real
-    /// Lua's own `collectgarbage("step", ...)` return value - crediting
+    /// A registered-but-no-longer-reachable coroutine's `ThreadObject` gets
+    /// physically swept by the collection above like any other dead heap
+    /// object, but `coroutine_registry`'s own entry for it is a side-table
+    /// keyed by that same id, not a heap edge - nothing prunes it on its own,
+    /// so it would otherwise sit in the map forever (`CoroutineRegistry`'s
+    /// own doc comment already says the two are meant to go together; its
+    /// `remove` was, until now, only ever called by a unit test).
+    /// `depth_charged` needs no attention here: `resume_coroutine`'s
+    /// `Yielded` arm already gives back a suspended coroutine's own charge to
+    /// `call_depth` the moment control returns to its resumer (parking the
+    /// amount in `co.depth_charged` purely so the *next* resume can restore
+    /// it), so an unreachable coroutine's stored charge was never still
+    /// outstanding against the shared counter in the first place.
+    fn prune_dead_coroutines(&mut self) {
+        let dead: Vec<ObjectId> = {
+            let heap = self.canonical_heap.borrow();
+            self.coroutine_registry
+                .borrow()
+                .entries()
+                .filter(|(id, _)| !heap.contains(*id))
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let mut registry = self.coroutine_registry.borrow_mut();
+        for id in dead {
+            registry.remove(ThreadRef::new(id));
+        }
+    }
+
+    /// `collectgarbage("step", size)`'s actual work. Under `"generational"`
+    /// mode (`self.gc_mode`), this is one complete, cheap young-generation-
+    /// only pass via `sol_core::Heap::collect_minor_with_conditional_roots` -
+    /// real Lua's own generational minor collection, run to completion in a
+    /// single call rather than bounded/resumed, matching that function's own
+    /// doc comment on why a minor cycle doesn't need incremental stepping.
+    /// Otherwise (the `"incremental"` default), `size` bounds major-
+    /// collection work via `sol_core::Heap::step_major_with_conditional_roots`,
+    /// resuming whatever incremental cycle (if any) a prior `step_garbage`
+    /// call left in progress. Returns whether this call finished the cycle -
+    /// real Lua's own `collectgarbage("step", ...)` return value (a minor
+    /// collection always finishes in the one call that ran it) - crediting
     /// back the reclaimed byte delta and running any `__gc` finalizers the
     /// same way `collect_garbage_with` does, once the cycle actually
-    /// finishes (a cycle still in progress never has any: see
+    /// finishes (an in-progress major cycle never has any: see
     /// `step_major_with_conditional_roots`'s own doc comment).
     pub(super) fn step_garbage(&mut self, size: usize, active_frame: Option<&LuaFrame>) -> bool {
         let (roots, conditional_roots) = self.frame_roots(active_frame);
         let live_before = self.canonical_heap.borrow().live_bytes();
-        let (finished, collection) = self
-            .canonical_heap
-            .borrow_mut()
-            .step_major_with_conditional_roots(size, &roots, &conditional_roots);
+        let (finished, collection) = if self.gc_mode == "generational" {
+            let collection = self
+                .canonical_heap
+                .borrow_mut()
+                .collect_minor_with_conditional_roots(&roots, &conditional_roots);
+            (true, collection)
+        } else {
+            self.canonical_heap
+                .borrow_mut()
+                .step_major_with_conditional_roots(size, &roots, &conditional_roots)
+        };
         let live_after = self.canonical_heap.borrow().live_bytes();
         let reclaimed_bytes = live_before.saturating_sub(live_after);
         self.allocation_remaining = self
@@ -193,6 +236,9 @@ impl LuaRuntime {
             .saturating_add(reclaimed_bytes)
             .min(self.allocation_budget);
         self.run_gc_finalizers(collection.finalizers, active_frame);
+        if finished {
+            self.prune_dead_coroutines();
+        }
         finished
     }
 
@@ -216,6 +262,14 @@ impl LuaRuntime {
             self.push_lua_frame_roots(frame, &mut pinned);
         }
         self.pinned_roots.push(pinned);
+        // Guard against a `__gc` finalizer that calls `collectgarbage()`
+        // itself - see `gc_finalizing`'s field doc. Saved/restored rather
+        // than unconditionally reset to `false` afterward in case this call
+        // is itself already nested inside another finalizer invocation (a
+        // finalizer's own call chain triggering an unrelated, later
+        // collection that queues more finalizers of its own).
+        let was_finalizing = self.gc_finalizing;
+        self.gc_finalizing = true;
         for id in finalizers {
             // Only tables register a finalizer today (`table_set_metatable`
             // is the sole `register_finalizer` call site) - `CanonicalUserdata`
@@ -241,6 +295,7 @@ impl LuaRuntime {
             }
             let _ = self.canonical_heap.borrow_mut().finish_finalizer(id);
         }
+        self.gc_finalizing = was_finalizing;
         self.pinned_roots.pop();
     }
 

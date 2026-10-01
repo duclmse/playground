@@ -193,18 +193,43 @@ impl LuaRuntime {
                 }
             }
             NativeFunction::SetMetatable => {
-                let value = required(0)?;
-                let metatable = required(1)?;
+                // Real Lua's `luaB_setmetatable` (`lbaselib.c`) checks arg 1's
+                // type before even looking at arg 2 - `setmetatable(1, {})`
+                // reports arg 1, not a missing/mismatched arg 2 - and treats
+                // an omitted arg 2 (`lua_type` reporting `LUA_TNONE`) as a
+                // distinct "no value" failure from an explicitly passed
+                // `nil` (which is accepted, same as a table).
+                let value = match args.first() {
+                    Some(value) => value.clone(),
+                    None => {
+                        return Err(LuaError::new(
+                            "bad argument #1 to 'setmetatable' (table expected, got no value)",
+                        ));
+                    }
+                };
                 let LuaValue::Table(table) = value else {
-                    return Err(LuaError::new("setmetatable expects a table"));
+                    return Err(LuaError::new(format!(
+                        "bad argument #1 to 'setmetatable' (table expected, got {})",
+                        value.type_name()
+                    )));
                 };
                 if self.metamethod(&value, b"__metatable")?.is_some() {
                     return Err(LuaError::new("cannot change a protected metatable"));
                 }
-                let new_metatable = match metatable {
-                    LuaValue::Nil => None,
-                    LuaValue::Table(meta) => Some(meta),
-                    _ => return Err(LuaError::new("metatable must be a table or nil")),
+                let new_metatable = match args.get(1) {
+                    None => {
+                        return Err(LuaError::new(
+                            "bad argument #2 to 'setmetatable' (nil or table expected, got no value)",
+                        ));
+                    }
+                    Some(LuaValue::Nil) => None,
+                    Some(LuaValue::Table(meta)) => Some(*meta),
+                    Some(other) => {
+                        return Err(LuaError::new(format!(
+                            "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.table_set_metatable(table, new_metatable)?;
                 self.table_sync_weak_mode(table)?;
@@ -352,10 +377,23 @@ impl LuaRuntime {
                         Ok(vec![LuaValue::Float(used)])
                     }
                     b"collect" => {
+                        // The collector is not reentrant: a `__gc` finalizer
+                        // that calls `collectgarbage()` on its own must not
+                        // trigger a nested collection pass while the outer
+                        // one is still running its finalizer queue - real
+                        // Lua reports this back as `false` rather than
+                        // performing any work (see `gc_finalizing`'s field
+                        // doc on `LuaRuntime`).
+                        if self.gc_finalizing {
+                            return Ok(vec![LuaValue::Bool(false)]);
+                        }
                         self.collect_garbage();
                         Ok(vec![LuaValue::Integer(0)])
                     }
                     b"step" => {
+                        if self.gc_finalizing {
+                            return Ok(vec![LuaValue::Bool(false)]);
+                        }
                         // Real Lua's `size` is a KByte-ish work amount; Sol's
                         // collector counts work in graph nodes/slots instead
                         // (see `step_garbage`'s doc comment), so `size` is
@@ -373,13 +411,13 @@ impl LuaRuntime {
                         let finished = self.step_garbage(size, None);
                         Ok(vec![LuaValue::Bool(finished)])
                     }
-                    // No real incremental/generational collector mode
-                    // difference exists yet ("collect" and "step" above
-                    // already always run a full major collection pass) -
-                    // but real Lua's `lua_gc` still
-                    // returns the *previous* mode name when switching, and
-                    // scripts assert on it, so that bookkeeping is tracked
-                    // for real even though it doesn't change behavior.
+                    // "collect" above always runs a full major collection
+                    // pass regardless of mode (real Lua's own
+                    // `collectgarbage("collect")` does too). "step" is where
+                    // the modes actually diverge - see `step_garbage`'s doc
+                    // comment. Real Lua's `lua_gc` returns the *previous*
+                    // mode name when switching, and scripts assert on it, so
+                    // that's tracked here too.
                     b"incremental" | b"generational" => {
                         let previous = self.gc_mode;
                         self.gc_mode = if option.as_slice() == b"incremental" {

@@ -31,11 +31,13 @@ Start with [the Sol overview](sol.md), then use:
 - [Language specification](spec/README.md) for current observable `.sol` and
   `.lua` behavior during migration.
 - [Architecture decisions](decisions/README.md) for the accepted U0 choices.
+- [Bytecode reference](bytecode.md) for Sol's two bytecode formats, real Lua
+  5.5 bytecode via `luac`, and LuaJIT bytecode background.
 
 ## Reading order
 
 1. [product-brief.md](./product-brief.md) - the unified product contract.
-2. [features/unified-sol-runtime-plan.md](./features/unified-sol-runtime-plan.md) - U0-U14 milestones and gates.
+2. [features/unified-sol-runtime-plan.md](./features/unified-sol-runtime-plan.md) - shared final architecture and gates; see [features/milestones/](./features/milestones/README.md) for U0-U14 specifications.
 3. [architecture.md](./architecture.md) - target layers plus the current Piccolo implementation.
 4. [debug-protocol.md](./debug-protocol.md) - the current debugger protocol and inspector model.
 5. [roadmap.md](./roadmap.md) - historical browser delivery phases.

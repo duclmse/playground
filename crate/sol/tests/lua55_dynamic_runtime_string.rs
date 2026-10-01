@@ -229,6 +229,54 @@ fn dynamic_lua_runtime_string_rep_handles_ordinary_and_edge_counts() {
 }
 
 #[test]
+fn dynamic_lua_runtime_two_separately_computed_long_strings_never_share_identity() {
+    // Regression test: `LuaValue::identity_address`'s `String` arm used to
+    // `| 1` an already-unique `ObjectId`, a mask carried over by mistake from
+    // an earlier content-hash-based scheme where it made the low bit
+    // meaningless noise. On the `ObjectId` slot/generation encoding this
+    // instead collapsed two adjacent, genuinely distinct long (over Lua's
+    // 40-byte short-string cutoff) strings' addresses together whenever they
+    // landed in neighboring heap slots - exactly `lua-5.5.1-tests/strings.lua`'s
+    // "long strings aren't internalized" case (`local s1 = string.rep("a",
+    // 300); local s2 = string.rep("a", 300); assert(topointer(s1) ~=
+    // topointer(s2))`), which only passed by the coincidental luck of
+    // intervening allocations pushing the two slots far enough apart.
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    let source = br#"
+        local function topointer(s) return string.format("%p", s) end
+        local s1 = string.rep("a", 300)
+        local s2 = string.rep("a", 300)
+        return topointer(s1) ~= topointer(s2)
+    "#;
+    let run = run_source(source).unwrap();
+    assert_eq!(run.value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_long_strings_from_different_sources_share_one_table_key() {
+    // Long strings (over the 40-byte short-string cutoff) are allocated
+    // fresh, not content-interned, so they must never gain short-string
+    // identity - but a table key still has to compare/hash by content:
+    // `t[built_by_concat]` must find a value stored under a
+    // byte-identical literal key, and vice versa.
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    let source = br#"
+        local t = {}
+        local long_lit = "01234567890123456789012345678901234567890123456789"
+        t[long_lit] = "from literal"
+        local built = "0123456789" .. "0123456789012345678901234567890123456789"
+        assert(built == long_lit)
+        assert(t[built] == "from literal")
+        t[built] = "from concat"
+        return t[long_lit] == "from concat"
+    "#;
+    let run = run_source(source).unwrap();
+    assert_eq!(run.value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_number_and_string_coercion_errors_use_luas_own_wording() {
     use sol::lua_runtime::{run_source, LuaValue};
 
@@ -316,6 +364,33 @@ fn dynamic_lua_runtime_dump_has_lua55_header_and_rejects_truncated_data() {
             numbercheck == -370.5
         local _, err = load(string.sub(dump, 1, #dump - 1))
         return header_ok and err:find("truncated") ~= nil
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_rejects_a_foreign_looking_binary_chunk() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // A real `luac5.5`-produced file (or any other foreign Lua 5.5
+    // implementation's dump) would share Sol's 40-byte `ldump.c`-shaped
+    // prefix exactly - version/format/data/size markers all match real Lua
+    // 5.5 - but diverge immediately after it, since Sol's dump envelope
+    // continues with its own `SolDmp\0\0` magic plus an opaque same-process
+    // proto handle (see `SOL_DUMP_MAGIC` in `natives_load.rs`), not a real
+    // serialized function body. This is the load-side half of the U6 "binary
+    // chunk load/dump compatibility" deliverable: the header alone can't
+    // distinguish a genuine external dump from Sol's own, so that byte
+    // immediately following the shared header must still be validated and
+    // any mismatch cleanly rejected, matching real Lua's own
+    // `bad header in precompiled chunk` message for chunks a given build
+    // can't recognize as its own, rather than misreading foreign bytes as a
+    // valid (or worse, a different) proto handle.
+    let source = br#"
+        local dump = string.dump(function () return 1 end)
+        local foreign = string.sub(dump, 1, 40) .. "X" .. string.sub(dump, 42)
+        local ok, err = load(foreign, nil, "b")
+        return ok == nil and err:find("bad header in precompiled chunk", 1, true) ~= nil
     "#;
     assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
 }

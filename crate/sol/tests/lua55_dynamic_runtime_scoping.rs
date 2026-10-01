@@ -494,6 +494,79 @@ fn dynamic_lua_runtime_named_vararg_mutations_control_later_expansion() {
 }
 
 #[test]
+fn dynamic_lua_runtime_named_vararg_lazy_view_answers_like_table_pack_with_no_allocation() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // `lua-5.5.1-tests/vararg.lua`'s `notab` test: a named vararg parameter
+    // used only through dynamic-key indexing/field access must behave
+    // exactly like a real `table.pack`-built table for every key shape -
+    // in range, out of range (negative/zero/too-large), non-integral
+    // (`1.1`), an integral float (`1.0`), the count key `"n"`, and
+    // unrelated types (a function, an unrelated string) - while never
+    // allocating. Sol previously built a fresh `Table` on every call for a
+    // named vararg parameter regardless of how it was used; the lazy view
+    // answers straight out of the frame's own vararg storage instead.
+    let source = br#"
+        local function notab(keys, t, ...v)
+            for _, k in pairs(keys) do
+                assert(t[k] == v[k])
+            end
+            assert(t.n == v.n)
+            return ...
+        end
+
+        local t = table.pack(10, 20, 30)
+        local keys = {-1, 0, 1, t.n, t.n + 1, 1.0, 1.1, "n", print, "k", "1"}
+        notab(keys, t, 10, 20, 30) -- ensure stack space
+        local before = collectgarbage("count")
+        local a, b, c = notab(keys, t, 10, 20, 30)
+        local after = collectgarbage("count")
+        return before == after and a == 10 and b == 20 and c == 30
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_named_vararg_lazy_view_supports_in_range_writes() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // `lua-5.5.1-tests/vararg.lua`'s `foo` test: an in-range integer-key
+    // write against the lazy view must mutate the same backing storage a
+    // later `...` expansion or read would see, without forcing the lazy
+    // view to materialize a real table.
+    let source = br#"
+        local function foo(...t)
+            t[1] = t[1] + 10
+            return t[1]
+        end
+        return foo(10, 30) == 20
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_named_vararg_lazy_view_falls_back_to_a_real_table_for_out_of_range_writes() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // An out-of-range/non-integer-key write is the one shape the lazy
+    // view can't answer without a real `Table` - it must fall back to
+    // building one on demand (matching the general-case table semantics
+    // the eager path already provided), rather than silently dropping the
+    // write or corrupting the frame's own `varargs` storage.
+    let source = br#"
+        local function grow(...t)
+            t[5] = "far"
+            t.extra = "field"
+            return t[5], t.extra, t.n, t[1]
+        end
+        local a, b, n, first = grow(1, 2)
+        return a == "far" and b == "field" and n == 2 and first == 1
+    "#;
+    let run = run_source(source).unwrap();
+    assert_eq!(run.value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_bare_global_declaration_does_not_clobber_existing_bindings() {
     use sol::lua_runtime::{run_source, LuaValue};
 
@@ -507,6 +580,47 @@ fn dynamic_lua_runtime_bare_global_declaration_does_not_clobber_existing_binding
     "#;
     let run = run_source(source).unwrap();
     assert_eq!(run.value, LuaValue::Integer(42));
+}
+
+#[test]
+fn dynamic_lua_runtime_global_is_a_contextual_keyword_not_a_reserved_word() {
+    // Regression test: real Lua's non-instrumented (non-`T`/ltests) build
+    // only treats `global` as a keyword at the specific `global`-declaration
+    // statement positions; everywhere else it is an ordinary identifier
+    // (goto.lua line 329: `load("global = 1; return global")() == 1`).
+    // Sol used to reserve `global` unconditionally, rejecting it as a plain
+    // identifier in every position below.
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    let load_as_plain_global = br#"
+        return load("global = 1; return global")() == 1
+    "#;
+    let run = run_source(load_as_plain_global).unwrap();
+    assert_eq!(run.value, LuaValue::Bool(true));
+
+    let table_field = br#"
+        local t = { global = 5 }
+        return t.global
+    "#;
+    let run = run_source(table_field).unwrap();
+    assert_eq!(run.value, LuaValue::Integer(5));
+
+    let local_variable = br#"
+        local global = 10
+        return global
+    "#;
+    let run = run_source(local_variable).unwrap();
+    assert_eq!(run.value, LuaValue::Integer(10));
+
+    let label_and_goto = br#"
+        local n = 0
+        ::global::
+        n = n + 1
+        if n < 3 then goto global end
+        return n
+    "#;
+    let run = run_source(label_and_goto).unwrap();
+    assert_eq!(run.value, LuaValue::Integer(3));
 }
 
 #[test]
