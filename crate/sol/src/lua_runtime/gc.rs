@@ -174,6 +174,25 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// The U9 baseline JIT's equivalent of `tick`: a promoted `Proto`'s
+    /// native code calls this at every loop backward-branch (one per
+    /// `tick`-interval, matching the interpreter's own per-instruction
+    /// cadence for a pure compute loop) so GC pacing/budget exhaustion stay
+    /// observable from native code exactly as they are from the
+    /// interpreter. Callable only once `frame.regs` is fully synced from the
+    /// native working-register array (see `dynjit`'s own module doc) -
+    /// a collection triggered from in here roots through `frame_roots`
+    /// exactly as it would mid-`dispatch_step`.
+    ///
+    /// Unlike `tick`, this does not itself charge allocation bytes - a
+    /// promoted allocation site (item 4 onward) calls `charge_allocation`
+    /// directly with its real byte count before allocating, exactly as the
+    /// interpreter's own allocation sites already do.
+    #[allow(dead_code)] // first real caller lands in item 3 (loop-lowering)
+    pub(super) fn jit_safepoint(&mut self, frame: &LuaFrame) -> LuaResult<()> {
+        self.tick(frame)
+    }
+
     /// `collectgarbage("count")`: a live snapshot of the canonical heap's
     /// currently retained bytes (see `sol_core::Heap::live_bytes`'s own
     /// doc), not a cumulative allocation counter.

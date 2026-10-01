@@ -997,6 +997,19 @@ impl LuaRuntime {
         call_chain_hops: usize,
     ) -> LuaResult<LuaFrame> {
         let function = self.prototype_id(&proto)?;
+        // U9 baseline JIT hot-function counter (single choke point for every
+        // Lua-function activation): on crossing `promote_threshold()`,
+        // attempt promotion. `wrapping_add` because a `Proto` run far more
+        // than `u32::MAX` times should keep running, not panic - it simply
+        // stops re-triggering `try_promote` at the exact power-of-threshold
+        // boundary again until the counter wraps back around, which is
+        // harmless (promotion is idempotent: `try_promote` is a no-op once
+        // `native_status` is no longer `Interpreted`).
+        let call_count = proto.call_count.get().wrapping_add(1);
+        proto.call_count.set(call_count);
+        if call_count == dynjit::promote_threshold() {
+            self.try_promote(&proto);
+        }
         let register_count = proto.metadata.registers as usize;
         let parameter_count = proto.metadata.arity.parameters as usize;
         self.pinned_roots.push(vec![sol_core::Value::object(closure.object_id())]);

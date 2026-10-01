@@ -41,6 +41,7 @@ mod codec;
 mod coroutine;
 mod diagnostics;
 mod dispatch;
+mod dynjit;
 mod format;
 mod frame;
 mod gc;
@@ -486,6 +487,13 @@ pub struct LuaRuntime {
     /// Callee of a call hook fired from the blocking native call bridge.
     /// Such leaf calls have no `Frame::Native` entry on the explicit stack.
     hook_event_callee: Option<LuaValue>,
+    /// U9 baseline-JIT state (see `dynjit`'s own module doc). Lazily built
+    /// on the first call whose `Proto::call_count` crosses
+    /// `dynjit::promote_threshold()` - not eagerly in the infallible
+    /// `with_budgets` constructor, since most runtimes (short scripts, most
+    /// of this crate's own tests) never reach that threshold and so never
+    /// need to pay for a `cranelift_jit::JITModule`. See `DynJitState`.
+    dynjit: dynjit::DynJitState,
 }
 
 impl Default for LuaRuntime {

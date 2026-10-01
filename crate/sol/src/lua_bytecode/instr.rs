@@ -384,6 +384,42 @@ pub struct Proto {
     /// no code executes *on* the `end` line itself, so scanning instruction
     /// line info can never recover it. From `ast::Function::end_line`.
     pub last_line_defined: u32,
+    /// Activation counter for the dynamic baseline JIT (U9): incremented
+    /// once per call at `LuaRuntime::new_lua_frame`'s single choke point,
+    /// exactly parallel to how `call_cache`/`field_cache`/`global_cache`
+    /// already live here as per-`Proto` side tables rather than in some
+    /// external `Proto`-identity-keyed map. Read by
+    /// `lua_runtime::dynjit::promote_threshold` consumers to decide when to
+    /// attempt promotion.
+    pub call_count: std::cell::Cell<u32>,
+    /// This `Proto`'s current native-code promotion state (U9). Lives here,
+    /// rather than in an external cache keyed by `Proto` identity, for the
+    /// same reason `call_count` does. A raw pointer inside `Native` is
+    /// `Copy`, so a plain `Cell` suffices.
+    pub native_status: std::cell::Cell<NativeStatus>,
+}
+
+/// A `Proto`'s current dynamic-JIT (U9) promotion state. Defined in
+/// `lua_bytecode` (not `lua_runtime`) because it lives directly on `Proto`,
+/// and `lua_bytecode` has no dependency on `lua_runtime` -
+/// `lua_runtime::dynjit` re-exports this type rather than defining its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeStatus {
+    /// Running through `dispatch_step` as ordinary bytecode. Either never
+    /// promoted, or permanently fell back here after a compile failure (no
+    /// retry).
+    Interpreted,
+    /// A promotion attempt for this `Proto` is in flight.
+    Promoting,
+    /// Compiled; the pointer is this `Proto`'s native entry point, whose
+    /// calling convention is defined by `lua_runtime::dynjit::abi`.
+    Native(*const u8),
+}
+
+impl Default for NativeStatus {
+    fn default() -> Self {
+        NativeStatus::Interpreted
+    }
 }
 
 impl ExecutablePrototype for Proto {

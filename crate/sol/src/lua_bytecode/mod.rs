@@ -72,8 +72,8 @@ mod instr;
 mod tests;
 
 pub use instr::{
-    BoundedCache, CallCacheEntry, Const, FieldCacheEntry, Instr, LocalDebug, Proto, UpvalSource,
-    IC_SLOTS,
+    BoundedCache, CallCacheEntry, Const, FieldCacheEntry, Instr, LocalDebug, NativeStatus, Proto,
+    UpvalSource, IC_SLOTS,
 };
 
 use func_state::{FuncState, GlobalScanState, LocalOrGlobal};
@@ -332,6 +332,8 @@ impl Compiler {
             } else {
                 function.end_line
             },
+            call_count: std::cell::Cell::new(0),
+            native_status: std::cell::Cell::new(NativeStatus::Interpreted),
         }))
     }
 
