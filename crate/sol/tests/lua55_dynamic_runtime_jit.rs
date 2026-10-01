@@ -160,3 +160,174 @@ fn table_field_global_and_index_access_survives_gc_stress_mode() {
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, stressed.stdout);
 }
+
+/// Item 5 (call/return protocol): a function containing ordinary nested
+/// calls (`Instr::Call`) to other Lua functions is now eligible for
+/// promotion - the call instruction itself always deopts to the interpreter
+/// (`lower.rs`'s own doc on this unconditional-deopt design), but everything
+/// around it (the surrounding arithmetic, the `Return`) still runs natively,
+/// and the whole function must still produce byte-identical output.
+#[test]
+fn a_function_with_nested_calls_is_promoted_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_nested_call.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "21\n23\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'compute' promoted to native code"),
+        "expected 'compute' to promote despite its nested Call instructions:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Item 5: `pcall` wrapping a call made from a promoted function must behave
+/// identically whether the wrapped call succeeds or raises - the `Call` to
+/// `pcall` itself deopts (per the unconditional-deopt design), and the
+/// interpreter's own existing `pcall`/error-unwind machinery handles the
+/// rest untouched.
+#[test]
+fn pcall_around_a_call_from_a_promoted_function_behaves_identically() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_pcall_call.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "10\n-1\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'safe_call' promoted to native code"),
+        "expected 'safe_call' (the pcall wrapper) to promote:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Item 5: a coroutine resumed (and yielding) from inside a call made by a
+/// promoted function - `driver`'s own `Call` to `coroutine.resume` deopts,
+/// and the interpreter's existing coroutine-yield machinery (untouched by
+/// this increment) drives `yielder` across three resumes exactly as it would
+/// with no promotion at all.
+#[test]
+fn coroutine_yield_from_a_call_inside_a_promoted_function_behaves_identically() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_coroutine_yield.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'driver' promoted to native code"),
+        "expected 'driver' to promote:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Item 5: a generic `for` loop (`ipairs`) now promotes - `TForCall` always
+/// deopts (it invokes the iterator function), but `TForLoop`'s back-edge
+/// check runs natively, so the loop body (`total = total + v`) stays
+/// compiled across iterations rather than falling back to the interpreter
+/// every time.
+#[test]
+fn a_generic_for_loop_is_promoted_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_generic_for.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "100\n100\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'sum_table' promoted to native code"),
+        "expected 'sum_table' to promote with its TForCall/TForLoop generic for:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Item 5: a to-be-closed (`<close>`) variable inside a promoted function -
+/// `MarkClose` runs as an ordinary native leaf stub (it never invokes `Lua`
+/// itself), while `CloseSlots` (which does invoke the `__close` metamethods)
+/// always deopts, letting the interpreter's existing blocking `__close` call
+/// path run unchanged.
+#[test]
+fn a_to_be_closed_variable_in_a_promoted_function_behaves_identically() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_close_slots.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "2\n4\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'use_closers' promoted to native code"),
+        "expected 'use_closers' to promote with its MarkClose/CloseSlots <close> variables:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}

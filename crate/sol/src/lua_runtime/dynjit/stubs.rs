@@ -41,6 +41,7 @@ pub fn register(builder: &mut JITBuilder) {
     builder.symbol("dynjit_get_environment", dynjit_get_environment as *const u8);
     builder.symbol("dynjit_set_environment", dynjit_set_environment as *const u8);
     builder.symbol("dynjit_new_table", dynjit_new_table as *const u8);
+    builder.symbol("dynjit_mark_close", dynjit_mark_close as *const u8);
 }
 
 /// Every stub's `FuncId` within `DynJit`'s own `JITModule`, declared once in
@@ -67,6 +68,12 @@ pub(super) struct StubFuncs {
     pub(super) get_environment: FuncId,
     pub(super) set_environment: FuncId,
     pub(super) new_table: FuncId,
+    /// Work item 5's only new stub - every `Call`/`TailCall`/`TForCall`/
+    /// `CloseSlots` deopts unconditionally instead (`lower.rs`'s own doc on
+    /// those arms), since `MarkClose` alone, among item 5's newly-eligible
+    /// instructions, never invokes arbitrary Lua (it only validates
+    /// closeability and records the value - see this stub's own doc).
+    pub(super) mark_close: FuncId,
 }
 
 pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
@@ -132,6 +139,7 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
     let get_environment = declare_common(module, "dynjit_get_environment")?;
     let set_environment = declare_common(module, "dynjit_set_environment")?;
     let new_table = declare_common(module, "dynjit_new_table")?;
+    let mark_close = declare_common(module, "dynjit_mark_close")?;
 
     Ok(StubFuncs {
         safepoint,
@@ -149,6 +157,7 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
         get_environment,
         set_environment,
         new_table,
+        mark_close,
     })
 }
 
@@ -872,6 +881,41 @@ pub extern "C" fn dynjit_new_table(rt: *mut LuaRuntime, frame: *mut LuaFrame, re
         let frame_mut = &mut *frame;
         frame_mut.regs[dst as usize] = value;
         *regs.add(dst as usize) = encoded;
+    }
+    1
+}
+
+/// `Instr::MarkClose` - mirrors `dispatch_step`'s own arm: validates the
+/// to-be-closed value (nil/false, or has a `__close` metamethod) and records
+/// it on `frame.to_close`. Never invokes arbitrary Lua itself (`metamethod`
+/// is a pure metatable lookup, same as `dynjit_get_field`'s own cache-miss
+/// path - see `LuaRuntime::metamethod`'s body), so unlike `CloseSlots`
+/// (which actually calls `__close` and therefore always deopts, per
+/// `lower.rs`'s own doc), this is an ordinary ok-or-deopt leaf stub. Deopts
+/// (rather than replicating the "got a non-closable value" error message) on
+/// a non-closeable value; the interpreter raises the exact right error
+/// itself when it redoes this instruction.
+pub extern "C" fn dynjit_mark_close(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::MarkClose(reg, _name_idx) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_mark_close only called for Instr::MarkClose")
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*reg as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if !matches!(value, LuaValue::Nil | LuaValue::Bool(false)) {
+        match rt.metamethod(&value, b"__close") {
+            Ok(Some(_)) => {}
+            Ok(None) => return 0,
+            Err(_) => return 0,
+        }
+    }
+    unsafe {
+        let frame_mut = &mut *frame;
+        frame_mut.to_close.push(value);
     }
     1
 }

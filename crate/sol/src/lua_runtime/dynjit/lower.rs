@@ -47,13 +47,16 @@ use super::stubs::StubFuncs;
 /// at a bogus pc.
 const TRAP_UNREACHABLE_TAIL: TrapCode = TrapCode::unwrap_user(1);
 
-/// Whether `proto` is eligible for item 3's restricted promotion: call-free,
-/// capture-free, no table/global/upvalue access, and every `Return` both
-/// fixed-count and statically within `metadata.registers` (so its result
-/// range never needs the interpreter's own out-of-range Nil-padding, which
-/// this ABI's contiguous `[out_base, out_base + out_count)` range can't
-/// represent). Anything outside this set stays interpreted until items 4-5
-/// extend lowering - see the plan's own "leaf-instruction lowering" scope.
+/// Whether `proto` is eligible for promotion: capture-free, no upvalue
+/// access beyond resolved cells (`captured_cell_count == 0`, still deferred
+/// to the item-4 follow-up noted in `stubs.rs`'s module doc). Work item 5
+/// lifts the call-free/fixed-in-bounds-`Return`-only restriction items 3-4
+/// enforced here: `Call`/`TailCall`/`TForCall`/`CloseSlots` always deopt to
+/// the interpreter at their own `pc` (see `lower_instr`'s doc on those arms),
+/// and an out-of-bounds or `Open`-count `Return` does the same - both reuse
+/// the interpreter's own already-correct call/return/close machinery
+/// unchanged rather than needing new native-side protocol, so neither needs
+/// to disqualify the whole `Proto` any more.
 pub(super) fn is_eligible(proto: &Proto) -> bool {
     if proto.captured_cell_count != 0 {
         return false;
@@ -61,7 +64,6 @@ pub(super) fn is_eligible(proto: &Proto) -> bool {
     if proto.instrs.is_empty() {
         return false;
     }
-    let register_count = proto.metadata.registers as usize;
     proto.instrs.iter().all(|instr| match instr {
         Instr::LoadConst(_, k) => !matches!(proto.consts.get(*k as usize), Some(Const::Str(_))),
         Instr::LoadNil(_)
@@ -89,11 +91,14 @@ pub(super) fn is_eligible(proto: &Proto) -> bool {
         | Instr::SetUpval(_, _)
         | Instr::GetEnvironment(_)
         | Instr::SetEnvironment(_)
-        | Instr::NewTable(_) => true,
-        Instr::Return(base, count) => match count {
-            ValueCount::Fixed(c) => (*base as usize) + (*c as usize) <= register_count,
-            ValueCount::Open => false,
-        },
+        | Instr::NewTable(_)
+        | Instr::Call(_, _, _)
+        | Instr::TailCall(_, _)
+        | Instr::TForCall(_, _)
+        | Instr::TForLoop(_, _)
+        | Instr::MarkClose(_, _)
+        | Instr::CloseSlots(_)
+        | Instr::Return(_, _) => true,
         _ => false,
     })
 }
@@ -101,6 +106,7 @@ pub(super) fn is_eligible(proto: &Proto) -> bool {
 struct Lowerer<'a, 'b> {
     builder: FunctionBuilder<'b>,
     proto: &'a Proto,
+    register_count: usize,
     rt: ClifValue,
     frame: ClifValue,
     regs: ClifValue,
@@ -124,6 +130,7 @@ struct Lowerer<'a, 'b> {
     get_environment_ref: FuncRef,
     set_environment_ref: FuncRef,
     new_table_ref: FuncRef,
+    mark_close_ref: FuncRef,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -374,19 +381,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.lower_conditional_jump(pc, *reg, *delta, true, fallthrough_target);
             }
             Instr::Return(base, count) => {
-                let ValueCount::Fixed(count) = count else {
-                    unreachable!("is_eligible excludes Instr::Return(.., Open)")
+                // A fixed, in-bounds result range fits this ABI's contiguous
+                // `[out_base, out_base + out_count)` native fast path; an
+                // `Open` count or an out-of-bounds `Fixed` one needs the
+                // interpreter's own Nil-padding/`top`-tracking `Return`
+                // handling (`dispatch/bytecode.rs`'s own `Instr::Return` arm)
+                // instead, so it deopts at this instruction's own `pc` - safe
+                // and correct because nothing has been written yet.
+                let in_bounds_fixed = match count {
+                    ValueCount::Fixed(c) => (*base as usize) + (*c as usize) <= self.register_count,
+                    ValueCount::Open => false,
                 };
-                let base_v = self.builder.ins().iconst(types::I64, *base as i64);
-                let count_v = self.builder.ins().iconst(types::I64, *count as i64);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), base_v, self.out_base, 0);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), count_v, self.out_count, 0);
-                let one = self.builder.ins().iconst(types::I64, 1);
-                self.builder.ins().return_(&[one]);
+                if in_bounds_fixed {
+                    let ValueCount::Fixed(count) = count else {
+                        unreachable!("checked above")
+                    };
+                    let base_v = self.builder.ins().iconst(types::I64, *base as i64);
+                    let count_v = self.builder.ins().iconst(types::I64, *count as i64);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), base_v, self.out_base, 0);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), count_v, self.out_count, 0);
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    self.builder.ins().return_(&[one]);
+                } else {
+                    let pcv = self.pc_const(pc);
+                    self.builder.ins().jump(self.deopt_block, &[BlockArg::Value(pcv)]);
+                }
             }
             Instr::ForPrep(base, delta) => {
                 self.lower_for_prep(pc, *base, *delta);
@@ -426,6 +449,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             Instr::NewTable(_) => {
                 self.lower_stub_instr(pc, self.new_table_ref, fallthrough_target);
+            }
+            Instr::MarkClose(_, _) => {
+                self.lower_stub_instr(pc, self.mark_close_ref, fallthrough_target);
+            }
+            // `Call`/`TailCall`/`TForCall`/`CloseSlots` can all invoke
+            // arbitrary Lua (a callee, a `__close` metamethod) and none of
+            // that arbitrary execution can safely run while this native
+            // frame's non-allocating registers are live only in the native
+            // `regs` array and not yet reflected in `frame.regs` (see
+            // `dynjit`'s module doc on the GC-rooting invariant item 3
+            // established). Rather than building new park-before-call
+            // machinery to keep that invariant across a nested call, these
+            // unconditionally deopt to the interpreter at their own `pc` -
+            // `run_native`'s universal regs flush (`dispatch.rs`) means
+            // `frame.regs` is already fully correct by the time the
+            // interpreter resumes, so this reuses 100% of its existing,
+            // already-correct call/return/close/error/yield handling with no
+            // new stub or protocol. The cost is a performance cliff right
+            // after any such instruction (native code can never resume after
+            // one in the same invocation - see this module's own follow-up
+            // note in `is_eligible`'s doc) rather than resuming natively once
+            // an ordinary call returns; that tradeoff is deliberate for this
+            // baseline tier, not an oversight.
+            Instr::Call(_, _, _) | Instr::TailCall(_, _) | Instr::TForCall(_, _) | Instr::CloseSlots(_) => {
+                let pcv = self.pc_const(pc);
+                self.builder.ins().jump(self.deopt_block, &[BlockArg::Value(pcv)]);
+            }
+            Instr::TForLoop(base, delta) => {
+                self.lower_tfor_loop(pc, *base, *delta, fallthrough_target);
             }
             _ => unreachable!("is_eligible excludes every other Instr variant"),
         }
@@ -561,6 +613,33 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .brif(is_continue, self.blocks[target_pc], &[], self.blocks[fallthrough_pc], &[]);
     }
+
+    /// `Instr::TForLoop` - mirrors `dispatch_step`'s own arm: if the
+    /// generic-for iterator's first result (`base + 3`) isn't `Nil`, copy it
+    /// into the loop control register (`base + 2`) and branch back; otherwise
+    /// fall through and let the loop end. The backward branch charges a
+    /// safepoint exactly like `ForLoop`'s own back-edge, since this is the
+    /// back-edge of a generic `for` loop whose body can otherwise run
+    /// natively indefinitely between `TForCall` deopts.
+    fn lower_tfor_loop(&mut self, pc: usize, base: u16, delta: i32, fallthrough_target: Option<Block>) {
+        let tag = self.load_tag(base + 3);
+        let is_nil = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_NIL);
+        let not_nil = self.builder.ins().bxor_imm_s(is_nil, 1);
+        let target_pc = (pc as i32 + delta) as usize;
+        let fallthrough_blk = match fallthrough_target {
+            Some(block) => block,
+            None => self.trap_block(),
+        };
+        let taken = self.new_block();
+        self.builder.ins().brif(not_nil, taken, &[], fallthrough_blk, &[]);
+        self.builder.switch_to_block(taken);
+        self.copy_reg(base + 2, base + 3);
+        if delta < 0 {
+            let cont = self.emit_safepoint(pc);
+            self.builder.switch_to_block(cont);
+        }
+        self.builder.ins().jump(self.blocks[target_pc], &[]);
+    }
 }
 
 /// Declares and defines `name` as a new function in `module`, lowering
@@ -606,6 +685,7 @@ pub(super) fn lower_proto(
         let get_environment_ref = module.declare_func_in_func(stubs.get_environment, builder.func);
         let set_environment_ref = module.declare_func_in_func(stubs.set_environment, builder.func);
         let new_table_ref = module.declare_func_in_func(stubs.new_table, builder.func);
+        let mark_close_ref = module.declare_func_in_func(stubs.mark_close, builder.func);
 
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -624,6 +704,7 @@ pub(super) fn lower_proto(
         let mut lowerer = Lowerer {
             builder,
             proto,
+            register_count: proto.metadata.registers as usize,
             rt,
             frame,
             regs,
@@ -647,6 +728,7 @@ pub(super) fn lower_proto(
             get_environment_ref,
             set_environment_ref,
             new_table_ref,
+            mark_close_ref,
         };
 
         for pc in 0..n {
