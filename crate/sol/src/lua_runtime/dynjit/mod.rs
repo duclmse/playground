@@ -73,6 +73,20 @@ fn jit_log_enabled() -> bool {
 }
 
 pub struct DynJit {
+    /// U9 item 7 (code-cache lifecycle, "confirm don't newly build"): a
+    /// `Proto`'s native code, once `promote`d into this `module`, is never
+    /// reclaimed even after the `Proto` itself becomes unreachable -
+    /// `cranelift-jit`'s `JITModule` has no per-function `free_function` in
+    /// the pinned version this crate uses, so this module only grows for the
+    /// lifetime of the owning `LuaRuntime`. There is no content-invalidation
+    /// case to handle alongside it: `Proto::instrs` is immutable post-load,
+    /// so a promoted function's native code never goes stale out from under
+    /// it. This is a known limitation against the exit gate's "code memory
+    /// stays within published budgets" criterion - see
+    /// `/Users/duclm/.claude/plans/enumerated-chasing-flute.md`'s "Code cache
+    /// lifecycle" note for the full rationale - and is deliberately left
+    /// unfixed pending real benchmark evidence that it matters, rather than
+    /// building eviction machinery speculatively.
     module: JITModule,
     builder_ctx: FunctionBuilderContext,
     /// Every stub's `FuncId`, declared once here and reused via
@@ -187,11 +201,19 @@ impl LuaRuntime {
     /// `promote_threshold()`. Lazily builds this runtime's `DynJit` on first
     /// use (see `DynJitState`'s doc), then attempts to promote `proto`.
     ///
-    /// Returns whether `proto` is now `NativeStatus::Native` - always
-    /// `false` for now, since `DynJit::promote` itself always fails until
-    /// item 3 lands real lowering. This hook exists ahead of that purely to
-    /// exercise the lazy-init/threshold-crossing wiring in isolation first.
-    pub(super) fn try_promote(&mut self, proto: &Rc<Proto>) -> bool {
+    /// `function` is `proto`'s already-registered `FunctionId` (`new_lua_frame`
+    /// always calls `prototype_id` before this, unconditionally, for every
+    /// activation - see that method's own doc) - item 7's `ExecutionTier`
+    /// bookkeeping: on a successful promotion, `function_registry`'s
+    /// descriptor for `proto` flips from the `ExecutionTier::Generic` it was
+    /// registered at to `ExecutionTier::Native`, so anything that later reads
+    /// the registry (no such reader exists yet - see the U9 milestone doc's
+    /// item 7 note on not adding a new introspection surface ahead of need)
+    /// sees accurate tier bookkeeping rather than a permanently-stale
+    /// `Generic`.
+    ///
+    /// Returns whether `proto` is now `NativeStatus::Native`.
+    pub(super) fn try_promote(&mut self, proto: &Rc<Proto>, function: sol_core::FunctionId) -> bool {
         if proto.native_status.get() != NativeStatus::Interpreted {
             return false;
         }
@@ -224,6 +246,12 @@ impl LuaRuntime {
         match jit.promote(proto) {
             Ok(ptr) => {
                 proto.native_status.set(NativeStatus::Native(ptr));
+                self.function_registry
+                    .set_tier(function, sol_core::ExecutionTier::Native)
+                    .expect(
+                        "function was already registered via prototype_id \
+                         earlier in this same new_lua_frame call",
+                    );
                 true
             }
             Err(_) => {

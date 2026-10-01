@@ -1008,7 +1008,7 @@ impl LuaRuntime {
         let call_count = proto.call_count.get().wrapping_add(1);
         proto.call_count.set(call_count);
         if call_count == dynjit::promote_threshold() {
-            self.try_promote(&proto);
+            self.try_promote(&proto, function);
         }
         let register_count = proto.metadata.registers as usize;
         let parameter_count = proto.metadata.arity.parameters as usize;

@@ -2538,7 +2538,7 @@ Deliverables:
       see `docs/features/milestones/u9-baseline-jit.md` for why this bullet
       does not apply under the call/return protocol actually shipped
       (unconditional deopt, not park-before-call);
-- [ ] code cache lifecycle, invalidation, and executable-memory safety.
+- [x] code cache lifecycle, invalidation, and executable-memory safety.
 
 Exit gate: baseline-JIT readiness gate passes; compile latency and code memory
 stay within published budgets; interpreter/JIT differential and GC tests pass.

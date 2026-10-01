@@ -63,7 +63,28 @@
       only to unlock this bullet would reopen a closed, already-tested,
       already-benchmarked milestone item without new justification. No code
       was written for this bullet.
-- [ ] Manage code-cache lifecycle, invalidation, and executable-memory safety.
+- [x] Manage code-cache lifecycle, invalidation, and executable-memory
+      safety. `Proto::native_status` is now wired to
+      `sol_core::abi::ExecutionTier` for introspection: `try_promote`
+      (`crate/sol/src/lua_runtime/dynjit/mod.rs`) flips the already-registered
+      `FunctionDescriptor`'s tier from `Generic` to `Native` via
+      `function_registry.set_tier` on a successful promotion. No new
+      `debug.getinfo` (or other) surface was added to read it - checked first,
+      per this bullet's own text, and none of the dynamic runtime's existing
+      introspection exposes tier information today, so adding one would be a
+      new feature beyond this bullet's scope, not a wiring fix. Confirmed
+      (not newly built): the no-eviction limitation is real and intentional -
+      `cranelift-jit`'s pinned `JITModule` has no per-function `free_function`,
+      so a promoted `Proto`'s native code is never reclaimed even once
+      unreachable; `Proto::instrs` is immutable post-load so there is no
+      content-invalidation case to handle either. Documented at the `DynJit`
+      struct's `module` field (`dynjit/mod.rs`) pointing at the plan's "Code
+      cache lifecycle" rationale for any future revisit. Verified via the
+      full existing dynjit differential suite (9/9,
+      `lua55_dynamic_runtime_jit.rs`) re-passing with `set_tier` now live on
+      every real promotion path those tests already exercise, plus the full
+      `crate/sol` (all green) and `crate/sol-core` (37/37) suites and the Lua
+      5.5 manifest check.
 
 **Exit gate:** baseline-JIT readiness passes within published compile-latency
 and code-memory budgets, with interpreter/JIT differential and GC tests.
