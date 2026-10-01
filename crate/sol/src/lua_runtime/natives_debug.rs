@@ -178,6 +178,40 @@ impl LuaRuntime {
                 }
                 Ok(vec![LuaValue::Table(table)])
             }
+            NativeFunction::DebugIcstats => {
+                let stats = self.ic_stats.get();
+                let table = self.new_table(None)?;
+                for (key, value) in [
+                    ("call_hits", stats.call.hits as f64),
+                    ("call_misses", stats.call.misses as f64),
+                    ("call_evictions", stats.call.evictions as f64),
+                    ("field_hits", stats.field.hits as f64),
+                    ("field_misses", stats.field.misses as f64),
+                    ("field_evictions", stats.field.evictions as f64),
+                    ("global_hits", stats.global.hits as f64),
+                    ("global_misses", stats.global.misses as f64),
+                    ("global_evictions", stats.global.evictions as f64),
+                ] {
+                    self.table_set(
+                        table,
+                        LuaValue::String(self.intern_str(key.as_bytes())),
+                        LuaValue::Float(value),
+                    )
+                    .unwrap();
+                }
+                Ok(vec![LuaValue::Table(table)])
+            }
+            NativeFunction::DebugIcprofile => {
+                // Level 1 (the immediate Lua caller of `debug.icprofile()`
+                // itself, matching `debug.getinfo`'s level convention - this
+                // native doesn't push its own frame onto `self.frames`, so
+                // the last Lua frame already *is* the caller).
+                let dump = match self.frames.last() {
+                    Some(Frame::Lua(frame)) => frame.proto.ic_profile_dump(),
+                    _ => String::new(),
+                };
+                Ok(vec![LuaValue::String(self.intern_str(dump.as_bytes()))])
+            }
             NativeFunction::DebugGetuservalue => {
                 let userdata = match required(0)? {
                     LuaValue::Userdata(userdata) => userdata,

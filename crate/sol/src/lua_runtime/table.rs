@@ -13,10 +13,11 @@
 
 use sol_core::{HeapObject, Value};
 
-use crate::lua_bytecode::Proto;
+use crate::lua_bytecode::{BoundedCache, CallCacheEntry, FieldCacheEntry, Proto};
 
 use super::canonical::{GMATCH_ITERATOR_FUNCTION, LEGACY_STATE_PROVIDER};
 use super::frame::*;
+use super::ic::IcKind;
 use super::*;
 
 /// `gmatch_read`'s `(source bytes, pattern bytes, position, last_end)`.
@@ -99,6 +100,34 @@ impl LuaRuntime {
         let upvalues = self.closure_upvalues(closure)?;
         let globals = self.globals_for_closure(closure);
         Ok((proto, upvalues, globals))
+    }
+
+    /// `closure_parts`, but consults/populates a per-call-site
+    /// `Instr::Call`/`TailCall`/`TForCall` inline cache (U8) for the
+    /// `(prototype, upvalues)` half first. `globals_for_closure` is looked up
+    /// fresh every time, cache hit or not - see `CallCacheEntry`'s doc
+    /// comment for why `Globals` itself is never cached here.
+    pub(super) fn closure_parts_cached(
+        &self,
+        cache: &BoundedCache<CallCacheEntry>,
+        closure: ClosureRef,
+    ) -> LuaResult<(Rc<Proto>, Rc<[std::cell::Cell<sol_core::ObjectId>]>, Globals)> {
+        let guard = closure.object_id();
+        if let Some(entry) = cache.find(|entry| entry.guard == guard) {
+            self.ic_record_hit(IcKind::Call);
+            let globals = self.globals_for_closure(closure);
+            return Ok((entry.prototype, entry.upvalues, globals));
+        }
+        self.ic_record_miss(IcKind::Call);
+        let (prototype, upvalues, globals) = self.closure_parts(closure)?;
+        if cache.insert(CallCacheEntry {
+            guard,
+            prototype: prototype.clone(),
+            upvalues: upvalues.clone(),
+        }) {
+            self.ic_record_eviction(IcKind::Call);
+        }
+        Ok((prototype, upvalues, globals))
     }
 
     pub(super) fn closure_prototype(&self, closure: ClosureRef) -> LuaResult<Rc<Proto>> {
@@ -205,6 +234,185 @@ impl LuaRuntime {
         table
             .set(&mut heap, key, value)
             .map_err(|error| LuaError::new(format!("internal error: {error}")))
+    }
+
+    /// `GetField`'s U8 inline-cache fast path: consults the per-pc
+    /// `field_cache` entry for `table`'s raw hash-part storage, re-reading
+    /// `heap.table_get_at_hash_index` only when the cached `ObjectId` guard
+    /// still matches. A `Some` result is always the field's current,
+    /// non-nil raw value - safe to return directly exactly like
+    /// `index_resolve`'s own `raw != LuaValue::Nil` branch. A stale/missing
+    /// cache entry, a key mismatch, or a nil-valued slot (which must still
+    /// fall through to `__index` metamethod resolution, same as an ordinary
+    /// raw miss) all report `None` so the caller falls back to the
+    /// unmodified slow path.
+    pub(super) fn field_cache_get(
+        &self,
+        cache: &BoundedCache<FieldCacheEntry>,
+        table: TableRef,
+        name: &[u8],
+        kind: IcKind,
+    ) -> LuaResult<Option<LuaValue>> {
+        let guard = table.object_id();
+        let Some(entry) = cache.find(|entry| entry.guard == guard) else {
+            self.ic_record_miss(kind);
+            return Ok(None);
+        };
+        let value = {
+            let heap = self.canonical_heap.borrow();
+            heap.table_get_at_hash_index(guard, entry.index, name)
+                .map_err(|error| LuaError::new(format!("internal error: {error}")))?
+        };
+        match value {
+            Some(value) if value != Value::NIL => {
+                self.ic_record_hit(kind);
+                Ok(Some(self.decode_value(value)?))
+            }
+            _ => {
+                self.ic_record_miss(kind);
+                Ok(None)
+            }
+        }
+    }
+
+    /// `SetField`'s U8 inline-cache fast path - the write counterpart to
+    /// `field_cache_get`. Only performs the write (returning `true`) when
+    /// the cached index still names the same key *and* that key's current
+    /// value is non-nil (the same "already exists on this table's own
+    /// storage" gate `set_index_resolve`'s own `raw != LuaValue::Nil`
+    /// branch uses to decide whether `__newindex` even needs consulting).
+    /// Returns `false` on any mismatch, nil slot, or missing entry, so the
+    /// caller falls back to the unmodified slow path (metamethod
+    /// resolution or a charged new-key insert).
+    pub(super) fn field_cache_set(
+        &self,
+        cache: &BoundedCache<FieldCacheEntry>,
+        table: TableRef,
+        name: &[u8],
+        value: LuaValue,
+        kind: IcKind,
+    ) -> LuaResult<bool> {
+        let guard = table.object_id();
+        let Some(entry) = cache.find(|entry| entry.guard == guard) else {
+            self.ic_record_miss(kind);
+            return Ok(false);
+        };
+        let encoded_value = self.encode_value(&value)?;
+        let mut heap = self.canonical_heap.borrow_mut();
+        let current = heap
+            .table_get_at_hash_index(guard, entry.index, name)
+            .map_err(|error| LuaError::new(format!("internal error: {error}")))?;
+        match current {
+            Some(current) if current != Value::NIL => {
+                heap.table_set_at_hash_index(guard, entry.index, name, encoded_value)
+                    .map_err(|error| LuaError::new(format!("internal error: {error}")))?;
+                self.ic_record_hit(kind);
+                Ok(true)
+            }
+            _ => {
+                self.ic_record_miss(kind);
+                Ok(false)
+            }
+        }
+    }
+
+    /// `GetField`'s U8 inline-cache miss path, tried *before* falling back to
+    /// the full `index_resolve` chain: looks `name` up directly in `table`'s
+    /// own hash-part storage via the same index-aware helpers
+    /// `field_cache_get` uses, and on a live (non-nil) hit, both returns the
+    /// value and populates `cache` with the index just found - one hash
+    /// lookup, not two. A raw miss here (absent key, or a key present but
+    /// tombstoned nil) returns `None` without touching the cache; the caller
+    /// then falls back to `index_resolve` for the `__index` metamethod chain,
+    /// which can never itself produce a cacheable depth-0 hit on `table`'s
+    /// own storage (if it could, this probe would already have found it), so
+    /// no second populate attempt is needed on that fallback path.
+    ///
+    /// `key` must be the already-encoded field-name key the caller used (or
+    /// will use) for its own slow-path lookup, e.g. `self.encode_value(&key)?`
+    /// on the `LuaValue::String` built from `self.intern_str(name)` -
+    /// re-deriving it via a fresh `heap.alloc_string(name)` would redundantly
+    /// pay `intern_str`'s own interner-lookup cost a second time on every
+    /// probe, including ones that can never cache anything (e.g. a call site
+    /// whose table is reallocated fresh every iteration, where this runs on
+    /// every access with no future hit to amortize it against).
+    pub(super) fn field_probe_raw(
+        &self,
+        cache: &BoundedCache<FieldCacheEntry>,
+        table: TableRef,
+        key: Value,
+        name: &[u8],
+        kind: IcKind,
+    ) -> LuaResult<Option<LuaValue>> {
+        let guard = table.object_id();
+        let found = {
+            let heap = self.canonical_heap.borrow();
+            let Some(index) = heap
+                .table_hash_index_of(guard, key)
+                .map_err(|error| LuaError::new(format!("internal error: {error}")))?
+            else {
+                return Ok(None);
+            };
+            let current = heap
+                .table_get_at_hash_index(guard, index, name)
+                .map_err(|error| LuaError::new(format!("internal error: {error}")))?;
+            match current {
+                Some(value) if value != Value::NIL => Some((index, value)),
+                _ => None,
+            }
+        };
+        match found {
+            Some((index, value)) => {
+                if cache.insert(FieldCacheEntry { guard, index }) {
+                    self.ic_record_eviction(kind);
+                }
+                Ok(Some(self.decode_value(value)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// `SetField`'s U8 inline-cache miss path - the write counterpart to
+    /// `field_probe_raw`. Only handles overwriting an existing non-nil raw
+    /// key (the same case `set_index_resolve`'s raw-exists branch handles
+    /// directly, bypassing `__newindex`); on that hit, writes the value and
+    /// populates `cache` in the same hash lookup. Returns `false` for an
+    /// absent or tombstoned-nil key so the caller falls back to
+    /// `set_index_resolve`, which may invoke `__newindex` or charge a new-key
+    /// allocation - neither of which this call site can ever cache, since the
+    /// key wasn't raw-present before the write either.
+    pub(super) fn field_write_raw(
+        &self,
+        cache: &BoundedCache<FieldCacheEntry>,
+        table: TableRef,
+        key: Value,
+        name: &[u8],
+        value: LuaValue,
+        kind: IcKind,
+    ) -> LuaResult<bool> {
+        let guard = table.object_id();
+        let encoded_value = self.encode_value(&value)?;
+        let mut heap = self.canonical_heap.borrow_mut();
+        let Some(index) = heap
+            .table_hash_index_of(guard, key)
+            .map_err(|error| LuaError::new(format!("internal error: {error}")))?
+        else {
+            return Ok(false);
+        };
+        let current = heap
+            .table_get_at_hash_index(guard, index, name)
+            .map_err(|error| LuaError::new(format!("internal error: {error}")))?;
+        match current {
+            Some(current) if current != Value::NIL => {
+                heap.table_set_at_hash_index(guard, index, name, encoded_value)
+                    .map_err(|error| LuaError::new(format!("internal error: {error}")))?;
+                if cache.insert(FieldCacheEntry { guard, index }) {
+                    self.ic_record_eviction(kind);
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Charges a genuinely new table entry (a key with no previously-live

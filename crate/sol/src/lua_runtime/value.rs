@@ -689,6 +689,8 @@ pub enum NativeFunction {
     DebugGetregistry,
     DebugGetuservalue,
     DebugGcstats,
+    DebugIcstats,
+    DebugIcprofile,
 }
 
 impl NativeFunction {
@@ -825,6 +827,8 @@ impl NativeFunction {
             Self::DebugGethook => "gethook",
             Self::DebugSetuservalue => "setuservalue",
             Self::DebugGcstats => "gcstats",
+            Self::DebugIcstats => "icstats",
+            Self::DebugIcprofile => "icprofile",
         }
     }
 
@@ -961,6 +965,8 @@ impl NativeFunction {
             123 => Self::DebugGetregistry,
             124 => Self::DebugGetuservalue,
             125 => Self::DebugGcstats,
+            126 => Self::DebugIcstats,
+            127 => Self::DebugIcprofile,
             _ => return None,
         })
     }

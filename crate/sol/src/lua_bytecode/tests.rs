@@ -1,4 +1,4 @@
-use super::Instr;
+use super::{BoundedCache, Instr, IC_SLOTS};
 
 #[test]
 fn generic_calls_project_to_the_semantic_call_abi() {
@@ -32,4 +32,38 @@ fn instr_size_regression() {
         size <= 24,
         "Instr grew to {size} bytes; keep dispatch-loop entries compact"
     );
+}
+
+/// `BoundedCache` (U8's shared inline-cache infrastructure) must stay at
+/// exactly `IC_SLOTS` entries once full, evicting the oldest first - this is
+/// the sole mechanism bounding a call site's mono -> poly -> megamorphic
+/// growth, so a regression here would let a megamorphic call site grow
+/// cache memory without bound.
+#[test]
+fn bounded_cache_evicts_oldest_once_full() {
+    let cache: BoundedCache<u32> = BoundedCache::new();
+    assert!(cache.is_empty());
+    for entry in 0..IC_SLOTS as u32 {
+        cache.insert(entry);
+    }
+    assert_eq!(cache.len(), IC_SLOTS);
+    for entry in 0..IC_SLOTS as u32 {
+        assert_eq!(cache.find(|&e| e == entry), Some(entry));
+    }
+
+    // One more insert beyond capacity evicts entry 0 (the oldest) and stays
+    // bounded at IC_SLOTS, never growing further.
+    cache.insert(IC_SLOTS as u32);
+    assert_eq!(cache.len(), IC_SLOTS);
+    assert_eq!(cache.find(|&e| e == 0), None, "oldest entry must be evicted");
+    for entry in 1..=IC_SLOTS as u32 {
+        assert_eq!(cache.find(|&e| e == entry), Some(entry));
+    }
+
+    // Megamorphic stress: many more distinct entries than IC_SLOTS never
+    // grows the cache past IC_SLOTS.
+    for entry in 0..1000u32 {
+        cache.insert(entry);
+        assert!(cache.len() <= IC_SLOTS);
+    }
 }

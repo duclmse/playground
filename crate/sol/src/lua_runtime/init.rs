@@ -115,6 +115,7 @@ impl LuaRuntime {
             gc_pause: 100,
             gc_stepmul: 100,
             gc_stats: gc::GcStats::default(),
+            ic_stats: std::cell::Cell::new(ic::IcStats::default()),
             current_locale: "C".to_string(),
             tmpname_counter: 0,
             io_stdout,
@@ -754,6 +755,8 @@ impl LuaRuntime {
             ("gethook", NativeFunction::DebugGethook),
             ("setuservalue", NativeFunction::DebugSetuservalue),
             ("gcstats", NativeFunction::DebugGcstats),
+            ("icstats", NativeFunction::DebugIcstats),
+            ("icprofile", NativeFunction::DebugIcprofile),
         ] {
             self.table_set(
                 debug,

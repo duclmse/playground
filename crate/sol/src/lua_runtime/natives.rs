@@ -54,6 +54,8 @@ impl LuaRuntime {
             | NativeFunction::DebugGethook
             | NativeFunction::DebugSetuservalue
             | NativeFunction::DebugGcstats
+            | NativeFunction::DebugIcstats
+            | NativeFunction::DebugIcprofile
                 if !self.capabilities.debug =>
             {
                 Some("debug")
@@ -182,7 +184,9 @@ impl LuaRuntime {
             | NativeFunction::DebugSethook
             | NativeFunction::DebugGethook
             | NativeFunction::DebugSetuservalue
-            | NativeFunction::DebugGcstats => self.call_native_debug(function, args),
+            | NativeFunction::DebugGcstats
+            | NativeFunction::DebugIcstats
+            | NativeFunction::DebugIcprofile => self.call_native_debug(function, args),
             NativeFunction::Require
             | NativeFunction::PackageSearchPath
             | NativeFunction::PackageSearcherPreload

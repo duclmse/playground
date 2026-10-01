@@ -44,6 +44,7 @@ mod dispatch;
 mod format;
 mod frame;
 mod gc;
+mod ic;
 mod init;
 mod natives;
 mod natives_core;
@@ -408,6 +409,9 @@ pub struct LuaRuntime {
     /// Cumulative collection counters, exposed read-only via
     /// `debug.gcstats()` - see `gc::GcStats`'s own doc comment.
     gc_stats: gc::GcStats,
+    /// Cumulative U8 inline-cache hit/miss/eviction counters, exposed
+    /// read-only via `debug.icstats()` - see `ic::IcStats`'s own doc comment.
+    ic_stats: std::cell::Cell<ic::IcStats>,
     /// Bookkeeping-only `os.setlocale` current-locale name (real Lua
     /// defaults to `"C"` until changed) - see `NativeFunction::OsSetlocale`.
     current_locale: String,

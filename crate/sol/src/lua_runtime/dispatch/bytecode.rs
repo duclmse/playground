@@ -1,6 +1,7 @@
 //! Bytecode instruction execution for the Lua frame trampoline.
 
 use super::*;
+use crate::lua_runtime::ic::IcKind;
 
 impl LuaRuntime {
     /// Runs `frame` from its current `pc` (after first resolving `incoming`
@@ -193,20 +194,68 @@ impl LuaRuntime {
                         let value = frame.globals.get(self, name);
                         reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
                     } else {
-                        let key = LuaValue::String(self.intern_str(name.as_bytes()));
-                        match self.index_resolve(frame.globals.as_value(), key)? {
-                            IndexResolution::Value(value) => {
+                        // Inline-cache fast path (U8): reuses the
+                        // `GetField`/`SetField` table-field-cache mechanism
+                        // against the current `_ENV` table - see
+                        // `Proto::global_cache`'s doc comment for why a bare
+                        // `_ENV = newtable` reassignment needs no special
+                        // invalidation here.
+                        let base_value = frame.globals.as_value();
+                        let base_table = match &base_value {
+                            LuaValue::Table(table) => Some(*table),
+                            _ => None,
+                        };
+                        let name_bytes = name.as_bytes();
+                        let cached = match base_table {
+                            Some(table) => self.field_cache_get(
+                                &proto.global_cache[pc],
+                                table,
+                                name_bytes,
+                                IcKind::Global,
+                            )?,
+                            None => None,
+                        };
+                        if let Some(value) = cached {
+                            reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
+                        } else {
+                            let key = LuaValue::String(self.intern_str(name_bytes));
+                            let probed = match base_table {
+                                Some(table) => {
+                                    let encoded_key = self.encode_value(&key)?;
+                                    self.field_probe_raw(
+                                        &proto.global_cache[pc],
+                                        table,
+                                        encoded_key,
+                                        name_bytes,
+                                        IcKind::Global,
+                                    )?
+                                }
+                                None => None,
+                            };
+                            if let Some(value) = probed {
                                 reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
-                            }
-                            IndexResolution::Call { method, args } => {
-                                frame.header.pc = pc as u32;
-                                frame.header.stack_top = top as u32;
-                                frame.header.state = FrameState::Suspended;
-                                frame.pending = Pending::Index {
-                                    dest: *dst as usize,
-                                };
-                                self.pending_frame_label = Some("index");
-                                return self.step_result_for_call(method, args);
+                            } else {
+                                match self.index_resolve(base_value, key)? {
+                                    IndexResolution::Value(value) => {
+                                        reg_set(
+                                            self,
+                                            &mut frame.regs,
+                                            &frame.cells,
+                                            *dst as usize,
+                                            value,
+                                        );
+                                    }
+                                    IndexResolution::Call { method, args } => {
+                                        frame.header.pc = pc as u32;
+                                        frame.header.stack_top = top as u32;
+                                        frame.header.state = FrameState::Suspended;
+                                        frame.pending = Pending::Index {
+                                            dest: *dst as usize,
+                                        };
+                                        self.pending_frame_label = Some("index");
+                                        return self.step_result_for_call(method, args);
+                                    }
+                                }
                             }
                         }
                     }
@@ -219,16 +268,57 @@ impl LuaRuntime {
                         frame.globals.assign(self, name, value)?;
                     } else {
                         frame.globals.check_writable(name)?;
-                        let key = LuaValue::String(self.intern_str(name.as_bytes()));
-                        match self.set_index_resolve(frame.globals.as_value(), key, value, Some(&*frame))? {
-                            SetIndexResolution::Done => {}
-                            SetIndexResolution::Call { method, args } => {
-                                frame.header.pc = pc as u32;
-                                frame.header.stack_top = top as u32;
-                                frame.header.state = FrameState::Suspended;
-                                frame.pending = Pending::SetIndex;
-                                self.pending_frame_label = Some("newindex");
-                                return self.step_result_for_call(method, args);
+                        // Inline-cache fast path (U8): see `Instr::GetGlobal`
+                        // above.
+                        let base_value = frame.globals.as_value();
+                        let base_table = match &base_value {
+                            LuaValue::Table(table) => Some(*table),
+                            _ => None,
+                        };
+                        let name_bytes = name.as_bytes();
+                        let cached = match base_table {
+                            Some(table) => self.field_cache_set(
+                                &proto.global_cache[pc],
+                                table,
+                                name_bytes,
+                                value.clone(),
+                                IcKind::Global,
+                            )?,
+                            None => false,
+                        };
+                        if !cached {
+                            let key = LuaValue::String(self.intern_str(name_bytes));
+                            let written = match base_table {
+                                Some(table) => {
+                                    let encoded_key = self.encode_value(&key)?;
+                                    self.field_write_raw(
+                                        &proto.global_cache[pc],
+                                        table,
+                                        encoded_key,
+                                        name_bytes,
+                                        value.clone(),
+                                        IcKind::Global,
+                                    )?
+                                }
+                                None => false,
+                            };
+                            if !written {
+                                match self.set_index_resolve(
+                                    base_value,
+                                    key,
+                                    value,
+                                    Some(&*frame),
+                                )? {
+                                    SetIndexResolution::Done => {}
+                                    SetIndexResolution::Call { method, args } => {
+                                        frame.header.pc = pc as u32;
+                                        frame.header.stack_top = top as u32;
+                                        frame.header.state = FrameState::Suspended;
+                                        frame.pending = Pending::SetIndex;
+                                        self.pending_frame_label = Some("newindex");
+                                        return self.step_result_for_call(method, args);
+                                    }
+                                }
                             }
                         }
                     }
@@ -271,44 +361,135 @@ impl LuaRuntime {
                 }
                 Instr::GetField(dst, base, name) => {
                     let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
-                    let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
-                    match self.index_resolve(base_value, key) {
-                        Ok(IndexResolution::Value(value)) => {
+                    let name_bytes = name_const(&proto, *name);
+                    let base_table = match &base_value {
+                        LuaValue::Table(table) => Some(*table),
+                        _ => None,
+                    };
+                    // Inline-cache fast path (U8): a prior access at this
+                    // call site already learned `base_value`'s raw
+                    // hash-part slot for this field name - skip
+                    // `intern_str` + the full `index_resolve` chain
+                    // entirely on a confirmed hit. See `field_cache_get`.
+                    let cached = match base_table {
+                        Some(table) => self.field_cache_get(
+                            &proto.field_cache[pc],
+                            table,
+                            name_bytes.as_slice(),
+                            IcKind::Field,
+                        )?,
+                        None => None,
+                    };
+                    if let Some(value) = cached {
+                        reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
+                    } else {
+                        let key = LuaValue::String(self.intern_str(name_bytes.as_slice()));
+                        // Try a direct raw hash-part probe first (U8): this
+                        // finds and caches the index in the same lookup,
+                        // instead of letting `index_resolve` find the raw
+                        // value and then re-hashing it a second time just to
+                        // learn the index for the cache (see
+                        // `field_probe_raw`). A probe miss here can only mean
+                        // `name` isn't live on `table`'s own storage, so
+                        // `index_resolve`'s fallback can never itself produce
+                        // a cacheable depth-0 hit either.
+                        let probed = match base_table {
+                            Some(table) => {
+                                let encoded_key = self.encode_value(&key)?;
+                                self.field_probe_raw(
+                                    &proto.field_cache[pc],
+                                    table,
+                                    encoded_key,
+                                    name_bytes.as_slice(),
+                                    IcKind::Field,
+                                )?
+                            }
+                            None => None,
+                        };
+                        if let Some(value) = probed {
                             reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
-                        }
-                        Ok(IndexResolution::Call { method, args }) => {
-                            frame.header.pc = pc as u32;
-                            frame.header.stack_top = top as u32;
-                            frame.header.state = FrameState::Suspended;
-                            frame.pending = Pending::Index {
-                                dest: *dst as usize,
-                            };
-                            self.pending_frame_label = Some("index");
-                            return self.step_result_for_call(method, args);
-                        }
-                        Err(mut err) => {
-                            annotate_index_error(&mut err, &proto, pc, *base);
-                            return Err(err);
+                        } else {
+                            match self.index_resolve(base_value, key) {
+                                Ok(IndexResolution::Value(value)) => {
+                                    reg_set(self, &mut frame.regs, &frame.cells, *dst as usize, value);
+                                }
+                                Ok(IndexResolution::Call { method, args }) => {
+                                    frame.header.pc = pc as u32;
+                                    frame.header.stack_top = top as u32;
+                                    frame.header.state = FrameState::Suspended;
+                                    frame.pending = Pending::Index {
+                                        dest: *dst as usize,
+                                    };
+                                    self.pending_frame_label = Some("index");
+                                    return self.step_result_for_call(method, args);
+                                }
+                                Err(mut err) => {
+                                    annotate_index_error(&mut err, &proto, pc, *base);
+                                    return Err(err);
+                                }
+                            }
                         }
                     }
                 }
                 Instr::SetField(base, name, src) => {
                     let base_value = reg_get(self, &frame.regs, &frame.cells, *base as usize);
-                    let key = LuaValue::String(self.intern_str(name_const(&proto, *name).as_slice()));
+                    let name_bytes = name_const(&proto, *name);
                     let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
-                    match self.set_index_resolve(base_value, key, value, Some(&*frame)) {
-                        Ok(SetIndexResolution::Done) => {}
-                        Ok(SetIndexResolution::Call { method, args }) => {
-                            frame.header.pc = pc as u32;
-                            frame.header.stack_top = top as u32;
-                            frame.header.state = FrameState::Suspended;
-                            frame.pending = Pending::SetIndex;
-                            self.pending_frame_label = Some("newindex");
-                            return self.step_result_for_call(method, args);
-                        }
-                        Err(mut err) => {
-                            annotate_index_error(&mut err, &proto, pc, *base);
-                            return Err(err);
+                    let base_table = match &base_value {
+                        LuaValue::Table(table) => Some(*table),
+                        _ => None,
+                    };
+                    // Inline-cache fast path (U8): see `Instr::GetField`'s
+                    // own cache comment above; `field_cache_set` only
+                    // reports success for an existing, non-nil field (the
+                    // same case `set_index_resolve`'s raw-exists branch
+                    // overwrites directly, no `__newindex` consultation).
+                    let cached = match base_table {
+                        Some(table) => self.field_cache_set(
+                            &proto.field_cache[pc],
+                            table,
+                            name_bytes.as_slice(),
+                            value.clone(),
+                            IcKind::Field,
+                        )?,
+                        None => false,
+                    };
+                    if !cached {
+                        let key = LuaValue::String(self.intern_str(name_bytes.as_slice()));
+                        // Same raw-probe-first strategy as `Instr::GetField`
+                        // above: try to overwrite an existing raw key and
+                        // cache its index in one hash lookup before falling
+                        // back to the full `__newindex`/new-key slow path.
+                        let written = match base_table {
+                            Some(table) => {
+                                let encoded_key = self.encode_value(&key)?;
+                                self.field_write_raw(
+                                    &proto.field_cache[pc],
+                                    table,
+                                    encoded_key,
+                                    name_bytes.as_slice(),
+                                    value.clone(),
+                                    IcKind::Field,
+                                )?
+                            }
+                            None => false,
+                        };
+                        if !written {
+                            match self.set_index_resolve(base_value, key, value, Some(&*frame)) {
+                                Ok(SetIndexResolution::Done) => {}
+                                Ok(SetIndexResolution::Call { method, args }) => {
+                                    frame.header.pc = pc as u32;
+                                    frame.header.stack_top = top as u32;
+                                    frame.header.state = FrameState::Suspended;
+                                    frame.pending = Pending::SetIndex;
+                                    self.pending_frame_label = Some("newindex");
+                                    return self.step_result_for_call(method, args);
+                                }
+                                Err(mut err) => {
+                                    annotate_index_error(&mut err, &proto, pc, *base);
+                                    return Err(err);
+                                }
+                            }
                         }
                     }
                 }
@@ -718,6 +899,24 @@ impl LuaRuntime {
                         base,
                         results: *results,
                     };
+                    // Inline-cache fast path (U8): a callee that's already a
+                    // resolved `LuaValue::Closure` needs no `__call`-chain
+                    // retry loop, so this is exactly the case
+                    // `step_result_for_call`'s generic resolution handles via
+                    // `closure_parts` - bypass it on a cache hit instead.
+                    if let LuaValue::Closure(closure) = &callee {
+                        let closure = *closure;
+                        let (proto, upvals, globals) =
+                            self.closure_parts_cached(&proto.call_cache[pc], closure)?;
+                        return Ok(StepResult::PushClosure {
+                            closure,
+                            proto,
+                            upvals,
+                            globals,
+                            args: call_args,
+                            call_chain_hops: 0,
+                        });
+                    }
                     return self.step_result_for_call(callee, call_args);
                 }
                 Instr::TailCall(base, arguments) => {
@@ -736,6 +935,19 @@ impl LuaRuntime {
                     frame.header.stack_top = top as u32;
                     frame.header.state = FrameState::Suspended;
                     frame.pending = Pending::TailCall;
+                    if let LuaValue::Closure(closure) = &callee {
+                        let closure = *closure;
+                        let (proto, upvals, globals) =
+                            self.closure_parts_cached(&proto.call_cache[pc], closure)?;
+                        return Ok(StepResult::TailClosure {
+                            closure,
+                            proto,
+                            upvals,
+                            globals,
+                            args: call_args,
+                            call_chain_hops: 0,
+                        });
+                    }
                     return match self.step_result_for_call(callee, call_args)? {
                         StepResult::PushClosure {
                             closure,
@@ -1042,6 +1254,19 @@ impl LuaRuntime {
                         base,
                         nvars: *nvars as usize,
                     };
+                    if let LuaValue::Closure(closure) = &f {
+                        let closure = *closure;
+                        let (proto, upvals, globals) =
+                            self.closure_parts_cached(&proto.call_cache[pc], closure)?;
+                        return Ok(StepResult::PushClosure {
+                            closure,
+                            proto,
+                            upvals,
+                            globals,
+                            args: vec![s, ctrl],
+                            call_chain_hops: 0,
+                        });
+                    }
                     return self.step_result_for_call(f, vec![s, ctrl]);
                 }
                 Instr::TForLoop(base, delta) => {

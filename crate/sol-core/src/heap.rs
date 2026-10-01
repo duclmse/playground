@@ -976,6 +976,73 @@ impl Heap {
         Ok(())
     }
 
+    /// The hash-part slot `key` currently occupies, if any - lets a
+    /// field/global-access inline cache (U8) remember *where* a
+    /// by-name-constant key lives so a later repeat access can skip
+    /// `table_key`/hashing entirely via `table_get_at_hash_index`/
+    /// `table_set_at_hash_index`. Only meaningful for keys that can never
+    /// take the array-part fast path (every `GetField`/`SetField`/
+    /// `GetGlobal`/`SetGlobal` key is a compile-time string constant, never a
+    /// `positive_array_index`), so this never needs to consult `array`.
+    pub fn table_hash_index_of(&self, table: ObjectId, key: Value) -> Result<Option<usize>, HeapError> {
+        let key = self.table_key(key)?;
+        Ok(self.table(table)?.hash.get_index_of(&key))
+    }
+
+    /// Re-reads `table`'s hash part at a previously learned `index` (see
+    /// `table_hash_index_of`), without rehashing or cloning `expected_name`.
+    /// `IndexMap::insert` on an existing key never changes its index (only a
+    /// genuinely new key appends one), so once `index` is valid for a given
+    /// `ObjectId` generation it stays valid as long as that generation lives
+    /// - the `expected_name` byte-slice compare below is a cheap safety net
+    /// confirming that invariant, not something this relies on strictly.
+    /// Returns `Ok(None)` (not an error) on any mismatch or stale index, so a
+    /// caller can simply fall back to the ordinary hashed lookup exactly as a
+    /// cold cache miss would.
+    pub fn table_get_at_hash_index(
+        &self,
+        table: ObjectId,
+        index: usize,
+        expected_name: &[u8],
+    ) -> Result<Option<Value>, HeapError> {
+        let object = self.table(table)?;
+        Ok(match object.hash.get_index(index) {
+            Some((TableKey::String(bytes, _), value)) if bytes.as_slice() == expected_name => {
+                Some(*value)
+            }
+            _ => None,
+        })
+    }
+
+    /// `table_get_at_hash_index`'s write counterpart: overwrites the value
+    /// already at `index` in place (same key, no insertion), returning
+    /// whether the cached index was still valid. Never used to create a
+    /// genuinely new key - the caller's cache only ever learns an index from
+    /// `table_hash_index_of` after a key is already known to exist.
+    pub fn table_set_at_hash_index(
+        &mut self,
+        table: ObjectId,
+        index: usize,
+        expected_name: &[u8],
+        value: Value,
+    ) -> Result<bool, HeapError> {
+        let matched = {
+            let object = self.table_mut(table)?;
+            match object.hash.get_index_mut(index) {
+                Some((TableKey::String(bytes, _), slot)) if bytes.as_slice() == expected_name => {
+                    *slot = value;
+                    object.version = object.version.wrapping_add(1);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if matched {
+            self.write_barrier(table, value);
+        }
+        Ok(matched)
+    }
+
     pub fn upvalue_value(&self, upvalue: ObjectId) -> Result<Value, HeapError> {
         match &self.entry(upvalue)?.object {
             HeapObject::Upvalue(cell) => Ok(cell.value),

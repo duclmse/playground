@@ -2188,9 +2188,16 @@ impl LuaRuntime {
         right: &LuaValue,
         name: &[u8],
     ) -> LuaResult<Option<LuaValue>> {
-        Ok(self
-            .metamethod(left, name)?
-            .or(self.metamethod(right, name)?))
+        // `Option::or` takes its argument by value, so a naive
+        // `self.metamethod(left, name)?.or(self.metamethod(right, name)?)`
+        // would evaluate the right-hand lookup (metatable fetch + intern +
+        // hash lookup) unconditionally, even when the left operand already
+        // supplied the metamethod - the common case, since Lua operator
+        // overloading typically defines the metamethod on one side.
+        if let Some(method) = self.metamethod(left, name)? {
+            return Ok(Some(method));
+        }
+        self.metamethod(right, name)
     }
 
     pub(super) fn binary_resolve(

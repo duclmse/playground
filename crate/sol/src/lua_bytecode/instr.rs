@@ -1,13 +1,107 @@
 //! The instruction/constant value types: `Const`, `UpvalSource`, `Instr`,
 //! and the compiled-function output type `Proto`.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use sol_core::{ExecutablePrototype, PrototypeMetadata, SourceMap, ValueCount};
+use sol_core::{ExecutablePrototype, ObjectId, PrototypeMetadata, SourceMap, ValueCount};
 
 use crate::ast::BinaryOp;
 
 use super::Reg;
+
+/// How many distinct identities a per-call-site inline cache (see
+/// `BoundedCache`) remembers before it starts evicting the oldest entry to
+/// make room for a new one. This is the sole thing bounding mono -> poly ->
+/// megamorphic growth: a call site that cycles through more than `IC_SLOTS`
+/// distinct identities just keeps round-robin-evicting, degrading to "always
+/// miss, same as an uncached interpreter" rather than growing without bound.
+pub const IC_SLOTS: usize = 4;
+
+/// A per-call-site inline cache: up to `IC_SLOTS` entries, oldest evicted
+/// first once full. `T` is intentionally not required to be `Copy` (cache
+/// payloads hold `Rc`-shared data, e.g. `CallCacheEntry`'s `Rc<Proto>`), so
+/// this uses a `RefCell<Vec<T>>` rather than a `Cell`-based slot array.
+/// Every lookup re-verifies the cached entry against live state (see each
+/// cache's own call site) rather than trusting it indefinitely, so this
+/// structure itself never needs invalidation logic - only bounded growth.
+#[derive(Debug, Clone)]
+pub struct BoundedCache<T>(RefCell<Vec<T>>);
+
+impl<T> Default for BoundedCache<T> {
+    fn default() -> Self {
+        Self(RefCell::new(Vec::new()))
+    }
+}
+
+impl<T: Clone> BoundedCache<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a clone of the first entry matching `predicate`, if any.
+    pub fn find<F: Fn(&T) -> bool>(&self, predicate: F) -> Option<T> {
+        self.0.borrow().iter().find(|entry| predicate(entry)).cloned()
+    }
+
+    /// Inserts `entry`, evicting the oldest entry first if already at
+    /// `IC_SLOTS` capacity. Returns whether an eviction happened, so callers
+    /// can feed U8's `debug.icstats()` eviction counters.
+    pub fn insert(&self, entry: T) -> bool {
+        let mut entries = self.0.borrow_mut();
+        let evicted = entries.len() >= IC_SLOTS;
+        if evicted {
+            entries.remove(0);
+        }
+        entries.push(entry);
+        evicted
+    }
+
+    /// Current entry count - test-only, to assert bounded growth.
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A call-site's cached resolution of a `LuaValue::Closure` callee's
+/// `(prototype, upvalue cells)`. Deliberately omits the callee's `Globals`:
+/// `Globals` is a `lua_runtime`-layer type, and `Proto` (this module,
+/// `lua_bytecode`) has no dependency on `lua_runtime` - embedding it here
+/// would be a layering violation, not just a style preference, since
+/// `lua_runtime` is the one that depends on `lua_bytecode`, not the reverse.
+/// `globals_for_closure` stays an uncached lookup on every call, cache hit or
+/// not; only the heap-object borrow + prototype-registry resolve this entry
+/// replaces are actually expensive per U7's own measurements.
+#[derive(Debug, Clone)]
+pub struct CallCacheEntry {
+    /// The closure `ObjectId` (generation-checked) this entry was resolved
+    /// for. A stale entry whose closure was freed and its slot reused simply
+    /// fails this equality check - see `sol_core::ObjectId`'s doc comment.
+    pub guard: ObjectId,
+    pub prototype: Rc<Proto>,
+    pub upvalues: Rc<[std::cell::Cell<ObjectId>]>,
+}
+
+/// A `GetField`/`SetField` call site's cached resolution of a table's own
+/// raw hash-part slot for that instruction's compile-time-constant field
+/// name. Scoped to a plain `LuaValue::Table` base whose raw lookup already
+/// found the field on the table's own storage (never via a `__index`/
+/// `__newindex` metatable fallback - that path stays uncached, same as the
+/// call-target cache leaves `step_result_for_call`'s metamethod chain
+/// uncached) - see `sol_core::Heap::table_hash_index_of`/
+/// `table_get_at_hash_index`/`table_set_at_hash_index`.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldCacheEntry {
+    /// The table `ObjectId` (generation-checked) this entry was resolved
+    /// for - same staleness guarantee as `CallCacheEntry::guard`.
+    pub guard: ObjectId,
+    /// Index into that table's `TableObject::hash` `IndexMap`.
+    pub index: usize,
+}
 
 #[derive(Debug, Clone)]
 pub enum Const {
@@ -259,6 +353,29 @@ pub struct Proto {
     /// instruction's line (e.g. the first statement inside the body) - those
     /// coincide for a one-line function but not for a multi-line signature
     /// or an empty body whose first instruction is the implicit `return`.
+    /// Per-`pc` inline cache for `Call`/`TailCall`/`TForCall`'s closure-
+    /// callee resolution (U8). Same length as `instrs`, indexed by `pc`,
+    /// following `source_map`'s existing "parallel side table on `Proto`"
+    /// precedent; entries at non-call `pc`s simply stay empty (no
+    /// allocation - `BoundedCache::default()` is a zero-capacity `Vec`).
+    pub call_cache: Vec<BoundedCache<CallCacheEntry>>,
+    /// Per-`pc` inline cache for `GetField`/`SetField`'s raw-hash-slot
+    /// resolution (U8). Same length/indexing/empty-by-default convention as
+    /// `call_cache`; entries at non-field-access `pc`s simply stay empty.
+    pub field_cache: Vec<BoundedCache<FieldCacheEntry>>,
+    /// Per-`pc` inline cache for `GetGlobal`/`SetGlobal`'s plain-`_ENV`
+    /// raw-hash-slot resolution (U8). Reuses `FieldCacheEntry` and the same
+    /// table-field-cache mechanism against the `_ENV` table's own hash part;
+    /// a bare `_ENV = newtable` reassignment is caught for free, since the
+    /// guard is the `_ENV` table's own `ObjectId` at time of use (read fresh
+    /// from `Globals::as_value()` on every access, never cached itself) - a
+    /// reassigned `_ENV` simply means a different `ObjectId` is checked
+    /// against the cache entry, which then misses. Same length/indexing/
+    /// empty-by-default convention as `call_cache`; entries at non-global-
+    /// access `pc`s (including every `pc` in a `has_base()` scope, which
+    /// always takes the uncached `base`-chain path instead) simply stay
+    /// empty.
+    pub global_cache: Vec<BoundedCache<FieldCacheEntry>>,
     pub line_defined: u32,
     /// The line of this function's closing `end` - real Lua's
     /// `debug.getinfo`'s `lastlinedefined` (`lua_Debug::lastlinedefined`,
@@ -280,5 +397,74 @@ impl ExecutablePrototype for Proto {
 
     fn instruction_count(&self) -> usize {
         self.instrs.len()
+    }
+}
+
+impl Proto {
+    /// U8 item 7's "serialize... for inspection" deliverable: a
+    /// human-readable text dump of this prototype's (and its nested
+    /// closures', recursively) per-call-site inline cache occupancy,
+    /// classified mono/poly/megamorphic by how many of `IC_SLOTS` distinct
+    /// identities are currently cached. Exposed via `debug.icprofile()`
+    /// (`natives_debug.rs`).
+    ///
+    /// Deliberately dumps occupancy only, not per-call-site hit/miss counts:
+    /// no per-pc counter infrastructure exists (only the cross-call-site
+    /// aggregate counters `debug.icstats()` exposes do), and nothing in the
+    /// dynamic `.lua` path consumes a profile for PGO yet - building one
+    /// speculatively is scoped out here the same way U7/U8 deferred other
+    /// unmeasured work elsewhere in this plan.
+    pub fn ic_profile_dump(&self) -> String {
+        let mut out = String::new();
+        self.write_ic_profile(&mut out, 0);
+        out
+    }
+
+    fn write_ic_profile(&self, out: &mut String, depth: usize) {
+        use std::fmt::Write;
+        let indent = "  ".repeat(depth);
+        let _ = writeln!(
+            out,
+            "{indent}proto '{}' line={} ({} instrs)",
+            self.metadata.name,
+            self.line_defined,
+            self.instrs.len()
+        );
+        for (pc, cache) in self.call_cache.iter().enumerate() {
+            Self::write_cache_line(out, &indent, &self.source_map, pc as u32, "call", cache.len());
+        }
+        for (pc, cache) in self.field_cache.iter().enumerate() {
+            Self::write_cache_line(out, &indent, &self.source_map, pc as u32, "field", cache.len());
+        }
+        for (pc, cache) in self.global_cache.iter().enumerate() {
+            Self::write_cache_line(out, &indent, &self.source_map, pc as u32, "global", cache.len());
+        }
+        for nested in &self.nested {
+            nested.write_ic_profile(out, depth + 1);
+        }
+    }
+
+    fn write_cache_line(
+        out: &mut String,
+        indent: &str,
+        source_map: &SourceMap,
+        pc: u32,
+        kind: &str,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        use std::fmt::Write;
+        let state = match len {
+            1 => "mono",
+            n if n >= IC_SLOTS => "megamorphic",
+            _ => "poly",
+        };
+        let line = source_map.location(pc).map(|loc| loc.line).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "{indent}  pc={pc} line={line} kind={kind} state={state}({len}/{IC_SLOTS})"
+        );
     }
 }

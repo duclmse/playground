@@ -71,7 +71,10 @@ mod instr;
 #[cfg(test)]
 mod tests;
 
-pub use instr::{Const, Instr, LocalDebug, Proto, UpvalSource};
+pub use instr::{
+    BoundedCache, CallCacheEntry, Const, FieldCacheEntry, Instr, LocalDebug, Proto, UpvalSource,
+    IC_SLOTS,
+};
 
 use func_state::{FuncState, GlobalScanState, LocalOrGlobal};
 
@@ -285,6 +288,7 @@ impl Compiler {
             }
             _ => false,
         };
+        let instr_count = state.instrs.len();
         Ok(Rc::new(Proto {
             metadata: PrototypeMetadata::new(
                 state.name,
@@ -314,6 +318,9 @@ impl Compiler {
             captured_registers,
             captured_cell_count,
             nested: std::mem::take(&mut state.nested),
+            call_cache: (0..instr_count).map(|_| BoundedCache::default()).collect(),
+            field_cache: (0..instr_count).map(|_| BoundedCache::default()).collect(),
+            global_cache: (0..instr_count).map(|_| BoundedCache::default()).collect(),
             // `debug.getinfo` reports both definition lines as zero for a
             // top-level chunk, even though its source map still uses the
             // source's real executable line numbers. An ordinary function

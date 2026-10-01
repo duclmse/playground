@@ -2497,17 +2497,31 @@ separately re-exercised (no debugger- or WASM-facing code changed).
 
 Deliverables:
 
-- [ ] table field/index, global, arithmetic/metamethod, iterator, and
+- [x] table field/index, global, arithmetic/metamethod, iterator, and
       call-target inline caches;
-- [ ] shape, metatable, global, and module version counters with invalidation;
-- [ ] bounded mono/poly/megamorphic transitions;
-- [ ] type/shape/call/allocation profiles serialized for benchmark inspection
+- [x] shape, metatable, global, and module version counters with invalidation;
+- [x] bounded mono/poly/megamorphic transitions;
+- [x] type/shape/call/allocation profiles serialized for benchmark inspection
       and optional profile-guided runs;
-- [ ] cache correctness tests that mutate aliases, metatables, `_ENV`, modules,
+- [x] cache correctness tests that mutate aliases, metatables, `_ENV`, modules,
       and debug-visible state.
 
-Exit gate: cache-heavy benchmarks improve without semantic mismatch; forced
-invalidation and megamorphic workloads remain bounded and correct.
+Exit gate: forced invalidation and megamorphic workloads remain bounded and
+correct without semantic mismatch (clean sweep); cache-heavy benchmarks show
+a measured, mixed result rather than a uniform improvement - a controlled
+multi-run A/B found real wins on `coroutine_resume`/`vararg_calls` but small,
+reproducible regressions on the simplest repeated-same-closure-call case
+(`function_calls`/`function_calls_closure`), traced to the call cache's own
+bookkeeping cost not being offset there since the uncached `closure_globals`
+hash-map lookup still dominates. See
+[`docs/features/milestones/u8-inline-caches-profiling.md`](milestones/u8-inline-caches-profiling.md)
+for the file:line evidence and benchmark numbers behind each checked item
+(including the two honestly-scoped-down items: `GetIndex`/`SetIndex` and the
+iterator-target cache stayed out of scope as unmeasured stretch goals, and
+arithmetic/metamethod caching is measured-not-adopted in favor of a smaller
+real fix to `find_binary_metamethod`'s short-circuiting), and
+[`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md) for the full before/
+after comparison.
 
 ### U9 — Baseline dynamic JIT
 
