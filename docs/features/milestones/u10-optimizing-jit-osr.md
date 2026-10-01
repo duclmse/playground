@@ -29,6 +29,11 @@
       iteration instructions are modeled by `sol_ir` yet, so none of those
       can be specialized by this pass either).
 - [ ] Inline stable dynamic and typed calls.
+      **Not built - see the item-6 note below for what was built instead
+      and why.** `sol_ir` has no call-site, table, global, or upvalue
+      construct of any kind (`lift_proto`'s own modeled-instruction list,
+      item-3 note above); real inlining needs a call representation and
+      cross-`Proto` splicing this milestone has not added yet.
 - [x] Enter optimized loops with OSR and exit through precise side exits.
       See the item-4 note below.
 - [ ] Reconstruct inlined frames for errors, coroutines, profiling, and debug.
@@ -254,5 +259,96 @@ pass, alongside the full existing suite (118 lib tests total, up from 115,
 plus `sol-core`'s 37 and the Lua 5.5 manifest check, all green) - this item
 changes gating only, with no behavior change on any path that was already
 succeeding.
+
+**Item 6 note (call-site identity-guard infrastructure, not inlining):** the
+plan's literal framing - splice a callee's lifted body into the caller,
+gated by a stable-call-site check - presupposes an `sol_ir` that can
+represent a call at all. It cannot yet: `lift_proto` (confirmed by rereading
+it in full before starting this item) models exactly the instruction set the
+item-3 note already lists, and a bytecode `Instr::Call`/`TailCall`/`TForCall`
+falls through to `Inst::Unsupported` like any other unmodeled opcode,
+clearing `Function::fully_lifted` and (via `opt_lower::is_eligible`)
+excluding the whole containing `Proto` from this tier - exactly like
+`dynjit/lower.rs`'s own baseline tier, which lowers `Call`/`TailCall`/
+`TForCall` only by unconditionally deopting (`lower.rs:549`, restated in
+`stubs.rs`'s own module doc at the top of its Work-item-4-stubs section).
+
+There is also a harder reason real splicing is further out than one item:
+Lua bytecode calls are never statically resolved. `Instr::Call` invokes
+whatever closure value is sitting in a register at runtime - there is no
+"direct call to a known `Proto`" shape in the bytecode for `lift_proto` to
+lift in the first place. The only candidate "stable call site" signal is
+runtime profile data: U8's per-pc `Proto::call_cache: Vec<BoundedCache
+<CallCacheEntry>>` (`lua_bytecode/instr.rs`). Trusting that profile inside
+compiled code is a genuinely speculative runtime check - a real `Inst::Guard`
+checking closure identity, not the unconditionally-true dataflow
+`propagate_proofs` already proves - and no real `Inst::Guard` has ever been
+constructed from actual bytecode anywhere in this codebase yet (items 1-5 all
+left `Inst::Guard` as hand-built-test-graph-only scaffolding; see the
+unchecked guard-insertion bullet and the item-5 note above). Building real
+splicing in this item would therefore mean building, in one increment: call
+lifting, cross-`Proto` block splicing with register renaming, argument/
+return-value wiring, *and* the first-ever real speculative guard with a
+working deopt-to-interpreter path - several firsts at once, exactly the
+"disproportionately large for one item" case this item's own directive
+flagged in advance. So, following items 3-5's own precedent of shipping the
+honest, bounded thing rather than the plan's literal text: this item built
+path 2 - real call-site identity-guard *infrastructure*, tested, with
+bytecode-level call lifting and splicing explicitly deferred.
+
+What shipped:
+
+- `GuardFact` (`sol_ir.rs`) gains a second variant,
+  `ClosureIdentity(ValueId, ObjectId)` - item 2's own doc comment already
+  reserved this shape ("work item 2 reserves the shape" for the
+  single-variant enum); this item names it and wires it through the two
+  functions `hoist_loop_invariant_guards`/`fuse_redundant_guards` are
+  generic over, `guard_fact_value`/`with_guard_fact_value` (`sol_ir.rs`), so
+  both existing passes handle it with no variant-specific logic of their
+  own - confirmed by two new tests exercising the identical hoist/fuse
+  fixtures the `TagIsInteger` tests already use, but with
+  `ClosureIdentity`, including a case that confirms two guards on the *same*
+  register but *different* identities (e.g. a polymorphic call site
+  re-checked after a deopt) survive fusion rather than being incorrectly
+  collapsed.
+- `BoundedCache<CallCacheEntry>::monomorphic_call_target`
+  (`lua_bytecode/instr.rs`) - the call-cache-side half of "is this call site
+  stable": returns the cache's one entry only when `len() == 1`. This is
+  sound, not just plausible, because of `closure_parts_cached`'s own
+  discipline (`lua_runtime/table.rs:110-131`, reread in full to confirm):
+  it only ever calls `insert` after a `find` miss against the live guard, so
+  a second `insert` only happens when a genuinely different closure identity
+  was seen at that call site - and `BoundedCache::insert`'s only removal path
+  is a round-robin eviction at `IC_SLOTS` capacity, never on a hit, so
+  `len()` can grow but never shrinks back to 1. A call site that was ever
+  polymorphic therefore stays correctly classified as non-monomorphic
+  permanently, not just at the instant it's checked. (`debug.icstats()`'s own
+  existing `write_cache_line` already classifies `len() == 1` as `"mono"`,
+  independently corroborating this as the right threshold rather than an
+  invented one.) Four new tests cover: `None` before any resolution, `Some`
+  after exactly one, `None` after a second distinct identity, and `None`
+  staying permanent even after the cache has round-robin-evicted back down
+  to `IC_SLOTS` entries.
+
+Explicitly not done, matching path 2's own deferral: no bytecode `Call`/
+`TailCall`/`TForCall` is lifted by `sol_ir` yet, nothing calls
+`monomorphic_call_target` from real lowering or lifting, no `Inst::Call` IR
+node exists, and no callee body is ever spliced anywhere. Nothing in
+`opt_lower.rs`/`lower.rs` changed. The typed-ABI half of this bullet (a
+stable dynamic call resolving to a typed `.sol` function through the
+semantic ABI) is further out still than the dynamic-call case analyzed
+above, which is itself not done - no attempt was made at it.
+
+No benchmark: this item added no new code path any `Proto` can reach at
+runtime (the new `GuardFact` variant and cache helper are exercised only by
+their own unit tests), so there is nothing yet to measure.
+
+Differential coverage: none beyond the unit tests above - no
+`lua55_dynamic_runtime_jit.rs` test was added, since nothing user-visible
+changed; adding one would only assert that ordinary call execution is
+unaffected, which the full existing suite (124 lib tests, up from 118, plus
+every integration suite, `sol-core`'s 37, and the Lua 5.5 manifest check, all
+green) already covers by construction, since no call-handling code path was
+touched.
 
 See the [historical U10 ledger](../unified-sol-runtime-plan.md#u10--optimizing-ssa-jit-osr-and-deoptimization).

@@ -43,7 +43,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use sol_core::{StackMap, ValueCount, ValueTag};
+use sol_core::{ObjectId, StackMap, ValueCount, ValueTag};
 
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::lua_bytecode::{Const, Instr, Proto, Reg};
@@ -67,14 +67,28 @@ pub enum Proof {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GuardId(pub u32);
 
-/// A fact a `Guard` checks at runtime before later code may rely on it. Only
-/// one variant so far - work item 2 reserves the shape; nothing in this
-/// module constructs a real `Guard` yet, since doing so for arithmetic would
-/// need U8's `BoundedCache` profile data threaded into the lifter, which is
-/// work item 3's job (`opt_lower.rs`), not this one's.
+/// A fact a `Guard` checks at runtime before later code may rely on it.
+/// `TagIsInteger` is work item 2's original reservation; nothing in this
+/// module constructs a real `Guard` from either variant yet - `lift_proto`
+/// never emits `Inst::Guard` at all (see `Function::fully_lifted`'s doc), so
+/// both are only exercised by the hand-built graphs this module's own tests
+/// construct below.
+///
+/// `ClosureIdentity(id, guard)` is work item 6's reservation of the
+/// call-site shape: "the closure value at `id` is the same object as
+/// `guard`". `guard` is meant to be a call site's own
+/// `CallCacheEntry::guard` (`lua_bytecode::instr`) - U8's existing
+/// generation-checked closure identity, already the signal
+/// `closure_parts_cached` (`lua_runtime/table.rs`) re-verifies on every
+/// cache hit. A real inlining pass would use this fact to guard a spliced-in
+/// callee body; `sol_ir::lift_proto` has no call-lifting support yet (see
+/// `docs/features/milestones/u10-optimizing-jit-osr.md`'s item-6 note for
+/// why that is deferred), so this variant is, for now, exactly as
+/// hand-graph-only as `TagIsInteger` already was.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GuardFact {
     TagIsInteger(ValueId),
+    ClosureIdentity(ValueId, ObjectId),
 }
 
 /// What the interpreter needs to resume correctly if a `Guard` fails: the
@@ -627,12 +641,14 @@ fn def_block_index(func: &Function, id: ValueId) -> Option<usize> {
 fn guard_fact_value(fact: &GuardFact) -> ValueId {
     match fact {
         GuardFact::TagIsInteger(id) => *id,
+        GuardFact::ClosureIdentity(id, _) => *id,
     }
 }
 
 fn with_guard_fact_value(fact: &GuardFact, id: ValueId) -> GuardFact {
     match fact {
         GuardFact::TagIsInteger(_) => GuardFact::TagIsInteger(id),
+        GuardFact::ClosureIdentity(_, guard) => GuardFact::ClosureIdentity(id, *guard),
     }
 }
 
@@ -1196,6 +1212,142 @@ mod tests {
             .filter(|(_, inst)| matches!(inst, Inst::Guard { .. }))
             .count();
         assert_eq!(guard_count, 1, "the duplicate guard on the same fact should have been fused away");
+    }
+
+    #[test]
+    fn fuse_redundant_guards_collapses_duplicate_closure_identity_checks_but_not_distinct_identities() {
+        let snapshot_a = DeoptSnapshot::full(0, 4);
+        let snapshot_b = DeoptSnapshot::full(0, 4);
+        let snapshot_c = DeoptSnapshot::full(0, 4);
+        let guard_x = ObjectId::from_raw(1).unwrap();
+        let guard_y = ObjectId::from_raw(2).unwrap();
+        let mut block = Block::default();
+        block.insts.push((
+            ValueId(0),
+            Inst::Guard {
+                id: GuardId(0),
+                fact: GuardFact::ClosureIdentity(ValueId(1), guard_x),
+                snapshot: snapshot_a,
+            },
+        ));
+        block.insts.push((
+            ValueId(2),
+            Inst::Guard {
+                id: GuardId(1),
+                fact: GuardFact::ClosureIdentity(ValueId(1), guard_x),
+                snapshot: snapshot_b,
+            },
+        ));
+        // A guard against the same register but a *different* identity is a
+        // genuinely different fact (e.g. a polymorphic call site re-checked
+        // after a deopt) and must survive fusion.
+        block.insts.push((
+            ValueId(3),
+            Inst::Guard {
+                id: GuardId(2),
+                fact: GuardFact::ClosureIdentity(ValueId(1), guard_y),
+                snapshot: snapshot_c,
+            },
+        ));
+        let mut func = Function {
+            blocks: vec![block],
+            entry: BlockId(0),
+            proofs: HashMap::new(),
+            fully_lifted: true,
+            value_at_pc: HashMap::new(),
+        };
+
+        fuse_redundant_guards(&mut func);
+
+        let facts: Vec<GuardFact> = func.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|(_, inst)| match inst {
+                Inst::Guard { fact, .. } => Some(*fact),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            facts,
+            vec![
+                GuardFact::ClosureIdentity(ValueId(1), guard_x),
+                GuardFact::ClosureIdentity(ValueId(1), guard_y),
+            ],
+            "same-identity duplicate must fuse away, but the distinct identity must remain"
+        );
+    }
+
+    #[test]
+    fn hoist_loop_invariant_guards_sinks_a_closure_identity_guard_to_the_preheader() {
+        // Same fixture shape as the `TagIsInteger` hoist test above -
+        // `hoist_loop_invariant_guards` is generic over `GuardFact` via
+        // `guard_fact_value`/`with_guard_fact_value`, so this only needs to
+        // show the new variant takes the identical path.
+        let proto = compile(
+            b"local limit = 10 local i = 0
+              while i < limit do
+                i = i + 1
+              end
+              return i",
+        );
+        let func = lift_proto(&proto);
+        let header = (1..func.blocks.len())
+            .find(|&b| {
+                func.blocks[b]
+                    .insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::Phi { .. }))
+            })
+            .expect("fixture has a loop header with preallocated phis");
+        let limit_phi_id = func.blocks[header]
+            .insts
+            .iter()
+            .find_map(|(id, inst)| match inst {
+                Inst::Phi { incomings, .. }
+                    if incomings.iter().filter(|(_, v)| v != id).all(|(_, v)| {
+                        *v == incomings.iter().find(|(_, v)| v != id).unwrap().1
+                    }) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("the loop has exactly one read-only register (limit)");
+
+        let mut func = func;
+        let loop_body = header + 1;
+        let snapshot = DeoptSnapshot::full(0, proto.metadata.registers as usize);
+        let guard = ObjectId::from_raw(7).unwrap();
+        func.blocks[loop_body].insts.insert(
+            0,
+            (
+                ValueId(u32::MAX),
+                Inst::Guard {
+                    id: GuardId(0),
+                    fact: GuardFact::ClosureIdentity(limit_phi_id, guard),
+                    snapshot,
+                },
+            ),
+        );
+
+        hoist_loop_invariant_guards(&mut func);
+
+        let body_still_has_guard = func.blocks[loop_body]
+            .insts
+            .iter()
+            .any(|(_, inst)| matches!(inst, Inst::Guard { .. }));
+        assert!(!body_still_has_guard, "the invariant guard should have moved out of the loop body");
+
+        let preheader = header - 1;
+        let hoisted = func.blocks[preheader]
+            .insts
+            .iter()
+            .find_map(|(_, inst)| match inst {
+                Inst::Guard { fact: GuardFact::ClosureIdentity(id, g), .. } if *g == guard => Some(*id),
+                _ => None,
+            })
+            .expect("the guard should have been hoisted into the preheader");
+        assert_ne!(hoisted, limit_phi_id);
     }
 
     #[test]

@@ -86,6 +86,31 @@ pub struct CallCacheEntry {
     pub upvalues: Rc<[std::cell::Cell<ObjectId>]>,
 }
 
+impl BoundedCache<CallCacheEntry> {
+    /// The call site's single resolved target, if and only if this call site
+    /// has only ever resolved to one closure identity so far.
+    ///
+    /// This is a safe, once-false-stays-false signal, not a snapshot that
+    /// can flicker back to `Some`: `closure_parts_cached`
+    /// (`lua_runtime/table.rs`) only ever calls `insert` after a `find`
+    /// miss, so a cache that has seen a second distinct closure identity
+    /// grows to `len() >= 2` and - since `insert`'s only removal is a
+    /// round-robin eviction at `IC_SLOTS` capacity, never on a hit - can
+    /// never shrink back down to `len() == 1` afterward. `U10`'s work item 6
+    /// reserves this as the call-site classification a real inlining pass
+    /// would read before trusting a `GuardFact::ClosureIdentity` guard
+    /// against this site (see that variant's doc comment, `sol_ir.rs`) -
+    /// nothing yet calls this from bytecode lifting or lowering.
+    pub fn monomorphic_call_target(&self) -> Option<CallCacheEntry> {
+        let entries = self.0.borrow();
+        if entries.len() == 1 {
+            Some(entries[0].clone())
+        } else {
+            None
+        }
+    }
+}
+
 /// A `GetField`/`SetField` call site's cached resolution of a table's own
 /// raw hash-part slot for that instruction's compile-time-constant field
 /// name. Scoped to a plain `LuaValue::Table` base whose raw lookup already
@@ -569,5 +594,67 @@ impl Proto {
             out,
             "{indent}  pc={pc} line={line} kind={kind} state={state}({len}/{IC_SLOTS})"
         );
+    }
+}
+
+#[cfg(test)]
+mod monomorphic_call_target_tests {
+    use super::*;
+
+    fn trivial_proto() -> Rc<Proto> {
+        let source = b"return 1";
+        let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).unwrap()).unwrap();
+        crate::lua_bytecode::Compiler::compile_top_level(&program.functions[0]).unwrap()
+    }
+
+    fn entry(guard: ObjectId, prototype: Rc<Proto>) -> CallCacheEntry {
+        CallCacheEntry { guard, prototype, upvalues: Rc::from(Vec::new().into_boxed_slice()) }
+    }
+
+    #[test]
+    fn none_before_any_resolution() {
+        let cache = BoundedCache::<CallCacheEntry>::new();
+        assert!(cache.monomorphic_call_target().is_none());
+    }
+
+    #[test]
+    fn some_after_exactly_one_resolved_identity() {
+        let cache = BoundedCache::<CallCacheEntry>::new();
+        let proto = trivial_proto();
+        let guard = ObjectId::from_raw(1).unwrap();
+        cache.insert(entry(guard, proto));
+
+        let target = cache.monomorphic_call_target();
+
+        assert!(matches!(target, Some(e) if e.guard == guard));
+    }
+
+    /// Mirrors `closure_parts_cached`'s real discipline (`lua_runtime/table.rs`):
+    /// it only ever calls `insert` after a `find` miss, so a second distinct
+    /// identity really does mean a second distinct closure was seen at this
+    /// call site, not a repeat resolution of the first.
+    #[test]
+    fn none_once_a_second_distinct_identity_is_seen() {
+        let cache = BoundedCache::<CallCacheEntry>::new();
+        let proto = trivial_proto();
+        cache.insert(entry(ObjectId::from_raw(1).unwrap(), proto.clone()));
+        cache.insert(entry(ObjectId::from_raw(2).unwrap(), proto));
+
+        assert!(cache.monomorphic_call_target().is_none());
+    }
+
+    #[test]
+    fn stays_none_permanently_once_polymorphic_even_after_round_robin_eviction() {
+        let cache = BoundedCache::<CallCacheEntry>::new();
+        let proto = trivial_proto();
+        for raw in 1..=(IC_SLOTS as u64 + 2) {
+            cache.insert(entry(ObjectId::from_raw(raw).unwrap(), proto.clone()));
+        }
+
+        // `len()` is pinned at `IC_SLOTS` by round-robin eviction - it never
+        // shrinks back down to 1, so a call site that was ever polymorphic
+        // can never again look monomorphic to this check.
+        assert_eq!(cache.len(), IC_SLOTS);
+        assert!(cache.monomorphic_call_target().is_none());
     }
 }
