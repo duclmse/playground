@@ -519,6 +519,46 @@ pub(super) fn lower_proto(
     proto: &Proto,
     name: &str,
 ) -> Result<FuncId, String> {
+    lower_proto_from(module, builder_ctx, stubs, proto, name, 0)
+}
+
+/// U10 work item 4 (OSR): identical to `lower_proto` above, except the
+/// compiled function's entry block jumps straight to `blocks[entry_pc]`
+/// instead of `blocks[0]` - every other block, guard, safepoint, and deopt
+/// wire-up is produced exactly as `lower_proto` would produce it, since
+/// `entry_pc` is just a different starting point into the same per-pc block
+/// array. `entry_pc` must be a backward-branch target within `proto`
+/// (i.e. a loop header) that the interpreter has already reached at least
+/// once - see `try_osr_backedge` (`lua_runtime/dispatch/bytecode.rs`), this
+/// function's only caller. Caller (`DynJit::osr_compile`) must have already
+/// confirmed `is_eligible(proto)`, exactly as `lower_proto`'s caller does.
+///
+/// Reusing the *entire* flat register array as input (rather than only the
+/// registers live at `entry_pc`) mirrors the precondition `run_native`
+/// already relies on for ordinary native entry: by the time the interpreter
+/// reaches `entry_pc`, every register the loop body can read has already
+/// been written by the interpreter itself, so handing over the whole
+/// `frame.regs` array (as `try_osr_backedge` does) is always safe, if
+/// sometimes slightly more than strictly necessary.
+pub(super) fn lower_osr_entry(
+    module: &mut JITModule,
+    builder_ctx: &mut FunctionBuilderContext,
+    stubs: &StubFuncs,
+    proto: &Proto,
+    name: &str,
+    entry_pc: usize,
+) -> Result<FuncId, String> {
+    lower_proto_from(module, builder_ctx, stubs, proto, name, entry_pc)
+}
+
+fn lower_proto_from(
+    module: &mut JITModule,
+    builder_ctx: &mut FunctionBuilderContext,
+    stubs: &StubFuncs,
+    proto: &Proto,
+    name: &str,
+    entry_pc: usize,
+) -> Result<FuncId, String> {
     let mut func = sol_ir::lift_proto(proto);
     sol_ir::propagate_proofs(&mut func);
 
@@ -555,7 +595,7 @@ pub(super) fn lower_proto(
         builder.append_block_param(deopt_block, types::I32);
 
         builder.switch_to_block(entry);
-        builder.ins().jump(blocks[0], &[]);
+        builder.ins().jump(blocks[entry_pc], &[]);
 
         let mut lowerer = Lowerer {
             builder,

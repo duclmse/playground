@@ -92,6 +92,26 @@ pub fn optimize_threshold() -> u32 {
     })
 }
 
+/// Reads `SOL_LUA_OSR_THRESHOLD`, gating U10 work item 4's mid-loop OSR
+/// entry - mirrors `promote_threshold()`/`optimize_threshold()`'s own
+/// cached-env-var pattern. Unlike those two, this counts backward branches
+/// taken (`Proto::osr_counts`, bumped once per loop iteration a given loop
+/// header is reached - see `try_osr_backedge`), not function activations, so
+/// a single long-running call can cross it on its own; the typed tier's own
+/// OSR precedent (`tier.rs`'s `DEFAULT_OSR_THRESHOLD`) is likewise lower
+/// than its promote threshold for the same reason - a loop iterating inside
+/// one activation needs its own, faster-firing signal, independent of how
+/// many times the *function itself* has been called.
+pub fn osr_threshold() -> u32 {
+    static THRESHOLD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("SOL_LUA_OSR_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+    })
+}
+
 pub struct DynJit {
     /// U9 item 7 (code-cache lifecycle, "confirm don't newly build"): a
     /// `Proto`'s native code, once `promote`d into this `module`, is never
@@ -237,6 +257,56 @@ impl DynJit {
         if self.jit_log {
             eprintln!(
                 "[dynjit] '{}' optimized to native code as '{name}'",
+                proto.metadata.name
+            );
+        }
+        Ok(ptr)
+    }
+
+    /// Compiles a U10 work item 4 OSR entry for the loop headed at bytecode
+    /// `header_pc` inside `proto`, and returns its entry point. Shares this
+    /// same `module`/`builder_ctx`/`stub_funcs` with `promote`/`optimize`,
+    /// same rationale as `optimize`'s own doc.
+    ///
+    /// Gated on the *same* eligibility as `optimize` (`opt_lower::is_eligible`
+    /// - pure arithmetic/branch/return/loop `Proto`s `sol_ir::lift_proto`
+    /// fully models), since the OSR entry is compiled by that same lowering,
+    /// just starting at a different block. Callers (`LuaRuntime::try_osr`)
+    /// must treat an `Err` here as "this loop stays interpreted," exactly
+    /// like a failed `promote`/`optimize` call.
+    pub fn osr_compile(&mut self, proto: &Rc<Proto>, header_pc: usize) -> Result<*const u8, String> {
+        if self.jit_log {
+            eprintln!(
+                "[dynjit] OSR entry requested for '{}' at loop header pc {header_pc}",
+                proto.metadata.name
+            );
+        }
+        if !opt_lower::is_eligible(proto) {
+            if self.jit_log {
+                eprintln!(
+                    "[dynjit] '{}' is not eligible for OSR (same restriction as item 3's \
+                     optimizing tier - anything beyond arithmetic/branch/return/loop)",
+                    proto.metadata.name
+                );
+            }
+            return Err("not eligible for OSR lowering".to_string());
+        }
+        let name = self.fresh_name(proto);
+        let func_id = opt_lower::lower_osr_entry(
+            &mut self.module,
+            &mut self.builder_ctx,
+            &self.stub_funcs,
+            proto,
+            &name,
+            header_pc,
+        )?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| e.to_string())?;
+        let ptr = self.module.get_finalized_function(func_id);
+        if self.jit_log {
+            eprintln!(
+                "[dynjit] '{}' gained an OSR entry at loop header pc {header_pc} ('{name}')",
                 proto.metadata.name
             );
         }
@@ -392,6 +462,52 @@ impl LuaRuntime {
                 proto.native_status.set(NativeStatus::Native(baseline_ptr));
                 false
             }
+        }
+    }
+
+    /// Called from `try_osr_backedge` (`lua_runtime/dispatch/bytecode.rs`)
+    /// once a loop header's own backward-branch counter has just crossed
+    /// `osr_threshold()`. Unlike `try_promote`/`try_optimize`, this has no
+    /// `NativeStatus` state machine of its own to drive - `Proto::osr_entries`
+    /// is a plain cache keyed by `header_pc`, checked by the caller *before*
+    /// this is invoked (see that method's doc), so this is only ever called
+    /// once per `(proto, header_pc)` pair for the whole process lifetime.
+    ///
+    /// Returns `None` (and leaves the loop interpreted forever after) on any
+    /// failure - ineligible `Proto`, or `DynJit` unavailable - mirroring
+    /// `try_promote`/`try_optimize`'s own graceful-fallback shape.
+    pub(super) fn try_osr(&mut self, proto: &Rc<Proto>, header_pc: usize) -> Option<*const u8> {
+        let jit = match &mut self.dynjit {
+            DynJitState::Ready(jit) => jit,
+            DynJitState::Unavailable => return None,
+            DynJitState::Uninit => match DynJit::new() {
+                Ok(jit) => {
+                    self.dynjit = DynJitState::Ready(jit);
+                    match &mut self.dynjit {
+                        DynJitState::Ready(jit) => jit,
+                        DynJitState::Uninit | DynJitState::Unavailable => {
+                            unreachable!("just assigned DynJitState::Ready above")
+                        }
+                    }
+                }
+                Err(err) => {
+                    if jit_log_enabled() {
+                        eprintln!(
+                            "[dynjit] could not initialize the dynamic JIT; disabling \
+                             promotion for the rest of this runtime: {err}"
+                        );
+                    }
+                    self.dynjit = DynJitState::Unavailable;
+                    return None;
+                }
+            },
+        };
+        match jit.osr_compile(proto, header_pc) {
+            Ok(ptr) => {
+                proto.osr_entries.borrow_mut().insert(header_pc, ptr);
+                Some(ptr)
+            }
+            Err(_) => None,
         }
     }
 }

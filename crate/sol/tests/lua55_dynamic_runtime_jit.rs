@@ -487,3 +487,90 @@ fn constant_driven_arithmetic_survives_gc_stress_mode() {
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, stressed.stdout);
 }
+
+/// U10 work item 4 (OSR): a `while`-loop-shaped function (`Jump`/
+/// `JumpIfFalse` backward branches, not `ForPrep`/`ForLoop` - `sol_ir::
+/// lift_proto` only models the former, see that module's own doc) is
+/// eligible for `opt_lower`'s lowering per se, but this test's point is that
+/// it never goes through `try_promote`/`try_optimize` at all (both
+/// thresholds are left at their untouched defaults, so `call_count`/
+/// `optimize_count` never reach them for a function called exactly once) -
+/// only `SOL_LUA_OSR_THRESHOLD` is forced low, so the *only* way this
+/// `Proto` can ever reach native code is `try_osr_backedge`
+/// (`lua_runtime/dispatch/bytecode.rs`) firing mid-loop, inside a single
+/// still-`NativeStatus::Interpreted` activation - proving OSR entry is
+/// genuinely independent machinery from the whole-function promote/optimize
+/// tiers, not just another path into them.
+#[test]
+fn a_hot_while_loop_is_entered_via_osr_mid_activation_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_osr_while_sum.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let osr = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_OSR_THRESHOLD", "5")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(osr.status.success());
+    assert_eq!(String::from_utf8_lossy(&osr.stdout).trim(), "2001000\nnil");
+    let stderr = String::from_utf8_lossy(&osr.stderr);
+    assert!(
+        stderr.contains("OSR entry requested for 'loop_sum'"),
+        "expected an OSR entry attempt for 'loop_sum':\n{stderr}"
+    );
+    assert!(
+        stderr.contains("'loop_sum' gained an OSR entry"),
+        "expected 'loop_sum' to actually compile an OSR entry, not just \
+         attempt-and-reject:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("promoted to native code") && !stderr.contains("optimized to native code"),
+        "expected 'loop_sum' to reach native code *only* via OSR, with \
+         promote/optimize thresholds left untouched:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, osr.stdout);
+}
+
+/// Same fixture, under `SOL_LUA_GC_STRESS=1`: exercises the OSR entry's own
+/// register-sync (encode-in/decode-out, `try_osr_backedge`) under maximal
+/// collection pressure, mirroring item 3's own GC-stress coverage for the
+/// whole-function optimizing tier.
+#[test]
+fn a_hot_while_loop_entered_via_osr_survives_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_osr_while_sum.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_OSR_THRESHOLD", "5")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "2001000\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'loop_sum' gained an OSR entry"),
+        "expected 'loop_sum' to gain an OSR entry even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}

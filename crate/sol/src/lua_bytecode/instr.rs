@@ -404,6 +404,28 @@ pub struct Proto {
     /// consumers to decide when to attempt a proof-specialized recompile on
     /// top of the already-promoted baseline tier.
     pub optimize_count: std::cell::Cell<u32>,
+    /// U10 work item 4 (OSR): per-loop-header backward-branch counters,
+    /// keyed by the bytecode `pc` a backward `Jump`/`JumpIfFalse`/
+    /// `JumpIfTrue` targets (that target pc *is* the loop header, by the
+    /// ordinary compiler definition of a back edge - no separate loop-header
+    /// side table is needed beyond what the jump instructions already
+    /// encode). Parallel in spirit to `call_count`/`optimize_count`, but a
+    /// `Proto` can contain more than one loop, so this is a map rather than
+    /// a single `Cell`, and it counts backward branches taken by the
+    /// interpreter, not activations. Read/written only from
+    /// `LuaRuntime::try_osr_backedge` (`lua_runtime/dispatch/bytecode.rs`).
+    pub osr_counts: std::cell::RefCell<std::collections::HashMap<usize, u32>>,
+    /// U10 work item 4 (OSR): compiled OSR entry points, keyed by the same
+    /// loop-header `pc` as `osr_counts`. Each pointer is a distinct
+    /// `dynjit::abi::NativeFn`-shaped native function compiled by
+    /// `opt_lower::lower_osr_entry` that begins execution at that header's
+    /// Cranelift block instead of block 0, so a hot loop can be entered mid-
+    /// iteration directly from the interpreter instead of only via a fresh
+    /// whole-function activation. Deliberately a side table independent of
+    /// `native_status`: a `Proto` can gain an OSR entry for one of its loops
+    /// without ever itself reaching `NativeStatus::Native`/`Optimized` as a
+    /// whole function (see `try_osr`'s doc).
+    pub osr_entries: std::cell::RefCell<std::collections::HashMap<usize, *const u8>>,
 }
 
 /// A `Proto`'s current dynamic-JIT (U9/U10) promotion state. Defined in

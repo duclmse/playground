@@ -335,6 +335,8 @@ impl Compiler {
             call_count: std::cell::Cell::new(0),
             native_status: std::cell::Cell::new(NativeStatus::Interpreted),
             optimize_count: std::cell::Cell::new(0),
+            osr_counts: std::cell::RefCell::new(std::collections::HashMap::new()),
+            osr_entries: std::cell::RefCell::new(std::collections::HashMap::new()),
         }))
     }
 

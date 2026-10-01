@@ -3,7 +3,120 @@
 use super::*;
 use crate::lua_runtime::ic::IcKind;
 
+/// U10 work item 4 (OSR): what `try_osr_backedge` decided to do about one
+/// backward branch. `NotAttempted` covers every case where the interpreter
+/// should just keep running unchanged - not yet at threshold, already failed
+/// eligibility, or an active debug hook (native code, OSR entries included,
+/// can't fire per-instruction hooks the way `dispatch_step` does, mirroring
+/// `run_native`'s own `active_hook`/C-instruction-hook gate in `drive_result`).
+enum OsrOutcome {
+    NotAttempted,
+    /// The OSR entry hit a guard/stub failure partway through the loop and
+    /// flushed its registers back to `frame.regs` before returning here -
+    /// resume ordinary interpretation at this bytecode pc, reusing the exact
+    /// same deopt mechanism `run_native`'s own `outcome == 0` branch does.
+    Deopt(usize),
+    /// The OSR entry ran the rest of the function to completion.
+    Done(Vec<LuaValue>),
+}
+
 impl LuaRuntime {
+    /// U10 work item 4 (OSR): called from the three backward-branch arms
+    /// below (`Jump`/`JumpIfFalse`/`JumpIfTrue`) whenever the branch target
+    /// is a loop header (`target_pc <= ` the branch instruction's own pc).
+    /// Bumps that header's backward-branch counter (`Proto::osr_counts`) and,
+    /// once it first exactly equals `dynjit::osr_threshold()` (mirroring the
+    /// typed tier's own `on_loop_backedge`, `interp.rs` - an exact-equality
+    /// check, not `>=`, so a loop only ever attempts compilation once), asks
+    /// `LuaRuntime::try_osr` to compile and cache an OSR entry for it. Once
+    /// an entry exists (just compiled, or already cached from an earlier
+    /// activation of this same `Proto`), calls straight into it with the
+    /// frame's *entire* already-synced register array - safe because, by
+    /// construction, every register the loop body can read has already been
+    /// written by the interpreter before this backward branch runs (the same
+    /// precondition `run_native` relies on for ordinary native entry).
+    fn try_osr_backedge(
+        &mut self,
+        frame: &mut LuaFrame,
+        proto: &Rc<Proto>,
+        header_pc: usize,
+    ) -> LuaResult<OsrOutcome> {
+        if self.active_hook.is_some() || c_api::c_instruction_hooks_active(self) {
+            return Ok(OsrOutcome::NotAttempted);
+        }
+        // Must not call `.borrow()` directly in this `if let`'s scrutinee:
+        // the guard would otherwise live until the end of the whole
+        // if/else (temporaries in a `match`/`if let` scrutinee are scoped to
+        // the entire statement), still held when the `else` arm's `try_osr`
+        // tries to `borrow_mut()` the same `RefCell` and panics.
+        let cached = proto.osr_entries.borrow().get(&header_pc).copied();
+        let ptr = if let Some(ptr) = cached {
+            Some(ptr)
+        } else {
+            let count = {
+                let mut counts = proto.osr_counts.borrow_mut();
+                let slot = counts.entry(header_pc).or_insert(0);
+                *slot = slot.wrapping_add(1);
+                *slot
+            };
+            if count == dynjit::osr_threshold() {
+                self.try_osr(proto, header_pc)
+            } else {
+                None
+            }
+        };
+        let Some(ptr) = ptr else {
+            return Ok(OsrOutcome::NotAttempted);
+        };
+
+        let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
+        // Same encode/decode shape as `run_native` (`dispatch.rs`) - see that
+        // method's own comment on why a captured register is seeded from its
+        // cell rather than `frame.regs` directly. `opt_lower::is_eligible`
+        // excludes any `Proto` with a captured register at all, so every
+        // `frame.cells[i]` here is always `None` in practice; kept general
+        // rather than assumed, since nothing here enforces that exclusion
+        // locally.
+        let mut regs: Vec<sol_core::Value> = Vec::with_capacity(frame.regs.len());
+        for (i, value) in frame.regs.iter().enumerate() {
+            let encoded = match frame.cells[i] {
+                Some(id) => self
+                    .canonical_heap
+                    .borrow()
+                    .upvalue_value(id)
+                    .expect("cell id must address a live upvalue object"),
+                None => self.encode_value(value)?,
+            };
+            regs.push(encoded);
+        }
+
+        let mut out_pc: i64 = 0;
+        let mut out_base: i64 = 0;
+        let mut out_count: i64 = 0;
+        let rt_ptr: *mut LuaRuntime = self;
+        let frame_ptr: *mut LuaFrame = frame;
+        let outcome = native_fn(
+            rt_ptr,
+            frame_ptr,
+            regs.as_mut_ptr(),
+            &mut out_pc,
+            &mut out_base,
+            &mut out_count,
+        );
+
+        for (slot, value) in frame.regs.iter_mut().zip(regs) {
+            *slot = self.decode_value(value)?;
+        }
+
+        if outcome == 1 {
+            let base = out_base as usize;
+            let count = out_count as usize;
+            Ok(OsrOutcome::Done(frame.regs[base..base + count].to_vec()))
+        } else {
+            Ok(OsrOutcome::Deopt(out_pc as usize))
+        }
+    }
+
     /// Runs `frame` from its current `pc` (after first resolving `incoming`
     /// against `frame.pending`, if this is a resumed frame rather than a
     /// fresh one) until it either returns (`StepResult::Done`) or issues
@@ -865,18 +978,51 @@ impl LuaRuntime {
                     }
                 }
                 Instr::Jump(delta) => {
-                    pc = (pc as i32 + delta) as usize;
+                    let target = (pc as i32 + delta) as usize;
+                    if target <= pc {
+                        match self.try_osr_backedge(frame, &proto, target)? {
+                            OsrOutcome::Done(values) => return Ok(StepResult::Done(values)),
+                            OsrOutcome::Deopt(resume_pc) => {
+                                pc = resume_pc;
+                                continue 'exec;
+                            }
+                            OsrOutcome::NotAttempted => {}
+                        }
+                    }
+                    pc = target;
                     continue 'exec;
                 }
                 Instr::JumpIfFalse(reg, delta) => {
                     if !reg_truthy(self, &frame.regs, &frame.cells, *reg as usize) {
-                        pc = (pc as i32 + delta) as usize;
+                        let target = (pc as i32 + delta) as usize;
+                        if target <= pc {
+                            match self.try_osr_backedge(frame, &proto, target)? {
+                                OsrOutcome::Done(values) => return Ok(StepResult::Done(values)),
+                                OsrOutcome::Deopt(resume_pc) => {
+                                    pc = resume_pc;
+                                    continue 'exec;
+                                }
+                                OsrOutcome::NotAttempted => {}
+                            }
+                        }
+                        pc = target;
                         continue 'exec;
                     }
                 }
                 Instr::JumpIfTrue(reg, delta) => {
                     if reg_truthy(self, &frame.regs, &frame.cells, *reg as usize) {
-                        pc = (pc as i32 + delta) as usize;
+                        let target = (pc as i32 + delta) as usize;
+                        if target <= pc {
+                            match self.try_osr_backedge(frame, &proto, target)? {
+                                OsrOutcome::Done(values) => return Ok(StepResult::Done(values)),
+                                OsrOutcome::Deopt(resume_pc) => {
+                                    pc = resume_pc;
+                                    continue 'exec;
+                                }
+                                OsrOutcome::NotAttempted => {}
+                            }
+                        }
+                        pc = target;
                         continue 'exec;
                     }
                 }
