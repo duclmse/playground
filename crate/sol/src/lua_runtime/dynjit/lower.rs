@@ -47,21 +47,17 @@ use super::stubs::StubFuncs;
 /// at a bogus pc.
 const TRAP_UNREACHABLE_TAIL: TrapCode = TrapCode::unwrap_user(1);
 
-/// Whether `proto` is eligible for promotion: capture-free, no upvalue
-/// access beyond resolved cells (`captured_cell_count == 0`). The
-/// captured-register *access* machinery itself now exists (`store_value`'s
-/// `sync_cell_out`, `lower_new_local`, the `DetachCell` arm, and
-/// `stubs.rs`'s `dynjit_cell_set`/`dynjit_cell_set_fresh`/
-/// `dynjit_detach_cell`), but this guard still can't come down on its own:
-/// every `Proto` with `captured_cell_count != 0` also contains at least one
-/// `NewClosure` (the only instruction that ever marks a register captured,
-/// `lua_bytecode/mod.rs`'s `resolve`), and `NewClosure` itself has no
-/// lowering yet (falls to this function's own `_ => false` below) - so
-/// lifting this guard without also lowering `NewClosure` would still
-/// disqualify every such `Proto` on that instruction alone. Dropping it is
-/// therefore deferred to a further follow-up, paired with a `NewClosure`
-/// lowering. Work item 5
-/// lifts the call-free/fixed-in-bounds-`Return`-only restriction items 3-4
+/// Whether `proto` is eligible for promotion. The captured-register *access*
+/// machinery (`store_value`'s `sync_cell_out`, `lower_new_local`, the
+/// `DetachCell` arm, and `stubs.rs`'s `dynjit_cell_set`/
+/// `dynjit_cell_set_fresh`/`dynjit_detach_cell`) and `NewClosure` itself
+/// (`dynjit_new_closure`) are both lowered now, so a `Proto` with
+/// `captured_cell_count != 0` no longer needs excluding up front - every
+/// instruction such a `Proto` can contain, including the `NewClosure` that
+/// necessarily creates the capture (the only instruction that ever marks a
+/// register captured, `lua_bytecode/mod.rs`'s `resolve`), has a real
+/// lowering below, so the whitelist scan is sufficient on its own. Work item
+/// 5 lifts the call-free/fixed-in-bounds-`Return`-only restriction items 3-4
 /// enforced here: `Call`/`TailCall`/`TForCall`/`CloseSlots` always deopt to
 /// the interpreter at their own `pc` (see `lower_instr`'s doc on those arms),
 /// and an out-of-bounds or `Open`-count `Return` does the same - both reuse
@@ -69,9 +65,6 @@ const TRAP_UNREACHABLE_TAIL: TrapCode = TrapCode::unwrap_user(1);
 /// unchanged rather than needing new native-side protocol, so neither needs
 /// to disqualify the whole `Proto` any more.
 pub(super) fn is_eligible(proto: &Proto) -> bool {
-    if proto.captured_cell_count != 0 {
-        return false;
-    }
     if proto.instrs.is_empty() {
         return false;
     }
@@ -103,6 +96,7 @@ pub(super) fn is_eligible(proto: &Proto) -> bool {
         | Instr::GetEnvironment(_)
         | Instr::SetEnvironment(_)
         | Instr::NewTable(_)
+        | Instr::NewClosure(_, _)
         | Instr::Call(_, _, _)
         | Instr::TailCall(_, _)
         | Instr::TForCall(_, _)
@@ -141,6 +135,7 @@ struct Lowerer<'a, 'b> {
     get_environment_ref: FuncRef,
     set_environment_ref: FuncRef,
     new_table_ref: FuncRef,
+    new_closure_ref: FuncRef,
     mark_close_ref: FuncRef,
     cell_set_ref: FuncRef,
     cell_set_fresh_ref: FuncRef,
@@ -196,14 +191,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.proto.captured_registers.get(reg as usize).copied().unwrap_or(false)
     }
 
-    /// Write-through for a captured register: pushes whatever a flat store
-    /// just wrote into `regs[reg]` into that register's *existing* cell
-    /// (`dynjit_cell_set`, mirrors `reg_set`'s `Some` branch, `util.rs`) - a
-    /// plain `void` call, since `heap::set_upvalue` never allocates and so
-    /// can't fail. A no-op for an uncaptured register - the only case an
-    /// eligible `Proto` could produce before this follow-up's cell machinery
-    /// existed, and still the overwhelmingly common one today since
-    /// `is_eligible` keeps requiring `captured_cell_count == 0`.
+    /// Write-through for a statically-capturable register: pushes whatever a
+    /// flat store just wrote into `regs[reg]` into that register's cell, if
+    /// it currently has one (`dynjit_cell_set`, which itself re-checks
+    /// `frame.cells[reg]` at runtime and no-ops if absent - see its own doc
+    /// comment for why a statically-captured register can still be
+    /// cell-less in the `DetachCell`->`NewLocal` bracket). A no-op call for
+    /// an uncaptured register never happens at all, short-circuited by
+    /// `is_captured` below.
     fn sync_cell_out(&mut self, reg: u16) {
         if !self.is_captured(reg) {
             return;
@@ -526,6 +521,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Instr::NewTable(dst) => {
                 self.lower_stub_instr(pc, self.new_table_ref, fallthrough_target, Some(*dst));
             }
+            Instr::NewClosure(dst, _) => {
+                self.lower_stub_instr(pc, self.new_closure_ref, fallthrough_target, Some(*dst));
+            }
             Instr::MarkClose(_, _) => {
                 self.lower_stub_instr(pc, self.mark_close_ref, fallthrough_target, None);
             }
@@ -799,6 +797,7 @@ pub(super) fn lower_proto(
         let get_environment_ref = module.declare_func_in_func(stubs.get_environment, builder.func);
         let set_environment_ref = module.declare_func_in_func(stubs.set_environment, builder.func);
         let new_table_ref = module.declare_func_in_func(stubs.new_table, builder.func);
+        let new_closure_ref = module.declare_func_in_func(stubs.new_closure, builder.func);
         let mark_close_ref = module.declare_func_in_func(stubs.mark_close, builder.func);
         let cell_set_ref = module.declare_func_in_func(stubs.cell_set, builder.func);
         let cell_set_fresh_ref = module.declare_func_in_func(stubs.cell_set_fresh, builder.func);
@@ -845,6 +844,7 @@ pub(super) fn lower_proto(
             get_environment_ref,
             set_environment_ref,
             new_table_ref,
+            new_closure_ref,
             mark_close_ref,
             cell_set_ref,
             cell_set_fresh_ref,

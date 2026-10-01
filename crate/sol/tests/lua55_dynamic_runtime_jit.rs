@@ -331,3 +331,76 @@ fn a_to_be_closed_variable_in_a_promoted_function_behaves_identically() {
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, promoted.stdout);
 }
+
+/// U9 follow-up (`NewClosure` lowering): a function whose own local is
+/// captured by a nested closure (`Instr::NewClosure`, `captured_cell_count
+/// != 0`) is now eligible for promotion - `is_eligible` no longer excludes
+/// `captured_cell_count != 0` up front. The captured local's writes
+/// (`n = n + 1`, inside the nested closure itself, promoted separately) and
+/// reads must still observe the same value as the fully interpreted run,
+/// across two outer calls (each building a fresh closure over a fresh `n`).
+#[test]
+fn a_function_with_a_captured_upvalue_is_promoted_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_captured_upvalue.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'make_counter' promoted to native code"),
+        "expected 'make_counter' to actually compile now that NewClosure lowers:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Same fixture, under `SOL_LUA_GC_STRESS=1`: exercises the captured-cell
+/// allocation (`dynjit_cell_set_fresh`, at `NewLocal` for `n`) and the
+/// `NewClosure` allocation (`dynjit_new_closure`) both under maximal
+/// collection pressure, including the `DetachCell`->`NewLocal` bracket's
+/// cell-less write (`dynjit_cell_set`'s own doc comment) on the second call
+/// to `make_counter`, which reuses the same register `n` previously held.
+#[test]
+fn a_function_with_a_captured_upvalue_survives_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_captured_upvalue.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "6\n6\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'make_counter' promoted to native code"),
+        "expected 'make_counter' to actually compile even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}
