@@ -16,9 +16,11 @@ use cranelift_module::{FuncId, Linkage, Module};
 use sol_core::{Value, ValueTag};
 
 use crate::ast::BinaryOp;
-use crate::lua_runtime::frame::{BinaryResolution, LuaFrame};
-use crate::lua_runtime::util::float_for_limit;
-use crate::lua_runtime::LuaRuntime;
+use crate::lua_bytecode::Instr;
+use crate::lua_runtime::frame::{BinaryResolution, IndexResolution, LuaFrame, SetIndexResolution};
+use crate::lua_runtime::ic::IcKind;
+use crate::lua_runtime::util::{float_for_limit, name_const};
+use crate::lua_runtime::{LuaRuntime, LuaValue};
 
 use super::abi::WORD;
 
@@ -28,6 +30,17 @@ pub fn register(builder: &mut JITBuilder) {
     builder.symbol("dynjit_for_prep", dynjit_for_prep as *const u8);
     builder.symbol("dynjit_for_loop", dynjit_for_loop as *const u8);
     builder.symbol("dynjit_binary", dynjit_binary as *const u8);
+    builder.symbol("dynjit_get_field", dynjit_get_field as *const u8);
+    builder.symbol("dynjit_set_field", dynjit_set_field as *const u8);
+    builder.symbol("dynjit_get_global", dynjit_get_global as *const u8);
+    builder.symbol("dynjit_set_global", dynjit_set_global as *const u8);
+    builder.symbol("dynjit_get_index", dynjit_get_index as *const u8);
+    builder.symbol("dynjit_set_index", dynjit_set_index as *const u8);
+    builder.symbol("dynjit_get_upval", dynjit_get_upval as *const u8);
+    builder.symbol("dynjit_set_upval", dynjit_set_upval as *const u8);
+    builder.symbol("dynjit_get_environment", dynjit_get_environment as *const u8);
+    builder.symbol("dynjit_set_environment", dynjit_set_environment as *const u8);
+    builder.symbol("dynjit_new_table", dynjit_new_table as *const u8);
 }
 
 /// Every stub's `FuncId` within `DynJit`'s own `JITModule`, declared once in
@@ -39,6 +52,21 @@ pub(super) struct StubFuncs {
     pub(super) for_prep: FuncId,
     pub(super) for_loop: FuncId,
     pub(super) binary: FuncId,
+    /// Work item 4's new stubs all share one signature,
+    /// `(rt, frame, regs, pc) -> i64` - each re-derives its own instruction's
+    /// operands from `frame.proto.instrs[pc]` rather than marshaling them
+    /// across the FFI boundary (see `lower.rs`'s `lower_stub_instr`).
+    pub(super) get_field: FuncId,
+    pub(super) set_field: FuncId,
+    pub(super) get_global: FuncId,
+    pub(super) set_global: FuncId,
+    pub(super) get_index: FuncId,
+    pub(super) set_index: FuncId,
+    pub(super) get_upval: FuncId,
+    pub(super) set_upval: FuncId,
+    pub(super) get_environment: FuncId,
+    pub(super) set_environment: FuncId,
+    pub(super) new_table: FuncId,
 }
 
 pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
@@ -82,11 +110,45 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
         .declare_function("dynjit_binary", Linkage::Import, &binary_sig)
         .map_err(|e| e.to_string())?;
 
+    let mut common_sig = Signature::new(call_conv);
+    common_sig.params.push(AbiParam::new(WORD)); // rt
+    common_sig.params.push(AbiParam::new(WORD)); // frame
+    common_sig.params.push(AbiParam::new(WORD)); // regs
+    common_sig.params.push(AbiParam::new(types::I64)); // pc
+    common_sig.returns.push(AbiParam::new(types::I64));
+    let declare_common = |module: &mut dyn Module, name: &str| -> Result<FuncId, String> {
+        module
+            .declare_function(name, Linkage::Import, &common_sig)
+            .map_err(|e| e.to_string())
+    };
+    let get_field = declare_common(module, "dynjit_get_field")?;
+    let set_field = declare_common(module, "dynjit_set_field")?;
+    let get_global = declare_common(module, "dynjit_get_global")?;
+    let set_global = declare_common(module, "dynjit_set_global")?;
+    let get_index = declare_common(module, "dynjit_get_index")?;
+    let set_index = declare_common(module, "dynjit_set_index")?;
+    let get_upval = declare_common(module, "dynjit_get_upval")?;
+    let set_upval = declare_common(module, "dynjit_set_upval")?;
+    let get_environment = declare_common(module, "dynjit_get_environment")?;
+    let set_environment = declare_common(module, "dynjit_set_environment")?;
+    let new_table = declare_common(module, "dynjit_new_table")?;
+
     Ok(StubFuncs {
         safepoint,
         for_prep,
         for_loop,
         binary,
+        get_field,
+        set_field,
+        get_global,
+        set_global,
+        get_index,
+        set_index,
+        get_upval,
+        set_upval,
+        get_environment,
+        set_environment,
+        new_table,
     })
 }
 
@@ -313,4 +375,503 @@ pub extern "C" fn dynjit_binary(
         },
         Ok(BinaryResolution::Call { .. }) | Err(_) => 0,
     }
+}
+
+// Work item 4's stubs below all share one shape: re-derive the instruction's
+// own operands from `frame.proto.instrs[pc]` (never marshaled across the
+// FFI boundary - see this module's own doc comment and `lower.rs`'s
+// `lower_stub_instr`), mirror the matching `dispatch_step` arm
+// (`lua_runtime/dispatch/bytecode.rs`) as closely as possible, and deopt
+// (`0`) on any IC-cache-miss/metamethod-call/error outcome - every one of
+// those outcomes is reached before this stub has written anything, so
+// deopting and letting the interpreter redo the instruction from scratch is
+// always correct. `NewTable` is the only stub here that allocates; see its
+// own doc comment for why it alone needs a dual write into both the native
+// `regs` array and `frame.regs` (every other stub here only ever copies or
+// mutates an already-independently-rooted heap reference, so it needs no
+// special GC-safety handling beyond what item 3 already established).
+//
+// `NewClosure` and the captured-register (`frame.cells`) mechanism are
+// deliberately out of scope for this increment - both are deferred to a
+// follow-up within item 4 - so `is_eligible` still requires
+// `captured_cell_count == 0`, which also means every register access below
+// is a plain flat-slot access (cell-aware `reg_get`/`reg_set` would only
+// matter for a captured register, and there are none in an eligible
+// `Proto`).
+
+/// `Instr::GetField`'s U8 inline-cache fast path, then `field_probe_raw`,
+/// then the full `index_resolve` chain - mirrors `dispatch_step`'s own
+/// `Instr::GetField` arm. Deopts (rather than replicating
+/// `annotate_index_error`) on any error; the interpreter raises the exact
+/// right annotated error itself when it redoes this instruction.
+pub extern "C" fn dynjit_get_field(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::GetField(dst, base, name) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_get_field only called for Instr::GetField")
+    };
+    let name_bytes = name_const(proto, *name);
+    let base_value = match rt.decode_value(unsafe { *regs.add(*base as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let base_table = match &base_value {
+        LuaValue::Table(table) => Some(*table),
+        _ => None,
+    };
+    let cached = match base_table {
+        Some(table) => match rt.field_cache_get(
+            &proto.field_cache[pc as usize],
+            table,
+            name_bytes.as_slice(),
+            IcKind::Field,
+        ) {
+            Ok(value) => value,
+            Err(_) => return 0,
+        },
+        None => None,
+    };
+    let value = match cached {
+        Some(value) => value,
+        None => {
+            let key = LuaValue::String(rt.intern_str(name_bytes.as_slice()));
+            let probed = match base_table {
+                Some(table) => {
+                    let Ok(encoded_key) = rt.encode_value(&key) else {
+                        return 0;
+                    };
+                    match rt.field_probe_raw(
+                        &proto.field_cache[pc as usize],
+                        table,
+                        encoded_key,
+                        name_bytes.as_slice(),
+                        IcKind::Field,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => return 0,
+                    }
+                }
+                None => None,
+            };
+            match probed {
+                Some(value) => value,
+                None => match rt.index_resolve(base_value, key) {
+                    Ok(IndexResolution::Value(value)) => value,
+                    Ok(IndexResolution::Call { .. }) | Err(_) => return 0,
+                },
+            }
+        }
+    };
+    match rt.encode_value(&value) {
+        Ok(encoded) => {
+            unsafe { *regs.add(*dst as usize) = encoded };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::SetField`'s U8 inline-cache fast path, then `field_write_raw`,
+/// then the full `set_index_resolve` chain - mirrors `dispatch_step`'s own
+/// `Instr::SetField` arm.
+pub extern "C" fn dynjit_set_field(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::SetField(base, name, src) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_set_field only called for Instr::SetField")
+    };
+    let name_bytes = name_const(proto, *name);
+    let base_value = match rt.decode_value(unsafe { *regs.add(*base as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*src as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let base_table = match &base_value {
+        LuaValue::Table(table) => Some(*table),
+        _ => None,
+    };
+    let cached = match base_table {
+        Some(table) => match rt.field_cache_set(
+            &proto.field_cache[pc as usize],
+            table,
+            name_bytes.as_slice(),
+            value.clone(),
+            IcKind::Field,
+        ) {
+            Ok(hit) => hit,
+            Err(_) => return 0,
+        },
+        None => false,
+    };
+    if !cached {
+        let key = LuaValue::String(rt.intern_str(name_bytes.as_slice()));
+        let written = match base_table {
+            Some(table) => {
+                let Ok(encoded_key) = rt.encode_value(&key) else {
+                    return 0;
+                };
+                match rt.field_write_raw(
+                    &proto.field_cache[pc as usize],
+                    table,
+                    encoded_key,
+                    name_bytes.as_slice(),
+                    value.clone(),
+                    IcKind::Field,
+                ) {
+                    Ok(hit) => hit,
+                    Err(_) => return 0,
+                }
+            }
+            None => false,
+        };
+        if !written {
+            match rt.set_index_resolve(base_value, key, value, Some(frame_ref)) {
+                Ok(SetIndexResolution::Done) => {}
+                Ok(SetIndexResolution::Call { .. }) | Err(_) => return 0,
+            }
+        }
+    }
+    1
+}
+
+/// `Instr::GetGlobal` - mirrors `dispatch_step`'s own arm: a `has_base()`
+/// scope (Sol's `require`-sandboxed modules) takes the plain `base`-chain
+/// path directly; otherwise the same cache/probe/`index_resolve` fast path
+/// as `dynjit_get_field`, against `global_cache` and the current `_ENV`
+/// table.
+pub extern "C" fn dynjit_get_global(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::GetGlobal(dst, name) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_get_global only called for Instr::GetGlobal")
+    };
+    let value = if frame_ref.globals.has_base() {
+        frame_ref.globals.get(rt, name)
+    } else {
+        let base_value = frame_ref.globals.as_value();
+        let base_table = match &base_value {
+            LuaValue::Table(table) => Some(*table),
+            _ => None,
+        };
+        let name_bytes = name.as_bytes();
+        let cached = match base_table {
+            Some(table) => match rt.field_cache_get(
+                &proto.global_cache[pc as usize],
+                table,
+                name_bytes,
+                IcKind::Global,
+            ) {
+                Ok(value) => value,
+                Err(_) => return 0,
+            },
+            None => None,
+        };
+        match cached {
+            Some(value) => value,
+            None => {
+                let key = LuaValue::String(rt.intern_str(name_bytes));
+                let probed = match base_table {
+                    Some(table) => {
+                        let Ok(encoded_key) = rt.encode_value(&key) else {
+                            return 0;
+                        };
+                        match rt.field_probe_raw(
+                            &proto.global_cache[pc as usize],
+                            table,
+                            encoded_key,
+                            name_bytes,
+                            IcKind::Global,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => return 0,
+                        }
+                    }
+                    None => None,
+                };
+                match probed {
+                    Some(value) => value,
+                    None => match rt.index_resolve(base_value, key) {
+                        Ok(IndexResolution::Value(value)) => value,
+                        Ok(IndexResolution::Call { .. }) | Err(_) => return 0,
+                    },
+                }
+            }
+        }
+    };
+    match rt.encode_value(&value) {
+        Ok(encoded) => {
+            unsafe { *regs.add(*dst as usize) = encoded };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::SetGlobal` - mirrors `dispatch_step`'s own arm: `declare`
+/// (unconditional `global` binding), then a `has_base()` scope's plain
+/// `assign`, then the cache/probe/`set_index_resolve` fast path against
+/// `global_cache`.
+pub extern "C" fn dynjit_set_global(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::SetGlobal(name, src, constant, declare) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_set_global only called for Instr::SetGlobal")
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*src as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if *declare {
+        frame_ref.globals.define(rt, name, value, *constant);
+    } else if frame_ref.globals.has_base() {
+        if frame_ref.globals.assign(rt, name, value).is_err() {
+            return 0;
+        }
+    } else {
+        if frame_ref.globals.check_writable(name).is_err() {
+            return 0;
+        }
+        let base_value = frame_ref.globals.as_value();
+        let base_table = match &base_value {
+            LuaValue::Table(table) => Some(*table),
+            _ => None,
+        };
+        let name_bytes = name.as_bytes();
+        let cached = match base_table {
+            Some(table) => match rt.field_cache_set(
+                &proto.global_cache[pc as usize],
+                table,
+                name_bytes,
+                value.clone(),
+                IcKind::Global,
+            ) {
+                Ok(hit) => hit,
+                Err(_) => return 0,
+            },
+            None => false,
+        };
+        if !cached {
+            let key = LuaValue::String(rt.intern_str(name_bytes));
+            let written = match base_table {
+                Some(table) => {
+                    let Ok(encoded_key) = rt.encode_value(&key) else {
+                        return 0;
+                    };
+                    match rt.field_write_raw(
+                        &proto.global_cache[pc as usize],
+                        table,
+                        encoded_key,
+                        name_bytes,
+                        value.clone(),
+                        IcKind::Global,
+                    ) {
+                        Ok(hit) => hit,
+                        Err(_) => return 0,
+                    }
+                }
+                None => false,
+            };
+            if !written {
+                match rt.set_index_resolve(base_value, key, value, Some(frame_ref)) {
+                    Ok(SetIndexResolution::Done) => {}
+                    Ok(SetIndexResolution::Call { .. }) | Err(_) => return 0,
+                }
+            }
+        }
+    }
+    1
+}
+
+/// `Instr::GetIndex` - a runtime key, so no inline cache; a plain
+/// `index_resolve` call, mirroring `dispatch_step`'s own arm.
+pub extern "C" fn dynjit_get_index(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::GetIndex(dst, base, index) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_get_index only called for Instr::GetIndex")
+    };
+    let base_value = match rt.decode_value(unsafe { *regs.add(*base as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let key = match rt.decode_value(unsafe { *regs.add(*index as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let value = match rt.index_resolve(base_value, key) {
+        Ok(IndexResolution::Value(value)) => value,
+        Ok(IndexResolution::Call { .. }) | Err(_) => return 0,
+    };
+    match rt.encode_value(&value) {
+        Ok(encoded) => {
+            unsafe { *regs.add(*dst as usize) = encoded };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::SetIndex` - the write counterpart to `dynjit_get_index`.
+pub extern "C" fn dynjit_set_index(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::SetIndex(base, index, src) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_set_index only called for Instr::SetIndex")
+    };
+    let base_value = match rt.decode_value(unsafe { *regs.add(*base as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let key = match rt.decode_value(unsafe { *regs.add(*index as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*src as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    match rt.set_index_resolve(base_value, key, value, Some(frame_ref)) {
+        Ok(SetIndexResolution::Done) => 1,
+        Ok(SetIndexResolution::Call { .. }) | Err(_) => 0,
+    }
+}
+
+/// `Instr::GetUpval` - reads an already-resolved upvalue cell
+/// (`frame.upvals`, unrelated to the captured-*register* `frame.cells`
+/// mechanism this increment stays out of - see this module's own doc
+/// comment above).
+pub extern "C" fn dynjit_get_upval(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::GetUpval(dst, idx) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_get_upval only called for Instr::GetUpval")
+    };
+    let id = frame_ref.upvals[*idx as usize].get();
+    let value = match rt.upvalue_get(id) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    match rt.encode_value(&value) {
+        Ok(encoded) => {
+            unsafe { *regs.add(*dst as usize) = encoded };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::SetUpval` - the write counterpart to `dynjit_get_upval`.
+pub extern "C" fn dynjit_set_upval(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::SetUpval(idx, src) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_set_upval only called for Instr::SetUpval")
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*src as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let id = frame_ref.upvals[*idx as usize].get();
+    match rt.upvalue_set(id, value) {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::GetEnvironment` - reads the current `_ENV` value (always already
+/// live via `frame.globals`/`closure_globals`, never a fresh allocation).
+pub extern "C" fn dynjit_get_environment(
+    rt: *mut LuaRuntime,
+    frame: *mut LuaFrame,
+    regs: *mut Value,
+    pc: i64,
+) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::GetEnvironment(dst) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_get_environment only called for Instr::GetEnvironment")
+    };
+    let value = frame_ref.globals.as_value();
+    match rt.encode_value(&value) {
+        Ok(encoded) => {
+            unsafe { *regs.add(*dst as usize) = encoded };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// `Instr::SetEnvironment` - rebinds `_ENV`'s shared cell in place; cannot
+/// fail (`Globals::set_value` is an infallible `RefCell` overwrite).
+pub extern "C" fn dynjit_set_environment(
+    rt: *mut LuaRuntime,
+    frame: *mut LuaFrame,
+    regs: *mut Value,
+    pc: i64,
+) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let proto = &frame_ref.proto;
+    let Instr::SetEnvironment(src) = &proto.instrs[pc as usize] else {
+        unreachable!("dynjit_set_environment only called for Instr::SetEnvironment")
+    };
+    let value = match rt.decode_value(unsafe { *regs.add(*src as usize) }) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    frame_ref.globals.set_value(value);
+    1
+}
+
+/// `Instr::NewTable` - the only stub in this increment that allocates.
+/// `LuaRuntime::new_table` charges the allocation budget (the only point a
+/// GC collection can be triggered) strictly *before* the table itself is
+/// allocated, so the new table can never be collected before this stub has
+/// a chance to root it - seeing this stub run at all means the table
+/// already exists and needs rooting now. Unlike every other stub here, this
+/// one therefore writes the new value into *both* the native `regs` array
+/// (for subsequent native instructions in the same call) *and*
+/// `frame.regs` directly (the actual GC root `frame_roots`/
+/// `push_lua_frame_roots` walk) - a single dual write immediately after
+/// allocation succeeds is sufficient; no other instruction in this
+/// increment ever needs the same treatment because none of them allocate.
+pub extern "C" fn dynjit_new_table(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, pc: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let dst = {
+        let frame_ref = unsafe { &*frame };
+        let Instr::NewTable(dst) = &frame_ref.proto.instrs[pc as usize] else {
+            unreachable!("dynjit_new_table only called for Instr::NewTable")
+        };
+        *dst
+    };
+    let table = {
+        let frame_ref = unsafe { &*frame };
+        match rt.new_table(Some(frame_ref)) {
+            Ok(table) => table,
+            Err(_) => return 0,
+        }
+    };
+    let value = LuaValue::Table(table);
+    let encoded = match rt.encode_value(&value) {
+        Ok(encoded) => encoded,
+        Err(_) => return 0,
+    };
+    unsafe {
+        let frame_mut = &mut *frame;
+        frame_mut.regs[dst as usize] = value;
+        *regs.add(dst as usize) = encoded;
+    }
+    1
 }

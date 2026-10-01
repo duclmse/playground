@@ -78,7 +78,18 @@ pub(super) fn is_eligible(proto: &Proto) -> bool {
         | Instr::JumpIfFalse(_, _)
         | Instr::JumpIfTrue(_, _)
         | Instr::ForPrep(_, _)
-        | Instr::ForLoop(_, _) => true,
+        | Instr::ForLoop(_, _)
+        | Instr::GetField(_, _, _)
+        | Instr::SetField(_, _, _)
+        | Instr::GetGlobal(_, _)
+        | Instr::SetGlobal(_, _, _, _)
+        | Instr::GetIndex(_, _, _)
+        | Instr::SetIndex(_, _, _)
+        | Instr::GetUpval(_, _)
+        | Instr::SetUpval(_, _)
+        | Instr::GetEnvironment(_)
+        | Instr::SetEnvironment(_)
+        | Instr::NewTable(_) => true,
         Instr::Return(base, count) => match count {
             ValueCount::Fixed(c) => (*base as usize) + (*c as usize) <= register_count,
             ValueCount::Open => false,
@@ -102,6 +113,17 @@ struct Lowerer<'a, 'b> {
     for_prep_ref: FuncRef,
     for_loop_ref: FuncRef,
     binary_ref: FuncRef,
+    get_field_ref: FuncRef,
+    set_field_ref: FuncRef,
+    get_global_ref: FuncRef,
+    set_global_ref: FuncRef,
+    get_index_ref: FuncRef,
+    set_index_ref: FuncRef,
+    get_upval_ref: FuncRef,
+    set_upval_ref: FuncRef,
+    get_environment_ref: FuncRef,
+    set_environment_ref: FuncRef,
+    new_table_ref: FuncRef,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -191,6 +213,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     fn pc_const(&mut self, pc: usize) -> ClifValue {
         self.builder.ins().iconst(types::I32, pc as i64)
+    }
+
+    /// `pc` as the `i64` call argument every item-4 stub takes (distinct from
+    /// `pc_const`'s `i32`, which is only ever used as the deopt block's own
+    /// resume-point parameter).
+    fn pc_arg(&mut self, pc: usize) -> ClifValue {
+        self.builder.ins().iconst(types::I64, pc as i64)
+    }
+
+    /// Shared lowering for every item-4 instruction: all of them share the
+    /// `(rt, frame, regs, pc) -> i64` stub signature (`stubs.rs`'s own doc),
+    /// re-deriving their operands from `frame.proto.instrs[pc]` on the Rust
+    /// side rather than marshaling them across the FFI boundary - so lowering
+    /// them is just "call the stub, deopt unless it reports success."
+    fn lower_stub_instr(&mut self, pc: usize, func_ref: FuncRef, fallthrough_target: Option<Block>) {
+        let pc_arg = self.pc_arg(pc);
+        let call = self
+            .builder
+            .ins()
+            .call(func_ref, &[self.rt, self.frame, self.regs, pc_arg]);
+        let result = self.builder.inst_results(call)[0];
+        let ok = self.builder.ins().icmp_imm_s(IntCC::Equal, result, 1);
+        let pcv = self.pc_const(pc);
+        let cont = self.new_block();
+        self.builder
+            .ins()
+            .brif(ok, cont, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
+        self.builder.switch_to_block(cont);
+        self.fallthrough(fallthrough_target);
     }
 
     /// Emits a call to `dynjit_safepoint`; returns the block execution
@@ -342,6 +393,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             Instr::ForLoop(base, delta) => {
                 self.lower_for_loop(pc, *base, *delta);
+            }
+            Instr::GetField(_, _, _) => {
+                self.lower_stub_instr(pc, self.get_field_ref, fallthrough_target);
+            }
+            Instr::SetField(_, _, _) => {
+                self.lower_stub_instr(pc, self.set_field_ref, fallthrough_target);
+            }
+            Instr::GetGlobal(_, _) => {
+                self.lower_stub_instr(pc, self.get_global_ref, fallthrough_target);
+            }
+            Instr::SetGlobal(_, _, _, _) => {
+                self.lower_stub_instr(pc, self.set_global_ref, fallthrough_target);
+            }
+            Instr::GetIndex(_, _, _) => {
+                self.lower_stub_instr(pc, self.get_index_ref, fallthrough_target);
+            }
+            Instr::SetIndex(_, _, _) => {
+                self.lower_stub_instr(pc, self.set_index_ref, fallthrough_target);
+            }
+            Instr::GetUpval(_, _) => {
+                self.lower_stub_instr(pc, self.get_upval_ref, fallthrough_target);
+            }
+            Instr::SetUpval(_, _) => {
+                self.lower_stub_instr(pc, self.set_upval_ref, fallthrough_target);
+            }
+            Instr::GetEnvironment(_) => {
+                self.lower_stub_instr(pc, self.get_environment_ref, fallthrough_target);
+            }
+            Instr::SetEnvironment(_) => {
+                self.lower_stub_instr(pc, self.set_environment_ref, fallthrough_target);
+            }
+            Instr::NewTable(_) => {
+                self.lower_stub_instr(pc, self.new_table_ref, fallthrough_target);
             }
             _ => unreachable!("is_eligible excludes every other Instr variant"),
         }
@@ -511,6 +595,17 @@ pub(super) fn lower_proto(
         let for_prep_ref = module.declare_func_in_func(stubs.for_prep, builder.func);
         let for_loop_ref = module.declare_func_in_func(stubs.for_loop, builder.func);
         let binary_ref = module.declare_func_in_func(stubs.binary, builder.func);
+        let get_field_ref = module.declare_func_in_func(stubs.get_field, builder.func);
+        let set_field_ref = module.declare_func_in_func(stubs.set_field, builder.func);
+        let get_global_ref = module.declare_func_in_func(stubs.get_global, builder.func);
+        let set_global_ref = module.declare_func_in_func(stubs.set_global, builder.func);
+        let get_index_ref = module.declare_func_in_func(stubs.get_index, builder.func);
+        let set_index_ref = module.declare_func_in_func(stubs.set_index, builder.func);
+        let get_upval_ref = module.declare_func_in_func(stubs.get_upval, builder.func);
+        let set_upval_ref = module.declare_func_in_func(stubs.set_upval, builder.func);
+        let get_environment_ref = module.declare_func_in_func(stubs.get_environment, builder.func);
+        let set_environment_ref = module.declare_func_in_func(stubs.set_environment, builder.func);
+        let new_table_ref = module.declare_func_in_func(stubs.new_table, builder.func);
 
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -541,6 +636,17 @@ pub(super) fn lower_proto(
             for_prep_ref,
             for_loop_ref,
             binary_ref,
+            get_field_ref,
+            set_field_ref,
+            get_global_ref,
+            set_global_ref,
+            get_index_ref,
+            set_index_ref,
+            get_upval_ref,
+            set_upval_ref,
+            get_environment_ref,
+            set_environment_ref,
+            new_table_ref,
         };
 
         for pc in 0..n {

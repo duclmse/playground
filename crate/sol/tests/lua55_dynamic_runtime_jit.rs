@@ -83,3 +83,80 @@ fn a_call_free_numeric_loop_is_promoted_to_native_code_with_no_behavior_change()
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, promoted.stdout);
 }
+
+/// Item 4 (field/global access + allocation): a function that allocates a
+/// table (`NewTable`), writes/reads it through both the constant-key IC path
+/// (`GetField`/`SetField`) and the runtime-key path (`GetIndex`/`SetIndex`),
+/// and reads/writes a global (`GetGlobal`/`SetGlobal`) is now eligible for
+/// promotion - forcing `SOL_LUA_PROMOTE_THRESHOLD=1` must actually compile it
+/// (not just attempt-and-reject, as item 3's `dynjit_promote.lua` still
+/// does) and produce byte-identical output to the fully interpreted run,
+/// across two calls (the first call triggers promotion and already runs
+/// natively; the second call exercises an already-`Native` `Proto`).
+#[test]
+fn table_field_global_and_index_access_is_promoted_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_table_global.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(promoted.status.success());
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "61\n62\nnil");
+    let stderr = String::from_utf8_lossy(&promoted.stderr);
+    assert!(
+        stderr.contains("'touch' promoted to native code"),
+        "expected 'touch' to actually compile under item 4's extended \
+         eligible instruction set, not just attempt-and-reject:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, promoted.stdout);
+}
+
+/// Same fixture as above, but with `SOL_LUA_GC_STRESS=1`: every allocation
+/// (`NewTable` here) runs a full collection pass first - this exercises the
+/// `dynjit_new_table` stub's dual-write GC-safety contract (`stubs.rs`'s own
+/// doc comment on that stub) under the highest allocation-triggered
+/// collection pressure this suite can produce, not just the register-sync
+/// contract at backward-branch safepoints that item 3's own GC-stress
+/// coverage already exercises.
+#[test]
+fn table_field_global_and_index_access_survives_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_table_global.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "61\n62\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'touch' promoted to native code"),
+        "expected 'touch' to actually compile even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}

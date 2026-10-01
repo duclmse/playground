@@ -2823,7 +2823,7 @@ impl LuaRuntime {
     /// Non-blocking half of `__newindex` dispatch - see `index_resolve`; the
     /// same unbounded-cycle risk applies to `__newindex` table chains, and
     /// the same iterative-loop fix avoids native stack growth per fallback.
-    fn set_index_resolve(
+    pub(super) fn set_index_resolve(
         &mut self,
         mut value: LuaValue,
         key: LuaValue,
