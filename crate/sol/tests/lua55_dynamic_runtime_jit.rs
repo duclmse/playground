@@ -404,3 +404,86 @@ fn a_function_with_a_captured_upvalue_survives_gc_stress_mode() {
     assert!(baseline.status.success());
     assert_eq!(baseline.stdout, stressed.stdout);
 }
+
+/// U10 work item 3 (proof-specialized optimizing tier): a call-free,
+/// capture-free, constant-driven arithmetic function - straight-line, no
+/// loop, so `sol_ir::propagate_proofs` (a conservative single forward pass,
+/// see that function's own doc) can actually prove every operand's tag
+/// instead of leaving a loop-carried phi unproven - is eligible for *both*
+/// tiers: forcing `SOL_LUA_PROMOTE_THRESHOLD=1` and
+/// `SOL_LUA_OPTIMIZE_THRESHOLD=1` together must drive the `Proto` through
+/// `try_promote` and then, on the very same first activation (the
+/// per-activation `optimize_count` check runs right after the `call_count`
+/// one within a single `new_lua_frame` call - see `dispatch.rs`), through
+/// `try_optimize` as well, producing byte-identical output to the fully
+/// interpreted run either way.
+#[test]
+fn constant_driven_arithmetic_is_optimized_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_optimize_arithmetic.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let optimized = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(optimized.status.success());
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "79\n79\nnil");
+    let stderr = String::from_utf8_lossy(&optimized.stderr);
+    assert!(
+        stderr.contains("'compute' promoted to native code"),
+        "expected 'compute' to promote to the baseline tier first:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("'compute' optimized to native code"),
+        "expected 'compute' to then compile under item 3's proof-specialized \
+         optimizing tier:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, optimized.stdout);
+}
+
+/// Same fixture, under `SOL_LUA_GC_STRESS=1`: the optimizing tier never
+/// allocates on its own fast arithmetic path, but still shares every
+/// safepoint/stub-call machinery the baseline tier does, so this exercises
+/// the same register-sync contract under maximal collection pressure.
+#[test]
+fn constant_driven_arithmetic_survives_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_optimize_arithmetic.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "1")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "79\n79\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'compute' optimized to native code"),
+        "expected 'compute' to optimize even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}

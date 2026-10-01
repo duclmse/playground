@@ -26,6 +26,7 @@
 
 mod abi;
 mod lower;
+mod opt_lower;
 mod stubs;
 
 use std::rc::Rc;
@@ -70,6 +71,25 @@ pub fn promote_threshold() -> u32 {
 
 fn jit_log_enabled() -> bool {
     std::env::var_os("SOL_LUA_JIT_LOG").is_some()
+}
+
+/// Reads `SOL_LUA_OPTIMIZE_THRESHOLD`, gating U10 work item 3's proof-
+/// specialized recompile - mirrors `promote_threshold()`'s own cached-env-var
+/// pattern exactly. This threshold only starts counting once a `Proto` is
+/// already `NativeStatus::Native` (see `LuaRuntime::try_optimize`'s own
+/// `optimize_count` increment site in `dispatch.rs`), so it is deliberately
+/// a *second* activation count on top of `promote_threshold()`'s own, not a
+/// replacement for it - a default an order of magnitude above
+/// `promote_threshold()`'s default of 200 means only `Proto`s that stay hot
+/// well past their initial baseline promotion pay for a second compile.
+pub fn optimize_threshold() -> u32 {
+    static THRESHOLD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("SOL_LUA_OPTIMIZE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000)
+    })
 }
 
 pub struct DynJit {
@@ -170,6 +190,59 @@ impl DynJit {
         Ok(ptr)
     }
 
+    /// Compiles `proto`'s body a second time, through the proof-specialized
+    /// `opt_lower` path, and returns its entry point - the optimizing-tier
+    /// counterpart to `promote` above. Shares this same `module`/
+    /// `builder_ctx`/`stub_funcs` rather than standing up a second
+    /// `JITModule`: both tiers declare functions into one symbol namespace,
+    /// and `opt_lower::lower_proto` only ever reuses stubs `stub_funcs`
+    /// already declared for `promote`'s own lowering.
+    ///
+    /// Restricted to `opt_lower::is_eligible`'s subset (pure arithmetic/
+    /// branch/return `Proto`s `sol_ir::lift_proto` fully models - see that
+    /// module's own doc) - a strict *subset* of `lower::is_eligible`'s own
+    /// whitelist, not a superset, so a `Proto` ineligible here can still be
+    /// (and in practice almost always already is, by the time this runs -
+    /// see `optimize_threshold`'s doc) eligible for the baseline tier.
+    pub fn optimize(&mut self, proto: &Rc<Proto>) -> Result<*const u8, String> {
+        if self.jit_log {
+            eprintln!(
+                "[dynjit] optimization requested for '{}' (line {})",
+                proto.metadata.name, proto.line_defined
+            );
+        }
+        if !opt_lower::is_eligible(proto) {
+            if self.jit_log {
+                eprintln!(
+                    "[dynjit] '{}' is not eligible for item-3 optimizing lowering (anything \
+                     beyond arithmetic/branch/return - calls, table/global/upvalue access, \
+                     closures, or `for` loops)",
+                    proto.metadata.name
+                );
+            }
+            return Err("not eligible for optimizing lowering".to_string());
+        }
+        let name = self.fresh_name(proto);
+        let func_id = opt_lower::lower_proto(
+            &mut self.module,
+            &mut self.builder_ctx,
+            &self.stub_funcs,
+            proto,
+            &name,
+        )?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| e.to_string())?;
+        let ptr = self.module.get_finalized_function(func_id);
+        if self.jit_log {
+            eprintln!(
+                "[dynjit] '{}' optimized to native code as '{name}'",
+                proto.metadata.name
+            );
+        }
+        Ok(ptr)
+    }
+
     /// Reserves and returns a name guaranteed unique across every function
     /// this `DynJit` instance ever declares - see `next_id`'s doc comment.
     fn fresh_name(&mut self, proto: &Proto) -> String {
@@ -256,6 +329,67 @@ impl LuaRuntime {
             }
             Err(_) => {
                 proto.native_status.set(NativeStatus::Interpreted);
+                false
+            }
+        }
+    }
+
+    /// Called from `new_lua_frame` once `proto.optimize_count` has just
+    /// crossed `optimize_threshold()`, mirroring `try_promote`'s own shape -
+    /// see that method's doc for the shared `DynJitState` lazy-construction
+    /// path, reused unchanged here since `optimize` lives on the same
+    /// `DynJit`/`JITModule` `promote` does.
+    ///
+    /// Gated on `proto` already being `NativeStatus::Native` (not
+    /// `Interpreted`): this tier only ever recompiles a `Proto` that has
+    /// already earned, and kept, its baseline native code. Unlike
+    /// `try_promote`'s failure path, a failed optimizing recompile leaves
+    /// `native_status` at its still-valid `Native(ptr)` rather than
+    /// regressing to `Interpreted` - there is a perfectly good, already-
+    /// finalized baseline entry point sitting right there, and discarding it
+    /// over a failed *second* compile would be a pure regression.
+    ///
+    /// Returns whether `proto` is now `NativeStatus::Optimized`.
+    pub(super) fn try_optimize(&mut self, proto: &Rc<Proto>, _function: sol_core::FunctionId) -> bool {
+        let Some(baseline_ptr) = (match proto.native_status.get() {
+            NativeStatus::Native(ptr) => Some(ptr),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let jit = match &mut self.dynjit {
+            DynJitState::Ready(jit) => jit,
+            DynJitState::Unavailable => return false,
+            DynJitState::Uninit => match DynJit::new() {
+                Ok(jit) => {
+                    self.dynjit = DynJitState::Ready(jit);
+                    match &mut self.dynjit {
+                        DynJitState::Ready(jit) => jit,
+                        DynJitState::Uninit | DynJitState::Unavailable => {
+                            unreachable!("just assigned DynJitState::Ready above")
+                        }
+                    }
+                }
+                Err(err) => {
+                    if jit_log_enabled() {
+                        eprintln!(
+                            "[dynjit] could not initialize the dynamic JIT; disabling \
+                             promotion for the rest of this runtime: {err}"
+                        );
+                    }
+                    self.dynjit = DynJitState::Unavailable;
+                    return false;
+                }
+            },
+        };
+        proto.native_status.set(NativeStatus::Optimizing);
+        match jit.optimize(proto) {
+            Ok(ptr) => {
+                proto.native_status.set(NativeStatus::Optimized(ptr));
+                true
+            }
+            Err(_) => {
+                proto.native_status.set(NativeStatus::Native(baseline_ptr));
                 false
             }
         }

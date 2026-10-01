@@ -1010,6 +1010,15 @@ impl LuaRuntime {
         if call_count == dynjit::promote_threshold() {
             self.try_promote(&proto, function);
         }
+        // U10 work item 3's second, higher-threshold counter: only ever
+        // fires useful work once `proto` is already `NativeStatus::Native`
+        // (`try_optimize`'s own gate), but stays a plain per-activation bump
+        // regardless, mirroring `call_count`'s own always-incremented shape.
+        let optimize_count = proto.optimize_count.get().wrapping_add(1);
+        proto.optimize_count.set(optimize_count);
+        if optimize_count == dynjit::optimize_threshold() {
+            self.try_optimize(&proto, function);
+        }
         let register_count = proto.metadata.registers as usize;
         let parameter_count = proto.metadata.arity.parameters as usize;
         self.pinned_roots.push(vec![sol_core::Value::object(closure.object_id())]);
@@ -1129,8 +1138,8 @@ impl LuaRuntime {
     /// hooks per-instruction the way the interpreter does).
     fn run_native(&mut self, frame: &mut LuaFrame) -> LuaResult<StepResult> {
         let ptr = match frame.proto.native_status.get() {
-            NativeStatus::Native(ptr) => ptr,
-            _ => unreachable!("run_native only called when NativeStatus::Native"),
+            NativeStatus::Native(ptr) | NativeStatus::Optimized(ptr) => ptr,
+            _ => unreachable!("run_native only called when NativeStatus::Native or ::Optimized"),
         };
         let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
 
@@ -1247,7 +1256,10 @@ impl LuaRuntime {
                     // check those the way `dispatch_step` does).
                     let use_native = incoming.is_none()
                         && frame.header.pc == 0
-                        && matches!(frame.proto.native_status.get(), NativeStatus::Native(_))
+                        && matches!(
+                            frame.proto.native_status.get(),
+                            NativeStatus::Native(_) | NativeStatus::Optimized(_)
+                        )
                         && self.active_hook.is_none()
                         && !c_api::c_instruction_hooks_active(self);
                     let step = if use_native {

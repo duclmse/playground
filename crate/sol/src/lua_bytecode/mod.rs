@@ -334,6 +334,7 @@ impl Compiler {
             },
             call_count: std::cell::Cell::new(0),
             native_status: std::cell::Cell::new(NativeStatus::Interpreted),
+            optimize_count: std::cell::Cell::new(0),
         }))
     }
 

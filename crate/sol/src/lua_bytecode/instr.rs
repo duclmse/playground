@@ -397,9 +397,16 @@ pub struct Proto {
     /// same reason `call_count` does. A raw pointer inside `Native` is
     /// `Copy`, so a plain `Cell` suffices.
     pub native_status: std::cell::Cell<NativeStatus>,
+    /// Second-tier hot-activation counter for the optimizing JIT (U10 work
+    /// item 3): incremented once per call *after* `native_status` has
+    /// already reached `Native`, mirroring `call_count`'s own single-
+    /// choke-point design. Read by `lua_runtime::dynjit::optimize_threshold`
+    /// consumers to decide when to attempt a proof-specialized recompile on
+    /// top of the already-promoted baseline tier.
+    pub optimize_count: std::cell::Cell<u32>,
 }
 
-/// A `Proto`'s current dynamic-JIT (U9) promotion state. Defined in
+/// A `Proto`'s current dynamic-JIT (U9/U10) promotion state. Defined in
 /// `lua_bytecode` (not `lua_runtime`) because it lives directly on `Proto`,
 /// and `lua_bytecode` has no dependency on `lua_runtime` -
 /// `lua_runtime::dynjit` re-exports this type rather than defining its own.
@@ -411,9 +418,23 @@ pub enum NativeStatus {
     Interpreted,
     /// A promotion attempt for this `Proto` is in flight.
     Promoting,
-    /// Compiled; the pointer is this `Proto`'s native entry point, whose
-    /// calling convention is defined by `lua_runtime::dynjit::abi`.
+    /// Compiled by the baseline tier (U9); the pointer is this `Proto`'s
+    /// native entry point, whose calling convention is defined by
+    /// `lua_runtime::dynjit::abi`. A `Native` `Proto` is itself eligible for
+    /// a further optimizing recompile once it stays hot (see `Optimizing`/
+    /// `Optimized` below) - `Native` does not mean "final tier".
     Native(*const u8),
+    /// An optimizing recompile (U10 work item 3) on top of an already-
+    /// `Native` `Proto` is in flight.
+    Optimizing,
+    /// Compiled by the optimizing tier (U10 work item 3): proof-specialized
+    /// native code sharing the exact same calling convention as `Native`
+    /// (`lua_runtime::dynjit::abi::NativeFn`), so every `Native` consumer
+    /// (`run_native`) handles `Optimized` identically. Kept as a distinct
+    /// variant (rather than overwriting the `Native` pointer in place) so a
+    /// failed optimizing recompile can fall back to the still-valid baseline
+    /// pointer - see `lua_runtime::dynjit::try_optimize`.
+    Optimized(*const u8),
 }
 
 impl Default for NativeStatus {

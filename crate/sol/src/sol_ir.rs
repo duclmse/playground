@@ -153,6 +153,16 @@ pub struct Function {
     /// consumer) - its register map past the first unsupported point is not
     /// trustworthy.
     pub fully_lifted: bool,
+    /// The result `ValueId` and lifted `Inst` for every bytecode `pc` that
+    /// produced a new SSA value (`LoadConst`/`LoadNil`/`LoadBool`, `Not`/
+    /// `Neg`/`BitNot`, `Binary`/`IntegerBinary`) - `Move`/`NewLocal`/
+    /// `DetachCell` alias an existing `ValueId` rather than defining a new
+    /// one, so they have no entry here. Work item 3's `opt_lower.rs` is the
+    /// only consumer: it needs each arithmetic instruction's *operand*
+    /// `ValueId`s (already inside the recorded `Inst::Binary`/`Inst::Unary`)
+    /// to look up `proofs` without re-deriving Phase B's per-pc register
+    /// map from scratch.
+    pub value_at_pc: HashMap<usize, (ValueId, Inst)>,
 }
 
 /// Block topology only (which block(s) a block exits to), computed before
@@ -331,6 +341,7 @@ pub fn lift_proto(proto: &Proto) -> Function {
     // `is_phi_block`'s own back-edge check), so it is always already
     // processed here.
     let mut exit_map: Vec<HashMap<Reg, ValueId>> = vec![HashMap::new(); num_blocks];
+    let mut value_at_pc: HashMap<usize, (ValueId, Inst)> = HashMap::new();
     for b in 0..num_blocks {
         let mut current: HashMap<Reg, ValueId> = if b == 0 || is_phi_block(b) {
             entry_map[b].clone()
@@ -345,17 +356,23 @@ pub fn lift_proto(proto: &Proto) -> Function {
                 Instr::LoadConst(dst, idx) => {
                     let value = proto.consts[*idx as usize].clone();
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Const(value)));
+                    let inst = Inst::Const(value);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::LoadNil(dst) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Const(Const::Nil)));
+                    let inst = Inst::Const(Const::Nil);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::LoadBool(dst, value) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Const(Const::Bool(*value))));
+                    let inst = Inst::Const(Const::Bool(*value));
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::Move(dst, src) => {
@@ -381,22 +398,30 @@ pub fn lift_proto(proto: &Proto) -> Function {
                 }
                 Instr::Not(dst, src) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Unary(UnaryOp::Not, current[src])));
+                    let inst = Inst::Unary(UnaryOp::Not, current[src]);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::Neg(dst, src) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Unary(UnaryOp::Neg, current[src])));
+                    let inst = Inst::Unary(UnaryOp::Neg, current[src]);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::BitNot(dst, src) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Unary(UnaryOp::BitNot, current[src])));
+                    let inst = Inst::Unary(UnaryOp::BitNot, current[src]);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::Binary(op, dst, lhs, rhs) | Instr::IntegerBinary(op, dst, lhs, rhs) => {
                     let id = alloc.next();
-                    blocks[b].insts.push((id, Inst::Binary(*op, current[lhs], current[rhs])));
+                    let inst = Inst::Binary(*op, current[lhs], current[rhs]);
+                    blocks[b].insts.push((id, inst.clone()));
+                    value_at_pc.insert(pc, (id, inst));
                     current.insert(*dst, id);
                 }
                 Instr::Jump(_) | Instr::JumpIfFalse(..) | Instr::JumpIfTrue(..) | Instr::Return(..) => {
@@ -455,6 +480,7 @@ pub fn lift_proto(proto: &Proto) -> Function {
         entry: BlockId(0),
         proofs: HashMap::new(),
         fully_lifted,
+        value_at_pc,
     }
 }
 
@@ -934,6 +960,33 @@ mod tests {
     }
 
     #[test]
+    fn value_at_pc_records_every_arithmetic_instructions_operand_ids() {
+        let proto = compile(b"local a = 3 local b = 4 return a * b + 1");
+        let func = lift_proto(&proto);
+        assert!(func.fully_lifted);
+        // `local a = 3` / `local b = 4` each lower to a `LoadConst`, and
+        // `a * b` / `+ 1` each lower to a `Binary` - all four are
+        // value-producing and so must have a `value_at_pc` entry recording
+        // their own result id and lifted `Inst`.
+        let binary_pcs: Vec<usize> = proto
+            .instrs
+            .iter()
+            .enumerate()
+            .filter(|(_, instr)| matches!(instr, Instr::Binary(..) | Instr::IntegerBinary(..)))
+            .map(|(pc, _)| pc)
+            .collect();
+        assert_eq!(binary_pcs.len(), 2, "fixture should lower to exactly two binary ops");
+        for pc in binary_pcs {
+            let (id, inst) = func.value_at_pc.get(&pc).expect("every Binary pc must be recorded");
+            assert!(matches!(inst, Inst::Binary(..)), "recorded Inst must match what was lowered");
+            assert!(
+                func.blocks.iter().any(|b| b.insts.iter().any(|(vid, _)| vid == id)),
+                "the recorded ValueId must actually be defined somewhere in the function"
+            );
+        }
+    }
+
+    #[test]
     fn if_else_merge_point_becomes_a_phi() {
         assert_lift_matches_interpreter(
             b"local x = 7 local y
@@ -1132,6 +1185,7 @@ mod tests {
             entry: BlockId(0),
             proofs: HashMap::new(),
             fully_lifted: true,
+            value_at_pc: HashMap::new(),
         };
 
         fuse_redundant_guards(&mut func);
