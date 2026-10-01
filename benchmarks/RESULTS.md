@@ -957,3 +957,112 @@ that did this work; those are scratch files, not checked into the repo. See
 [`docs/features/milestones/u8-inline-caches-profiling.md`](../docs/features/milestones/u8-inline-caches-profiling.md)
 for the per-item file:line evidence and correctness-test inventory behind
 this section.
+
+## U9 — baseline dynamic JIT: real wins where a hot callee's body is small and leaf-eligible, no change where it structurally can't promote at all
+
+U9 (`docs/features/milestones/u9-baseline-jit.md`) added a bounded,
+synchronous Cranelift baseline JIT for hot `.lua` functions: leaf
+arithmetic/comparison/branch lowering, field/global/index access and
+`NewTable` allocation via semantic stubs, and an unconditional-deopt
+call/return protocol (every `Call`/`TailCall`/`TForCall`/`CloseSlots` always
+hands back to the interpreter rather than resuming natively - see that
+milestone doc's item 5/6 notes for why). Promotion is gated purely on a
+per-`Proto` `call_count` crossing `SOL_LUA_PROMOTE_THRESHOLD`, counted once
+per function *activation* (`new_lua_frame`), and on `is_eligible`
+(`crate/sol/src/lua_runtime/dynjit/lower.rs:60-103`) accepting every
+instruction in that `Proto` - an exhaustive whitelist of leaf arithmetic,
+local/global/field/index access, control flow, calls, and `Return`, with no
+`Vararg`/multi-result-forwarding variant in it, so any function touching
+varargs is categorically ineligible.
+
+Given the unconditional-deopt design, the plan's own cited benchmarks for
+this milestone (`function_calls`, `function_calls_closure`, `objects`,
+`coroutine_resume`, `vararg_calls`, plus `hashmap_lookup` and `table_array`
+for two call-free control cases) were expected to show little or no change,
+since the *call site* itself never resumes natively. A controlled, repeated
+A/B - `hyperfine --warmup 2 --min-runs 8`, one release binary from this
+milestone's pre-work commit (`3c299c3`, via a throwaway `git worktree`) vs.
+one from the finished U9 code, same machine, same elevated
+`SOL_LUA_*_BUDGET` env vars `scripts/benchmark.sh` itself uses - shows that
+expectation was only half right:
+
+| Benchmark               | pre-U9 (mean ± σ, 8 runs) | post-U9 (mean ± σ, 8 runs) |  delta |
+| :----------------------- | ------------------------: | --------------------------: | -----: |
+| function_calls_closure   |            26.806 s ± 0.090 s |            17.029 s ± 0.158 s | -36.5% |
+| function_calls           |            26.827 s ± 0.115 s |            17.510 s ± 0.803 s | -34.7% |
+| objects                  |             8.150 s ± 0.175 s |             6.584 s ± 0.107 s | -19.2% |
+| coroutine_resume         |             1.992 s ± 0.019 s |             1.978 s ± 0.008 s |  -0.7% |
+| vararg_calls             |            12.284 s ± 0.099 s |            12.318 s ± 0.070 s |  +0.3% |
+| table_array              |             2.010 s ± 0.008 s |             2.029 s ± 0.016 s |  +0.9% |
+| hashmap_lookup           |              13.1 ms ± 0.8 ms |              13.8 ms ± 1.5 ms |  +5.3% |
+
+`function_calls`, `function_calls_closure`, and `objects` are large,
+reproducible wins (σ tiny relative to the delta), not noise - and, on first
+look, surprising: the call site itself always deopts under this milestone's
+design, so the win cannot come from the call/return path. It comes from the
+*callee*. `work` in `function_calls.lua` and the closure in
+`function_calls_closure.lua` are chains of plain `Binary` adds (plus one
+`GetUpval` for the closure) ending in `Return` - every instruction is in
+`is_eligible`'s whitelist, so once each function's own `call_count` crosses
+the threshold, its entire body (21 chained operations) runs as native code
+on every subsequent call, even though entering and leaving it still
+round-trips through the interpreter's ordinary call machinery. `dist_squared`
+in `objects.lua` is the same shape (`GetField` + `Binary` + `Return`) but
+nets a smaller win because its caller's loop body also allocates a fresh
+table (`{ x = i, y = i }`) every iteration outside the promoted function,
+diluting the share of per-iteration cost that moved to native code.
+
+`coroutine_resume` and `vararg_calls` are flat, and for two different,
+source-confirmed reasons rather than one. The coroutine body
+(`total = total + coroutine.yield(total)`) is itself eligible, but its cost
+is dominated by the yield/resume fiber context switch, not the one addition
+it does - so promoting its arithmetic doesn't move the needle. `vararg_calls`'s
+four functions (`triple`, `sum_varargs`, `forward`, `pass_through`) all
+touch `...`/`select`, which has no variant in `is_eligible`'s whitelist, so
+none of them are eligible at all; this benchmark runs byte-identical,
+fully-interpreted code before and after U9, which is exactly why its delta
+is indistinguishable from zero. `table_array` and `hashmap_lookup` are flat
+for a third, structural reason: both are bare top-level loops with no
+function call anywhere in their hot path, so the `Proto` that would need to
+promote (the main chunk) is only ever activated once - `call_count` never
+crosses the promotion threshold no matter how many loop iterations run,
+since that counter increments per *call*, not per iteration. These two
+benchmarks are architecturally outside this milestone's reach, not a missed
+optimization opportunity within it.
+
+A full-suite single-run snapshot of the finished U9 code
+(`scripts/benchmark.sh --export-markdown`, current absolute numbers across
+every benchmark rather than a second before/after comparison - the
+controlled table above already covers this milestone's call/closure-
+sensitive benchmarks with repeated-run rigor) is consistent with the above:
+`fib` (7010.3 ms), `loop_sum` (1151.1 ms), `nested_loop` (605.6 ms), `matrix`
+(403.8 ms), `metatable_dispatch` (1050.4 ms), and `arithmetic_metamethod`
+(6086.8 ms) all have hot loops made of the same eligible leaf instructions as
+`function_calls`'s `work`, just inlined directly into a loop body rather
+than behind a repeatedly-called function - consistent with those loops'
+*own* enclosing function needing to be called enough times to promote, which
+`scripts/benchmark.sh`'s single top-level run of each script does not by
+itself guarantee and this pass did not separately verify per-benchmark.
+
+Bottom line, stated honestly rather than rounded up: U9's baseline JIT is a
+real, large win precisely where it was designed to apply - a hot function
+whose entire body is leaf-eligible gets that body's cost moved to native
+code regardless of whether its call site itself ever resumes natively - and
+a precise no-op everywhere that doesn't hold, whether because the function
+touches varargs (`is_eligible` has no variant for that), because the
+dominant cost lives outside the promoted body entirely (`coroutine_resume`'s
+fiber switch), or because the hot code never accumulates enough *calls* to
+promote at all (`table_array`, `hashmap_lookup`'s bare top-level loops).
+None of this is a defect in what was shipped - item 6's own milestone-doc
+section already explains why a direct-entry adapter would be byte-identical
+to the general call stub under this design, and the call-free case is an
+inherent property of counting promotions per call rather than per loop
+iteration, not a bug to fix within this milestone's scope.
+
+Full before/after numbers for the controlled A/B are in
+`/tmp/sol-u9-ab-*.md` (one file per benchmark) and the full single-run
+suite is in `/tmp/sol-u9-full-suite.md`, from the session that did this
+work; those are scratch files, not checked into the repo. See
+[`docs/features/milestones/u9-baseline-jit.md`](../docs/features/milestones/u9-baseline-jit.md)
+for the per-item file:line evidence and differential-test inventory behind
+this section.

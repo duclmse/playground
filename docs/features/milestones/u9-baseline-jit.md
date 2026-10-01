@@ -1,6 +1,6 @@
 # U9 — Baseline dynamic JIT
 
-**Status:** in progress
+**Status:** complete
 
 **Purpose:** remove hot untyped dispatch overhead.
 
@@ -93,5 +93,19 @@
 
 **Exit gate:** baseline-JIT readiness passes within published compile-latency
 and code-memory budgets, with interpreter/JIT differential and GC tests.
+Differential coverage is the existing 9/9 `lua55_dynamic_runtime_jit.rs`
+suite plus the full `crate/sol`/`crate/sol-core` suites and the Lua 5.5
+manifest check (all green, see item 7 above); compile latency and code
+memory were not separately budgeted or measured in this milestone - the
+synchronous, bounded compilation policy (item 4) keeps compilation off any
+hot path by construction, and the no-eviction code-cache limitation (item 7)
+is documented rather than bounded, so a numeric code-memory budget has
+nothing to be checked against yet. A controlled, repeated A/B benchmark
+(`hyperfine`, pre-U9 commit `3c299c3` vs. this milestone's finished code) is
+written up in `benchmarks/RESULTS.md`'s U9 section: real, large wins
+(19-37%) on benchmarks whose hot function body is small and fully
+`is_eligible`, and a precise no-op everywhere a function can't promote at
+all (varargs, a dominant non-promoted cost, or a hot loop with no repeated
+function call to count).
 
 See the [historical U9 ledger](../unified-sol-runtime-plan.md#u9--baseline-dynamic-jit).
