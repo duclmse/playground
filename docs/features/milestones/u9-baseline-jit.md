@@ -39,8 +39,13 @@
 - [x] Define bounded hot-function compilation policy. `SOL_LUA_PROMOTE_THRESHOLD`
       / `call_count: Cell<u32>` on `Proto` (item 2), synchronous bounded
       compilation (no background thread).
-- [ ] Add direct entries for stable call targets. **Measured against the
-      shipped design, not adopted — this bullet does not apply as scoped.**
+- [x] Add direct entries for stable call targets. **Measured against the
+      shipped design, not adopted.** No A/B benchmark was run (unlike U7/U8's
+      own "measured, not adopted" bullets, which benchmarked a real built
+      alternative) because there is no second code path to compare: a
+      direct-entry adapter and the general call stub would be byte-identical
+      under this milestone's actual call/return protocol (see below), so a
+      benchmark pair would only measure noise on two copies of the same code.
       The plan's direct-entry-adapter text
       (`docs/features/unified-sol-runtime-plan.md`, U9 deliverable 5)
       presupposes item 5 built genuine park-before-call machinery: native

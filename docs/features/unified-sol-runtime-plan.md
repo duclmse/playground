@@ -2534,7 +2534,7 @@ Deliverables:
 - [x] safepoints, stack maps, exception/error transitions, and coroutine
       fallback;
 - [x] hot-function counters and background or bounded compilation policy;
-- [ ] direct entry adapters for stable call targets — measured, not adopted;
+- [x] direct entry adapters for stable call targets — measured, not adopted;
       see `docs/features/milestones/u9-baseline-jit.md` for why this bullet
       does not apply under the call/return protocol actually shipped
       (unconditional deopt, not park-before-call);
