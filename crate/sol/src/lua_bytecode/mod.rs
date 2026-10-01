@@ -337,6 +337,9 @@ impl Compiler {
             optimize_count: std::cell::Cell::new(0),
             osr_counts: std::cell::RefCell::new(std::collections::HashMap::new()),
             osr_entries: std::cell::RefCell::new(std::collections::HashMap::new()),
+            promotion_failed: std::cell::Cell::new(false),
+            optimization_failed: std::cell::Cell::new(false),
+            osr_failed: std::cell::RefCell::new(std::collections::HashSet::new()),
         }))
     }
 

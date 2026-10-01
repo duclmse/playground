@@ -92,6 +92,26 @@ pub fn optimize_threshold() -> u32 {
     })
 }
 
+/// U10 work item 5 (recompilation-storm guard): whether an activation/
+/// backedge counter that has just reached `threshold` should actually
+/// trigger a (re-)compile attempt. Separated out from the three call sites
+/// that each bump their own counter (`new_lua_frame`'s `call_count`/
+/// `optimize_count` in `dispatch.rs`, `try_osr_backedge`'s per-header
+/// `osr_counts` in `dispatch/bytecode.rs`) so the exact same bounding rule
+/// applies everywhere: a `u32` counter driven by `wrapping_add(1)` forever
+/// (every further activation/backedge, for the rest of the process) will
+/// equal `threshold` again after a full wraparound cycle even though
+/// nothing about the underlying `Proto`'s eligibility can ever change
+/// (`Proto::instrs` is immutable) - `already_failed` closes that gap by
+/// making a prior failure permanent, rather than relying on a wraparound
+/// period of ~4 billion activations never actually being reached in
+/// practice. See this module's own `tests` below for the exact
+/// pathological scenario this bounds (a counter poised just before
+/// wraparound).
+pub(super) fn should_attempt(count: u32, threshold: u32, already_failed: bool) -> bool {
+    !already_failed && count == threshold
+}
+
 /// Reads `SOL_LUA_OSR_THRESHOLD`, gating U10 work item 4's mid-loop OSR
 /// entry - mirrors `promote_threshold()`/`optimize_threshold()`'s own
 /// cached-env-var pattern. Unlike those two, this counts backward branches
@@ -357,7 +377,7 @@ impl LuaRuntime {
     ///
     /// Returns whether `proto` is now `NativeStatus::Native`.
     pub(super) fn try_promote(&mut self, proto: &Rc<Proto>, function: sol_core::FunctionId) -> bool {
-        if proto.native_status.get() != NativeStatus::Interpreted {
+        if proto.native_status.get() != NativeStatus::Interpreted || proto.promotion_failed.get() {
             return false;
         }
         let jit = match &mut self.dynjit {
@@ -399,6 +419,9 @@ impl LuaRuntime {
             }
             Err(_) => {
                 proto.native_status.set(NativeStatus::Interpreted);
+                // U10 work item 5: a failed compile is permanent - see
+                // `promotion_failed`'s own doc and `should_attempt` above.
+                proto.promotion_failed.set(true);
                 false
             }
         }
@@ -421,6 +444,9 @@ impl LuaRuntime {
     ///
     /// Returns whether `proto` is now `NativeStatus::Optimized`.
     pub(super) fn try_optimize(&mut self, proto: &Rc<Proto>, _function: sol_core::FunctionId) -> bool {
+        if proto.optimization_failed.get() {
+            return false;
+        }
         let Some(baseline_ptr) = (match proto.native_status.get() {
             NativeStatus::Native(ptr) => Some(ptr),
             _ => None,
@@ -460,6 +486,9 @@ impl LuaRuntime {
             }
             Err(_) => {
                 proto.native_status.set(NativeStatus::Native(baseline_ptr));
+                // U10 work item 5: permanent, same reasoning as
+                // `try_promote`'s own `promotion_failed` above.
+                proto.optimization_failed.set(true);
                 false
             }
         }
@@ -467,15 +496,18 @@ impl LuaRuntime {
 
     /// Called from `try_osr_backedge` (`lua_runtime/dispatch/bytecode.rs`)
     /// once a loop header's own backward-branch counter has just crossed
-    /// `osr_threshold()`. Unlike `try_promote`/`try_optimize`, this has no
+    /// `osr_threshold()` (gated by `should_attempt`, U10 work item 5 - see
+    /// that function's doc). Unlike `try_promote`/`try_optimize`, this has no
     /// `NativeStatus` state machine of its own to drive - `Proto::osr_entries`
-    /// is a plain cache keyed by `header_pc`, checked by the caller *before*
-    /// this is invoked (see that method's doc), so this is only ever called
-    /// once per `(proto, header_pc)` pair for the whole process lifetime.
+    /// is a plain success cache keyed by `header_pc`, and `Proto::osr_failed`
+    /// is the parallel permanent-failure cache, both checked by the caller
+    /// before this is invoked (see that method's doc).
     ///
-    /// Returns `None` (and leaves the loop interpreted forever after) on any
-    /// failure - ineligible `Proto`, or `DynJit` unavailable - mirroring
-    /// `try_promote`/`try_optimize`'s own graceful-fallback shape.
+    /// Returns `None` (and leaves the loop interpreted forever after,
+    /// mirroring `try_promote`/`try_optimize`'s own graceful-fallback shape)
+    /// on any failure - ineligible `Proto`, or `DynJit` unavailable. The
+    /// caller is responsible for recording that failure into
+    /// `proto.osr_failed`.
     pub(super) fn try_osr(&mut self, proto: &Rc<Proto>, header_pc: usize) -> Option<*const u8> {
         let jit = match &mut self.dynjit {
             DynJitState::Ready(jit) => jit,
@@ -509,5 +541,77 @@ impl LuaRuntime {
             }
             Err(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_attempt;
+
+    /// U10 work item 5's own stated verification goal: a synthetic
+    /// pathological case (a counter that keeps incrementing past threshold
+    /// forever) must converge to "never attempt again" rather than retrying
+    /// in an unbounded loop. `call_count`/`optimize_count`/`osr_counts` are
+    /// all real `u32`s driven by `wrapping_add(1)` with no reset, so the
+    /// pathological case this project can actually hit is wraparound: a
+    /// counter equals `threshold` once, the attempt fails, and ~4 billion
+    /// activations later the counter (having wrapped through 0) equals
+    /// `threshold` again. Modeled here directly on the counter arithmetic
+    /// (not by actually driving a real `Proto` through 4 billion calls,
+    /// which no test budget affords) - this is exactly `should_attempt`'s
+    /// own contract, so testing it directly is a faithful, not a weakened,
+    /// check of the real behavior.
+    #[test]
+    fn a_counter_that_wraps_back_to_threshold_after_a_failure_never_attempts_again() {
+        let threshold: u32 = 200;
+
+        // First activation sequence: counter climbs from 0 up to `threshold`
+        // one activation at a time, exactly like `new_lua_frame`'s own
+        // `wrapping_add(1)` loop. Nothing should fire before `threshold`,
+        // and it must fire exactly once on reaching it.
+        let mut already_failed = false;
+        let mut attempts = 0u32;
+        let mut count: u32 = 0;
+        for _ in 0..threshold {
+            count = count.wrapping_add(1);
+            if should_attempt(count, threshold, already_failed) {
+                attempts += 1;
+                already_failed = true; // the one real attempt fails
+            }
+        }
+        assert_eq!(count, threshold);
+        assert_eq!(attempts, 1, "must attempt exactly once on reaching threshold");
+
+        // Second sequence: the counter keeps incrementing for the rest of
+        // the process's life (every further activation), wraps through
+        // `u32::MAX`, and reaches `threshold` again. Simulated by jumping
+        // straight to a value a few steps before the wrap (real wraparound
+        // takes ~4 billion steps - this reproduces the identical arithmetic
+        // `wrapping_add` would reach, just without spending that long doing
+        // it) and then stepping the remaining distance back to `threshold`.
+        count = u32::MAX - 2;
+        let remaining_until_rewrap = u32::MAX.wrapping_sub(count).wrapping_add(threshold).wrapping_add(1);
+        for _ in 0..remaining_until_rewrap {
+            count = count.wrapping_add(1);
+            if should_attempt(count, threshold, already_failed) {
+                attempts += 1;
+            }
+        }
+        assert_eq!(count, threshold, "counter must have wrapped back to threshold");
+        assert_eq!(
+            attempts, 1,
+            "a counter re-equaling threshold after a wraparound must not retry an already-failed compile"
+        );
+    }
+
+    #[test]
+    fn a_fresh_counter_reaching_threshold_without_a_prior_failure_does_attempt() {
+        assert!(should_attempt(200, 200, false));
+    }
+
+    #[test]
+    fn a_counter_below_threshold_never_attempts_regardless_of_failure_state() {
+        assert!(!should_attempt(199, 200, false));
+        assert!(!should_attempt(199, 200, true));
     }
 }

@@ -1007,7 +1007,12 @@ impl LuaRuntime {
         // `native_status` is no longer `Interpreted`).
         let call_count = proto.call_count.get().wrapping_add(1);
         proto.call_count.set(call_count);
-        if call_count == dynjit::promote_threshold() {
+        // U10 work item 5: `should_attempt` (not a bare `==`) also checks
+        // `promotion_failed`, so a `call_count` that wraps back around to
+        // `promote_threshold()` after a prior failure doesn't retry a
+        // compile that's guaranteed to fail identically again - see that
+        // function's own doc.
+        if dynjit::should_attempt(call_count, dynjit::promote_threshold(), proto.promotion_failed.get()) {
             self.try_promote(&proto, function);
         }
         // U10 work item 3's second, higher-threshold counter: only ever
@@ -1016,7 +1021,7 @@ impl LuaRuntime {
         // regardless, mirroring `call_count`'s own always-incremented shape.
         let optimize_count = proto.optimize_count.get().wrapping_add(1);
         proto.optimize_count.set(optimize_count);
-        if optimize_count == dynjit::optimize_threshold() {
+        if dynjit::should_attempt(optimize_count, dynjit::optimize_threshold(), proto.optimization_failed.get()) {
             self.try_optimize(&proto, function);
         }
         let register_count = proto.metadata.registers as usize;

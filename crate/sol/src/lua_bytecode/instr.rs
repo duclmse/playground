@@ -426,6 +426,30 @@ pub struct Proto {
     /// without ever itself reaching `NativeStatus::Native`/`Optimized` as a
     /// whole function (see `try_osr`'s doc).
     pub osr_entries: std::cell::RefCell<std::collections::HashMap<usize, *const u8>>,
+    /// U10 work item 5 (recompilation-storm guard): set once a baseline
+    /// promotion attempt (`try_promote`) has failed for this `Proto`. The
+    /// activation counter driving that attempt (`call_count`) is a `u32`
+    /// that keeps incrementing via `wrapping_add` for the rest of the
+    /// process's life - without this flag, `call_count` would silently
+    /// equal `promote_threshold()` again after a full wraparound cycle
+    /// (~4 billion further activations) and retry a compile that is
+    /// guaranteed to fail identically every time (`Proto::instrs` is
+    /// immutable, so nothing about eligibility can ever change). Checked
+    /// by `dynjit::should_attempt` alongside the counter-equality test, and
+    /// as a second, independent gate inside `try_promote` itself.
+    pub promotion_failed: std::cell::Cell<bool>,
+    /// Same bounding as `promotion_failed`, for the optimizing recompile
+    /// attempt (`try_optimize`)/`optimize_count`. Kept separate from
+    /// `promotion_failed` since the two attempts are independent: a
+    /// `Proto` can permanently fail to optimize while remaining
+    /// `NativeStatus::Native` at its baseline tier forever.
+    pub optimization_failed: std::cell::Cell<bool>,
+    /// Same bounding as `promotion_failed`/`optimization_failed`, for OSR
+    /// compile attempts (`try_osr`) - one entry per loop-header `pc` that
+    /// has permanently failed, parallel to `osr_counts`/`osr_entries`'s own
+    /// per-header-pc keying. A `Proto` can have some loop headers
+    /// permanently OSR-failed while others still succeed independently.
+    pub osr_failed: std::cell::RefCell<std::collections::HashSet<usize>>,
 }
 
 /// A `Proto`'s current dynamic-JIT (U9/U10) promotion state. Defined in

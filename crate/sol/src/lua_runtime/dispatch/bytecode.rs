@@ -50,6 +50,7 @@ impl LuaRuntime {
         // the entire statement), still held when the `else` arm's `try_osr`
         // tries to `borrow_mut()` the same `RefCell` and panics.
         let cached = proto.osr_entries.borrow().get(&header_pc).copied();
+        let already_failed = proto.osr_failed.borrow().contains(&header_pc);
         let ptr = if let Some(ptr) = cached {
             Some(ptr)
         } else {
@@ -59,8 +60,17 @@ impl LuaRuntime {
                 *slot = slot.wrapping_add(1);
                 *slot
             };
-            if count == dynjit::osr_threshold() {
-                self.try_osr(proto, header_pc)
+            // U10 work item 5: see `dynjit::should_attempt`'s doc - a
+            // per-header `osr_counts` entry wraps and re-equals
+            // `osr_threshold()` after a full cycle exactly like
+            // `call_count`/`optimize_count` do, so a prior failure for this
+            // same header must stay permanent too.
+            if dynjit::should_attempt(count, dynjit::osr_threshold(), already_failed) {
+                let compiled = self.try_osr(proto, header_pc);
+                if compiled.is_none() {
+                    proto.osr_failed.borrow_mut().insert(header_pc);
+                }
+                compiled
             } else {
                 None
             }

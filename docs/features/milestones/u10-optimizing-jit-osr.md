@@ -33,6 +33,14 @@
       See the item-4 note below.
 - [ ] Reconstruct inlined frames for errors, coroutines, profiling, and debug.
 - [ ] Bound recompilation with failure counters and widening.
+      No real falsifiable `Inst::Guard` exists yet (see the unchecked guard
+      bullet above), so there is no tag-guard *widening* to build - widening
+      only makes sense once a guard can actually narrow a type and then need
+      re-widening on repeated failure. **What shipped instead - see the
+      item-5 note below** - permanently bounds the three compile attempts
+      that do exist today (`try_promote`/`try_optimize`/`try_osr_backedge`),
+      closing a genuine, if currently astronomically unlikely, unbounded-
+      retry gap in their `u32` activation counters.
 
 **Exit gate:** dynamic parity passes before final performance claims.
 
@@ -186,5 +194,65 @@ item 3's own "no measurable difference" result on a call-bound micro-
 benchmark - directly validating the item-3 note's own prediction that
 "items 4-8 ... are the parts of the U10 plan this specialization is actually
 building toward paying off under."
+
+**Item 5 note (bounding recompilation attempts, not guard widening):** the
+plan's literal framing - "per-`GuardId` failure counter" plus "tag-guard
+widening" - has no real target yet: `sol_ir.rs` builds `GuardId`/`GuardFact`/
+`DeoptSnapshot`/`Inst::Guard` as scaffolding (item 2), but `lift_proto` never
+constructs a real one, and `opt_lower.rs` has its own doc comment stating
+guards are deliberately not wired up. Items 3-4's specialization is all over
+*unconditionally true* dataflow (proven facts), not speculation that could
+ever fail at runtime - there is nothing a failure counter could count yet.
+
+So this item binds "bounded recompilation" to the real failure signal that
+does exist: the per-`Proto` (`call_count`, `optimize_count`) and per-loop-
+header (`osr_counts`) `u32` activation counters that gate `try_promote`/
+`try_optimize`/`try_osr_backedge`. Before this item, each gate was a bare
+`count == threshold` check against a `wrapping_add(1)`-driven counter that
+never resets (`dispatch.rs`, `dispatch/bytecode.rs`). In practice a compile
+is attempted "once" - but not as an actual invariant: after
+`u32::MAX - threshold + 1` further activations/backedges past the first
+attempt, the counter wraps back through 0 and re-equals `threshold`,
+re-triggering an attempt that is guaranteed to fail identically forever,
+since `Proto::instrs` is immutable and nothing about eligibility can change.
+This is exactly the kind of recompilation storm this item's bullet asks to
+bound, just found one level down from where the plan expected it - at the
+compile-attempt gate itself, rather than inside a (nonexistent) guard.
+
+What shipped: three new permanent-failure flags alongside the existing
+counters on `Proto` - `promotion_failed: Cell<bool>`, `optimization_failed:
+Cell<bool>`, and `osr_failed: RefCell<HashSet<usize>>` (keyed per loop-header
+pc, since OSR already tracks counters per-header)
+(`crate/sol/src/lua_bytecode/instr.rs:440-452`, initialized at the crate's
+single `Proto` construction site,
+`crate/sol/src/lua_bytecode/mod.rs:340-342`). A new pure gate,
+`dynjit::should_attempt(count, threshold, already_failed) -> bool`
+(`crate/sol/src/lua_runtime/dynjit/mod.rs:111`), replaces the bare `==`
+checks: `!already_failed && count == threshold`. `try_promote`
+(`dynjit/mod.rs:379`) and `try_optimize` (`dynjit/mod.rs:446`) now check
+their own flag on entry and set it in their `Err(_)` arm, alongside the
+existing `NativeStatus` reset. `try_osr`'s doc (`dynjit/mod.rs:499`) was
+corrected to drop its previous (inaccurate) "only ever called once for the
+whole process lifetime" claim, documenting instead that the caller owns the
+failure cache; `try_osr_backedge` (`dispatch/bytecode.rs:38`) reads
+`proto.osr_failed` into `already_failed`, passes it to `should_attempt`
+(`dispatch/bytecode.rs:68`), and inserts the header pc into `osr_failed` on a
+`None` result. `dispatch.rs:1015` and `dispatch.rs:1024` wire the same gate
+into the promote/optimize call sites.
+
+Differential coverage is a pure unit test, not an integration/benchmark one:
+real wraparound needs ~4 billion activations, infeasible through the
+subprocess-driven `tests/lua55_dynamic_runtime_jit.rs` harness. Instead,
+`dynjit::mod::tests` (`dynjit/mod.rs:549-615`) exercises `should_attempt`
+directly with a counter crafted a few steps from `u32::MAX`, stepping it
+through wraparound back to the threshold value and asserting the gate stays
+closed once `already_failed` is set - the exact pathological case, reproduced
+deterministically instead of by brute force - plus two narrower tests
+confirming a fresh counter still attempts once at threshold, and a
+sub-threshold counter never attempts regardless of failure state. All three
+pass, alongside the full existing suite (118 lib tests total, up from 115,
+plus `sol-core`'s 37 and the Lua 5.5 manifest check, all green) - this item
+changes gating only, with no behavior change on any path that was already
+succeeding.
 
 See the [historical U10 ledger](../unified-sol-runtime-plan.md#u10--optimizing-ssa-jit-osr-and-deoptimization).
