@@ -31,6 +31,7 @@ pub mod optimize;
 pub mod parser;
 pub mod profile;
 pub mod runtime;
+pub mod sol_ir;
 pub mod strings;
 pub mod tier;
 pub mod typeck;
