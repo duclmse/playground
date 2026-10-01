@@ -12,8 +12,18 @@
       `crate/sol/src/lua_runtime/dynjit/stubs.rs`), then
       `Call`/`TailCall`/`TForCall`/`CloseSlots`/`MarkClose`/`TForLoop`
       (`lower.rs:453-475`, `lower_tfor_loop` at `lower.rs:624`) all lower.
-      `is_eligible` (`lower.rs:60`) now only excludes captured-upvalue
-      registers (tracked as the item-9-follow-up item below).
+      `is_eligible` (`lower.rs:60`) still excludes any `Proto` with
+      `captured_cell_count != 0` (see the item-9 follow-up note below): the
+      captured-register *access* machinery itself is now fully built
+      (`store_value`'s `sync_cell_out`, `lower_new_local`, the `DetachCell`
+      arm, and `dynjit_cell_set`/`dynjit_cell_set_fresh`/`dynjit_detach_cell`
+      in `stubs.rs`, unit-tested directly in that file's own `tests` module
+      since no promoted `Proto` can reach them yet), but the guard can't come
+      down until a further follow-up also lowers `NewClosure` - every `Proto`
+      with a captured register contains at least one `NewClosure`
+      instruction (the only instruction that ever marks a register
+      captured), which still falls to `is_eligible`'s own `_ => false` and
+      would disqualify the `Proto` on that instruction alone.
 - [x] Provide semantic slow-path stubs. Every instruction that can observe or
       trigger GC, metatables, or arbitrary Lua re-entry goes through an
       `extern "C"` stub that re-derives its operands from
@@ -107,5 +117,37 @@ written up in `benchmarks/RESULTS.md`'s U9 section: real, large wins
 `is_eligible`, and a precise no-op everywhere a function can't promote at
 all (varargs, a dominant non-promoted cost, or a hot loop with no repeated
 function call to count).
+
+**U9 follow-up — captured-register (upvalue cell) access machinery:** item
+1's own deferral ("captured registers deferred") is now built: any register
+a `Proto` marks captured (`captured_registers[i]`) can be read and written
+from native code. Reads need no special handling - `Call`/`TailCall`/
+`TForCall`/`CloseSlots`'s unconditional-deopt design (item 5) means no other
+code can mutate a shared cell mid-native-execution, so a plain flat load is
+always current. Writes route through new stubs
+(`crate/sol/src/lua_runtime/dynjit/stubs.rs`): `dynjit_cell_set` (write-
+through an existing cell, used by `store_value`'s `sync_cell_out` for every
+ordinary write and by `lower_stub_instr`'s `out_reg` parameter for the
+field/global/index/upvalue/environment/`NewTable` stubs, which write their
+`dst` directly into the native register file) and `dynjit_cell_set_fresh`
+(gives a register a brand-new cell, used by `Instr::NewLocal`'s lowering,
+`lower_new_local`, since a fresh binding never write-throughs a prior cell);
+`dynjit_detach_cell` lowers `Instr::DetachCell`. `run_native`
+(`dispatch.rs`) was also fixed to seed a captured register's native slot
+from `frame.cells[i]`'s cell value rather than unconditionally from
+`frame.regs[i]` (always stale `Nil` for a captured register). Unit-tested
+directly (`stubs.rs`'s own `tests` module, since no promoted `Proto` can
+reach this code yet - see below): cell allocation/round-trip, allocation-
+budget-exhaustion failing closed without touching the cell, write-through,
+and detach.
+
+This still doesn't change `is_eligible`'s promotion guard: every `Proto`
+with a captured register also contains at least one `Instr::NewClosure`
+(the only instruction that ever marks a register captured), and
+`NewClosure` itself has no lowering yet, so it still falls to
+`is_eligible`'s own whitelist-miss `_ => false`. Lifting the
+`captured_cell_count != 0 => false` guard is deferred to a further
+follow-up that lowers `NewClosure` - this item built only the access
+machinery that follow-up will need, ahead of time.
 
 See the [historical U9 ledger](../unified-sol-runtime-plan.md#u9--baseline-dynamic-jit).

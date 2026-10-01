@@ -1134,9 +1134,27 @@ impl LuaRuntime {
         };
         let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
 
+        // `frame.regs[i]` is always `LuaValue::Nil` for a captured register
+        // (`reg_get`/`reg_set`, `util.rs` - a captured register's real value
+        // lives only in its `frame.cells[i]` upvalue object), so seeding the
+        // native array from `frame.regs` unconditionally would hand native
+        // code the wrong value for any captured register that this
+        // invocation never explicitly writes before reading (e.g. via a
+        // `Return` that copies it out untouched). Seed from the cell instead
+        // wherever one exists; `upvalue_value` already returns the
+        // `sol_core::Value` the native array wants directly, no
+        // `encode_value` round-trip needed.
         let mut regs: Vec<sol_core::Value> = Vec::with_capacity(frame.regs.len());
-        for value in &frame.regs {
-            regs.push(self.encode_value(value)?);
+        for (i, value) in frame.regs.iter().enumerate() {
+            let encoded = match frame.cells[i] {
+                Some(id) => self
+                    .canonical_heap
+                    .borrow()
+                    .upvalue_value(id)
+                    .expect("cell id must address a live upvalue object"),
+                None => self.encode_value(value)?,
+            };
+            regs.push(encoded);
         }
 
         let mut out_pc: i64 = 0;

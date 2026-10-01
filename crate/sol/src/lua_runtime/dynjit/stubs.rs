@@ -42,6 +42,9 @@ pub fn register(builder: &mut JITBuilder) {
     builder.symbol("dynjit_set_environment", dynjit_set_environment as *const u8);
     builder.symbol("dynjit_new_table", dynjit_new_table as *const u8);
     builder.symbol("dynjit_mark_close", dynjit_mark_close as *const u8);
+    builder.symbol("dynjit_cell_set", dynjit_cell_set as *const u8);
+    builder.symbol("dynjit_cell_set_fresh", dynjit_cell_set_fresh as *const u8);
+    builder.symbol("dynjit_detach_cell", dynjit_detach_cell as *const u8);
 }
 
 /// Every stub's `FuncId` within `DynJit`'s own `JITModule`, declared once in
@@ -74,6 +77,15 @@ pub(super) struct StubFuncs {
     /// instructions, never invokes arbitrary Lua (it only validates
     /// closeability and records the value - see this stub's own doc).
     pub(super) mark_close: FuncId,
+    /// The captured-register (upvalue cell) follow-up's three new stubs -
+    /// see `dynjit_cell_set`/`dynjit_cell_set_fresh`/`dynjit_detach_cell`'s
+    /// own doc comments. `is_eligible` still requires `captured_cell_count
+    /// == 0` (NewClosure itself remains unlowered - see `lower.rs`'s own
+    /// doc on that), so these are unreachable from a real promotion today;
+    /// they exist so that follow-up doesn't also have to design this half.
+    pub(super) cell_set: FuncId,
+    pub(super) cell_set_fresh: FuncId,
+    pub(super) detach_cell: FuncId,
 }
 
 pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
@@ -88,8 +100,10 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
         .map_err(|e| e.to_string())?;
 
     let mut for_prep_sig = Signature::new(call_conv);
-    for_prep_sig.params.push(AbiParam::new(WORD));
-    for_prep_sig.params.push(AbiParam::new(types::I64));
+    for_prep_sig.params.push(AbiParam::new(WORD)); // rt
+    for_prep_sig.params.push(AbiParam::new(WORD)); // frame
+    for_prep_sig.params.push(AbiParam::new(WORD)); // regs
+    for_prep_sig.params.push(AbiParam::new(types::I64)); // base
     for_prep_sig.returns.push(AbiParam::new(types::I64));
     let for_prep = module
         .declare_function("dynjit_for_prep", Linkage::Import, &for_prep_sig)
@@ -140,6 +154,26 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
     let set_environment = declare_common(module, "dynjit_set_environment")?;
     let new_table = declare_common(module, "dynjit_new_table")?;
     let mark_close = declare_common(module, "dynjit_mark_close")?;
+    // Same `(rt, frame, regs, i64) -> i64` shape as `declare_common`'s own
+    // stubs; `dynjit_cell_set_fresh`'s last argument is a register index
+    // rather than a `pc`, but the ABI shape is identical.
+    let cell_set_fresh = declare_common(module, "dynjit_cell_set_fresh")?;
+
+    let mut cell_set_sig = Signature::new(call_conv);
+    cell_set_sig.params.push(AbiParam::new(WORD)); // rt
+    cell_set_sig.params.push(AbiParam::new(WORD)); // frame
+    cell_set_sig.params.push(AbiParam::new(WORD)); // regs
+    cell_set_sig.params.push(AbiParam::new(types::I64)); // reg
+    let cell_set = module
+        .declare_function("dynjit_cell_set", Linkage::Import, &cell_set_sig)
+        .map_err(|e| e.to_string())?;
+
+    let mut detach_cell_sig = Signature::new(call_conv);
+    detach_cell_sig.params.push(AbiParam::new(WORD)); // frame
+    detach_cell_sig.params.push(AbiParam::new(types::I64)); // reg
+    let detach_cell = module
+        .declare_function("dynjit_detach_cell", Linkage::Import, &detach_cell_sig)
+        .map_err(|e| e.to_string())?;
 
     Ok(StubFuncs {
         safepoint,
@@ -158,6 +192,9 @@ pub(super) fn declare(module: &mut dyn Module) -> Result<StubFuncs, String> {
         set_environment,
         new_table,
         mark_close,
+        cell_set,
+        cell_set_fresh,
+        detach_cell,
     })
 }
 
@@ -190,17 +227,28 @@ pub extern "C" fn dynjit_safepoint(rt: *mut LuaRuntime, frame: *mut LuaFrame) ->
 /// `Instr::ForPrep`'s full coercion/bounds logic (mirrors
 /// `dispatch_step`'s own `Instr::ForPrep` arm, `lua_runtime/dispatch/bytecode.rs`),
 /// restricted to the registers a numeric `for` loop's hidden
-/// `[start, stop, step, var]` block occupies (`base..base+4`), none of
-/// which are ever captured in an item-3-eligible `Proto` (captured
-/// registers disqualify a `Proto` from promotion until item 4) - so every
-/// write here is a plain slot write, with no `reg_set_fresh` cell
-/// allocation to charge.
+/// `[start, stop, step, var]` block occupies (`base..base+4`). `base`,
+/// `base+1`, and `base+2` are compiler-internal control temporaries with no
+/// AST-visible name, so they can never be captured - only `base+3` (the
+/// user-visible loop variable a closure in the loop body might capture)
+/// ever needs `dynjit_cell_set_fresh`'s fresh-cell treatment instead of a
+/// plain slot write, mirroring `dispatch_step`'s own `reg_set_fresh` call
+/// for this same register.
 ///
-/// Returns `0` to deopt (a non-numeric bound, or a zero step - let the
-/// interpreter raise the exact right error message), `1` if the loop body
-/// should run (fall through), or `2` if the loop never runs (jump past it).
-pub extern "C" fn dynjit_for_prep(regs: *mut Value, base: i64) -> i64 {
+/// Returns `0` to deopt (a non-numeric bound, a zero step, or `base+3`'s
+/// allocation budget exhausted if it's captured - let the interpreter raise
+/// the exact right error message or continue), `1` if the loop body should
+/// run (fall through), or `2` if the loop never runs (jump past it).
+pub extern "C" fn dynjit_for_prep(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, base: i64) -> i64 {
     let base = base as usize;
+    let rt = unsafe { &mut *rt };
+    let frame_mut = unsafe { &mut *frame };
+    let captured = frame_mut
+        .proto
+        .captured_registers
+        .get(base + 3)
+        .copied()
+        .unwrap_or(false);
     unsafe {
         let start = *regs.add(base);
         let stop = *regs.add(base + 1);
@@ -229,7 +277,6 @@ pub extern "C" fn dynjit_for_prep(regs: *mut Value, base: i64) -> i64 {
             }
             *regs.add(base + 1) = Value::integer(stop_i);
             *regs.add(base + 3) = Value::integer(start_i);
-            1
         } else {
             let (Some(start_f), Some(stop_f), Some(step_f)) =
                 (value_as_f64(start), value_as_f64(stop), value_as_f64(step))
@@ -251,9 +298,12 @@ pub extern "C" fn dynjit_for_prep(regs: *mut Value, base: i64) -> i64 {
                 return 2;
             }
             *regs.add(base + 3) = Value::float(start_f);
-            1
         }
     }
+    if captured && !cell_set_fresh(rt, frame_mut, regs, base + 3) {
+        return 0;
+    }
+    1
 }
 
 /// `Instr::ForLoop`'s advance/bounds-check logic (mirrors `dispatch_step`'s
@@ -271,6 +321,14 @@ pub extern "C" fn dynjit_for_prep(regs: *mut Value, base: i64) -> i64 {
 /// `2` if the loop continues (jump back by `delta`).
 pub extern "C" fn dynjit_for_loop(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, base: i64) -> i64 {
     let base = base as usize;
+    let rt = unsafe { &mut *rt };
+    let frame_mut = unsafe { &mut *frame };
+    let captured = frame_mut
+        .proto
+        .captured_registers
+        .get(base + 3)
+        .copied()
+        .unwrap_or(false);
     unsafe {
         let current = *regs.add(base);
         match current.tag() {
@@ -309,9 +367,10 @@ pub extern "C" fn dynjit_for_loop(rt: *mut LuaRuntime, frame: *mut LuaFrame, reg
             _ => return 0,
         }
     }
-    let rt = unsafe { &mut *rt };
-    let frame_ref = unsafe { &*frame };
-    match rt.jit_safepoint(frame_ref) {
+    if captured && !cell_set_fresh(rt, frame_mut, regs, base + 3) {
+        return 0;
+    }
+    match rt.jit_safepoint(frame_mut) {
         Ok(()) => 2,
         Err(_) => 0,
     }
@@ -918,4 +977,231 @@ pub extern "C" fn dynjit_mark_close(rt: *mut LuaRuntime, frame: *mut LuaFrame, r
         frame_mut.to_close.push(value);
     }
     1
+}
+
+// The captured-register (upvalue cell) follow-up's stubs, below. Unlike
+// every stub above, these aren't keyed to one `Instr` variant's own `pc` -
+// `lower.rs`'s `sync_cell_out`/`lower_new_local`/the `DetachCell` arm call
+// them directly against a register index known at lowering time, mirroring
+// `util::reg_set`/`reg_set_fresh` (the interpreter's own cell-aware
+// register-file helpers) rather than `dispatch_step`'s per-instruction
+// shape. `is_eligible` (`lower.rs`) still requires `captured_cell_count ==
+// 0`, so none of these are reachable from a real promotion yet - that
+// guard only comes down once `NewClosure` itself also has a lowering
+// (tracked there), since every `Proto` with a captured register also
+// contains at least one `NewClosure` (the only instruction that ever marks
+// a register captured, `lua_bytecode/mod.rs`'s `resolve`) and that
+// instruction alone would still force a deopt-disqualifying whitelist miss
+// today. Building this now, ahead of that follow-up, is exactly this
+// increment's own scope (see `stubs.rs`'s module doc and
+// `docs/features/milestones/u9-baseline-jit.md`).
+
+/// Shared by `dynjit_cell_set_fresh`, `dynjit_for_prep`, and
+/// `dynjit_for_loop`: gives register `reg` a *fresh* cell holding whatever
+/// value is already sitting in the native `regs` array at that slot -
+/// mirrors `reg_set_fresh`'s `should_capture = true` branch (`util.rs`),
+/// called only where `captured_registers[reg]` is already known to be true.
+///
+/// Charging the allocation budget can itself trigger a GC collection
+/// (`charge_allocation`/`stress_collect_if_enabled`) - at that point
+/// `regs[reg]`'s value exists only in the native array, which is not a GC
+/// root (`dynjit`'s own module doc), so this writes it into `frame.regs[reg]`
+/// *first* - the one root `frame_roots` walks unconditionally regardless of
+/// a register's capture status - exactly the "root before you can trigger a
+/// collection" discipline `dynjit_new_table` already established for its
+/// own allocation (see that stub's doc comment). Returns `false` only on
+/// allocation-budget exhaustion, before anything has been written to any
+/// cell - safe for the caller to deopt and let the interpreter redo the
+/// whole instruction from scratch.
+fn cell_set_fresh(rt: &mut LuaRuntime, frame: &mut LuaFrame, regs: *mut Value, reg: usize) -> bool {
+    let encoded = unsafe { *regs.add(reg) };
+    let Ok(decoded) = rt.decode_value(encoded) else {
+        return false;
+    };
+    frame.regs[reg] = decoded;
+    if rt
+        .charge_allocation(std::mem::size_of::<LuaValue>(), Some(&*frame))
+        .is_err()
+    {
+        return false;
+    }
+    let id = rt.canonical_heap.borrow_mut().alloc_upvalue(encoded, None);
+    frame.cells[reg] = Some(id);
+    true
+}
+
+/// `Instr::NewLocal`'s native lowering (`lower.rs`'s `lower_new_local`) for
+/// a captured `dst`, once `regs[dst]` already holds the value to capture
+/// (written there by that lowering's own flat store just before this call).
+/// Returns `1` on success, `0` to deopt.
+pub extern "C" fn dynjit_cell_set_fresh(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, reg: i64) -> i64 {
+    let rt = unsafe { &mut *rt };
+    let frame_mut = unsafe { &mut *frame };
+    if cell_set_fresh(rt, frame_mut, regs, reg as usize) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Ordinary write-through sync for a captured register: writes whatever
+/// value a flat store just placed at `regs[reg]` into that register's
+/// *existing* cell - mirrors `reg_set`'s `Some` branch (`util.rs`). Unlike
+/// `dynjit_cell_set_fresh`, `heap::set_upvalue` is a pure in-place mutation
+/// plus a GC write-barrier call, never an allocation
+/// (`sol-core/src/heap.rs`), so this can't fail and needs no GC-safety
+/// pre-rooting beyond what's already in place for `reg` itself.
+pub extern "C" fn dynjit_cell_set(rt: *mut LuaRuntime, frame: *mut LuaFrame, regs: *mut Value, reg: i64) {
+    let rt = unsafe { &mut *rt };
+    let frame_ref = unsafe { &*frame };
+    let id = frame_ref.cells[reg as usize].expect("dynjit_cell_set only called for a captured register");
+    let value = unsafe { *regs.add(reg as usize) };
+    rt.canonical_heap
+        .borrow_mut()
+        .set_upvalue(id, value)
+        .expect("cell id must address a live upvalue object");
+}
+
+/// `Instr::DetachCell`'s native lowering - see that instruction's own doc
+/// comment (`lua_bytecode/instr.rs`) and the matching interpreter arm
+/// (`dispatch/bytecode.rs`) for why this must run *before* the `NewLocal`
+/// that follows it writes a fresh value into the same register: clears the
+/// stale aliasing to whatever cell `reg` previously pointed to, without
+/// touching `regs[reg]`'s current (about-to-be-overwritten) value.
+pub extern "C" fn dynjit_detach_cell(frame: *mut LuaFrame, reg: i64) {
+    let frame = unsafe { &mut *frame };
+    frame.cells[reg as usize] = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::lua_bytecode::{Compiler, Proto};
+    use crate::lua_runtime::frame::Pending;
+    use crate::lua_runtime::value::{Cells, ClosureRef};
+
+    /// Compiles a real Lua function whose body captures one of its own
+    /// locals via a nested `local function`, so `captured_registers` is
+    /// resolved by the genuine compiler rather than hand-constructed -
+    /// `is_eligible` (`lower.rs`) still disqualifies any such `Proto` from
+    /// promotion (see this file's own module doc above), so this is the
+    /// only way to exercise the new cell stubs against a `captured_registers`
+    /// that's actually `true` somewhere.
+    fn captured_proto() -> (Rc<Proto>, usize) {
+        let source = br#"
+            function outer()
+                local x = 0
+                local function inner() x = x + 1 end
+                inner()
+                return x
+            end
+        "#;
+        let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).unwrap()).unwrap();
+        let proto = Compiler::compile_top_level(&program.functions[0]).unwrap();
+        let reg = proto
+            .captured_registers
+            .iter()
+            .position(|&captured| captured)
+            .expect("outer's `x` local must be captured by the nested `inner` closure");
+        (proto, reg)
+    }
+
+    /// A `LuaFrame` sized for `proto`, with every cell slot starting `None`
+    /// (each test populates what it needs) - safe to build with GC stress
+    /// off (the default, not set by this test), since `charge_allocation`
+    /// then never reads the frame's less-critical fields (`closure`'s
+    /// `environment`/the empty `upvals`/`varargs` are never walked).
+    fn test_frame(proto: Rc<Proto>, rt: &mut LuaRuntime) -> LuaFrame {
+        let register_count = proto.metadata.registers as usize;
+        let env_upvalue = rt.canonical_heap.borrow_mut().alloc_upvalue(Value::NIL, None);
+        let closure = ClosureRef::alloc(&mut rt.canonical_heap.borrow_mut(), 0, vec![env_upvalue], 0)
+            .expect("closure allocation cannot fail against a fresh heap with a valid environment index");
+        let cells: Cells = vec![None; register_count];
+        LuaFrame {
+            header: sol_core::FrameHeader::new(sol_core::FunctionId::new(0), 0, 0),
+            closure,
+            proto,
+            upvals: Rc::from(Vec::new().into_boxed_slice()),
+            globals: rt.globals.clone(),
+            regs: vec![LuaValue::Nil; register_count],
+            cells,
+            varargs: Vec::new(),
+            call_chain_hops: 0,
+            is_tail_call: false,
+            pending: Pending::None,
+            to_close: Vec::new(),
+            entry_label: None,
+            hook_last_pc: -1,
+            hook_last_line: -1,
+            c_hook_last_pc: -1,
+            c_hook_last_line: -1,
+        }
+    }
+
+    #[test]
+    fn cell_set_fresh_allocates_a_cell_and_round_trips_the_value() {
+        let mut rt = LuaRuntime::new();
+        let (proto, reg) = captured_proto();
+        let mut frame = test_frame(proto, &mut rt);
+        let encoded = rt.encode_value(&LuaValue::Integer(42)).unwrap();
+        let mut native_regs = vec![Value::NIL; frame.regs.len()];
+        native_regs[reg] = encoded;
+
+        let ok = dynjit_cell_set_fresh(&mut rt, &mut frame, native_regs.as_mut_ptr(), reg as i64);
+
+        assert_eq!(ok, 1);
+        let id = frame.cells[reg].expect("cell_set_fresh must populate the cell");
+        let value = rt.canonical_heap.borrow().upvalue_value(id).unwrap();
+        assert!(matches!(rt.decode_value(value).unwrap(), LuaValue::Integer(42)));
+    }
+
+    #[test]
+    fn cell_set_fresh_fails_closed_on_allocation_budget_exhaustion() {
+        let mut rt = LuaRuntime::new();
+        let (proto, reg) = captured_proto();
+        let mut frame = test_frame(proto, &mut rt);
+        let encoded = rt.encode_value(&LuaValue::Integer(1)).unwrap();
+        let mut native_regs = vec![Value::NIL; frame.regs.len()];
+        native_regs[reg] = encoded;
+        rt.allocation_remaining = 0;
+
+        let ok = dynjit_cell_set_fresh(&mut rt, &mut frame, native_regs.as_mut_ptr(), reg as i64);
+
+        assert_eq!(ok, 0, "budget exhaustion must deopt rather than allocate");
+        assert!(frame.cells[reg].is_none(), "a failed attempt must not populate the cell");
+    }
+
+    #[test]
+    fn cell_set_writes_through_an_existing_cell() {
+        let mut rt = LuaRuntime::new();
+        let (proto, reg) = captured_proto();
+        let mut frame = test_frame(proto, &mut rt);
+        let id = rt.canonical_heap.borrow_mut().alloc_upvalue(Value::NIL, None);
+        frame.cells[reg] = Some(id);
+        let encoded = rt.encode_value(&LuaValue::Integer(7)).unwrap();
+        let mut native_regs = vec![Value::NIL; frame.regs.len()];
+        native_regs[reg] = encoded;
+
+        dynjit_cell_set(&mut rt, &mut frame, native_regs.as_mut_ptr(), reg as i64);
+
+        let value = rt.canonical_heap.borrow().upvalue_value(id).unwrap();
+        assert!(matches!(rt.decode_value(value).unwrap(), LuaValue::Integer(7)));
+    }
+
+    #[test]
+    fn detach_cell_clears_the_cell_without_touching_regs() {
+        let mut rt = LuaRuntime::new();
+        let (proto, reg) = captured_proto();
+        let mut frame = test_frame(proto, &mut rt);
+        let id = rt.canonical_heap.borrow_mut().alloc_upvalue(Value::NIL, None);
+        frame.cells[reg] = Some(id);
+        frame.regs[reg] = LuaValue::Integer(9);
+
+        dynjit_detach_cell(&mut frame, reg as i64);
+
+        assert!(frame.cells[reg].is_none());
+        assert!(matches!(frame.regs[reg], LuaValue::Integer(9)));
+    }
 }

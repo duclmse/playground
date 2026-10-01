@@ -48,8 +48,19 @@ use super::stubs::StubFuncs;
 const TRAP_UNREACHABLE_TAIL: TrapCode = TrapCode::unwrap_user(1);
 
 /// Whether `proto` is eligible for promotion: capture-free, no upvalue
-/// access beyond resolved cells (`captured_cell_count == 0`, still deferred
-/// to the item-4 follow-up noted in `stubs.rs`'s module doc). Work item 5
+/// access beyond resolved cells (`captured_cell_count == 0`). The
+/// captured-register *access* machinery itself now exists (`store_value`'s
+/// `sync_cell_out`, `lower_new_local`, the `DetachCell` arm, and
+/// `stubs.rs`'s `dynjit_cell_set`/`dynjit_cell_set_fresh`/
+/// `dynjit_detach_cell`), but this guard still can't come down on its own:
+/// every `Proto` with `captured_cell_count != 0` also contains at least one
+/// `NewClosure` (the only instruction that ever marks a register captured,
+/// `lua_bytecode/mod.rs`'s `resolve`), and `NewClosure` itself has no
+/// lowering yet (falls to this function's own `_ => false` below) - so
+/// lifting this guard without also lowering `NewClosure` would still
+/// disqualify every such `Proto` on that instruction alone. Dropping it is
+/// therefore deferred to a further follow-up, paired with a `NewClosure`
+/// lowering. Work item 5
 /// lifts the call-free/fixed-in-bounds-`Return`-only restriction items 3-4
 /// enforced here: `Call`/`TailCall`/`TForCall`/`CloseSlots` always deopt to
 /// the interpreter at their own `pc` (see `lower_instr`'s doc on those arms),
@@ -131,6 +142,9 @@ struct Lowerer<'a, 'b> {
     set_environment_ref: FuncRef,
     new_table_ref: FuncRef,
     mark_close_ref: FuncRef,
+    cell_set_ref: FuncRef,
+    cell_set_fresh_ref: FuncRef,
+    detach_cell_ref: FuncRef,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -153,7 +167,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         )
     }
 
-    fn store_value(&mut self, reg: u16, tag: ClifValue, payload: ClifValue) {
+    fn store_flat(&mut self, reg: u16, tag: ClifValue, payload: ClifValue) {
         let off = Self::reg_offset(reg);
         self.builder
             .ins()
@@ -161,6 +175,43 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::trusted(), payload, self.regs, off + 8);
+    }
+
+    /// Raw flat store (`store_flat`) plus write-through cell sync
+    /// (`sync_cell_out`) for any register `is_captured` - the ordinary write
+    /// path used by every instruction except `Instr::NewLocal`'s captured-
+    /// `dst` case (`lower_new_local`'s own doc comment: that one needs a
+    /// *fresh* cell rather than a write-through of an existing one).
+    fn store_value(&mut self, reg: u16, tag: ClifValue, payload: ClifValue) {
+        self.store_flat(reg, tag, payload);
+        self.sync_cell_out(reg);
+    }
+
+    /// Statically known at lowering time - `Proto::captured_registers` is
+    /// resolved once, at compile time, from the source's own closure
+    /// structure (`lua_bytecode/mod.rs`'s `resolve`/`mark_captured`), so this
+    /// needs no runtime branch, just a lookup against the `Proto` this
+    /// `Lowerer` is already compiling.
+    fn is_captured(&self, reg: u16) -> bool {
+        self.proto.captured_registers.get(reg as usize).copied().unwrap_or(false)
+    }
+
+    /// Write-through for a captured register: pushes whatever a flat store
+    /// just wrote into `regs[reg]` into that register's *existing* cell
+    /// (`dynjit_cell_set`, mirrors `reg_set`'s `Some` branch, `util.rs`) - a
+    /// plain `void` call, since `heap::set_upvalue` never allocates and so
+    /// can't fail. A no-op for an uncaptured register - the only case an
+    /// eligible `Proto` could produce before this follow-up's cell machinery
+    /// existed, and still the overwhelmingly common one today since
+    /// `is_eligible` keeps requiring `captured_cell_count == 0`.
+    fn sync_cell_out(&mut self, reg: u16) {
+        if !self.is_captured(reg) {
+            return;
+        }
+        let reg_arg = self.builder.ins().iconst(types::I64, reg as i64);
+        self.builder
+            .ins()
+            .call(self.cell_set_ref, &[self.rt, self.frame, self.regs, reg_arg]);
     }
 
     fn store_const(&mut self, reg: u16, tag: i64, payload: i64) {
@@ -234,7 +285,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// re-deriving their operands from `frame.proto.instrs[pc]` on the Rust
     /// side rather than marshaling them across the FFI boundary - so lowering
     /// them is just "call the stub, deopt unless it reports success."
-    fn lower_stub_instr(&mut self, pc: usize, func_ref: FuncRef, fallthrough_target: Option<Block>) {
+    /// `out_reg`: the register (if any) whose own write happens inside the
+    /// stub itself - directly into `regs[reg]`, not through `store_value` -
+    /// so a captured `out_reg`'s cell still needs an explicit `sync_cell_out`
+    /// after the stub returns success (`GetField`/`GetGlobal`/`GetIndex`/
+    /// `GetUpval`/`GetEnvironment`/`NewTable`; `None` for every stub that
+    /// writes a table/global/upvalue slot rather than a register, or
+    /// `MarkClose`, which writes no new value at all).
+    fn lower_stub_instr(
+        &mut self,
+        pc: usize,
+        func_ref: FuncRef,
+        fallthrough_target: Option<Block>,
+        out_reg: Option<u16>,
+    ) {
         let pc_arg = self.pc_arg(pc);
         let call = self
             .builder
@@ -248,6 +312,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .brif(ok, cont, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
         self.builder.switch_to_block(cont);
+        if let Some(reg) = out_reg {
+            self.sync_cell_out(reg);
+        }
         self.fallthrough(fallthrough_target);
     }
 
@@ -291,11 +358,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.store_const(*dst, TAG_BOOLEAN, *v as i64);
                 self.fallthrough(fallthrough_target);
             }
-            Instr::Move(dst, src) | Instr::NewLocal(dst, src, _) => {
+            Instr::Move(dst, src) => {
                 self.copy_reg(*dst, *src);
                 self.fallthrough(fallthrough_target);
             }
-            Instr::DetachCell(_) => {
+            Instr::NewLocal(dst, src, _) => {
+                self.lower_new_local(pc, *dst, *src, fallthrough_target);
+            }
+            Instr::DetachCell(reg) => {
+                if self.is_captured(*reg) {
+                    let reg_arg = self.builder.ins().iconst(types::I64, *reg as i64);
+                    self.builder.ins().call(self.detach_cell_ref, &[self.frame, reg_arg]);
+                }
                 self.fallthrough(fallthrough_target);
             }
             Instr::Not(dst, src) => {
@@ -347,6 +421,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Instr::Binary(op, dst, left, right) => {
                 self.lower_binary(pc, *op, *dst, *left, *right, fallthrough_target);
             }
+            // Note: `IntegerBinary`'s own `store_value` call (unchanged,
+            // below) already picks up captured-`dst` write-through for free.
             Instr::IntegerBinary(op, dst, left, right) => {
                 let left_tag = self.load_tag(*left);
                 let right_tag = self.load_tag(*right);
@@ -417,41 +493,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Instr::ForLoop(base, delta) => {
                 self.lower_for_loop(pc, *base, *delta);
             }
-            Instr::GetField(_, _, _) => {
-                self.lower_stub_instr(pc, self.get_field_ref, fallthrough_target);
+            Instr::GetField(dst, _, _) => {
+                self.lower_stub_instr(pc, self.get_field_ref, fallthrough_target, Some(*dst));
             }
             Instr::SetField(_, _, _) => {
-                self.lower_stub_instr(pc, self.set_field_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.set_field_ref, fallthrough_target, None);
             }
-            Instr::GetGlobal(_, _) => {
-                self.lower_stub_instr(pc, self.get_global_ref, fallthrough_target);
+            Instr::GetGlobal(dst, _) => {
+                self.lower_stub_instr(pc, self.get_global_ref, fallthrough_target, Some(*dst));
             }
             Instr::SetGlobal(_, _, _, _) => {
-                self.lower_stub_instr(pc, self.set_global_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.set_global_ref, fallthrough_target, None);
             }
-            Instr::GetIndex(_, _, _) => {
-                self.lower_stub_instr(pc, self.get_index_ref, fallthrough_target);
+            Instr::GetIndex(dst, _, _) => {
+                self.lower_stub_instr(pc, self.get_index_ref, fallthrough_target, Some(*dst));
             }
             Instr::SetIndex(_, _, _) => {
-                self.lower_stub_instr(pc, self.set_index_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.set_index_ref, fallthrough_target, None);
             }
-            Instr::GetUpval(_, _) => {
-                self.lower_stub_instr(pc, self.get_upval_ref, fallthrough_target);
+            Instr::GetUpval(dst, _) => {
+                self.lower_stub_instr(pc, self.get_upval_ref, fallthrough_target, Some(*dst));
             }
             Instr::SetUpval(_, _) => {
-                self.lower_stub_instr(pc, self.set_upval_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.set_upval_ref, fallthrough_target, None);
             }
-            Instr::GetEnvironment(_) => {
-                self.lower_stub_instr(pc, self.get_environment_ref, fallthrough_target);
+            Instr::GetEnvironment(dst) => {
+                self.lower_stub_instr(pc, self.get_environment_ref, fallthrough_target, Some(*dst));
             }
             Instr::SetEnvironment(_) => {
-                self.lower_stub_instr(pc, self.set_environment_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.set_environment_ref, fallthrough_target, None);
             }
-            Instr::NewTable(_) => {
-                self.lower_stub_instr(pc, self.new_table_ref, fallthrough_target);
+            Instr::NewTable(dst) => {
+                self.lower_stub_instr(pc, self.new_table_ref, fallthrough_target, Some(*dst));
             }
             Instr::MarkClose(_, _) => {
-                self.lower_stub_instr(pc, self.mark_close_ref, fallthrough_target);
+                self.lower_stub_instr(pc, self.mark_close_ref, fallthrough_target, None);
             }
             // `Call`/`TailCall`/`TForCall`/`CloseSlots` can all invoke
             // arbitrary Lua (a callee, a `__close` metamethod) and none of
@@ -481,6 +557,40 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             _ => unreachable!("is_eligible excludes every other Instr variant"),
         }
+    }
+
+    /// `Instr::NewLocal`'s native lowering: copies `src`'s current value into
+    /// `dst`'s flat slot via `store_flat` directly (never through
+    /// `store_value`'s write-through cell sync - `dst` has no *existing*
+    /// cell to write through here, by construction: `NewLocal` always
+    /// introduces a fresh binding, mirroring `reg_set_fresh`'s own
+    /// distinction from `reg_set`, `util.rs`). Only when `dst` is captured
+    /// does it then give it a *fresh* cell via `dynjit_cell_set_fresh`,
+    /// which deopts on allocation-budget exhaustion - nothing has been
+    /// written to any cell yet in that case, so redoing `NewLocal` from the
+    /// interpreter is exactly correct.
+    fn lower_new_local(&mut self, pc: usize, dst: u16, src: u16, fallthrough_target: Option<Block>) {
+        let t = self.load_tag(src);
+        let p = self.load_payload(src);
+        self.store_flat(dst, t, p);
+        if !self.is_captured(dst) {
+            self.fallthrough(fallthrough_target);
+            return;
+        }
+        let reg_arg = self.builder.ins().iconst(types::I64, dst as i64);
+        let call = self
+            .builder
+            .ins()
+            .call(self.cell_set_fresh_ref, &[self.rt, self.frame, self.regs, reg_arg]);
+        let result = self.builder.inst_results(call)[0];
+        let ok = self.builder.ins().icmp_imm_s(IntCC::Equal, result, 1);
+        let pcv = self.pc_const(pc);
+        let cont = self.new_block();
+        self.builder
+            .ins()
+            .brif(ok, cont, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
+        self.builder.switch_to_block(cont);
+        self.fallthrough(fallthrough_target);
     }
 
     fn fallthrough(&mut self, target: Option<Block>) {
@@ -568,12 +678,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .brif(ok, cont, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
         self.builder.switch_to_block(cont);
+        self.sync_cell_out(dst);
         self.fallthrough(fallthrough_target);
     }
 
     fn lower_for_prep(&mut self, pc: usize, base: u16, delta: i32) {
         let base_v = self.builder.ins().iconst(types::I64, base as i64);
-        let call = self.builder.ins().call(self.for_prep_ref, &[self.regs, base_v]);
+        let call = self
+            .builder
+            .ins()
+            .call(self.for_prep_ref, &[self.rt, self.frame, self.regs, base_v]);
         let outcome = self.builder.inst_results(call)[0];
         let is_skip = self.builder.ins().icmp_imm_s(IntCC::Equal, outcome, 2);
         let is_fall = self.builder.ins().icmp_imm_s(IntCC::Equal, outcome, 1);
@@ -686,6 +800,9 @@ pub(super) fn lower_proto(
         let set_environment_ref = module.declare_func_in_func(stubs.set_environment, builder.func);
         let new_table_ref = module.declare_func_in_func(stubs.new_table, builder.func);
         let mark_close_ref = module.declare_func_in_func(stubs.mark_close, builder.func);
+        let cell_set_ref = module.declare_func_in_func(stubs.cell_set, builder.func);
+        let cell_set_fresh_ref = module.declare_func_in_func(stubs.cell_set_fresh, builder.func);
+        let detach_cell_ref = module.declare_func_in_func(stubs.detach_cell, builder.func);
 
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -729,6 +846,9 @@ pub(super) fn lower_proto(
             set_environment_ref,
             new_table_ref,
             mark_close_ref,
+            cell_set_ref,
+            cell_set_fresh_ref,
+            detach_cell_ref,
         };
 
         for pc in 0..n {
