@@ -114,6 +114,7 @@ impl LuaRuntime {
             gc_finalizing: false,
             gc_pause: 100,
             gc_stepmul: 100,
+            gc_stats: gc::GcStats::default(),
             current_locale: "C".to_string(),
             tmpname_counter: 0,
             io_stdout,
@@ -752,6 +753,7 @@ impl LuaRuntime {
             ("sethook", NativeFunction::DebugSethook),
             ("gethook", NativeFunction::DebugGethook),
             ("setuservalue", NativeFunction::DebugSetuservalue),
+            ("gcstats", NativeFunction::DebugGcstats),
         ] {
             self.table_set(
                 debug,

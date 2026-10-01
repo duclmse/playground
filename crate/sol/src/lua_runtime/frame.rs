@@ -138,7 +138,7 @@ pub(super) struct LuaFrame {
     /// this identity from `proto` and `upvals` after the call begins.
     pub(super) closure: ClosureRef,
     pub(super) proto: Rc<Proto>,
-    pub(super) upvals: Vec<sol_core::ObjectId>,
+    pub(super) upvals: Rc<[std::cell::Cell<sol_core::ObjectId>]>,
     pub(super) globals: Globals,
     pub(super) regs: Vec<LuaValue>,
     pub(super) cells: Cells,
@@ -367,7 +367,7 @@ pub(super) enum StepResult {
     PushClosure {
         closure: ClosureRef,
         proto: Rc<Proto>,
-        upvals: Vec<sol_core::ObjectId>,
+        upvals: Rc<[std::cell::Cell<sol_core::ObjectId>]>,
         globals: Globals,
         args: Vec<LuaValue>,
         /// See `LuaFrame::call_chain_hops`.
@@ -378,7 +378,7 @@ pub(super) enum StepResult {
     TailClosure {
         closure: ClosureRef,
         proto: Rc<Proto>,
-        upvals: Vec<sol_core::ObjectId>,
+        upvals: Rc<[std::cell::Cell<sol_core::ObjectId>]>,
         globals: Globals,
         args: Vec<LuaValue>,
         /// See `LuaFrame::call_chain_hops`.

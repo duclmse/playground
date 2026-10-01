@@ -943,7 +943,7 @@ impl LuaRuntime {
         &mut self,
         closure: ClosureRef,
         proto: Rc<Proto>,
-        upvals: Vec<sol_core::ObjectId>,
+        upvals: Rc<[std::cell::Cell<sol_core::ObjectId>]>,
         globals: Globals,
         args: Vec<LuaValue>,
     ) -> LuaResult<Vec<LuaValue>> {
@@ -991,7 +991,7 @@ impl LuaRuntime {
         &mut self,
         closure: ClosureRef,
         proto: Rc<Proto>,
-        upvals: Vec<sol_core::ObjectId>,
+        upvals: Rc<[std::cell::Cell<sol_core::ObjectId>]>,
         globals: Globals,
         args: Vec<LuaValue>,
         call_chain_hops: usize,

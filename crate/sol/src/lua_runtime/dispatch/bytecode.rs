@@ -149,7 +149,7 @@ impl LuaRuntime {
                     frame.cells[*reg as usize] = None;
                 }
                 Instr::GetUpval(dst, idx) => {
-                    let id = frame.upvals[*idx as usize];
+                    let id = frame.upvals[*idx as usize].get();
                     let encoded = self
                         .canonical_heap
                         .borrow()
@@ -162,7 +162,7 @@ impl LuaRuntime {
                 }
                 Instr::SetUpval(idx, src) => {
                     let value = reg_get(self, &frame.regs, &frame.cells, *src as usize);
-                    let id = frame.upvals[*idx as usize];
+                    let id = frame.upvals[*idx as usize].get();
                     let encoded = self
                         .encode_value(&value)
                         .expect("a value already resident in a register must encode cleanly");
@@ -257,7 +257,7 @@ impl LuaRuntime {
                             UpvalSource::ParentLocal(reg) => frame.cells[*reg as usize].expect(
                                 "compiler marks any ParentLocal-captured register as captured",
                             ),
-                            UpvalSource::ParentUpval(idx) => frame.upvals[*idx as usize],
+                            UpvalSource::ParentUpval(idx) => frame.upvals[*idx as usize].get(),
                         });
                     }
                     let closure = self.new_closure(child_proto, child_upvals, frame.globals.clone(), Some(&*frame))?;

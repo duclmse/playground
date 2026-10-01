@@ -405,6 +405,9 @@ pub struct LuaRuntime {
     /// what they just set observe consistent values.
     gc_pause: i64,
     gc_stepmul: i64,
+    /// Cumulative collection counters, exposed read-only via
+    /// `debug.gcstats()` - see `gc::GcStats`'s own doc comment.
+    gc_stats: gc::GcStats,
     /// Bookkeeping-only `os.setlocale` current-locale name (real Lua
     /// defaults to `"C"` until changed) - see `NativeFunction::OsSetlocale`.
     current_locale: String,

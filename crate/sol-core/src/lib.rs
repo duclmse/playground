@@ -19,7 +19,7 @@ pub use capabilities::Capabilities;
 pub use heap::{
     ClosureObject, Collection, CollectionKind, ErrorObject, FinalizerState, GcGeneration, Heap,
     HeapError, HeapObject, NativeCallableObject, ObjectHeader, ObjectKind, RootId, StackMap,
-    StackMapError, TableKey, TableObject, ThreadObject, ThreadStatus, UpvalueObject,
+    StackMapError, StringObject, TableKey, TableObject, ThreadObject, ThreadStatus, UpvalueObject,
     UserdataObject, WeakHandle,
 };
 pub use value::{BoundaryTypeError, BoundaryValue, ObjectId, ScalarKind, Value, ValueTag};

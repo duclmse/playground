@@ -149,6 +149,34 @@ fn dynamic_lua_runtime_closures_survive_register_slot_reuse_after_their_scope_en
 }
 
 #[test]
+fn dynamic_lua_runtime_closures_sharing_an_upvalue_see_each_others_writes_across_many_calls() {
+    use sol::lua_runtime::{run_source, LuaValue};
+
+    // `ClosureObject::upvalues` is shared (`Rc<[Cell<ObjectId>]>`) across
+    // every call to the same closure, not cloned per call - this only
+    // shares the *list of which cells a closure captures*, never the cells
+    // themselves, so two closures created from the same enclosing scope
+    // must still observe each other's writes through the same `Upvalue`
+    // object after many repeated calls (exercising the shared-list path
+    // repeatedly rather than just once).
+    let source = br#"
+        local function make_counter()
+            local count = 0
+            local function increment() count = count + 1 return count end
+            local function read() return count end
+            return increment, read
+        end
+        local increment, read = make_counter()
+        local last = 0
+        for i = 1, 1000 do
+            last = increment()
+        end
+        return last == 1000 and read() == 1000
+    "#;
+    assert_eq!(run_source(source).unwrap().value, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_supports_table_and_function_valued_keys() {
     use sol::lua_runtime::{run_source, LuaValue};
 

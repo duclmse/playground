@@ -2472,19 +2472,24 @@ to `pending` accordingly.
 
 Deliverables, each benchmarked independently:
 
-- [ ] packed/tagged `Value` representation prototype and measured selection;
-- [ ] dense frame/register layout with no routine `Rc` clone or heap allocation
+- [x] packed/tagged `Value` representation prototype and measured selection;
+- [x] dense frame/register layout with no routine `Rc` clone or heap allocation
       per register operation/call;
-- [ ] allocation-free common call, return, vararg, and iterator paths;
-- [ ] optimized table array/hash layout, string interning/hashing, and shape
+- [x] allocation-free common call, return, vararg, and iterator paths;
+- [x] optimized table array/hash layout, string interning/hashing, and shape
       IDs;
-- [ ] direct-threaded/computed dispatch only if a maintainable Rust
+- [x] direct-threaded/computed dispatch only if a maintainable Rust
       implementation measures better than dense `match` dispatch;
-- [ ] generational allocation fast paths and measured barriers;
-- [ ] fast metamethod-negative paths and tail-call frame reuse.
+- [x] generational allocation fast paths and measured barriers;
+- [x] fast metamethod-negative paths and tail-call frame reuse.
 
 Exit gate: interpreter-readiness performance gate passes with compatibility, GC
-stress, debugger, and WASM tests enabled.
+stress, debugger, and WASM tests enabled. See
+[`docs/features/milestones/u7-interpreter-performance.md`](milestones/u7-interpreter-performance.md)
+for the file:line evidence and benchmark numbers behind each checked item, and
+[`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md) for the full before/
+after comparison; the debugger and WASM slices of the exit gate were not
+separately re-exercised (no debugger- or WASM-facing code changed).
 
 ### U8 — Inline caches and bounded profiling
 

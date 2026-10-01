@@ -94,7 +94,7 @@ impl LuaRuntime {
     pub(super) fn closure_parts(
         &self,
         closure: ClosureRef,
-    ) -> LuaResult<(Rc<Proto>, Vec<sol_core::ObjectId>, Globals)> {
+    ) -> LuaResult<(Rc<Proto>, Rc<[std::cell::Cell<sol_core::ObjectId>]>, Globals)> {
         let proto = self.closure_prototype(closure)?;
         let upvalues = self.closure_upvalues(closure)?;
         let globals = self.globals_for_closure(closure);
@@ -116,7 +116,10 @@ impl LuaRuntime {
             .ok_or_else(|| LuaError::new("internal error: closure prototype not interned"))
     }
 
-    pub(super) fn closure_upvalues(&self, closure: ClosureRef) -> LuaResult<Vec<sol_core::ObjectId>> {
+    pub(super) fn closure_upvalues(
+        &self,
+        closure: ClosureRef,
+    ) -> LuaResult<Rc<[std::cell::Cell<sol_core::ObjectId>]>> {
         let heap = self.canonical_heap.borrow();
         match heap.object(closure.object_id()) {
             Ok(HeapObject::Closure(object)) => Ok(object.upvalues.clone()),
@@ -134,7 +137,7 @@ impl LuaRuntime {
     ) -> Option<sol_core::ObjectId> {
         let heap = self.canonical_heap.borrow();
         match heap.object(closure.object_id()) {
-            Ok(HeapObject::Closure(object)) => object.upvalues.get(index).copied(),
+            Ok(HeapObject::Closure(object)) => object.upvalues.get(index).map(std::cell::Cell::get),
             _ => None,
         }
     }
@@ -424,7 +427,7 @@ impl LuaRuntime {
                 .as_object()
                 .ok_or_else(|| LuaError::new("internal error: gmatch state corrupt"))?;
             match heap.object(id) {
-                Ok(HeapObject::String(bytes)) => Ok(bytes.clone()),
+                Ok(HeapObject::String(string)) => Ok(string.bytes.clone()),
                 _ => Err(LuaError::new("internal error: gmatch state corrupt")),
             }
         };

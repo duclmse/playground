@@ -775,3 +775,88 @@ this phase targets, and both improved substantially. `table_array.lua` and
 `fib.lua` are unaffected as expected (array-index and register-arithmetic
 bound, not field-name bound), confirming the fix is scoped correctly rather
 than a coincidental global speedup.
+
+## U7 — interpreter performance foundation: closure-upvalue sharing, hash caching, GC stats, and dispatch-strategy measurement
+
+U7 (`docs/features/milestones/u7-interpreter-performance.md`) closed four
+remaining gaps in the interpreter-performance checklist: `ClosureObject`
+shares one `Rc<[Cell<ObjectId>]>` upvalue list across every call instead of
+cloning a fresh `Vec<ObjectId>` per call; string table/global keys carry a
+lazily-memoized hash instead of re-hashing their bytes on every access;
+`debug.gcstats()` exposes cumulative minor/major collection counts and
+wall-clock time so the generational collector's cheap-minor-collection claim
+is measured rather than assumed; and a real-bytecode dispatch-strategy
+comparison (`crate/sol/examples/dispatch_bench_real.rs`, compiling and running
+`benchmarks/loop_sum.lua`'s actual hot loop through both a `match`-based and a
+function-pointer-table dispatcher) settled the "direct-threaded dispatch"
+checklist item as measured-but-not-adopted: `match` dispatch beat the
+function-pointer table by roughly 1.2-1.35x on the real `Instr` stream, so no
+dispatch-loop rewrite followed. See the milestone doc for full file:line
+evidence and the isolated `--filter` numbers behind each item.
+
+Those isolated per-item checks mostly showed no measurable movement on the
+existing benchmark suite in either direction - `function_calls_closure`/
+`objects` didn't move measurably from the upvalue-sharing fix alone,
+`hashmap_lookup`/`objects`/`string_concat` didn't move measurably from the
+hash-caching fix alone (beyond erasing a ~2.2x regression an earlier, eager-
+hashing design had introduced), and `gc_alloc` showed no regression from the
+two added `Instant::now()` calls per collection. That is expected: none of
+`function_calls_closure`/`objects`/`string_concat` as written allocate enough
+distinct closures or re-hash enough repeated string keys per unit of work for
+either single fix to dominate an isolated A/B at this benchmark suite's scale.
+
+Re-running the full suite before and after all four fixes landed tells a more
+complete story. Same machine, same `scripts/benchmark.sh` invocation, single
+run before vs. single run after (not a repeated, averaged A/B like the
+controlled comparisons elsewhere in this file - see the caveat below), warm
+numbers only (cold-start deltas moved in the same direction, with more
+variance, as expected for single short-lived process invocations):
+
+| Benchmark | sol (dynamic) before | sol (dynamic) after | delta |
+|:---|---:|---:|---:|
+| matrix | 449.5 ms | 375.7 ms | -16.4% |
+| table_array | 2094.2 ms | 1853.0 ms | -11.5% |
+| hashmap_lookup | 11.7 ms | 10.5 ms | -9.7% |
+| string_concat | 62.1 ms | 56.4 ms | -9.2% |
+| gc_alloc | 3567.5 ms | 3256.7 ms | -8.7% |
+| fib | 6872.3 ms | 6337.5 ms | -7.8% |
+| metatable_dispatch | 1000.7 ms | 940.0 ms | -6.1% |
+| vararg_calls | 13495.9 ms | 12799.7 ms | -5.2% |
+| function_calls | 26811.6 ms | 25396.0 ms | -5.3% |
+| nested_loop | 596.0 ms | 567.6 ms | -4.8% |
+| function_calls_closure | 26748.1 ms | 25557.6 ms | -4.4% |
+| coroutine_resume | 2969.1 ms | 2844.9 ms | -4.2% |
+| objects | 8108.4 ms | 7890.5 ms | -2.7% |
+| loop_sum | 1091.2 ms | 1073.4 ms | -1.6% |
+
+Every one of the 14 `sol (dynamic)` benchmarks improved; none regressed. The
+spread (1.6% on `loop_sum`, a loop/arithmetic-bound workload none of these
+four fixes directly target, up to 16.4% on `matrix`, a table-heavy workload)
+is broadly consistent with where the fixes should matter most, but this run
+is a single before/after pair rather than the repeated, averaged A/B this
+file's earlier controlled comparisons use, so treat the exact percentages as
+directional, not precise per-fix attribution - the isolated `--filter` checks
+above remain the stronger evidence for what each individual fix does and does
+not move.
+
+The typed `.sol` benchmarks, untouched by any of this milestone's Lua-runtime-
+specific code, moved too: `table_array` -21.2%, `nested_loop` -17.5%,
+`vector_add` -16.2%, `function_calls` -10.3%, `hashmap_lookup` -11.3%,
+`string_concat` -8.9%, alongside two small (2-3%) moves in the opposite
+direction on `fib`/`objects` that are consistent with ordinary run-to-run
+noise at this benchmark suite's scale. The string-hash-caching fix
+(`StringObject`'s memoized hash, `TableKey::table_key()`) lives in
+`crates/sol-core`, the heap/value foundation shared by both the typed and
+dynamic runtimes, which plausibly explains why hash- and table-heavy typed
+benchmarks improved even though this milestone's work was scoped at the
+dynamic `.lua` path; the closure-upvalue-sharing fix is likewise a
+`sol-core` change (`ClosureObject.upvalues`), though typed closures mostly
+use a separate, escape-analyzed representation and are less exposed to it.
+
+Full before/after numbers for every benchmark (warm and cold, both runtimes)
+are in `/tmp/sol_bench_results.md` (pre-change baseline) and
+`/tmp/sol_bench_results_after.md` (post-change) from the session that did
+this work; those are scratch files, not checked into the repo. See
+[`docs/features/milestones/u7-interpreter-performance.md`](../docs/features/milestones/u7-interpreter-performance.md)
+for the per-item file:line evidence, the GC-stats regression tests, and the
+dispatch-strategy measurement methodology behind this section.

@@ -702,6 +702,78 @@ fn dynamic_lua_runtime_generational_mode_clears_weak_entries_in_a_single_step() 
 }
 
 #[test]
+fn dynamic_lua_runtime_debug_gcstats_counts_minor_collections_scaling_with_explicit_steps() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+
+    // U7's "measured barriers" deliverable: `debug.gcstats()` must prove the
+    // generational fast path (`step_garbage`'s `"generational"` branch,
+    // `sol_core::Heap::collect_minor_with_conditional_roots`) is actually
+    // cheap and actually distinct from major collections, not just
+    // mechanically different. Each explicit `collectgarbage("step")` call
+    // under `"generational"` mode always finishes in that one call (see
+    // `step_garbage`'s own doc comment), so `minor_collections` must equal
+    // exactly the number of step calls made, while nothing here is anywhere
+    // near the 65,536-instruction auto-collect threshold
+    // (`AUTO_GC_INSTRUCTION_INTERVAL`), so no major collection should ever
+    // fire alongside them.
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let result = runtime
+        .run(&parse(
+            br#"
+            collectgarbage("generational")
+            local steps = 20
+            for i = 1, steps do
+                local junk = {}
+                junk.x = i
+                collectgarbage("step")
+            end
+            local stats = debug.gcstats()
+            return stats.minor_collections == steps
+                and stats.major_collections == 0
+                and stats.minor_time >= 0.0
+                and stats.major_time >= 0.0
+        "#,
+        ))
+        .unwrap();
+    assert_eq!(result, LuaValue::Bool(true));
+}
+
+#[test]
+fn dynamic_lua_runtime_debug_gcstats_counts_major_collections_from_explicit_collect() {
+    use sol::lua_runtime::{Capabilities, LuaRuntime, LuaValue};
+
+    // `collectgarbage("collect")` always runs a full major pass
+    // (`collect_garbage_with`) regardless of `gc_mode` - distinct from
+    // `"step"`, which only runs a major pass outside `"generational"` mode.
+    // Three explicit collections must show up as exactly three major
+    // collections and zero minor ones, confirming `GcStats::record` keys off
+    // the `Collection`'s own reported `kind` rather than `gc_mode`.
+    let source = br#"
+        for i = 1, 3 do
+            local junk = {}
+            junk.x = i
+            collectgarbage()
+        end
+        local stats = debug.gcstats()
+        return stats.major_collections == 3 and stats.minor_collections == 0
+    "#;
+    let mut runtime = LuaRuntime::with_capabilities(Capabilities {
+        debug: true,
+        ..Capabilities::SANDBOX
+    });
+    let parse =
+        |source: &[u8]| sol::parser::parse_lua(sol::lexer::lex_bytes(source).unwrap()).unwrap();
+    let result = runtime.run(&parse(source)).unwrap();
+    assert_eq!(result, LuaValue::Bool(true));
+}
+
+#[test]
 fn dynamic_lua_runtime_minor_collection_traces_remembered_old_objects_unreachable_from_roots() {
     use sol::lua_runtime::{run_source, LuaValue};
 

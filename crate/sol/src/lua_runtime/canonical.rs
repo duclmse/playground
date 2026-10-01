@@ -199,7 +199,10 @@ mod tests {
         };
         assert_eq!(object.prototype, 3);
         assert_eq!(object.environment, 0);
-        assert_eq!(object.upvalues, vec![environment_cell]);
+        assert_eq!(
+            object.upvalues.iter().map(|cell| cell.get()).collect::<Vec<_>>(),
+            vec![environment_cell]
+        );
     }
 
     #[test]

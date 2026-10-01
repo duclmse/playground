@@ -41,6 +41,59 @@ use super::*;
 /// underneath has changed.
 const AUTO_GC_INSTRUCTION_INTERVAL: u64 = 65_536;
 
+/// Cumulative GC counters aggregated across a `LuaRuntime`'s whole lifetime,
+/// split by `sol_core::CollectionKind` rather than by `gc_mode`: a
+/// `"generational"`-mode run only ever produces `Minor` collections via
+/// `step_garbage`, but `collectgarbage("collect")`/the auto-collect trigger
+/// (`collect_garbage_with`) always run a `Major` pass regardless of
+/// `gc_mode`, so keying off the `Collection`'s own reported `kind` covers
+/// every call site uniformly instead of duplicating that branch here.
+///
+/// `major_collections` counts major-collection *passes*, not finished
+/// cycles: under `"incremental"` mode, `step_major_with_conditional_roots`
+/// may need several `step_garbage` calls to finish one logical cycle, and
+/// each call here is one increment - this is deliberately the finer-grained
+/// "total major steps" measure U7's GC-stats deliverable asks for, so a
+/// benchmark/test can compare per-pass cost between the two kinds rather
+/// than only whole-cycle counts.
+///
+/// Exposed read-only to Lua through `debug.gcstats()` (`natives_debug.rs`),
+/// so `docs/features/milestones/u7-interpreter-performance.md`'s "measured
+/// barriers" bullet has something to point at: minor passes should show far
+/// lower `*_time`-per-pass than major ones for the same live-heap size,
+/// proving the generational fast path is actually cheap, not just
+/// mechanically distinct.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct GcStats {
+    pub minor_collections: u64,
+    pub major_collections: u64,
+    pub minor_reclaimed: u64,
+    pub major_reclaimed: u64,
+    pub minor_promoted: u64,
+    pub major_promoted: u64,
+    pub minor_time: std::time::Duration,
+    pub major_time: std::time::Duration,
+}
+
+impl GcStats {
+    fn record(&mut self, collection: &sol_core::Collection, elapsed: std::time::Duration) {
+        match collection.kind {
+            sol_core::CollectionKind::Minor => {
+                self.minor_collections += 1;
+                self.minor_reclaimed += collection.reclaimed as u64;
+                self.minor_promoted += collection.promoted as u64;
+                self.minor_time += elapsed;
+            }
+            sol_core::CollectionKind::Major => {
+                self.major_collections += 1;
+                self.major_reclaimed += collection.reclaimed as u64;
+                self.major_promoted += collection.promoted as u64;
+                self.major_time += elapsed;
+            }
+        }
+    }
+}
+
 impl LuaRuntime {
     /// Enables/disables GC stress mode (see the `gc_stress` field doc) for
     /// this runtime. Off by default for every constructor; opt in
@@ -156,10 +209,12 @@ impl LuaRuntime {
         // against a metric `charge_allocation` never charged from in the
         // first place.
         let live_before = self.canonical_heap.borrow().live_bytes();
+        let started = std::time::Instant::now();
         let collection = self
             .canonical_heap
             .borrow_mut()
             .collect_major_with_conditional_roots(&roots, &conditional_roots);
+        self.gc_stats.record(&collection, started.elapsed());
         let live_after = self.canonical_heap.borrow().live_bytes();
         let reclaimed_bytes = live_before.saturating_sub(live_after);
         self.allocation_remaining = self
@@ -218,6 +273,7 @@ impl LuaRuntime {
     pub(super) fn step_garbage(&mut self, size: usize, active_frame: Option<&LuaFrame>) -> bool {
         let (roots, conditional_roots) = self.frame_roots(active_frame);
         let live_before = self.canonical_heap.borrow().live_bytes();
+        let started = std::time::Instant::now();
         let (finished, collection) = if self.gc_mode == "generational" {
             let collection = self
                 .canonical_heap
@@ -229,6 +285,7 @@ impl LuaRuntime {
                 .borrow_mut()
                 .step_major_with_conditional_roots(size, &roots, &conditional_roots)
         };
+        self.gc_stats.record(&collection, started.elapsed());
         let live_after = self.canonical_heap.borrow().live_bytes();
         let reclaimed_bytes = live_before.saturating_sub(live_after);
         self.allocation_remaining = self
@@ -445,8 +502,8 @@ impl LuaRuntime {
         for cell in frame.cells.iter().flatten() {
             roots.push(Value::object(*cell));
         }
-        for upvalue in &frame.upvals {
-            roots.push(Value::object(*upvalue));
+        for upvalue in frame.upvals.iter() {
+            roots.push(Value::object(upvalue.get()));
         }
         for value in &frame.varargs {
             roots.push(self.encode_value(value).unwrap_or(Value::NIL));

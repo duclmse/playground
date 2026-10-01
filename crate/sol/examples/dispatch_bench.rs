@@ -1,5 +1,10 @@
 // §30: match-dispatch vs. function-pointer-table dispatch, measured on a
 // synthetic tight loop (arithmetic + backward jump) rather than assumed.
+// Superseded as U7's authoritative dispatch-strategy measurement by
+// `dispatch_bench_real.rs`, which runs the same comparison against the real
+// `Instr`/`Proto` bytecode the compiler emits for `benchmarks/loop_sum.lua`
+// instead of this hand-authored 6-opcode program; kept for its own
+// before/after value as the original synthetic baseline.
 // Run: cargo run --manifest-path crates/sol/Cargo.toml --release --example dispatch_bench
 
 use std::time::Instant;

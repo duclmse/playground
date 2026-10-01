@@ -344,12 +344,13 @@ impl CanonicalString {
 
     pub fn as_bytes(&self) -> &[u8] {
         let heap = self.0.heap.borrow();
-        let sol_core::HeapObject::String(bytes) = heap
+        let sol_core::HeapObject::String(string) = heap
             .object(self.0.object)
             .expect("rooted string must remain live")
         else {
             unreachable!("canonical string has the wrong object kind")
         };
+        let bytes = &string.bytes;
         // SAFETY: `bytes`'s heap-allocated buffer address is independent of
         // the owning slab entry moving, and `self.0`'s root keeps the string
         // live for as long as this borrowed slice can be observed - the same
@@ -687,6 +688,7 @@ pub enum NativeFunction {
     DebugSetlocal,
     DebugGetregistry,
     DebugGetuservalue,
+    DebugGcstats,
 }
 
 impl NativeFunction {
@@ -822,6 +824,7 @@ impl NativeFunction {
             Self::DebugSethook => "sethook",
             Self::DebugGethook => "gethook",
             Self::DebugSetuservalue => "setuservalue",
+            Self::DebugGcstats => "gcstats",
         }
     }
 
@@ -957,6 +960,7 @@ impl NativeFunction {
             122 => Self::DebugSetlocal,
             123 => Self::DebugGetregistry,
             124 => Self::DebugGetuservalue,
+            125 => Self::DebugGcstats,
             _ => return None,
         })
     }

@@ -156,6 +156,28 @@ impl LuaRuntime {
             NativeFunction::DebugGetregistry => {
                 Ok(vec![LuaValue::Table(TableRef::new(self.c_registry))])
             }
+            NativeFunction::DebugGcstats => {
+                let stats = self.gc_stats;
+                let table = self.new_table(None)?;
+                for (key, value) in [
+                    ("minor_collections", stats.minor_collections as f64),
+                    ("major_collections", stats.major_collections as f64),
+                    ("minor_reclaimed", stats.minor_reclaimed as f64),
+                    ("major_reclaimed", stats.major_reclaimed as f64),
+                    ("minor_promoted", stats.minor_promoted as f64),
+                    ("major_promoted", stats.major_promoted as f64),
+                    ("minor_time", stats.minor_time.as_secs_f64()),
+                    ("major_time", stats.major_time.as_secs_f64()),
+                ] {
+                    self.table_set(
+                        table,
+                        LuaValue::String(self.intern_str(key.as_bytes())),
+                        LuaValue::Float(value),
+                    )
+                    .unwrap();
+                }
+                Ok(vec![LuaValue::Table(table)])
+            }
             NativeFunction::DebugGetuservalue => {
                 let userdata = match required(0)? {
                     LuaValue::Userdata(userdata) => userdata,
@@ -260,8 +282,8 @@ impl LuaRuntime {
                         .get(index)
                         .map(String::as_bytes)
                         .unwrap_or(b"(no name)");
-                    let value = match upvalues.get(index) {
-                        Some(&cell) => self.upvalue_get(cell)?,
+                    let value = match upvalues.get(index).map(std::cell::Cell::get) {
+                        Some(cell) => self.upvalue_get(cell)?,
                         None => LuaValue::Nil,
                     };
                     return Ok(vec![LuaValue::String(self.intern_str(name)), value]);
@@ -303,7 +325,7 @@ impl LuaRuntime {
                             // except through the explicit `_ENV` check below.
                             .filter(|&index| index < proto.upvals.len())
                             .and_then(|index| upvalues.get(index))
-                            .map(|cell| cell.raw() as usize)
+                            .map(|cell| cell.get().raw() as usize)
                             // The legacy bytecode frame still stores its
                             // implicit environment beside lexical upvalues.
                             // Expose the final mandatory `_ENV` identity at
@@ -365,7 +387,7 @@ impl LuaRuntime {
                     .ok()
                     .and_then(|index| index.checked_sub(1))
                     .filter(|&index| index < f2_proto.upvals.len())
-                    .and_then(|index| f2_upvalues.get(index).copied())
+                    .and_then(|index| f2_upvalues.get(index).map(std::cell::Cell::get))
                     .ok_or_else(|| {
                         LuaError::new("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
                     })?;
@@ -403,7 +425,7 @@ impl LuaRuntime {
                 // trailing environment cell, excluded here the same way so it
                 // is only reachable through the explicit `_ENV` branch below.
                 if index < proto.upvals.len() && upvalues.get(index).is_some() {
-                    let cell = upvalues[index];
+                    let cell = upvalues[index].get();
                     self.upvalue_set(cell, value)?;
                     let name = proto
                         .upval_names
