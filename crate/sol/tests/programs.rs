@@ -1834,3 +1834,67 @@ fn debug_repl_quit_stops_immediately() {
         "quit must stop before main finishes"
     );
 }
+
+/// U11 item 4: `debug.rs`'s call-boundary hook (`Hooks::on_call_enter`) must
+/// keep firing correctly - right breakpoint, right backtrace, right final
+/// answer - even once item 2's whole-program proof has elided `triple`'s
+/// per-call runtime tag guard and the JIT has promoted it to native code
+/// mid-session. `Runtime::call` wraps the hook around the call boundary
+/// itself regardless of tier (see debug.rs's module comment), so this should
+/// hold; this test pins that it actually does, not just that it should.
+#[test]
+fn debug_repl_keeps_working_after_a_speculative_candidate_is_proven_exhaustive_and_promoted() {
+    let path = format!(
+        "{}/tests/fixtures/speculative_exhaustive_any_param.sol",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["debug", &path])
+        .env("SOL_SPECULATIVE_THRESHOLD", "1")
+        .env("SOL_PROMOTE_THRESHOLD", "100000")
+        .env("SOL_OSR_THRESHOLD", "100000")
+        .env("SOL_JIT_LOG", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"break triple\nc\nbt\nc\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'triple' speculative candidate proven exhaustive"),
+        "expected the whole-program proof to fire before any calls happen:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("promoting 'triple'"),
+        "expected triple to actually be promoted to native mid-session:\n{stderr}"
+    );
+    assert!(stdout.contains("-> main([])"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("speculative_exhaustive_any_param.sol:13"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(stdout.contains("breakpoint set: triple"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("-> triple(") && stdout.contains("speculative_exhaustive_any_param.sol:8"),
+        "expected the breakpoint on triple to hit (both pre- and post-promotion):\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  triple at ")
+            && stdout.contains("speculative_exhaustive_any_param.sol:8\n  main at ")
+            && stdout.contains("speculative_exhaustive_any_param.sol:13"),
+        "expected a backtrace showing triple called from main:\n{stdout}"
+    );
+    assert!(
+        stdout.trim_end().ends_with("5310"),
+        "expected the correct final answer despite the elided guard and native promotion:\n{stdout}"
+    );
+}

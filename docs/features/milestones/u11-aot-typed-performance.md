@@ -47,7 +47,42 @@
       feature, not a bounded follow-on to the existing single-intrinsic
       mechanism. Measured, not adopted: left for a future milestone rather
       than attempted as a partial/unsound slice.
-- [ ] Retain dynamic adapters at exported and reflective boundaries.
+- [ ] Retain dynamic adapters at exported and reflective boundaries. Item 4
+      (2026-10-02, partial): this is a verification item against items 2/3's
+      already-landed changes, not new mechanism. Added
+      `tests/programs.rs`'s
+      `debug_repl_keeps_working_after_a_speculative_candidate_is_proven_exhaustive_and_promoted`,
+      which runs `sol debug` against the item-2 fixture
+      (`speculative_exhaustive_any_param.sol`) with
+      `SOL_SPECULATIVE_THRESHOLD=1` so the whole-program proof fires and
+      `triple` is promoted to native *during* the debug session, and confirms
+      `debug.rs`'s call-boundary hook (`Hooks::on_call_enter`,
+      `debug.rs:113-120`) still breakpoints, backtraces, and reaches the
+      correct final answer (`5310`) both before and after the promotion -
+      the cross-tier guarantee `debug.rs:1-14`'s header comment claims is now
+      pinned by a real test, not just asserted in a comment. The FFI extern
+      boundary (`TExternFunction`, `types.rs:144-148`) needed no new
+      coverage: neither item touches extern dispatch (item 2 is scoped to
+      the `any`-parameter speculative tag guard, item 3 to `ArrayMap`'s
+      `elem` field), and the existing
+      `ffi_extern_function_works_once_the_caller_is_promoted_to_native`
+      already pins that boundary across tiers.
+      **Not resolved, left open:** investigated whether `require()`-based
+      dynamic field dispatch (`local m = require("x"); m.f(...)`) can defeat
+      item 2's whole-program proof, since `jit::is_speculative_exhaustive`'s
+      call-site walk (`jit.rs:860-1009`) only recognizes literal
+      `TExprKind::Call` and disqualifying `FunctionRef` nodes, never
+      `CallIndirect` - a dynamic dispatch call is invisible to it either way
+      (neither counted as a call site nor flagged unsound). Calls crossing
+      the dynamic/typed boundary do route through a separate semantic-adapter
+      mechanism (`LuaPartition::mixed`, `typeck.rs:232-236`;
+      `load_with_natives`'s "semantic adapter slots" comment,
+      `lua_runtime/init.rs:820-822`) distinct from `interp::try_speculative`'s
+      internal per-call tag guard, which is the structural reason this did
+      not reproduce as an observable type-safety break in manual probing -
+      but that was exploratory, not a committed fixture, and is not an
+      exhaustive proof. Left unchecked and flagged here rather than claimed
+      as verified.
 - [ ] Support profile-guided AOT with safe profile-change fallback.
 - [x] Compare gradually typed programs to their unchanged Lua versions. Item 6
       (2026-10-02): `benchmarks/gradual-manifest.json` + new

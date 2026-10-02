@@ -2607,7 +2607,10 @@ Deliverables:
       item 3 generalized the one existing specialization (`ArrayMap`) to
       monomorphize over more than one concrete type; narrower than the
       bullet's full "user-defined generics" scope - see the item-3 note;
-- [ ] retain dynamic adapters for exported/reflective entry points;
+- [ ] retain dynamic adapters for exported/reflective entry points - item 4
+      verified the `debug.rs` REPL boundary and found the FFI extern boundary
+      already covered; the `require()`-boundary question is investigated but
+      left open, see the item-4 note;
 - [ ] support profile-guided AOT with safe fallback when profiles change;
 - [x] compare each gradually typed program against its unchanged Lua version -
       item 6, see the dated note below.
@@ -2744,6 +2747,39 @@ attempted as a partial or unsound slice - measured, not adopted. Full `cargo
 test --manifest-path crate/sol/Cargo.toml` suite (130 lib tests, 68
 `programs.rs` tests [66 + 2 new], 0 failed, 0 new warnings) and
 `scripts/test-lua55-manifest.sh` both pass.
+
+Item 4 (2026-10-02, partial): a verification item against items 2/3's
+already-landed changes, not new mechanism - per the plan, targets `require`
+boundaries, FFI extern calls, and `debug.rs`'s REPL. Added
+`tests/programs.rs`'s
+`debug_repl_keeps_working_after_a_speculative_candidate_is_proven_exhaustive_and_promoted`:
+runs `sol debug` against the item-2 fixture
+(`speculative_exhaustive_any_param.sol`) with `SOL_SPECULATIVE_THRESHOLD=1`
+so the whole-program proof fires and `triple` is promoted to native *during*
+the debug session, and confirms `debug.rs`'s call-boundary hook
+(`Hooks::on_call_enter`, `debug.rs:113-120`) still breakpoints, backtraces,
+and reaches the correct final answer (`5310`) both before and after
+promotion - pinning the cross-tier guarantee `debug.rs:1-14`'s header
+comment claims with a real test rather than only a comment. The FFI extern
+boundary needed no new coverage: neither item 2 (scoped to the
+`any`-parameter speculative tag guard) nor item 3 (scoped to `ArrayMap`'s
+`elem` field) touches extern dispatch, and the existing
+`ffi_extern_function_works_once_the_caller_is_promoted_to_native` already
+pins that boundary across tiers. **Not resolved, left open:** whether
+`require()`-based dynamic field dispatch (`local m = require("x");
+m.f(...)`) can defeat item 2's proof, since `jit::is_speculative_exhaustive`'s
+call-site walk (`jit.rs:860-1009`) only recognizes literal `TExprKind::Call`
+and disqualifying `FunctionRef` nodes - a `CallIndirect` from dynamic
+dispatch is invisible to it either way (neither counted as a call site nor
+flagged unsound). Manual probing did not reproduce an observable type-safety
+break, consistent with such calls routing through the separate
+semantic-adapter mechanism (`LuaPartition::mixed`, `typeck.rs:232-236`;
+`lua_runtime/init.rs:820-822`'s "semantic adapter slots") rather than through
+`interp::try_speculative`'s internal per-call tag guard, but this was
+exploratory, not a committed fixture, and is not an exhaustive proof - left
+unchecked rather than claimed as verified. Full `cargo test --manifest-path
+crate/sol/Cargo.toml` suite (130 lib tests, 69 `programs.rs` tests, 0
+failed, 0 new warnings) and `scripts/test-lua55-manifest.sh` both pass.
 
 ### U12 — Canonical WASM playground and debugger
 
