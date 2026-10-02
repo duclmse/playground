@@ -540,6 +540,177 @@ fn a_hot_while_loop_is_entered_via_osr_mid_activation_with_no_behavior_change() 
     assert_eq!(baseline.stdout, osr.stdout);
 }
 
+/// U10 work item 7 (real call inlining): a monomorphic call site (`f(x)`,
+/// `f` arriving as `caller`'s own parameter so the call's callee register
+/// needs no global/upvalue access - see `sol_ir::callee_is_inlinable`'s own
+/// doc on why a bare pass-through argument can't itself carry a proof, which
+/// is why `x` here is built from constant arithmetic inside `caller` rather
+/// than threaded through as a second parameter) that only ever resolves to
+/// `add_one` is eligible for the optimizing tier's real splicing, not just
+/// `lower.rs`'s baseline always-deopt call protocol (item 5's own
+/// `dynjit_nested_call.lua` coverage) - forcing `SOL_LUA_PROMOTE_THRESHOLD=1`
+/// and `SOL_LUA_OPTIMIZE_THRESHOLD=2` (never `=1`: the call-site cache is
+/// still empty on `caller`'s very first activation, since `try_optimize` runs
+/// at frame entry, before that activation's own body - and therefore its one
+/// real call - ever executes; `=2` lands the optimize attempt on the second
+/// activation, once the first has already populated `proto.call_cache` with
+/// a single `add_one` entry) must drive `caller` through both tiers and
+/// produce byte-identical output to the fully interpreted run across three
+/// calls, all through the same stable callee.
+#[test]
+fn a_monomorphic_call_site_is_inlined_to_native_code_with_no_behavior_change() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_inline_call_stable.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let optimized = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "2")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(optimized.status.success());
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n8\nnil");
+    let stderr = String::from_utf8_lossy(&optimized.stderr);
+    assert!(
+        stderr.contains("'caller' optimized to native code"),
+        "expected 'caller' to actually compile under work item 7's call \
+         inlining, not just stay at the baseline always-deopt tier:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, optimized.stdout);
+}
+
+/// Same fixture, under `SOL_LUA_GC_STRESS=1`: the inlined callee body
+/// (`add_one`'s `x + 1`) computes as bare Cranelift SSA values with no
+/// register-array traffic of its own (see `opt_lower.rs`'s `lower_call` doc),
+/// so this exercises the surrounding guard/caller-register-array machinery
+/// (the closure-identity load, the final `store_value` of the inlined
+/// result) under maximal collection pressure, mirroring item 3's own
+/// GC-stress coverage for the whole-function optimizing tier.
+#[test]
+fn a_monomorphic_call_site_survives_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_inline_call_stable.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "2")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n8\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'caller' optimized to native code"),
+        "expected 'caller' to inline even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}
+
+/// U10 work item 7: same shape as the stable-callee test above, except the
+/// call site's own callee argument changes identity on the third call
+/// (`add_one` for the first two, `times_ten` - same arity, same
+/// cheap-integer-arithmetic shape, so it would *also* be independently
+/// inlinable, but a distinct closure object - for the third). `caller`'s
+/// optimizing-tier compile (triggered on the second activation, with the
+/// call-site cache already monomorphic(`add_one`) from the first) bakes in a
+/// `GuardFact::ClosureIdentity` check against `add_one`'s own `ObjectId`; the
+/// third call's guard must fail that check and deopt via the exact same
+/// snapshot/resume mechanism every other guard in this tier uses, falling
+/// back to a real interpreted call to `times_ten`. This is the test that
+/// actually distinguishes a correctly-firing guard from a silently-broken
+/// one: `add_one(7)` and `times_ten(7)` disagree (8 vs. 70), so a guard that
+/// failed to fire (or never ran at all) would wrongly replay `add_one`'s
+/// baked-in inlined arithmetic for the third call and print `8`, not `70`.
+#[test]
+fn a_call_site_that_turns_polymorphic_deopts_the_inlined_guard_correctly() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_inline_call_deopt.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let optimized = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "2")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .output()
+        .unwrap();
+    assert!(optimized.status.success());
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n70\nnil");
+    let stderr = String::from_utf8_lossy(&optimized.stderr);
+    assert!(
+        stderr.contains("'caller' optimized to native code"),
+        "expected 'caller' to actually inline (and then deopt) rather than \
+         never reaching the optimizing tier at all - a 'caller' that stayed \
+         at the baseline tier would also happen to print 8/8/70 (every call \
+         there unconditionally deopts), which would make this test pass \
+         without ever exercising the new ClosureIdentity guard:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, optimized.stdout);
+}
+
+/// Same fixture, under `SOL_LUA_GC_STRESS=1`: exercises the guard-failure
+/// deopt path's own register/cell-sync - `run_native`'s decode-out loop after
+/// a `0` (deopt) outcome - under maximal collection pressure.
+#[test]
+fn a_call_site_that_turns_polymorphic_deopts_correctly_under_gc_stress_mode() {
+    let path = format!(
+        "{}/tests/fixtures/dynjit_inline_call_deopt.lua",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let stressed = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_PROMOTE_THRESHOLD", "1")
+        .env("SOL_LUA_OPTIMIZE_THRESHOLD", "2")
+        .env("SOL_LUA_JIT_LOG", "1")
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(stressed.status.success());
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n70\nnil");
+    let stderr = String::from_utf8_lossy(&stressed.stderr);
+    assert!(
+        stderr.contains("'caller' optimized to native code"),
+        "expected 'caller' to inline even under gc_stress:\n{stderr}"
+    );
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_LUA_GC_STRESS", "1")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    assert_eq!(baseline.stdout, stressed.stdout);
+}
+
 /// Same fixture, under `SOL_LUA_GC_STRESS=1`: exercises the OSR entry's own
 /// register-sync (encode-in/decode-out, `try_osr_backedge`) under maximal
 /// collection pressure, mirroring item 3's own GC-stress coverage for the

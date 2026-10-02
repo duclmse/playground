@@ -96,11 +96,13 @@ impl BoundedCache<CallCacheEntry> {
     /// miss, so a cache that has seen a second distinct closure identity
     /// grows to `len() >= 2` and - since `insert`'s only removal is a
     /// round-robin eviction at `IC_SLOTS` capacity, never on a hit - can
-    /// never shrink back down to `len() == 1` afterward. `U10`'s work item 6
-    /// reserves this as the call-site classification a real inlining pass
-    /// would read before trusting a `GuardFact::ClosureIdentity` guard
-    /// against this site (see that variant's doc comment, `sol_ir.rs`) -
-    /// nothing yet calls this from bytecode lifting or lowering.
+    /// never shrink back down to `len() == 1` afterward. `U10` work item 7's
+    /// `sol_ir::lift_proto_impl` reads this directly at each `Instr::Call`
+    /// site to decide whether `callee_is_inlinable` should even be
+    /// consulted; a guard against the returned entry's `guard` identity
+    /// (`GuardFact::ClosureIdentity`, see that variant's doc comment) is what
+    /// lets `opt_lower.rs`'s `lower_call` splice the callee in without
+    /// re-checking this cache at run time.
     pub fn monomorphic_call_target(&self) -> Option<CallCacheEntry> {
         let entries = self.0.borrow();
         if entries.len() == 1 {

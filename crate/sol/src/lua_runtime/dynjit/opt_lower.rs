@@ -27,16 +27,25 @@
 //! report `fully_lifted`, and `sol_ir::lift_proto` only models
 //! `LoadConst`(non-string)/`LoadNil`/`LoadBool`/`Move`/uncaptured
 //! `NewLocal`/`DetachCell`, `Not`/`Neg`/`BitNot`, `Binary`/`IntegerBinary`,
-//! `Jump`/`JumpIfFalse`/`JumpIfTrue`, and a `Return` of zero or one value -
-//! no field/global/table/upvalue access, no calls, no `for` loops, no
-//! captured registers (a captured register implies some `NewClosure`
-//! created the capture, and `NewClosure` is outside `sol_ir`'s modeled
-//! subset, so `fully_lifted` is already false whenever any register is
-//! captured). Extending `sol_ir::lift_proto` to model those is future work,
-//! not attempted here - see `docs/features/milestones/u10-optimizing-jit-osr.md`.
-//! A direct consequence: every register in an eligible `Proto` is
-//! statically known *uncaptured*, so this module's lowering never needs the
-//! cell-sync stubs `lower.rs`'s `store_value`/`sync_cell_out` call.
+//! `Jump`/`JumpIfFalse`/`JumpIfTrue`, a `Return` of zero or one value, and
+//! (work item 7) a narrow shape of monomorphic `Instr::Call` - no
+//! field/global/table/upvalue access, no `for` loops, no captured registers
+//! (a captured register implies some `NewClosure` created the capture, and
+//! `NewClosure` is outside `sol_ir`'s modeled subset, so `fully_lifted` is
+//! already false whenever any register is captured). A call site that
+//! doesn't meet work item 7's narrow inlining shape (see
+//! `sol_ir::callee_is_inlinable`) lifts to `Inst::Unsupported` exactly like
+//! any other out-of-scope instruction, clearing `fully_lifted` the same way -
+//! so `is_eligible` never needs its own separate call-awareness, and a
+//! `Proto` only ever reaches `lower_call` below once `sol_ir` has already
+//! decided inlining it is sound. Extending `sol_ir::lift_proto` to model the
+//! rest is future work, not attempted here - see
+//! `docs/features/milestones/u10-optimizing-jit-osr.md`. A direct
+//! consequence: every register in an eligible `Proto` is statically known
+//! *uncaptured*, so this module's lowering never needs the cell-sync stubs
+//! `lower.rs`'s `store_value`/`sync_cell_out` call.
+
+use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -49,10 +58,10 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::ast::BinaryOp;
 use crate::lua_bytecode::{Const, Instr, Proto};
-use crate::sol_ir::{self, Proof};
+use crate::sol_ir::{self, Inst, Proof, ValueId};
 use sol_core::{ValueCount, ValueTag};
 
-use super::abi::{TAG_BOOLEAN, TAG_FLOAT, TAG_INTEGER, TAG_NIL, WORD};
+use super::abi::{TAG_BOOLEAN, TAG_FLOAT, TAG_INTEGER, TAG_NIL, TAG_OBJECT, WORD};
 use super::stubs::StubFuncs;
 
 /// See `lower.rs`'s identical constant for why `fallthrough` traps rather
@@ -288,6 +297,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Instr::Binary(op, dst, left, right) | Instr::IntegerBinary(op, dst, left, right) => {
                 self.lower_binary(pc, *op, *dst, *left, *right, fallthrough_target);
             }
+            Instr::Call(base, _, _) => {
+                self.lower_call(pc, *base, fallthrough_target);
+            }
             Instr::Jump(delta) => {
                 self.lower_unconditional_jump(pc, *delta);
             }
@@ -505,6 +517,121 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .ins()
             .brif(ok, cont, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
         self.builder.switch_to_block(cont);
+        self.fallthrough(fallthrough_target);
+    }
+
+    /// Work item 7's real call inlining: `pc`'s paired `Inst::Guard`/
+    /// `Inst::Call` (`sol_ir::callee_is_inlinable`'s resolved `InlinePlan` -
+    /// see that doc for exactly which callee shapes reach here) is spliced
+    /// directly into this function's own Cranelift IR, with no actual call
+    /// or frame push. Emits its own closure-identity check as raw IR rather
+    /// than consulting `sol_ir::Inst::Guard` (unused here, same as every
+    /// other proof this lowerer re-derives on demand instead of walking
+    /// `sol_ir`'s block graph - see the module doc): every heap-allocated
+    /// value shares `TAG_OBJECT` at the `sol_core::Value` level regardless of
+    /// kind (`abi::TAG_OBJECT`'s own doc), so "the value at `base` is the
+    /// exact closure `target.guard` names" is just a tag-and-payload compare,
+    /// identical in spirit to `closure_parts_cached`'s own cache-hit check.
+    /// Guard failure branches to `deopt_block` exactly like every other guard
+    /// in this file, resuming the interpreter at this same `Instr::Call` -
+    /// which redoes the real call from scratch, correct because nothing here
+    /// writes any register before the guard passes.
+    ///
+    /// On success, the callee's `body` is replayed as bare Cranelift SSA
+    /// values (`values: HashMap<ValueId, (tag, payload)>`), never through a
+    /// flat register window of its own: `param_value_ids[i]` is pre-seeded
+    /// from the caller's own `base + 1 + i` argument register (both tag and
+    /// payload, not payload alone - a parameter that flows straight to
+    /// `result` without passing through any `Binary` can carry any type, so
+    /// its tag matters too), then every remaining `body` entry - by
+    /// construction by `sol_ir`, only ever `Const` or a proof-provably-
+    /// `Integer` `Add`/`Sub`/`Mul` `Binary` - is translated in order (already
+    /// a valid def-before-use order, same invariant `sol_ir::infer_known_proof`
+    /// relies on). The `Binary` arm skips the runtime "both operands integer"
+    /// check `lower_binary`'s unproven fallback needs, for the same reason
+    /// `lower_binary`'s own `both_proven_integer` fast lane does: `sol_ir`
+    /// already proved it unconditionally true. Finally, `result` (if the
+    /// callee returns a value) is stored into the caller's own `base`
+    /// register - the call site's result register, by `Instr::Call`'s own
+    /// ABI (this module's doc / `Instr::Call`'s doc in `lua_bytecode/instr.rs`).
+    fn lower_call(&mut self, pc: usize, base: u16, fallthrough_target: Option<Block>) {
+        let Some((
+            _,
+            Inst::Call {
+                target,
+                param_value_ids,
+                body,
+                result,
+            },
+        )) = self.func.value_at_pc.get(&pc)
+        else {
+            unreachable!("Instr::Call at a value-producing pc must have lifted to Inst::Call")
+        };
+
+        let tag = self.load_tag(base);
+        let payload = self.load_payload(base);
+        let is_object = self.builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_OBJECT);
+        let is_target = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, payload, target.guard.raw() as i64);
+        let guard_ok = self.builder.ins().band(is_object, is_target);
+        let pcv = self.pc_const(pc);
+        let inline_block = self.new_block();
+        self.builder
+            .ins()
+            .brif(guard_ok, inline_block, &[], self.deopt_block, &[BlockArg::Value(pcv)]);
+        self.builder.switch_to_block(inline_block);
+
+        let mut values: HashMap<ValueId, (ClifValue, ClifValue)> = HashMap::new();
+        for (i, param_id) in param_value_ids.iter().enumerate() {
+            let reg = base + 1 + i as u16;
+            values.insert(*param_id, (self.load_tag(reg), self.load_payload(reg)));
+        }
+        for (id, inst) in body {
+            if values.contains_key(id) {
+                continue;
+            }
+            let pair = match inst {
+                Inst::Const(c) => match c {
+                    Const::Nil => (
+                        self.builder.ins().iconst(types::I64, TAG_NIL),
+                        self.builder.ins().iconst(types::I64, 0),
+                    ),
+                    Const::Bool(v) => (
+                        self.builder.ins().iconst(types::I64, TAG_BOOLEAN),
+                        self.builder.ins().iconst(types::I64, *v as i64),
+                    ),
+                    Const::Integer(v) => (
+                        self.builder.ins().iconst(types::I64, TAG_INTEGER),
+                        self.builder.ins().iconst(types::I64, *v),
+                    ),
+                    Const::Float(v) => (
+                        self.builder.ins().iconst(types::I64, TAG_FLOAT),
+                        self.builder.ins().iconst(types::I64, v.to_bits() as i64),
+                    ),
+                    Const::Str(_) => unreachable!("callee_is_inlinable excludes string constants"),
+                },
+                Inst::Binary(op, a, b) => {
+                    let (_, av) = values[a];
+                    let (_, bv) = values[b];
+                    let payload = match op {
+                        BinaryOp::Add => self.builder.ins().iadd(av, bv),
+                        BinaryOp::Sub => self.builder.ins().isub(av, bv),
+                        BinaryOp::Mul => self.builder.ins().imul(av, bv),
+                        _ => unreachable!("callee_is_inlinable excludes every other Binary op"),
+                    };
+                    (self.builder.ins().iconst(types::I64, TAG_INTEGER), payload)
+                }
+                _ => unreachable!("callee_is_inlinable excludes every other Inst variant"),
+            };
+            values.insert(*id, pair);
+        }
+
+        if let Some(result_id) = result {
+            let (t, p) = values[result_id];
+            self.store_value(base, t, p);
+        }
         self.fallthrough(fallthrough_target);
     }
 }

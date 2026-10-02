@@ -351,4 +351,101 @@ every integration suite, `sol-core`'s 37, and the Lua 5.5 manifest check, all
 green) already covers by construction, since no call-handling code path was
 touched.
 
+**Item 7 note (real call splicing: a narrow first inlining slice, extending
+item 6):** item 6 built the identity-guard infrastructure and explicitly left
+"bytecode-level call lifting and splicing" undone. This item does that
+lifting and splicing for a deliberately narrow shape, not the general case the
+plan's text describes.
+
+What a call site must look like to be inlined, all checked by
+`callee_is_inlinable` (`sol_ir.rs:683`, called from `lift_proto_impl`'s
+`Instr::Call` arm, `sol_ir.rs:493`): the call's own `call_cache` slot must
+already be monomorphic (`BoundedCache::monomorphic_call_target`,
+`lua_bytecode/instr.rs:104`); the resolved callee must take exactly as many
+fixed, non-variadic parameters as the call site passes fixed arguments, return
+0 or 1 results (matching the call site's own result count), and capture no
+upvalues; the callee's own body (lifted via `lift_proto_impl(_, false)` - the
+non-call-lifting pass, so a callee can never itself inline a further call,
+which is what keeps mutual recursion between two monomorphic call sites from
+inlining without bound) must terminate its entry block directly in a `Return`/
+`ImplicitReturn` of the right arity (never a `Jump`/`Branch` - a callee whose
+own logic branches at all is simply not inlined); and that entry block may
+contain only `Const` (non-string) and proof-provably-`Integer` `Add`/`Sub`/
+`Mul` `Binary` - not even `Not`/`Neg`/`BitNot`, which `lift_proto_impl` lowers
+in general but which this increment's value-shaped Cranelift splicing
+(`opt_lower.rs:557`'s `lower_call`) does not yet handle. A consequence of
+`lift_proto_impl` always seeding a fresh `Proto`'s block-0 registers with
+`Const::Nil` (nothing before this item needed a callee's *own* parameters to
+carry a real proof): a plain pass-through parameter used directly as a call
+argument can never be proven `Integer`, so it can never be inlined as one -
+`propagate_proofs_with_param_seed` (`sol_ir.rs:762`) only substitutes a real
+proof for the callee's *own* parameters, not the caller's argument
+expressions. Both new fixtures below work around this by building the call
+argument from constant arithmetic in the caller (`local x = 5 + 2`) rather
+than forwarding a bare parameter.
+
+On success, `lift_proto_impl` emits a real `Inst::Guard` (`fact:
+GuardFact::ClosureIdentity(current[base], entry.guard)`, the item-6 variant)
+followed by an `Inst::Call{target, param_value_ids, body, result}` carrying
+`callee_is_inlinable`'s whole resolved splice plan (`sol_ir.rs:677`'s
+`InlinePlan`) - `opt_lower.rs` never re-derives eligibility, it mechanically
+translates this plan. `lower_call` (`opt_lower.rs:557`) lowers the guard as a
+plain Cranelift compare (`tag == TAG_OBJECT && payload ==
+guard.raw()`, `abi.rs:44`'s doc explains why a bare tag/payload compare is
+enough: every heap object shares tag `Object`, identity lives in the payload)
+branching on failure to the *same* shared `self.deopt_block` every other
+`opt_lower.rs` guard already uses (`BlockArg::Value(pcv)`, item 2's existing
+snapshot/stamp-resume-pc/flush-then-interpret mechanism, unchanged) - no new
+deopt mechanism was introduced. On success it threads the callee's body as
+bare Cranelift SSA value pairs (`HashMap<ValueId, (tag, payload)>`), touching
+the caller's own flat register array only to read the argument registers once
+and write the final result register once.
+
+Narrowed further than the governing task's own suggested increment ("a callee
+with NO further calls inside it" was already required; this item additionally
+restricts the callee's entire body to constant/integer-arithmetic-only,
+single-block, non-branching, no-upvalue, fixed small arity) because that is
+the exact subset `sol_ir`'s existing proof/lifting machinery already makes
+sound without new work - field/global/table access, closures, and
+multi-register-result calls remain `Inst::Unsupported` exactly as item 6 left
+them.
+
+Differential coverage (`crate/sol/tests/lua55_dynamic_runtime_jit.rs:561-719`,
+fixtures `tests/fixtures/dynjit_inline_call_stable.lua`/
+`dynjit_inline_call_deopt.lua`): `a_monomorphic_call_site_is_inlined_to_native_code_with_no_behavior_change`
+and its GC-stress twin drive a call site that stays monomorphic across three
+activations and assert both byte-identical output against a no-JIT baseline
+run *and* the `"'caller' optimized to native code"` JIT_LOG trace (needed
+because the baseline native tier already deopts every call unconditionally -
+without the trace assertion a test where inlining silently never engaged
+would still pass with the same output, a false-confidence risk considered and
+rejected). `a_call_site_that_turns_polymorphic_deopts_the_inlined_guard_correctly`
+and its GC-stress twin call the same site with `add_one` twice (populating the
+cache monomorphic and triggering inlining) then `times_ten` once - a second,
+distinct closure of the same arity/shape, forcing the baked-in guard to fail
+and deopt back to a real call; `add_one(7) = 8` vs `times_ten(7) = 70` means a
+guard that silently never fired would produce the wrong answer (`8` instead of
+`70`), not just slower output, so this is a correctness assertion, not only a
+behavioral one. All four tests pass, output and traces confirmed by hand
+against the built CLI before writing the Rust assertions; adversarially
+confirmed non-vacuous by temporarily dropping the identity half of the guard
+compare (`let guard_ok = is_object;`) and observing both deopt tests fail with
+the wrong `"8\n8\n8\nnil"` output, then reverting. Full suite: 128 lib tests
+(up from 124), every integration suite including
+`lua55_dynamic_runtime_jit.rs` at 19/19, `sol-core`'s 37, and the Lua 5.5
+manifest check, all green, zero new warnings.
+
+Benchmark (`crate/sol/scratch/inline_call_bench.lua`, gitignored scratch, not
+committed - a tight loop calling a monomorphic single-arg function 20,000,000
+times): run twice against the release CLI with everything else held fixed
+(`SOL_LUA_PROMOTE_THRESHOLD=1` both times, so the function is native from its
+first activation) and only `SOL_LUA_OPTIMIZE_THRESHOLD` varied -
+`999999999` (never reached, so the call site stays on the baseline tier,
+which deopts to the interpreter for every single call) vs. `2` (reached on
+the call site's second activation, so nearly the whole run executes the
+inlined guard-and-splice path with no per-call deopt): 32.98s real vs. 16.73s
+real, both producing the identical correct `160000000` total - roughly a 2x
+wall-clock improvement on a call-dominated loop, from eliminating the
+deopt-to-interpreter round trip on every call once the guard proves stable.
+
 See the [historical U10 ledger](../unified-sol-runtime-plan.md#u10--optimizing-ssa-jit-osr-and-deoptimization).

@@ -35,6 +35,13 @@ pub const TAG_NIL: i64 = 0;
 pub const TAG_BOOLEAN: i64 = 1;
 pub const TAG_INTEGER: i64 = 2;
 pub const TAG_FLOAT: i64 = 3;
+/// Every heap-allocated value (table, closure, string, ...) shares this one
+/// tag at the `sol_core::Value` level - identity/kind live in the payload's
+/// `ObjectId`, not in a per-kind tag. Work item 7's inlining guard
+/// (`opt_lower.rs`'s `lower_call`) is the first user: checking a call site's
+/// own `base` register against `CallCacheEntry::guard` needs exactly this
+/// tag plus a raw payload compare, nothing more specific.
+pub const TAG_OBJECT: i64 = 4;
 
 /// A compiled `Proto` body's native entry point signature (see `lower.rs`'s
 /// module doc for the full calling convention this mirrors): takes the
