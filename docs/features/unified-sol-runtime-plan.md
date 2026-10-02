@@ -2598,14 +2598,51 @@ item-8 note and [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md)'s
 Deliverables:
 
 - [ ] feed checked annotations and static inference directly into shared SSA;
-- [ ] remove guards and generic runtime calls proven unnecessary;
+- [ ] remove guards and generic runtime calls proven unnecessary - the typed
+      tier's only runtime guard (`interp.rs`'s `try_speculative` call-boundary
+      tag check on a speculatively-specialized `any` parameter) is now
+      statically elided when a whole-program proof holds; narrower than the
+      bullet's full scope - see the item-2 note;
 - [ ] specialize generics, records, arrays, maps, and callbacks across modules;
 - [ ] retain dynamic adapters for exported/reflective entry points;
 - [ ] support profile-guided AOT with safe fallback when profiles change;
 - [ ] compare each gradually typed program against its unchanged Lua version.
 
 Exit gate: typed advantage gate passes, annotation coverage yields monotonic or
-explained results, and mixed dynamic behavior remains compatible.
+explained results, and mixed dynamic behavior remains compatible. **Not yet
+reached** - work is still in progress across the other deliverables.
+
+Item 2 (2026-10-02): `jit::is_speculative_exhaustive` proves, across every
+function in the whole compiled `TProgram`, that a speculatively-specialized
+`any` parameter's call-site argument is always freshly boxed (via `coerce`)
+from exactly the candidate's target type, and that the function is never
+taken as a first-class value (which would make call sites uncountable via
+`CallIndirect`/callbacks). When the proof holds, `interp::Runtime`'s
+per-call tag re-check (`Speculative::proven`) is skipped entirely once the
+candidate is specialized - the specialized body itself already had no guard
+(`jit::specialize` deletes the redundant `Unbox`), so this closes the last
+gap and makes the call genuinely guard-free end to end. Scope cut: the proof
+is purely syntactic per call site - a value boxed into an intermediate
+`any`-typed local before being passed on
+(`local b: any = x; f(b)`) is not recognized even when every write to that
+local agrees on the type, since that needs per-local reaching-definitions
+dataflow this pass does not attempt; such calls simply don't count as
+evidence, so the guard is conservatively kept, never unsoundly dropped.
+Verified: a positive fixture (`speculative_exhaustive_any_param.sol`, direct
+inline boxing at every call site) shows the proof firing via `SOL_JIT_LOG`;
+the existing indirect-local fixture (`speculative_any_param.sol`) and a new
+mismatched-type-across-call-sites fixture
+(`speculative_type_mismatch_traps.sol`) both show the proof conservatively
+declining and the original guarded behavior - including correct trapping on
+a real mismatch - unchanged. Full `cargo test --manifest-path
+crate/sol/Cargo.toml` suite, `scripts/test-lua55-manifest.sh`, and
+`scripts/typed-regression-check.sh` all pass; the latter's three flagged
+"REGRESSED" benchmarks across two runs (`any_dynamic`, `objects`,
+`vector_add`) are confirmed pre-existing measurement noise, not caused by
+this change - `objects`/`vector_add` have no `any` usage at all (never reach
+the modified code path), and `any_dynamic`'s one candidate uses the
+intermediate-local pattern above, so its guard condition is logically
+identical before and after this change.
 
 ### U12 — Canonical WASM playground and debugger
 

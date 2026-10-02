@@ -1198,6 +1198,108 @@ fn speculative_any_parameter_specialization_is_visible_in_dumped_ir() {
     );
 }
 
+/// U11 item 2: `triple`'s only call site boxes its argument directly inline
+/// (`triple(i)`), so `jit::is_speculative_exhaustive`'s whole-program proof
+/// can show every call always passes `i64` - `SOL_JIT_LOG` should report the
+/// candidate as proven exhaustive, and the (guard-skipped) result must still
+/// be correct.
+#[test]
+fn speculative_exhaustive_candidate_proof_fires_and_skips_the_guard() {
+    let path = format!(
+        "{}/tests/fixtures/speculative_exhaustive_any_param.sol",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_JIT_LOG", "1")
+        .env("SOL_SPECULATIVE_THRESHOLD", "1")
+        .env("SOL_PROMOTE_THRESHOLD", "100000")
+        .env("SOL_OSR_THRESHOLD", "100000")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5310");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains("'triple' speculative candidate proven exhaustive"),
+        "expected triple's candidate to be proven exhaustive:\n{log}"
+    );
+}
+
+/// U11 item 2 scope cut: `double`'s one call site passes its argument
+/// through an intermediate `any`-typed local (`local boxed: any = i; ...
+/// double(boxed)`), not a direct `any(i64)` boxing at the call site itself -
+/// a value `jit::is_speculative_exhaustive` conservatively declines to
+/// prove (see its doc comment), so the per-call guard must stay in place.
+/// Existing correctness (the guarded path still works) is already covered
+/// by `speculative_any_parameter_specializes_and_stays_correct`.
+#[test]
+fn speculative_candidate_with_indirect_any_argument_is_not_proven_exhaustive() {
+    let path = format!(
+        "{}/tests/fixtures/speculative_any_param.sol",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_JIT_LOG", "1")
+        .env("SOL_SPECULATIVE_THRESHOLD", "1")
+        .env("SOL_PROMOTE_THRESHOLD", "100000")
+        .env("SOL_OSR_THRESHOLD", "100000")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3540");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !log.contains("'double' speculative candidate proven exhaustive"),
+        "double's candidate is called through an indirect any-typed local and must not be proven exhaustive:\n{log}"
+    );
+}
+
+/// U11 item 2 soundness regression: `narrow`'s candidate (unboxes to `i64`)
+/// is called 40 times with `i64` (warming it past the specialization
+/// threshold), then once with an `f64` boxed directly at that call site.
+/// The mismatched call site must disqualify the whole-program proof, and
+/// the mismatched call must still trap - confirming the proof can never
+/// turn a real type mismatch into silent bit-misinterpretation.
+#[test]
+fn speculative_candidate_type_mismatch_is_not_proven_exhaustive_and_still_traps() {
+    let path = format!(
+        "{}/tests/fixtures/speculative_type_mismatch_traps.sol",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", &path])
+        .env("SOL_JIT_LOG", "1")
+        .env("SOL_SPECULATIVE_THRESHOLD", "1")
+        .env("SOL_PROMOTE_THRESHOLD", "100000")
+        .env("SOL_OSR_THRESHOLD", "100000")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a type mismatch on narrow's speculative candidate must not succeed"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(1),
+        "must be a trap/crash, not a normal exit(1) error path"
+    );
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !log.contains("'narrow' speculative candidate proven exhaustive"),
+        "narrow is called with mismatched types across call sites and must not be proven exhaustive:\n{log}"
+    );
+}
+
 /// `--dump-ir`'s CLIF text only ever prints callees as opaque `u0:N`
 /// module-function-id references (Cranelift's `Function` `Display` never
 /// prints a linkage name) - so a plain `stderr.contains("sol_dynamic_binary")`

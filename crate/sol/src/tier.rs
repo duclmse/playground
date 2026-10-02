@@ -183,13 +183,14 @@ impl<H: interp::Hooks> Engine<H> {
             };
 
         // Speculative-candidate eligibility is a static property of each function's body, computed once up front.
-        let speculative_candidates: HashMap<u8, (usize, i64)> = functions
+        let speculative_candidates: HashMap<u8, (usize, i64, bool)> = functions
             .iter()
             .filter_map(|f| {
                 let (param_index, ty) = jit.borrow().speculative_candidate(&f.name)?;
                 let tag = crate::value::tag_for(&ty)
                     .expect("speculative candidate types are always boxable scalars");
-                Some((name_to_id[&f.name], (param_index, tag)))
+                let proven = jit.borrow().speculative_exhaustive(&f.name);
+                Some((name_to_id[&f.name], (param_index, tag, proven)))
             })
             .collect();
         let spec_jit = Rc::clone(&jit);

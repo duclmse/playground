@@ -71,6 +71,11 @@ impl Hooks for () {}
 struct Speculative {
     param_index: usize,
     tag: i64,
+    /// U11 item 2: true if `jit::is_speculative_exhaustive` proved every call
+    /// site in the whole program passes this parameter as exactly `tag` -
+    /// the per-call tag re-check below is then dead weight, never a
+    /// safety net, so it's skipped.
+    proven: bool,
     hits: Cell<u32>,
     ptr: Cell<Option<*const u8>>,
 }
@@ -84,7 +89,8 @@ fn unbox_raw(boxed: u64) -> (i64, u64) {
 /// `Runtime::new`'s speculative-specialization inputs, bundled to avoid
 /// clippy's `too_many_arguments`.
 pub struct SpeculativeConfig<'a> {
-    pub candidates: HashMap<u8, (usize, i64)>,
+    /// `(param_index, tag, proven_exhaustive)` - see `Speculative::proven`.
+    pub candidates: HashMap<u8, (usize, i64, bool)>,
     pub threshold: u32,
     pub promote: Box<dyn Fn(u8) -> PromoteResult + 'a>,
 }
@@ -157,12 +163,13 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         let speculative = speculative
             .candidates
             .into_iter()
-            .map(|(id, (param_index, tag))| {
+            .map(|(id, (param_index, tag, proven))| {
                 (
                     id,
                     Speculative {
                         param_index,
                         tag,
+                        proven,
                         hits: Cell::new(0),
                         ptr: Cell::new(None),
                     },
@@ -318,12 +325,15 @@ impl<'a, H: Hooks> Runtime<'a, H> {
     /// The inline-cache guard: `Some(result)` only if `func_id` has a
     /// candidate param and the argument's tag matches. Skipping this check
     /// would let a mismatched boxed value be reinterpreted as a raw scalar
-    /// instead of trapping. `None` = no candidate, not hot yet, or a tag
-    /// mismatch (falls through to the general path, which traps correctly).
+    /// instead of trapping - unless `spec.proven` (U11 item 2), in which case
+    /// a whole-program static proof already established the tag can never
+    /// mismatch, so the check is redundant rather than load-bearing. `None` =
+    /// no candidate, not hot yet, or (when unproven) a tag mismatch (falls
+    /// through to the general path, which traps correctly).
     fn try_speculative(&self, func_id: u8, args: &[u64]) -> Option<u64> {
         let spec = self.speculative.get(&func_id)?;
         let (tag, payload) = unbox_raw(args[spec.param_index]);
-        if tag != spec.tag {
+        if !spec.proven && tag != spec.tag {
             return None;
         }
         if let Some(ptr) = spec.ptr.get() {

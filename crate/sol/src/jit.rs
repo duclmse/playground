@@ -38,6 +38,11 @@ pub struct Jit {
     /// Per-function speculative-specialization target, computed once (see
     /// `speculative_candidate`) rather than re-walked on every promotion.
     speculative_candidates: HashMap<String, (usize, LocalId, Type)>,
+    /// U11 item 2: names in `speculative_candidates` whose candidate is
+    /// provably exhaustive across the whole program (see
+    /// `speculative_exhaustive`) - `tier.rs` wires these into
+    /// `interp::Runtime` with the per-call runtime tag re-check skipped.
+    speculative_exhaustive: HashSet<String>,
 }
 
 impl Jit {
@@ -120,11 +125,25 @@ impl Jit {
         let jit_log = std::env::var_os("SOL_JIT_LOG")
             .or_else(|| std::env::var_os("SOL_JIT_LOG"))
             .is_some();
-        let speculative_candidates = program
+        let speculative_candidates: HashMap<String, (usize, LocalId, Type)> = program
             .functions
             .iter()
             .filter_map(|f| speculative_candidate(f).map(|c| (f.name.clone(), c)))
             .collect();
+        let speculative_exhaustive: HashSet<String> = speculative_candidates
+            .iter()
+            .filter(|(name, (param_index, _, target))| {
+                is_speculative_exhaustive(&program, name, *param_index, target)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if jit_log {
+            for name in &speculative_exhaustive {
+                eprintln!(
+                    "[jit] '{name}' speculative candidate proven exhaustive across the whole program - runtime tag guard skipped"
+                );
+            }
+        }
 
         // Externs are linked separately (`link_externs`), never via
         // `promote`'s dependency walk - seeding `compiled` with their
@@ -145,6 +164,7 @@ impl Jit {
             dump_asm,
             jit_log,
             speculative_candidates,
+            speculative_exhaustive,
         })
     }
 
@@ -155,6 +175,15 @@ impl Jit {
         self.speculative_candidates
             .get(name)
             .map(|(idx, _, ty)| (*idx, ty.clone()))
+    }
+
+    /// U11 item 2: whether `name`'s speculative candidate is provably
+    /// exhaustive (see `is_speculative_exhaustive`) - `tier.rs` reads this to
+    /// tell `interp::Runtime` it can skip the per-call runtime tag re-check
+    /// for `name` once specialized, since every call site in the whole
+    /// program is statically guaranteed to pass the candidate's target type.
+    pub fn speculative_exhaustive(&self, name: &str) -> bool {
+        self.speculative_exhaustive.contains(name)
     }
 
     /// M7 §25 FFI: compiles every extern's uniform-ABI wrapper (the real
@@ -803,6 +832,180 @@ fn infer_unbox_type(f: &TFunction, id: LocalId) -> Option<Type> {
         found
     } else {
         None
+    }
+}
+
+/// U11 item 2: whole-program static proof that `name`'s speculative
+/// candidate (`param_index`/`target`, from `speculative_candidate`) needs no
+/// runtime tag guard - every call to `name` anywhere in `program` passes a
+/// value just boxed from exactly `target` at that call site (via `coerce`;
+/// see `typeck.rs`), never a value forwarded through an already-`any`
+/// local/field/param, never a different concrete type, and `name` is never
+/// taken as a first-class value (an indirect call through a stored function
+/// reference would make call sites uncountable). A function proven this way
+/// can never actually observe a type mismatch at this parameter, so skipping
+/// the check cannot turn a would-be trap into silent bit-misinterpretation -
+/// it can only ever remove a check that would always have passed.
+///
+/// Requires at least one direct call site: an unreachable/never-called
+/// function has no evidence to prove exhaustiveness from.
+///
+/// Scope cut, not a fundamental limit: a value boxed into an `any`-typed
+/// local before being passed on (`local b: any = x; f(b)`) defeats this
+/// syntactic check even when every write to that local agrees on the type -
+/// proving that needs per-local reaching-definitions dataflow, which this
+/// pass does not attempt. Such calls simply don't count as evidence, so the
+/// guard is conservatively kept (never unsoundly dropped).
+fn is_speculative_exhaustive(program: &TProgram, name: &str, param_index: usize, target: &Type) -> bool {
+    let mut call_sites = 0usize;
+    let mut sound = true;
+    for f in &program.functions {
+        walk_stmts_for_exhaustiveness(&f.body, name, param_index, target, &mut call_sites, &mut sound);
+        if !sound {
+            return false;
+        }
+    }
+    sound && call_sites > 0
+}
+
+fn walk_stmts_for_exhaustiveness(
+    stmts: &[TStmt],
+    name: &str,
+    param_index: usize,
+    target: &Type,
+    call_sites: &mut usize,
+    sound: &mut bool,
+) {
+    for s in stmts {
+        if !*sound {
+            return;
+        }
+        match s {
+            TStmt::Break => {}
+            TStmt::Local { value, .. } | TStmt::Assign { value, .. } => {
+                walk_expr_for_exhaustiveness(value, name, param_index, target, call_sites, sound)
+            }
+            TStmt::AssignIndex { array, index, value } => {
+                walk_expr_for_exhaustiveness(array, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(index, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(value, name, param_index, target, call_sites, sound);
+            }
+            TStmt::AssignField { base, value, .. } => {
+                walk_expr_for_exhaustiveness(base, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(value, name, param_index, target, call_sites, sound);
+            }
+            TStmt::If { cond, then_block, else_block } => {
+                walk_expr_for_exhaustiveness(cond, name, param_index, target, call_sites, sound);
+                walk_stmts_for_exhaustiveness(then_block, name, param_index, target, call_sites, sound);
+                walk_stmts_for_exhaustiveness(else_block, name, param_index, target, call_sites, sound);
+            }
+            TStmt::While { cond, body } => {
+                walk_expr_for_exhaustiveness(cond, name, param_index, target, call_sites, sound);
+                walk_stmts_for_exhaustiveness(body, name, param_index, target, call_sites, sound);
+            }
+            TStmt::NumericFor { start, stop, step, body, .. } => {
+                walk_expr_for_exhaustiveness(start, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(stop, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(step, name, param_index, target, call_sites, sound);
+                walk_stmts_for_exhaustiveness(body, name, param_index, target, call_sites, sound);
+            }
+            TStmt::Return { value } => {
+                if let Some(v) = value {
+                    walk_expr_for_exhaustiveness(v, name, param_index, target, call_sites, sound);
+                }
+            }
+        }
+    }
+}
+
+fn walk_expr_for_exhaustiveness(
+    e: &TExpr,
+    name: &str,
+    param_index: usize,
+    target: &Type,
+    call_sites: &mut usize,
+    sound: &mut bool,
+) {
+    if !*sound {
+        return;
+    }
+    match &e.kind {
+        TExprKind::FunctionRef(n) => {
+            if n.as_str() == name {
+                // Taken as a first-class value - indirect call sites through
+                // it aren't enumerable, so exhaustiveness isn't provable.
+                *sound = false;
+            }
+        }
+        TExprKind::Call(callee, args) => {
+            if callee.as_str() == name {
+                match args.get(param_index) {
+                    Some(TExpr {
+                        kind: TExprKind::Box(inner),
+                        ..
+                    }) if inner.ty == *target => {
+                        *call_sites += 1;
+                    }
+                    _ => *sound = false,
+                }
+            }
+            args.iter()
+                .for_each(|a| walk_expr_for_exhaustiveness(a, name, param_index, target, call_sites, sound));
+        }
+        TExprKind::CallIndirect { callee, args } => {
+            walk_expr_for_exhaustiveness(callee, name, param_index, target, call_sites, sound);
+            args.iter()
+                .for_each(|a| walk_expr_for_exhaustiveness(a, name, param_index, target, call_sites, sound));
+        }
+        TExprKind::Truth(inner)
+        | TExprKind::Neg(inner)
+        | TExprKind::Not(inner)
+        | TExprKind::IntToFloat(inner)
+        | TExprKind::Len(inner)
+        | TExprKind::Field { base: inner, .. }
+        | TExprKind::Box(inner)
+        | TExprKind::Unbox(inner, _) => {
+            walk_expr_for_exhaustiveness(inner, name, param_index, target, call_sites, sound)
+        }
+        TExprKind::Arith(_, l, r)
+        | TExprKind::Compare(_, l, r)
+        | TExprKind::Logical(_, l, r)
+        | TExprKind::Index(l, r) => {
+            walk_expr_for_exhaustiveness(l, name, param_index, target, call_sites, sound);
+            walk_expr_for_exhaustiveness(r, name, param_index, target, call_sites, sound);
+        }
+        TExprKind::NewArray { len, .. } => {
+            walk_expr_for_exhaustiveness(len, name, param_index, target, call_sites, sound)
+        }
+        TExprKind::ArrayLiteral { values, .. } => values
+            .iter()
+            .for_each(|v| walk_expr_for_exhaustiveness(v, name, param_index, target, call_sites, sound)),
+        TExprKind::ArrayMap { array, callback } => {
+            walk_expr_for_exhaustiveness(array, name, param_index, target, call_sites, sound);
+            walk_expr_for_exhaustiveness(callback, name, param_index, target, call_sites, sound);
+        }
+        TExprKind::NewMap { .. } => {}
+        TExprKind::MapLiteral { entries, .. } => {
+            for (k, v) in entries {
+                walk_expr_for_exhaustiveness(k, name, param_index, target, call_sites, sound);
+                walk_expr_for_exhaustiveness(v, name, param_index, target, call_sites, sound);
+            }
+        }
+        TExprKind::MapNext { map, cursor }
+        | TExprKind::MapKey { map, cursor }
+        | TExprKind::MapValue { map, cursor } => {
+            walk_expr_for_exhaustiveness(map, name, param_index, target, call_sites, sound);
+            walk_expr_for_exhaustiveness(cursor, name, param_index, target, call_sites, sound);
+        }
+        TExprKind::StructLiteral { fields, .. } => fields
+            .iter()
+            .for_each(|f| walk_expr_for_exhaustiveness(f, name, param_index, target, call_sites, sound)),
+        TExprKind::StringLit(_)
+        | TExprKind::NilLit
+        | TExprKind::IntLit(_)
+        | TExprKind::FloatLit(_)
+        | TExprKind::BoolLit(_)
+        | TExprKind::Local(_) => {}
     }
 }
 
