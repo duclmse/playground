@@ -2918,6 +2918,41 @@ unaffected. See `docs/features/milestones/u12-wasm-playground.md`'s own
 crate, no wasm-bindgen bindings, no execution-parity harness - the Tier-0
 module set has only been proven to *compile* for wasm32, never run there.
 
+Item 2 (2026-10-02): minimal Tier-0-only execution parity. Found execution
+itself - not just compilation - had never existed without `jit`: `tier.rs`
+unconditionally builds a `jit::Jit` and is itself `jit`-gated, so there was no
+path to actually *run* a typed program on wasm32 before this item. Added
+`crate/sol/src/tier0.rs`, an always-compiled, jit-free bytecode-only engine
+(never promotes; rejects arbitrary user `extern` FFI with a clear error,
+since that needs Cranelift codegen Tier-0 doesn't have; hand-adapts the two
+fixed-signature compiler-injected externs, string concat and `any`-type
+tests). Added instruction-budget parity to `interp::Runtime` itself
+(previously absent from the typed tier; the dynamic `.lua` tier already had
+one), with `u64::MAX` at every pre-existing call site to keep `sol run`/`sol
+debug` unaffected. Built a differential test
+(`tests/tier0_conformance.rs`) against the real, pre-existing
+`tests/fixtures/sol-conformance/` corpus - the plan's cited
+`conformance/fixtures`/`conformance/expected` directory does not exist and
+never has, a factual correction to this item's own plan text - and got 33/34
+exact matches (the one exception is the documented native-FFI case).
+Investigated `SourceMap` population and found it real but incomplete for the
+typed tier: every instruction in a function reports the same line (a
+function-level stub), because the typed IR drops the AST's real per-statement
+line field during lowering, unlike the dynamic `.lua` tier which tracks real
+per-instruction lines - a scoped gap for item 3 (the debugger) to close, not
+fixed here. Built a throwaway wasm-bindgen harness (`wasm_api.rs`, a
+non-default `wasm` feature) and ran all 33 fixtures through the real compiled
+`.wasm` artifact from Node successfully; found the wasm import table leaks
+unresolved `malloc`/`free`/`realloc`/a linker anchor from the (unconditionally
+compiled, unrelated) Lua C embedding API module, satisfied here with
+throwaway JS stubs but flagged for item 6 to resolve properly (likely by
+feature-gating that module out of the browser build). Full `cargo test`
+suite and the wasm32 `cargo check` both stay clean. See
+`docs/features/milestones/u12-wasm-playground.md`'s "Work item 2" section
+for full file:line detail. Not done: no debugger, no `packages/sol-runtime`/
+worker wiring, no fix for the SourceMap or wasm-import-leakage gaps above
+(both explicitly deferred to later items).
+
 ### U13 — Semantic LSP and first-party VS Code client
 
 **Purpose:** ship supported editor tooling, not only a generic-server binary.

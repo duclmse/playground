@@ -24,6 +24,10 @@ cranelift-module = { version = "0.134", optional = true }
 cranelift-object = { version = "0.134", optional = true }
 cranelift-native = { version = "0.134", optional = true }
 indexmap = "2"
+# Pinned to match crate/lua-vm/Cargo.toml's existing wasm-bindgen pin, so a
+# future shared wasm toolchain/build script doesn't have to reconcile two
+# versions.
+wasm-bindgen = { version = "=0.2.100", optional = true }
 
 [features]
 default = ["jit"]
@@ -42,5 +46,10 @@ jit = [
   "dep:cranelift-object",
   "dep:cranelift-native",
 ]
+# U12 item 2: throwaway wasm-bindgen entry points (wasm_api.rs) exercising
+# tier0::Engine end-to-end from JS, mutually exclusive with `jit` in practice
+# (wasm32-unknown-unknown can't build `jit`) but not hard-gated against it -
+# see docs/features/milestones/u12-wasm-playground.md.
+wasm = ["dep:wasm-bindgen"]
 
 [dev-dependencies]

@@ -123,6 +123,16 @@ pub struct Runtime<'a, H: Hooks = ()> {
     /// Compiles `func_id`'s speculative variant; a side entry point, never
     /// written into `slots`.
     speculative_promote: Box<dyn Fn(u8) -> PromoteResult + 'a>,
+    /// U12 item 2: a hard cap on interpreted instructions across this
+    /// `Runtime`'s whole lifetime (shared across every nested call), mirroring
+    /// `lua_runtime/init.rs`'s `with_budgets`/`instructions_remaining` for the
+    /// dynamic tier - the browser needs this regardless of which language a
+    /// project uses. `u64::MAX` (every existing native call site, via
+    /// `tier::Engine::new`) is "no cap," matching `sol run`'s current
+    /// behavior exactly; only promoted/native code is exempt, since a
+    /// runaway loop that's already been promoted is the JIT's own problem,
+    /// not Tier-0's.
+    instructions_remaining: Cell<u64>,
 }
 
 impl<'a, H: Hooks> Runtime<'a, H> {
@@ -134,6 +144,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         osr_promote: impl Fn(u8, usize) -> PromoteResult + 'a,
         speculative: SpeculativeConfig<'a>,
         hooks: H,
+        instruction_budget: u64,
     ) -> Self {
         let mut functions = sol_core::FunctionRegistry::default();
         for (index, slot) in slots.iter().enumerate() {
@@ -189,6 +200,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
             speculative,
             speculative_threshold,
             speculative_promote,
+            instructions_remaining: Cell::new(instruction_budget),
         }
     }
 
@@ -404,6 +416,14 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         self.hooks.on_frame_state(&frame);
 
         loop {
+            let remaining = self.instructions_remaining.get();
+            if remaining == 0 {
+                return sol_core::CallOutcome::Raised(
+                    "instruction budget exceeded".to_string(),
+                );
+            }
+            self.instructions_remaining.set(remaining - 1);
+
             frame.pc = pc as u32;
             let instr = bf.code[pc];
             pc += 1;
@@ -863,6 +883,7 @@ mod tests {
                 promote: Box::new(|_| None),
             },
             (),
+            u64::MAX,
         );
 
         assert_eq!(runtime.call(0, &[]), 42);

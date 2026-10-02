@@ -227,6 +227,10 @@ impl<H: interp::Hooks> Engine<H> {
             osr_promote,
             speculative,
             hooks,
+            // No cap: `sol run`/`sol debug`/the tiered-JIT path never had one
+            // before U12 item 2 added `instructions_remaining` for
+            // `tier0.rs`'s sandboxed, jit-free engine - preserve that exactly.
+            u64::MAX,
         );
 
         if let Some(p) = profile {

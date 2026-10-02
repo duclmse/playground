@@ -799,6 +799,7 @@ fn try_run_mixed_main(
             promote: Box::new(|_| None),
         },
         (),
+        u64::MAX,
     );
     let main_id = function_ids["main"];
     let raw = match runtime.call_outcome(main_id, &[]) {

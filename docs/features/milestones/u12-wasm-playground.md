@@ -130,3 +130,138 @@ crate, no wasm-bindgen bindings, no execution-parity harness actually
 *running* `.lua`/`.sol` source on wasm32, no debugger. The `--no-default-features`
 build today only proves the Tier-0 module set *compiles* for wasm32 — it has
 never been run there.
+
+## Work item 2 — minimal Tier-0-only execution parity (no debugger yet)
+
+**Correction to this item's own plan text:** the plan cited an existing
+`conformance/fixtures`/`conformance/expected` corpus (10 fixtures) as the
+differential-testing asset. That directory does not exist and never has —
+`ls conformance/fixtures` and `git log --all -- conformance/` both confirm
+it's absent from the working tree and from all of history. It's likely a
+residual reference to `docs/conformance.md`'s plan for the retired
+`crate/lua-vm`/piccolo runtime, never actually created. The real,
+already-existing asset serving the same purpose is
+`crate/sol/tests/fixtures/sol-conformance/` (34 `.sol` fixtures ported from
+upstream `lua-5.5.1-tests`, with documented expected stdout in
+`crate/sol/tests/sol_conformance.rs`, which runs them through the `sol` CLI
+against the full tiered-JIT/AOT path) — used below instead.
+
+**Central finding: Tier-0-only execution did not previously exist at all.**
+`tier.rs`'s `Engine::new` unconditionally constructs a `jit::Jit`
+(`tier.rs:97`, pre-existing), and `tier.rs` itself is
+`#[cfg(feature = "jit")]`-gated (item 1). So before this item, there was no
+code path that could run a typed `.sol`/`.lua` program to completion without
+the `jit` feature — item 1 only proved the crate *compiles* for wasm32, not
+that it can execute anything. `interp.rs` itself has no such dependency
+(`Slot::Native` is a bare `*const u8`; `promote`/`osr_promote`/
+`speculative.promote` are injected closures that can simply always return
+`None`, meaning "keep interpreting"), so a jit-free engine was buildable
+without touching `interp.rs`'s architecture.
+
+**New module: `crate/sol/src/tier0.rs`** (unconditionally compiled, not
+feature-gated — `lib.rs:41`). `tier0::Engine::new`/`new_with_budget` compiles
+every function to `Slot::Bytecode` via the existing `bccompile.rs`, rejecting
+(with a clear error naming the function) any function too large for Tier-0's
+8-bit register budget, since there is no native fallback without `jit`. Two
+compiler-injected internal externs — `__sol_string_concat`
+(`strings.rs:39`) and `__sol_any_is` (`dynamic.rs:22`), both auto-added by
+`typeck.rs` for string `+` and `any`-type tests and both fixed-signature — get
+hand-written ABI-adapting shims (`tier0_string_concat_shim`/
+`tier0_any_is_shim`) matching `interp::call_native`'s uniform
+`extern "C" fn(*const u64, i64) -> u64` slot ABI. A user's own
+`extern function` declaration (arbitrary native FFI, e.g.
+`math.sol`'s `sqrt`/`pow` linking real libm symbols) is rejected with a clear
+error: that requires `jit.rs::link_externs`'s real Cranelift ABI-marshaling
+codegen, which Tier-0 has no equivalent of, and arguably couldn't use on a
+wasm32 host anyway (no native libm to link against).
+
+**Instruction-budget parity (plan goal (b)):** `interp::Runtime` gained an
+`instructions_remaining: Cell<u64>` field and a new, final
+`instruction_budget: u64` constructor parameter, checked once per bytecode
+instruction at the top of `interpret()`'s dispatch loop
+(`CallOutcome::Raised("instruction budget exceeded")` on exhaustion). Every
+pre-existing call site (`interp.rs`'s own test, `tier.rs::Engine::new`,
+`main.rs`'s mixed native/dynamic path) passes `u64::MAX` — zero behavior
+change for `sol run`/`sol debug`/the tiered-JIT path. `tier0::Engine`
+defaults to `DEFAULT_INSTRUCTION_BUDGET = 10_000_000`, matching
+`crate/lua-vm`'s documented `MAX_INSTRUCTIONS` sandboxed-host convention. Unit
+tests in `tier0.rs` confirm the budget trips and confirm normal programs run
+unaffected.
+
+**SourceMap population is real but incomplete for the typed tier (plan goal
+(c)):** `bccompile.rs:64` builds `SourceMap::single_line(b.code.len(),
+f.source_line)` — every instruction in a function reports the *same* line
+(the function's declaration line), not its own line. This is not a
+shortcut bug but a direct consequence of `types::TStmt`/`TExpr` (the typed
+IR `bccompile.rs` compiles from) carrying no per-node line field at all —
+only `TFunction` has `source_line`/`source_span`. The raw `ast::Stmt` *does*
+carry a real per-statement `line: u32` (`ast.rs:128` and siblings), and
+`typeck.rs`'s `check_stmt` reads it per statement (`typeck.rs:751-918`) but
+only for its own diagnostics — it's dropped during lowering to `TStmt`, never
+threaded through. By contrast the dynamic `.lua` bytecode tier
+(`lua_bytecode/mod.rs:301`) tracks a real per-instruction `Vec<u32>`
+(`state.lines`) end to end. **Consequence for item 3 (the Tier-0 debugger):**
+stepping/breakpoints on typed `.sol` code can currently only resolve to
+"which function," not "which line within it" — closing this gap means adding
+a line field to every `TStmt`/`TExpr` variant and threading it through
+`bccompile.rs`'s `Builder`, which is a real, scoped feature addition for that
+item to account for, not a bug to silently fix here.
+
+**Differential harness (plan goal (d)):** `crate/sol/tests/tier0_conformance.rs`
+runs every fixture in `tests/fixtures/sol-conformance/` through
+`tier0::Engine` directly (no CLI subprocess) and compares against the same
+expected values `tests/sol_conformance.rs` uses for the tiered-JIT/AOT path.
+33 of 34 fixtures match exactly; the one exception, `math.sol`, is the
+documented native-libm-FFI case above (`KNOWN_UNSUPPORTED`). A debug build of
+`interp.rs`'s recursive `dispatch`/`interpret` pair has a large enough
+per-frame stack footprint to overflow the default 8MB thread stack at
+`calls.sol`'s ~500-1000-deep recursion (trivial for native/JIT code, and for
+`--release`, which never needed this) — the test spawns itself on a
+256MB-stack thread, a standard debug-build fix, not a correctness regression;
+the same per-frame cost is relevant to wasm's own linear-memory stack sizing.
+
+**wasm-bindgen throwaway harness (plan goal (a)):** `crate/sol/Cargo.toml`
+gained an optional `wasm-bindgen = "=0.2.100"` dependency (pinned to match
+`crate/lua-vm/Cargo.toml`'s existing pin) under a new, non-default `wasm`
+feature, and `crate/sol/src/wasm_api.rs` (`#[cfg(feature = "wasm")]`) exposes
+a single `#[wasm_bindgen] pub fn run_sol(source: &str) -> Result<String,
+JsValue>` wrapping `tier0::Engine` exactly as `tier0_conformance.rs` does.
+Built with `cargo build --no-default-features --features wasm --target
+wasm32-unknown-unknown --release` and bound with `wasm-bindgen --target
+nodejs`; a throwaway Node script ran all 33 non-`math.sol` fixtures through
+the real compiled `.wasm` artifact and got exact matches, plus confirmed
+`math.sol` surfaces the expected extern-rejection error as a thrown
+`JsValue`.
+
+**Real finding from that harness, relevant to item 6's worker wiring:** the
+generated wasm module's import table includes `env.malloc`/`env.free`/
+`env.realloc`/`env.sol_c_api_shim_anchor` — raw libc-style externs declared
+by `lua_runtime/c_api/auxlib.rs:561`'s `default_alloc` (the Lua C embedding
+API's default allocator) and `lua_runtime/c_api.rs:728`'s linker anchor
+(normally satisfied natively by `build.rs`'s compiled `c_api_shim.c`, which
+has no wasm32 build path). These stay in the `.wasm` binary's required
+import table even though `run_sol`'s typed-only path never reaches
+`lua_runtime::c_api` at all — wasm32-unknown-unknown doesn't strip
+provably-unreachable `extern "C"` imports the way a native link would. For
+this throwaway harness, trivial throwing JS stubs under a local
+`node_modules/env.js` were enough (never actually invoked). For the real
+`packages/sol-runtime` wiring in item 6, the cleaner fix is almost certainly
+feature-gating `lua_runtime::c_api` out of the browser-facing wasm build
+entirely — the playground has no use for Lua's native C embedding API — or
+providing real, documented worker-side implementations.
+
+**Verified outcome:** `cargo test --manifest-path crate/sol/Cargo.toml`
+(every test binary, unit + integration) passes unchanged: 0 failed across
+all binaries, including the new `tier0::` unit tests and
+`tier0_conformance.rs`. `cargo check --no-default-features --target
+wasm32-unknown-unknown --lib` stays clean. `cargo build
+--no-default-features --features wasm --target wasm32-unknown-unknown
+--release` succeeds and the resulting `.wasm`, bound via `wasm-bindgen
+--target nodejs`, runs correctly from real Node.js (v24.14.0).
+
+**Explicitly not done here (left for later U12 items):** no debugger
+(breakpoints/stepping/frames — item 3), no `packages/sol-runtime` or worker
+wiring (item 6), no fix for the `SourceMap`/line-granularity gap above (item
+3's problem to account for), no fix for the `env.malloc`/`env.free`/
+`env.realloc`/`sol_c_api_shim_anchor` wasm import leakage beyond a throwaway
+stub (item 6's problem).

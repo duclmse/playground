@@ -38,10 +38,13 @@ pub mod sol_ir;
 pub mod strings;
 #[cfg(feature = "jit")]
 pub mod tier;
+pub mod tier0;
 pub mod typeck;
 pub mod types;
 pub mod value;
 pub mod verify;
+#[cfg(feature = "wasm")]
+pub mod wasm_api;
 
 use types::{TProgram, Type};
 
