@@ -513,3 +513,211 @@ it.
   exception/error-raising (`CallOutcome::Raised`) programs — the fixtures
   are small and all return normally; behavior of stepping through a trace
   that ends in a raised error was not exercised.
+
+## Work item 4 — frame-scoped evaluation, table inspection, memory stats
+
+**Goal:** extend item 3's native, non-wasm `DebugSession` spike with
+`debugEvaluate`/`debugSetVariable`-equivalent expression evaluation,
+`debugGetTableEntries`/`GetMetatable`-equivalent `Map` inspection, and
+`debugGetMemoryStats`/`ForceGc`-equivalent memory introspection — still a
+native Rust spike (no wasm-bindgen bindings, no `apps/web` changes, no
+worker-protocol wiring), built directly on item 3's `TraceStep`/`ValueRenderer`
+machinery rather than duplicating it.
+
+**Deliverable 1 — `debugEvaluate`.** The plan's own wording (`local<id0>`
+read, "re-entrant sub-interpreter invocation sharing the paused frame's
+register file/heap") assumes a true pause/resume engine. Item 3 built the
+opposite: `DebugSession` has no live paused frame at all — "paused" means
+"an index into an already-fully-recorded trace" (see item 3's scope-cut note
+above). So the honest architectural call here is that "frame-scoped" cannot
+mean sharing a live register file/heap; it means treating the recorded
+`TraceStep::regs` snapshot at the requested index as a **fixed set of
+inputs** and evaluating the expression as a pure function of those inputs via
+a second, independent, throwaway `tier0::Engine` — not a live re-entrant call
+into the real interpreter. This still does not create a second GC-root
+domain in the sense the plan worried about (a non-scalar local's snapshot
+word is only ever copied as an opaque `u64`, never dereferenced unless the
+expression itself indexes into it), but it does mean eval cannot observe or
+cause a side effect on the real run, and cannot call the real program's other
+functions (the synthetic program contains only the one function being
+evaluated).
+
+Implementation (`crate/sol/src/debugger.rs`'s "deliverable 1" section,
+`DebugSession::evaluate`): a two-pass synthetic-program compile.
+`crate::lib.rs`'s `compile()`/`compile_program_with_config` require a
+function literally named `"main"`, with zero parameters and a
+CLI-printable return type (checked directly: `lib.rs`'s `main_func` lookup
+and return-type validation) — unusable for an arbitrarily-named,
+parameterized eval expression, so `evaluate` instead calls
+`parser::parse`/`aliases::expand`/`closures::lower`/`typeck::check`/
+`verify::verify`/`optimize::optimize`/`escape::scalar_replace` directly
+(`eval_compile`), mirroring `compile_program_with_config`'s pipeline minus
+its `main`-only wrapper. Pass 1 wraps the expression in
+`function __sol_eval(local<id>: <ty>, ...): any\n return <expr>\nend`,
+with one parameter per **scalar**-typed local (`I64`/`F64`/`Bool`/`Nil`/
+`String` — `eval_type_annotation`) visible in the paused function
+(`types::collect_local_types`), named `local<id>` to match `locals_at`'s own
+id-only convention (confirmed: `TStmt::Local` carries no source name — see
+item 3's finding). Declaring the return type `any` forces
+`typeck.rs::coerce` to wrap the real result in `TExprKind::Box` (confirmed by
+reading `coerce`'s `Concrete -> Any` branch, lines ~703–732) unless it was
+already `Any` — which cannot happen here since `Any`-typed locals are
+excluded from the parameter list — so `eval_find_return_type` peels that one
+`Box` node back off to discover the expression's true static type. Pass 2
+recompiles the same source with that real type declared directly (so the
+interpreter never unboxes an `any` at all), builds a one-off
+`tier0::Engine::new(...)`, and calls it with the chosen locals' raw register
+words from the trace step as arguments; the result renders through the
+existing `ValueRenderer::render` (no new rendering logic).
+
+**Scope cut, stated explicitly:** only scalar-typed locals are exposed as
+synthetic parameters; `Array`/`Map`/`Struct`/`Function`/`Any`-typed locals are
+not — referencing one by name in an eval expression simply fails to
+typecheck as an undefined variable, rather than being silently dropped.
+Exposing them would additionally need reconstructing the real program's
+struct declarations and/or a reverse `Any`-tag registry inside the throwaway
+program — a real, bounded gap, deferred rather than attempted. `.sol`'s
+typed tier also has no mutable-global-variable concept at all (confirmed by
+grepping `typeck.rs`/`types.rs`/`ast.rs`: "global" there only ever means
+either Lua's dynamic `_ENV` runtime, unimplemented, or a top-level Sol
+function declaration, already callable through `TExprKind::Call`), so the
+plan's "eval of an expression referencing a global modified mid-session"
+test case does not apply to this tier and was not attempted; the two
+required differential tests (local-read, arithmetic over two locals) do not
+depend on it.
+
+**`debugSetVariable` is explicitly scoped out, not silently omitted.** A
+`TraceStep`'s `regs` are a copy already computed by the one completed run
+item 3's `TraceRecorder::on_instruction` recorded; mutating one recorded
+step's copy cannot retroactively change what later, already-recorded steps
+computed from the original unmodified execution. Supporting "set, then
+observe later steps change" would require the true externally-driven
+re-entrant interpreter both the plan and item 3 flagged as out of scope for
+this spike — a real, separate feature, not a gap a snapshot mutation could
+honestly paper over.
+
+**Known hazard, inherited rather than specially handled:** like any Tier-0
+execution, a trapping operation (e.g. integer division by zero) calls
+`trap()` (`process::abort()`), aborting the whole process, not just the eval
+call. `evaluate` does not sandbox against this — the same hazard already
+exists for `DebugSession::run` itself, and sandboxing it (e.g. running the
+synthetic engine out-of-process) is a real, separate feature.
+
+Tests (`crate/sol/tests/debugger.rs`): `eval_of_a_local_read_matches_locals_at_reported_value`
+confirms `evaluate(hit, "local0")` matches `locals_at`'s own reported value
+for the same local id at the same trace index;
+`eval_of_arithmetic_over_two_locals_matches_the_independently_computed_result`
+confirms `evaluate(hit, "local0 * local1 + 1")` matches the value the test
+independently computes from the fixture's known inputs (7, 6);
+`eval_rejects_a_reference_to_an_undefined_or_out_of_scope_name` confirms a
+name eval does not expose fails as a tagged `"eval:"` error rather than
+resolving to something unintended.
+
+**Deliverable 2 — `debugGetTableEntries` (`Map` expansion); no
+`GetMetatable` equivalent exists.** Item 3 left `Map` expansion undone
+because `runtime.rs`'s `MapI64Header` (an open-addressed table: `len`,
+`capacity`, `keys: *mut i64`, `values: *mut i64`, `occupied: *mut u8`) had no
+public C-layout contract outside the module. This item adds
+`MapI64Header::entries(header) -> Vec<(i64, i64)>`, a `pub(crate)` reader in
+`runtime.rs` that walks the same occupied-bitmap-filtered slots
+`map_slot`/`map_insert`/`sol_map_get_i64` already read/write, and wires it
+into `ValueRenderer::expand`'s new `Type::Map(key, value)` arm
+(`crate/sol/src/debugger.rs`): each entry's label is the key rendered through
+the same `ValueRenderer::render` (per `typeck.rs`'s `lower_type`, a map key's
+type is always `I64` in the current M10 slice, so this always renders as a
+plain decimal today, but goes through `render` rather than hand-formatting to
+stay correct if that restriction loosens), paired with the value's raw word
+and the map's static value type (`I64`/`F64`/`Bool` — M10's supported scalar
+value types; pointer-bearing map values remain gated on precise GC layouts,
+per `runtime.rs`'s own comment, unchanged by this item).
+
+Checked directly before assuming `GetMetatable` applies: grepping
+`metatable`/`Metatable` across the crate shows the concept exists only under
+`lua_runtime/*` — the separate dynamic `.lua` tier, untouched by item 3 and
+untouched here. The typed `.sol` tier this spike's `DebugSession` runs has no
+metatable concept at all, so there is nothing for a `GetMetatable`-equivalent
+to return; this is stated plainly rather than inventing a stub that always
+answers "no metatable."
+
+Test: `map_valued_local_expands_to_its_occupied_entries` builds a
+`Map<i64, i64>` local populated by one map-literal statement (`{ [1] = 10,
+[2] = 20 }`), confirms it renders as a `Reference` with summary `"Map<i64,
+i64>"`, and confirms `expand` reports exactly the two occupied entries with
+their correct values (sorted, since occupied-slot iteration order is not
+source order).
+
+**Deliverable 3 — `debugGetMemoryStats`/`ForceGc`.** Thin wrappers in
+`DebugSession`: `memory_stats() -> MemoryStats { live_bytes, live_blocks }`
+over `gc::live_bytes()`/`gc::live_blocks()`, and `force_gc()` over
+`gc::collect()`.
+
+Verified directly against `gc.rs` rather than assumed: `live_bytes`/
+`live_blocks` are simple, non-panicking bookkeeping sums over the heap's
+bump-arena chunks, unrelated to reachability — they never touch
+`STACK_BASE`, so they are fully meaningful and safe in a jit-free
+`DebugSession` context. `collect()` is a different story: `collect_heap`/
+`collect_minor` both check `STACK_BASE == 0` and return immediately, *before*
+even scanning `EXTRA_ROOTS` (the interpreter's own register-file GC roots,
+registered via `RootGuard`) — and `STACK_BASE` is only ever initialized by
+`gc::init_stack_base()`, called exclusively from the native JIT/AOT entry
+path (`main.rs`/`aot.rs`), never from `tier0::Engine`/`interp::Runtime` (what
+every `DebugSession` actually runs on). So `force_gc()` is safe to call (a
+plain, non-panicking function call) but is a **complete no-op** in this
+context: it reclaims nothing, ever, including genuinely unreachable garbage.
+This is a real, pre-existing property of the jit-free execution path that
+this item documents rather than works around — giving Tier-0 its own
+stack-scanning root set would be a real, separate feature.
+
+Note on the wire protocol's `MemoryStatsInfo` shape
+(`apps/web/src/debug-protocol.ts`, read for reference only):
+`totalAllocation`/`gcAllocation` map reasonably onto `live_bytes`, but there
+is no Tier-0 equivalent for `externalAllocation`/`allocationDebt` — those
+describe generational-GC bookkeeping concepts (`gc.rs`'s minor/major
+promotion debt) that `DebugSession` does not currently expose beyond the
+plain `live_bytes`/`live_blocks` totals; not invented here.
+
+Test: `memory_stats_report_plausible_values_and_force_gc_does_not_crash` runs
+an allocation-heavy fixture (a `Map<i64, i64>` grown to 2000 entries, forcing
+several internal resizes), confirms `live_bytes`/`live_blocks` are non-zero
+and non-decreasing after the run, then calls `force_gc()` and asserts the
+stats are **unchanged** afterward — directly exercising, not just asserting
+in prose, the documented no-op finding above.
+
+**Verified outcome:**
+`cargo test --manifest-path crate/sol/Cargo.toml` — 543 passed, 0 failed,
+across 25 test binaries (538 from item 3 plus the 5 new tests in
+`tests/debugger.rs`).
+`cargo test --manifest-path crate/sol/Cargo.toml --no-default-features` —
+536 passed, 0 failed, across 24 test binaries (531 from item 3 plus the same
+5 new tests).
+`cargo check --manifest-path crate/sol/Cargo.toml --no-default-features
+--target wasm32-unknown-unknown` — clean, after `touch`ing `debugger.rs` and
+`runtime.rs` first to rule out a stale-cache false pass. `scripts/test-lua55-manifest.sh`
+— passes (`Lua 5.5 manifest regression checks passed`). All new code lives in
+`debugger.rs`/`runtime.rs`, both declared in `lib.rs` with no
+`#[cfg(feature = "jit")]` gate, so part of the same always-compiled,
+always-wasm32-checked module set as item 3's own additions.
+
+**Explicitly not done here:**
+- No true interactive suspend/resume — unchanged from item 3; `evaluate`
+  still only ever evaluates against a frozen trace snapshot, never a live
+  paused frame.
+- `debugSetVariable` — scoped out above, with the stated reasoning (a
+  recorded trace's later steps cannot be retroactively affected by mutating
+  an earlier step's own copy).
+- Eval exposes only scalar-typed locals (`I64`/`F64`/`Bool`/`Nil`/`String`);
+  `Array`/`Map`/`Struct`/`Function`/`Any`-typed locals, and references to the
+  program's other top-level functions, are not reachable from an eval
+  expression.
+- No eval sandboxing against Tier-0 traps (e.g. division by zero aborts the
+  whole process, inherited unchanged from `DebugSession::run`'s existing
+  behavior).
+- `GetMetatable` — does not apply to the typed `.sol` tier at all (no
+  metatable concept exists there); not stubbed.
+- `Any`-typed local unboxing in `ValueRenderer` — still not done, unchanged
+  from item 3 (needs the same reverse tag→type registry noted there).
+- No wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
+  wiring — out of this item's explicit scope, not attempted.
+- `externalAllocation`/`allocationDebt` (the wire protocol's
+  `MemoryStatsInfo` fields beyond `live_bytes`/`live_blocks`) have no
+  implemented equivalent here — noted above, not invented.

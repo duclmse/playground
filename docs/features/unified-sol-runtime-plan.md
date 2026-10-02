@@ -3001,6 +3001,54 @@ interactive suspend/resume; no `Any`/`Map` value expansion; no
 wasm-bindgen/browser/worker wiring (explicitly out of scope for this
 item).
 
+Item 4 (2026-10-02): frame-scoped evaluation, `Map` table inspection, memory
+stats - extends item 3's `DebugSession` spike, still native/non-wasm. The
+plan's own wording for evaluation assumed a true pause/resume engine sharing
+a live register file/heap; since item 3 built a full-trace-recording engine
+instead (no live paused frame exists at all), made the honest call that
+"frame-scoped" here means treating a recorded `TraceStep`'s register
+snapshot as a fixed set of inputs to a second, independent, throwaway
+`tier0::Engine`, not a re-entrant call sharing the real one's heap/roots.
+`DebugSession::evaluate` synthesizes a throwaway function wrapping the
+expression, with one parameter per scalar-typed (`I64`/`F64`/`Bool`/`Nil`/
+`String`) local visible at the trace index; a first compile pass declares an
+`any` return type to discover the expression's real type (peeling the `Box`
+node `typeck.rs::coerce` inserts), and a second pass recompiles with that
+real type declared directly before executing. Scoped out explicitly, not
+silently: `Array`/`Map`/`Struct`/`Function`/`Any`-typed locals are not
+exposed to eval expressions (a bounded, stated gap, not a silent drop), and
+`debugSetVariable` is not implemented at all - mutating one recorded trace
+step's own register copy cannot retroactively affect later steps already
+computed from the original run, so it would need the same true re-entrant
+interpreter item 3 already flagged as out of scope. Added
+`runtime.rs::MapI64Header::entries`, a `pub(crate)` reader over the map
+runtime's occupied-bitmap-filtered table, closing item 3's `Map`-expansion
+gap via a new `Type::Map` arm in `ValueRenderer::expand`; confirmed by
+grepping the crate that the typed tier has no metatable concept at all
+(only the separate dynamic `.lua` tier does), so no `GetMetatable`
+equivalent was built, stated plainly rather than stubbed. Wired
+`gc::live_bytes()`/`live_blocks()`/`collect()` through `DebugSession` as
+`memory_stats()`/`force_gc()`; verified directly against `gc.rs` that
+`collect()` is a complete no-op in this context specifically (`STACK_BASE`
+is only ever initialized by the native JIT/AOT entry path, never by
+`tier0::Engine`, so `collect_heap`/`collect_minor` both bail out before
+scanning anything) - safe to call, but reclaims nothing, which the new
+memory-stats test exercises directly (asserting stats are unchanged after
+`force_gc()`) rather than just documenting in prose. Five new tests added to
+`crate/sol/tests/debugger.rs`. `cargo test` passes 543/0 (default features,
+25 binaries) and 536/0 (`--no-default-features`, 24 binaries); the wasm32
+`cargo check` (after touching the changed files to rule out a stale-cache
+pass) and `scripts/test-lua55-manifest.sh` both stay clean. See
+`docs/features/milestones/u12-wasm-playground.md`'s "Work item 4" section
+for full file:line detail and the complete not-done list. Not done,
+stated explicitly: no true interactive suspend/resume (unchanged from item
+3); no `debugSetVariable`; eval cannot reach non-scalar locals or the
+program's other functions; no Tier-0 trap sandboxing for eval (inherits
+`DebugSession::run`'s existing abort-on-trap behavior); no `GetMetatable`
+equivalent (does not apply to the typed tier); no `Any` unboxing in
+`ValueRenderer` (unchanged from item 3); no wasm-bindgen/browser/worker
+wiring (explicitly out of scope for this item).
+
 ### U13 — Semantic LSP and first-party VS Code client
 
 **Purpose:** ship supported editor tooling, not only a generic-server binary.

@@ -25,6 +25,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::gc;
 use crate::interp::Hooks;
 use crate::tier0;
 use crate::types::{self, StructLayout, TFunction, TProgram, Type};
@@ -180,15 +181,23 @@ impl<'a> ValueRenderer<'a> {
     /// Lazily expands a `reference`-style handle into its named/indexed
     /// children - deliverable 4's "paginated expansion for tables."
     ///
-    /// Only `Array` and `Struct` are supported: both are simple, pointer-
-    /// stable C layouts this spike can read directly (`Array`: `interp.rs`'s
-    /// `Op::Index` reads `{len: i64, data: *const u8}` then
-    /// `data[index*8..]`; `Struct`: `Op::GetField` reads
-    /// `*(base as *const u64).add(field_index)`, no header). `Map`'s
-    /// internal hash-table layout is `runtime.rs`'s private implementation
-    /// detail (no public C-layout contract to read from outside it), and
-    /// `Any`'s reverse tag-to-type lookup needs the registry noted above -
-    /// both are explicitly not done here.
+    /// `Array`, `Struct`, and (U12 item 4) `Map` are supported: all three are
+    /// simple, pointer-stable C layouts this spike can read directly
+    /// (`Array`: `interp.rs`'s `Op::Index` reads `{len: i64, data: *const
+    /// u8}` then `data[index*8..]`; `Struct`: `Op::GetField` reads
+    /// `*(base as *const u64).add(field_index)`, no header; `Map`: U12 item
+    /// 4 adds `runtime.rs`'s `MapI64Header::entries`, a `pub(crate)` reader
+    /// over the same occupied-bitmap-filtered open-addressed table
+    /// `sol_map_get_i64`/`sol_map_set_i64` already read/write, closing the
+    /// gap item 3 left open - see this module's doc comment history and
+    /// `docs/features/milestones/u12-wasm-playground.md`'s Work item 4
+    /// section). Each entry's label is the key rendered via this same
+    /// renderer (per `typeck.rs`'s `lower_type`, a `Map`'s key type is
+    /// always `I64` in the current M10 slice, so this always renders as a
+    /// plain decimal integer in practice, but goes through `render` rather
+    /// than hand-formatting to stay correct if that restriction loosens).
+    /// `Any`'s reverse tag-to-type lookup still needs the whole-program tag
+    /// registry noted above - still explicitly not done here.
     pub fn expand(&self, ty: &Type, reference: u64) -> Option<Vec<(String, Type, u64)>> {
         if reference == 0 {
             return Some(Vec::new());
@@ -222,9 +231,159 @@ impl<'a> ValueRenderer<'a> {
                         .collect(),
                 )
             }
+            Type::Map(key, value) => {
+                let header = reference as *const crate::runtime::MapI64Header;
+                let raw_entries = unsafe { crate::runtime::MapI64Header::entries(header) };
+                Some(
+                    raw_entries
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let label = match self.render(key, k as u64) {
+                                DisplayValue::Scalar(s) => s,
+                                DisplayValue::Reference { summary, .. } => summary,
+                            };
+                            (label, (**value).clone(), v as u64)
+                        })
+                        .collect(),
+                )
+            }
             _ => None,
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// U12 item 4, deliverable 1: frame-scoped expression evaluation
+// ---------------------------------------------------------------------
+//
+// Architectural call this deliverable has to make honestly: item 3's
+// `DebugSession` has no live paused frame to evaluate against at all - "pause"
+// there just means "an index into an already-fully-recorded trace" (see this
+// module's top doc comment). So "frame-scoped" here cannot mean "run the
+// expression inside the paused interpreter, sharing its live register file
+// and heap" (the milestone plan's own wording assumed a true pause/resume
+// engine, which item 3 explicitly did not build). What it *can* mean, and
+// what `evaluate` below actually implements, is: take the recorded
+// `TraceStep::regs` snapshot at the requested trace index as a fixed,
+// frozen set of inputs, and interpret the expression as a pure function of
+// those inputs alone, via a second, independent, throwaway `tier0::Engine`.
+// This deliberately does *not* create a second GC-root domain in the sense
+// the plan worried about (there is no live heap to double-root - a snapshot
+// register word for a non-scalar local is just copied as an opaque `u64`,
+// never dereferenced by eval unless the expression itself indexes into it),
+// but it also means an eval expression cannot observe or cause any
+// side effect on the real run (no `debugSetVariable` - see below) and cannot
+// call back into the real program's other functions (the synthetic program
+// contains only the one function being evaluated).
+//
+// `debugSetVariable` is explicitly out of scope, not silently dropped: a
+// `TraceStep`'s `regs` are a copy already computed by the one completed run
+// this session recorded (`TraceRecorder::on_instruction` pushes a snapshot,
+// it does not hold a mutable live view - see its definition below), so
+// mutating one recorded step's copy cannot retroactively change what later
+// steps (already recorded, from the original unmodified execution) computed.
+// Supporting "set then re-run from here" would require the true
+// externally-driven re-entrant interpreter the milestone plan and item 3
+// both flagged as out of scope for this spike - a real, larger feature, not
+// a gap to paper over with a snapshot mutation that wouldn't actually affect
+// subsequent steps.
+
+/// Sol source-syntax spelling of `ty`, usable as a parameter/return type
+/// annotation in a freshly synthesized program - `None` for every type
+/// `evaluate` does not expose to eval expressions at all (see
+/// `evaluate`'s doc comment: only scalar locals are exposed as synthetic
+/// parameters, and only a scalar result type is accepted back).
+fn eval_type_annotation(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::I64 => Some("i64"),
+        Type::F64 => Some("f64"),
+        Type::Bool => Some("bool"),
+        Type::Nil => Some("nil"),
+        Type::String => Some("string"),
+        Type::Array(_) | Type::Map(_, _) | Type::Function { .. } | Type::Struct(_) | Type::Any => {
+            None
+        }
+    }
+}
+
+/// `evaluate`'s synthetic parameter name for local `id` - matches
+/// `locals_at`'s own "no source name, id-only" convention (`TStmt::Local`
+/// carries no name - see `locals_at`'s doc comment), so an expression typed
+/// against a `LocalView::local_id` an earlier `locals_at` call reported uses
+/// this exact spelling.
+fn eval_param_name(id: usize) -> String {
+    format!("local{id}")
+}
+
+/// Finds `block`'s first `return <expr>`'s real (pre-coercion) type, by a
+/// small recursive walk that also looks inside `If` arms (defensive: a
+/// single `return <expr>` function body never actually needs the `If` case,
+/// but `check_stmt` is free to wrap statements in ways that don't change
+/// this). See `evaluate`'s doc comment for why discovering this type is a
+/// whole compile pass of its own: `typeck.rs::coerce`'s only way to go from
+/// a concrete type to `any` is to wrap the real expression in `TExprKind::Box`
+/// (unless the expression was already `any`, which cannot happen here since
+/// `evaluate` never exposes an `Any`-typed local as a synthetic parameter -
+/// see `eval_type_annotation`), so peeling that one `Box` node back off
+/// recovers the expression's true static type.
+fn eval_find_return_type(block: &types::TBlock) -> Option<Type> {
+    for (_, stmt) in block {
+        match stmt {
+            types::TStmt::Return { value: Some(expr) } => {
+                return Some(match &expr.kind {
+                    types::TExprKind::Box(inner) => inner.ty.clone(),
+                    _ => expr.ty.clone(),
+                });
+            }
+            types::TStmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                if let Some(ty) = eval_find_return_type(then_block) {
+                    return Some(ty);
+                }
+                if let Some(ty) = eval_find_return_type(else_block) {
+                    return Some(ty);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parses+typechecks `source` through the same front-end pipeline
+/// `lib.rs::compile_program_with_config` runs for Sol source
+/// (`aliases::expand` -> `closures::lower` -> `typeck::check` ->
+/// `verify::verify` -> `optimize::optimize` -> `verify::verify` ->
+/// `escape::scalar_replace` -> `verify::verify`), minus `lib.rs`'s own
+/// "a function named `main`, with zero parameters, with a CLI-printable
+/// return type" requirement (`compile()`/`compile_program_with_config`
+/// enforce that on the whole program via `lib.rs`'s wrapper - see
+/// `evaluate`'s doc comment for why that makes `lib.rs`'s convenience entry
+/// points unusable for synthesizing an arbitrarily-named, parameterized eval
+/// function). Called directly against `parser`/`typeck`/etc., not through
+/// `lib.rs`, for exactly that reason.
+fn eval_compile(source: &str) -> Result<TProgram, String> {
+    let tokens =
+        crate::lexer::lex_bytes(source.as_bytes()).map_err(|e| format!("eval: lex error: {e}"))?;
+    let mut program =
+        crate::parser::parse(tokens).map_err(|e| format!("eval: parse error: {e}"))?;
+    crate::aliases::expand(&mut program)
+        .map_err(|e| format!("eval: alias expansion error: {e}"))?;
+    crate::closures::lower(&mut program)
+        .map_err(|e| format!("eval: closure lowering error: {e}"))?;
+    let mut tprogram =
+        crate::typeck::check(&program, false).map_err(|e| format!("eval: type error: {e}"))?;
+    crate::verify::verify(&tprogram).map_err(|e| format!("eval: verify error: {e}"))?;
+    crate::optimize::optimize(&mut tprogram);
+    crate::verify::verify(&tprogram)
+        .map_err(|e| format!("eval: verify error (post-optimize): {e}"))?;
+    crate::escape::scalar_replace(&mut tprogram);
+    crate::verify::verify(&tprogram)
+        .map_err(|e| format!("eval: verify error (post-escape): {e}"))?;
+    Ok(tprogram)
 }
 
 // ---------------------------------------------------------------------
@@ -476,12 +635,171 @@ impl DebugSession {
         renderer.expand(ty, reference)
     }
 
+    /// U12 item 4, deliverable 1: evaluates a standalone Sol expression
+    /// against the scalar locals recorded at trace index `at` - see this
+    /// module's "deliverable 1" section comment above for the full
+    /// architectural rationale (what "frame-scoped" can mean here, and why
+    /// `debugSetVariable` is out of scope).
+    ///
+    /// Implementation: a two-pass synthetic-program compile. Every
+    /// scalar-typed local (`I64`/`F64`/`Bool`/`Nil`/`String` -
+    /// `eval_type_annotation`) visible in the paused function becomes a
+    /// same-named, same-typed parameter (`local{id}`) of a throwaway
+    /// `__sol_eval` function whose body is just `return <expr_source>`;
+    /// non-scalar locals (`Array`/`Map`/`Struct`/`Function`/`Any`) are not
+    /// exposed at all - referencing one by name simply fails to typecheck
+    /// as an undefined variable, a real but bounded, explicitly-documented
+    /// gap (exposing them would additionally require reconstructing the
+    /// real program's struct declarations, and/or a reverse `Any`-tag
+    /// registry, inside the throwaway program - out of scope here, same as
+    /// item 3's `ValueRenderer` leaving `Any` unboxing undone). Pass 1
+    /// declares the synthetic function's return type as `any` to discover
+    /// the expression's real type (`eval_find_return_type` peels the
+    /// `Box` node `typeck.rs::coerce` always inserts to get there); pass 2
+    /// recompiles with that real type declared directly, so the interpreter
+    /// never has to unbox an `any` at all. The recorded register words for
+    /// the chosen locals are then passed as the call's raw `u64` arguments
+    /// to a fresh, one-off `tier0::Engine` - entirely independent of this
+    /// session's own `engine`/heap (see the architecture note above: this is
+    /// why it does not create a second GC-root domain in the sense the
+    /// milestone plan worried about).
+    ///
+    /// Known hazard, inherited rather than specially handled: like any
+    /// Tier-0 execution, a trapping operation (e.g. integer division by
+    /// zero) calls `trap()` (`std::process::abort()` - see `gc.rs`/`interp.rs`
+    /// doc comments elsewhere), which aborts the whole process, not just this
+    /// call. `evaluate` does not sandbox against this; doing so (e.g. running
+    /// the synthetic engine in a subprocess) is a real, separate feature, not
+    /// a gap specific to eval - the exact same hazard already exists for
+    /// `DebugSession::run` itself.
+    pub fn evaluate(&self, at: usize, expr_source: &str) -> Result<DisplayValue, String> {
+        let trace = self.trace();
+        let step = trace
+            .get(at)
+            .ok_or_else(|| format!("eval: no trace step at index {at}"))?;
+        let function = self
+            .function_by_id(step.func_id)
+            .ok_or("eval: trace step references an unknown function")?;
+        let local_types = types::collect_local_types(function);
+
+        let params: Vec<(usize, Type)> = local_types
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| eval_type_annotation(ty).is_some())
+            .map(|(id, ty)| (id, ty.clone()))
+            .collect();
+        let param_list = params
+            .iter()
+            .map(|(id, ty)| {
+                format!(
+                    "{}: {}",
+                    eval_param_name(*id),
+                    eval_type_annotation(ty).expect("filtered above")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let synthesize = |return_ty: &str| -> String {
+            format!("function __sol_eval({param_list}): {return_ty}\n    return {expr_source}\nend")
+        };
+
+        // Pass 1: discover the expression's real (pre-`any`-coercion) type.
+        let probe = eval_compile(&synthesize("any"))?;
+        let probe_fn = probe
+            .functions
+            .iter()
+            .find(|f| f.name == "__sol_eval")
+            .expect("eval_compile's source always declares __sol_eval");
+        let real_type = eval_find_return_type(&probe_fn.body)
+            .ok_or("eval: expression produced no return value")?;
+        let return_annotation = eval_type_annotation(&real_type).ok_or_else(|| {
+            format!(
+                "eval: expression result type `{}` is not a supported eval result type (only i64/f64/bool/nil/string are)",
+                type_name(&real_type)
+            )
+        })?;
+
+        // Pass 2: recompile with the real type declared directly.
+        let program = eval_compile(&synthesize(return_annotation))?;
+        let engine: tier0::Engine =
+            tier0::Engine::new(program, ()).map_err(|e| format!("eval: tier0 engine build failed: {e}"))?;
+
+        let args: Vec<u64> = params
+            .iter()
+            .map(|(id, _)| step.regs.get(*id).copied().unwrap_or(0))
+            .collect();
+
+        match engine.call_outcome("__sol_eval", &args) {
+            sol_core::CallOutcome::Returned(values) => {
+                let raw = values.into_iter().next().unwrap_or(0);
+                let renderer = ValueRenderer {
+                    structs: &self.program.structs,
+                };
+                Ok(renderer.render(&real_type, raw))
+            }
+            sol_core::CallOutcome::Raised(error) => Err(format!("eval: expression raised: {error}")),
+            other => Err(format!("eval: unexpected call outcome: {other:?}")),
+        }
+    }
+
+    /// U12 item 4, deliverable 3: `gc::live_bytes()`/`gc::live_blocks()`,
+    /// exposed through `DebugSession`'s own public API rather than making a
+    /// caller reach into `gc` directly.
+    ///
+    /// **Honesty note, verified against `gc.rs` directly**: these two
+    /// numbers are meaningful and safe to call in a jit-free
+    /// `DebugSession` context - they are simple bookkeeping sums over the
+    /// heap's bump-arena chunks (`live_bytes`: payload bytes carved out;
+    /// `live_blocks`: allocation-record count), unrelated to reachability,
+    /// so they never depend on `STACK_BASE`/conservative stack scanning at
+    /// all. See `force_gc`'s doc comment for the very different story for
+    /// `collect()` itself.
+    pub fn memory_stats(&self) -> MemoryStats {
+        MemoryStats {
+            live_bytes: gc::live_bytes(),
+            live_blocks: gc::live_blocks(),
+        }
+    }
+
+    /// U12 item 4, deliverable 3: forces a GC cycle via `gc::collect()`.
+    ///
+    /// **Honesty note, verified against `gc.rs` directly**: `collect()` is
+    /// *safe* to call here (it is a plain, non-panicking function call -
+    /// `DebugSession` never crashes from calling it), but it is a **complete
+    /// no-op** in this context specifically. `gc::collect_heap`/
+    /// `collect_minor` both check `STACK_BASE == 0` and return immediately,
+    /// before even scanning `EXTRA_ROOTS` (the interpreter's own
+    /// register-file GC roots - see `gc.rs`'s `RootGuard`), and
+    /// `STACK_BASE` is only ever initialized by `gc::init_stack_base()`,
+    /// which only the native JIT/AOT entry path calls (`main.rs`/`aot.rs`) -
+    /// `tier0::Engine`/`interp::Runtime` (what every `DebugSession` actually
+    /// runs on) never calls it. So calling `force_gc` from a `DebugSession`
+    /// reclaims nothing, ever, including genuinely unreachable garbage -
+    /// `memory_stats()` before and after a `force_gc()` call will report the
+    /// same numbers. This is a real, pre-existing property of the jit-free
+    /// execution path, not something item 4 introduces or could paper over
+    /// without giving Tier-0 its own stack-scanning root set (a real,
+    /// separate feature - out of scope here).
+    pub fn force_gc(&self) {
+        gc::collect();
+    }
+
     fn function_by_id(&self, func_id: u8) -> Option<&TFunction> {
         self.program
             .functions
             .iter()
             .find(|f| self.engine.function_id(&f.name) == Some(func_id))
     }
+}
+
+/// U12 item 4, deliverable 3: `DebugSession::memory_stats`'s report. See
+/// that method's doc comment for exactly what these numbers do (and do not)
+/// mean in a jit-free `DebugSession` context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryStats {
+    pub live_bytes: usize,
+    pub live_blocks: usize,
 }
 
 /// One rendered local, as reported by `DebugSession::locals_at`.

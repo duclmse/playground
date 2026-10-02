@@ -25,6 +25,35 @@ pub struct MapI64Header {
     occupied: *mut u8,
 }
 
+impl MapI64Header {
+    /// U12 item 4, deliverable 2: every occupied `(key, value)` pair, read
+    /// directly off this header's own occupied-bitmap-filtered open-addressed
+    /// table (the same layout `map_slot`/`map_insert` above read/write) -
+    /// `pub(crate)` only, since this is still a private runtime layout with
+    /// no public C-layout contract; `debugger.rs`'s `ValueRenderer::expand`
+    /// is the one caller, from inside this crate.
+    ///
+    /// # Safety
+    /// `header` must point to a live `MapI64Header` returned by
+    /// `sol_new_map_i64` (or a pointer rebuilt from a `Type::Map` local's raw
+    /// register word, which is exactly such a pointer - see `interp.rs`'s own
+    /// `Op::Index`/`sol_map_get_i64` call sites for the same assumption).
+    pub(crate) unsafe fn entries(header: *const MapI64Header) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        unsafe {
+            let capacity = (*header).capacity as usize;
+            for slot in 0..capacity {
+                if *(*header).occupied.add(slot) != 0 {
+                    let key = *(*header).keys.add(slot);
+                    let value = *(*header).values.add(slot);
+                    out.push((key, value));
+                }
+            }
+        }
+        out
+    }
+}
+
 // The map runtime stores scalar values as opaque 64-bit slots. Typed lowering
 // bitcasts f64 and widens bool at the ABI boundary; i64 values pass through.
 // Pointer-bearing values remain gated on precise GC layouts.

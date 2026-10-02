@@ -5,6 +5,12 @@
 // this engine answers breakpoint/step queries by indexing a full recorded
 // instruction trace from one completed run, not by truly pausing/resuming a
 // live interpreter - see `debugger.rs`'s module doc comment).
+//
+// U12 item 4 adds the tests below the three original ones: `debugEvaluate`
+// frame-scoped expression evaluation, `Map`-valued local expansion, and
+// memory-stats/force-GC. See `docs/features/milestones/u12-wasm-playground.md`'s
+// Work item 4 section and `debugger.rs`'s own "deliverable 1"/`memory_stats`/
+// `force_gc` doc comments for the full design and scope cuts.
 
 use sol::debugger::DebugSession;
 
@@ -45,6 +51,35 @@ function main(): i64
     local before: i64 = 10
     local after: i64 = helper(before)
     return after
+end";
+
+/// Fixture 4 (U12 item 4): a function with two scalar locals in scope at the
+/// same point, for the eval differential tests.
+const TWO_LOCALS: &str = "function main(): i64
+    local a: i64 = 7
+    local b: i64 = 6
+    local c: i64 = a * b
+    return c
+end";
+
+/// Fixture 5 (U12 item 4): a `Map<i64, i64>` local, fully populated in one
+/// statement, for the Map-expansion test.
+const MAP_LOCAL: &str = "function main(): i64
+    local m: Map<i64, i64> = { [1] = 10, [2] = 20 }
+    local total: i64 = m[1] + m[2]
+    return total
+end";
+
+/// Fixture 6 (U12 item 4): allocation-heavy (many `Map` insertions in a
+/// loop), for the memory-stats test.
+const ALLOCATION_HEAVY: &str = "function main(): i64
+    local m: Map<i64, i64> = {}
+    local i: i64 = 0
+    while i < 2000 do
+        m[i] = i * 2
+        i = i + 1
+    end
+    return m[1999]
 end";
 
 #[test]
@@ -177,5 +212,167 @@ fn stepping_over_into_and_out_of_a_nested_call_behave_differently() {
     assert_eq!(
         trace[out].depth, trace[call_site].depth,
         "step_out must restore main's original call depth"
+    );
+}
+
+// -----------------------------------------------------------------------
+// U12 item 4, deliverable 1: `evaluate` differential tests.
+// -----------------------------------------------------------------------
+
+#[test]
+fn eval_of_a_local_read_matches_locals_at_reported_value() {
+    let program = compile(TWO_LOCALS);
+    let session = DebugSession::new(program).expect("session builds");
+    // Breakpoint at line 4 (`local c: i64 = a * b`): `a` and `b` are already
+    // assigned, `c` is not yet.
+    let breakpoint = session.set_breakpoint("main", 4);
+    assert!(breakpoint.verified, "line 4 must verify: {breakpoint:?}");
+    session.run("main", &[]);
+    let hit = session
+        .first_breakpoint_hit()
+        .expect("the breakpoint must be hit during this run");
+
+    let locals = session.locals_at(hit).expect("locals available at the hit");
+    let expected_a = match &locals[0].value {
+        sol::debugger::DisplayValue::Scalar(s) => s.clone(),
+        other => panic!("expected a scalar local for `a`, got {other:?}"),
+    };
+    assert_eq!(expected_a, "7", "sanity: local a is 7 at this point: {locals:?}");
+
+    let evaluated = session
+        .evaluate(hit, "local0")
+        .expect("eval of a plain local read must succeed");
+    assert_eq!(
+        evaluated,
+        sol::debugger::DisplayValue::Scalar(expected_a),
+        "eval of `local0` must match locals_at's own reported value for local id 0 (`a`)"
+    );
+}
+
+#[test]
+fn eval_of_arithmetic_over_two_locals_matches_the_independently_computed_result() {
+    let program = compile(TWO_LOCALS);
+    let session = DebugSession::new(program).expect("session builds");
+    let breakpoint = session.set_breakpoint("main", 4);
+    assert!(breakpoint.verified, "line 4 must verify: {breakpoint:?}");
+    session.run("main", &[]);
+    let hit = session
+        .first_breakpoint_hit()
+        .expect("the breakpoint must be hit during this run");
+
+    // Independently computable: local0 (a) = 7, local1 (b) = 6.
+    let evaluated = session
+        .evaluate(hit, "local0 * local1 + 1")
+        .expect("eval of arithmetic over two locals must succeed");
+    assert_eq!(
+        evaluated,
+        sol::debugger::DisplayValue::Scalar((7 * 6 + 1).to_string()),
+        "eval must independently recompute the same arithmetic the source expresses"
+    );
+}
+
+#[test]
+fn eval_rejects_a_reference_to_an_undefined_or_out_of_scope_name() {
+    let program = compile(TWO_LOCALS);
+    let session = DebugSession::new(program).expect("session builds");
+    session.run("main", &[]);
+    let trace = session.trace();
+    assert!(!trace.is_empty());
+
+    let error = session
+        .evaluate(0, "not_a_real_local")
+        .expect_err("an undefined name must fail to typecheck, not silently resolve");
+    assert!(
+        error.contains("eval:"),
+        "error should be tagged as an eval failure: {error}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// U12 item 4, deliverable 2: `Map` local expansion.
+// -----------------------------------------------------------------------
+
+#[test]
+fn map_valued_local_expands_to_its_occupied_entries() {
+    let program = compile(MAP_LOCAL);
+    let session = DebugSession::new(program).expect("session builds");
+    // Breakpoint at line 3 (`local total: i64 = m[1] + m[2]`): `m` is fully
+    // populated by line 2's single map-literal statement by this point.
+    let breakpoint = session.set_breakpoint("main", 3);
+    assert!(breakpoint.verified, "line 3 must verify: {breakpoint:?}");
+    session.run("main", &[]);
+    let hit = session
+        .first_breakpoint_hit()
+        .expect("the breakpoint must be hit during this run");
+    let locals = session.locals_at(hit).expect("locals available at the hit");
+
+    let map_local = &locals[0];
+    let (reference, summary) = match &map_local.value {
+        sol::debugger::DisplayValue::Reference { reference, summary } => {
+            (*reference, summary.clone())
+        }
+        other => panic!("expected local 0 (`m`) to render as a Map reference, got {other:?}"),
+    };
+    assert_eq!(summary, "Map<i64, i64>", "local 0 must be the Map<i64, i64> local `m`");
+
+    let mut entries = session
+        .expand(&map_local.ty, reference)
+        .expect("a populated Map reference must expand");
+    entries.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
+    let rendered: Vec<(String, i64)> = entries
+        .into_iter()
+        .map(|(key, ty, raw)| {
+            assert_eq!(ty, sol::types::Type::I64, "Map<i64, i64>'s value type is i64");
+            (key, raw as i64)
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![("1".to_string(), 10), ("2".to_string(), 20)],
+        "expand must report exactly the two occupied entries the literal inserted"
+    );
+}
+
+// -----------------------------------------------------------------------
+// U12 item 4, deliverable 3: memory stats + force-GC.
+// -----------------------------------------------------------------------
+
+#[test]
+fn memory_stats_report_plausible_values_and_force_gc_does_not_crash() {
+    let program = compile(ALLOCATION_HEAVY);
+    let session = DebugSession::new(program).expect("session builds");
+
+    let before = session.memory_stats();
+    session.run("main", &[]);
+    let after = session.memory_stats();
+
+    // Non-panicking, plausible values: the allocation-heavy fixture (a
+    // growing Map<i64, i64> plus its internal resizes) must have allocated
+    // something, and byte/block counts must stay mutually consistent (any
+    // allocation implies at least one live byte).
+    assert!(
+        after.live_bytes >= before.live_bytes,
+        "running an allocation-heavy fixture must not decrease live_bytes: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.live_blocks >= before.live_blocks,
+        "running an allocation-heavy fixture must not decrease live_blocks: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.live_bytes > 0 && after.live_blocks > 0,
+        "the fixture's own Map allocations must be reflected: after={after:?}"
+    );
+
+    // `force_gc` must be invocable through `DebugSession` without crashing.
+    // Per `DebugSession::force_gc`'s doc comment (verified against gc.rs
+    // directly): it is a documented no-op here, since `STACK_BASE` is never
+    // initialized outside the native JIT/AOT entry path, so it must not
+    // reclaim anything either - assert the stats are unchanged, not just
+    // that the call returned.
+    session.force_gc();
+    let after_gc = session.memory_stats();
+    assert_eq!(
+        after_gc, after,
+        "force_gc must be a safe no-op in a jit-free DebugSession context, not reclaim anything"
     );
 }
