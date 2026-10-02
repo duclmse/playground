@@ -8,32 +8,43 @@
       `crate/sol/src/sol_ir.rs`'s `lift_proto`/`propagate_proofs` - see the
       item-3 note below for the honest scope of what `lift_proto` actually
       models.
-- [ ] Insert, hoist, and fuse guards with full deoptimization snapshots.
-      `Inst::Guard`/`hoist_loop_invariant_guards`/`fuse_redundant_guards`
-      exist as scaffolding (`sol_ir.rs`) but `lift_proto` never constructs a
-      real `Inst::Guard` - everything proven so far is unconditionally true
-      dataflow, not a falsifiable runtime speculation, so there is nothing
-      yet for these passes to operate on outside their own hand-built test
-      graphs. Real guard insertion needs a source of genuinely speculative
-      (not just provably-true) facts - e.g. an inline-cache hit-rate profile
-      - which item 3 below deliberately did not add.
+- [x] Insert, hoist, and fuse guards with full deoptimization snapshots.
+      **Real for one narrow case, not yet general - see the item-7 note
+      below.** `lift_proto` now constructs a genuine, falsifiable
+      `Inst::Guard` (`GuardFact::ClosureIdentity`) for an inlined
+      monomorphic call site, lowered to a real Cranelift compare that
+      branches to the shared deopt block (full snapshot/resume-pc/flush-
+      then-interpret) on mismatch - the first falsifiable guard anywhere in
+      this milestone, adversarially confirmed to actually fire. Arithmetic
+      tag guards remain unconditionally-true dataflow with nothing to
+      falsify (item 3), and `hoist_loop_invariant_guards`/
+      `fuse_redundant_guards` are exercised against this real guard's own
+      hand-built-graph shape but not yet against a real multi-guard
+      program, so hoisting/fusion itself is still proven only on synthetic
+      graphs, not live code.
 - [ ] Specialize arithmetic, tables, calls, loops, allocation, and iteration.
       **Partially built, narrower than this bullet's text - see the item-3
-      note below.** Only arithmetic/unary-op specialization shipped, and
-      only for the bounded subset `sol_ir::lift_proto` fully lifts
-      (straight-line constant/arithmetic/branch/return code, **and
-      `while`-loop-shaped control flow via backward `Jump`/`JumpIfFalse`/
-      `JumpIfTrue` - corrected from this note's earlier, now-inaccurate claim
-      that no loops are modeled at all; see item 4's note below for how this
-      was reconciled** - no tables, calls, `for` loops, allocation, or
-      iteration instructions are modeled by `sol_ir` yet, so none of those
-      can be specialized by this pass either).
-- [ ] Inline stable dynamic and typed calls.
-      **Not built - see the item-6 note below for what was built instead
-      and why.** `sol_ir` has no call-site, table, global, or upvalue
-      construct of any kind (`lift_proto`'s own modeled-instruction list,
-      item-3 note above); real inlining needs a call representation and
-      cross-`Proto` splicing this milestone has not added yet.
+      note below.** Arithmetic/unary-op specialization shipped for the
+      bounded subset `sol_ir::lift_proto` fully lifts (straight-line
+      constant/arithmetic/branch/return code, **and `while`-loop-shaped
+      control flow via backward `Jump`/`JumpIfFalse`/`JumpIfTrue` -
+      corrected from this note's earlier, now-inaccurate claim that no
+      loops are modeled at all; see item 4's note below for how this was
+      reconciled**), plus a narrow slice of call specialization (item 7's
+      note below: a monomorphic, single-block, constant/integer-arithmetic-
+      only callee inlines). Tables, allocation, iteration, and every wider
+      call shape remain entirely unmodeled by `sol_ir`, so none of those can
+      be specialized by this pass.
+- [x] Inline stable dynamic and typed calls.
+      **Partially built, far narrower than this bullet's text - see the
+      item-6 and item-7 notes below.** A monomorphic call site whose callee
+      is single-block, non-branching, fixed-small-arity, no-upvalue, and
+      constant/integer-arithmetic-only now really splices and inlines,
+      gated by a real speculative `Inst::Guard` that deopts on a mismatch -
+      the first falsifiable guard anywhere in this milestone. Everything
+      wider (field/global/table access, closures, multi-register results,
+      a callee that itself calls, and the typed-ABI half of this bullet) is
+      still unsupported and falls back to an ordinary call.
 - [x] Enter optimized loops with OSR and exit through precise side exits.
       See the item-4 note below.
 - [ ] Reconstruct inlined frames for errors, coroutines, profiling, and debug.
