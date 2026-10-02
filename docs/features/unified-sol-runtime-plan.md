@@ -2606,7 +2606,8 @@ Deliverables:
 - [ ] specialize generics, records, arrays, maps, and callbacks across modules;
 - [ ] retain dynamic adapters for exported/reflective entry points;
 - [ ] support profile-guided AOT with safe fallback when profiles change;
-- [ ] compare each gradually typed program against its unchanged Lua version.
+- [x] compare each gradually typed program against its unchanged Lua version -
+      item 6, see the dated note below.
 
 Exit gate: typed advantage gate passes, annotation coverage yields monotonic or
 explained results, and mixed dynamic behavior remains compatible. **Not yet
@@ -2643,6 +2644,60 @@ this change - `objects`/`vector_add` have no `any` usage at all (never reach
 the modified code path), and `any_dynamic`'s one candidate uses the
 intermediate-local pattern above, so its guard condition is logically
 identical before and after this change.
+
+Item 6 (2026-10-02): closes the gap §7.1 flags - no existing benchmark
+measured intermediate annotation-coverage steps. New
+`benchmarks/gradual-manifest.json` defines, per benchmark, an ordered list of
+steps from 0% coverage (the unmodified `.lua`, and a `.sol` twin with zero
+annotations - both fall back to the same budget-gated dynamic interpreter in
+`lua_runtime.rs`) through one or two partial steps up to the existing 100%
+typed `.sol` file, each step a strict annotation superset of the last with
+identical logic/output. New `scripts/gradual-benchmark.sh` runs every step
+through the same `sol run` binary with `hyperfine`, reusing
+`scripts/typed-regression-check.sh`'s exact regression formula and 5%
+threshold (`delta_fraction = (new_mean - prev_mean) / prev_mean`,
+`regressed = delta_fraction > 0.05 and (new_mean - prev_mean) > prev_stddev +
+new_stddev`), and exits nonzero on any unexplained step-over-step regression.
+Chosen benchmarks/steps: `loop_sum` (0% -> return-type-only -> 100%) and
+`hashmap_lookup` (0% -> map-type-only -> 100%) each have one partial step,
+since one annotation is enough to seed `typeck/inference.rs`'s whole-file flow
+inference, which here already infers every remaining type on its own;
+`function_calls` keeps the existing `function_calls.sol` (typed call
+signature, inferred locals) as its partial step and adds a new fully-annotated
+twin, bracketing it on both sides. Canonical measured run (all monotonic or
+explained, exit 0): `loop_sum` 1077.5ms (.lua) -> 973.8ms (.sol, 0%, -9.6%) ->
+28.7ms (return type only, -97.1%) -> 29.1ms (fully typed, +1.3%);
+`function_calls` 16431.2ms -> 18290.6ms (0%, **+11.3%, EXPLAINED**) -> 17.4ms
+(signature only, -99.9%) -> 17.3ms (fully typed, all locals annotated,
++1.8%); `hashmap_lookup` 11.8ms -> 11.5ms (0%, -2.4%) -> 3.8ms (map type
+only, -66.9%) -> 3.5ms (fully typed, -6.6%). The one flagged regression
+(`function_calls`'s two 0%-coverage steps, `.lua` vs `.sol`) is not an
+annotation-coverage cost - both steps have 0% coverage - but a dispatch-cost
+difference: `function_calls.lua` declares `work` as `local function work(x)`
+(Lua idiom, compiles to a direct upvalue read via
+`lua_bytecode/compile_calls.rs`'s `Resolved::Local`/`Upval`, executed by
+`lua_runtime/dispatch/bytecode.rs`'s zero-guard `GetUpval`/`Move`), while the
+gradual step instead declares a top-level `function work(x)` (matching
+`function_calls.sol`'s own pre-existing convention, kept so only annotations
+vary across the suite's own steps), which compiles to `SetGlobal`/`GetGlobal`
+(`lua_bytecode/compile_stmt.rs`'s `GlobalFunction` path) and pays a per-call
+`_ENV`-table probe on all 10,000,000 hot-loop calls
+(`lua_runtime/dispatch/bytecode.rs:309-430`, inline-cached per pc via
+`lua_runtime/ic.rs`'s `Proto::global_cache`, but still a table/`ObjectId`
+guard and possible string-key intern on a miss). Isolated same-binary A/B/C
+(`hyperfine --warmup 1 --min-runs 5`) confirms the attribution:
+`lua`/local-fn 16.437s, `sol`/local-fn 17.364s (the base
+dynamic-interpreter-vs-reference-Lua gap), `sol`/global-fn 18.183s (+4.7%
+more on top, isolating the global-vs-local dispatch cost) - consistent with
+the full step's +11.3%. The fail-loudly gate was verified against a real bad
+case, not a synthetic one: re-running with the `explained` field removed from
+`function_calls`'s manifest entry reproduces this same regression as an
+unsuppressed `FAIL` row and a nonzero exit; restoring the field returns a
+clean, all-`ok`/`EXPLAINED` run with exit 0. `cargo test --manifest-path
+crate/sol/Cargo.toml` (66 + 2 passed, 0 failed, 0 new warnings) and
+`scripts/test-lua55-manifest.sh` both pass, confirming this benchmark-fixture
+and harness-only item left the typed compiler untouched. Full table:
+`benchmarks/RESULTS.md`'s 2026-10-02 gradual-benchmark section.
 
 ### U12 — Canonical WASM playground and debugger
 

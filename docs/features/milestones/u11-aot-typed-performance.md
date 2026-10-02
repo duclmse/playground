@@ -21,7 +21,30 @@
 - [ ] Specialize generics, records, arrays, maps, and callbacks across modules.
 - [ ] Retain dynamic adapters at exported and reflective boundaries.
 - [ ] Support profile-guided AOT with safe profile-change fallback.
-- [ ] Compare gradually typed programs to their unchanged Lua versions.
+- [x] Compare gradually typed programs to their unchanged Lua versions. Item 6
+      (2026-10-02): `benchmarks/gradual-manifest.json` + new
+      `scripts/gradual-benchmark.sh` measure `loop_sum`, `function_calls`, and
+      `hashmap_lookup` at 2-4 annotation-coverage steps each (0% `.lua`, 0%
+      `.sol` with no annotations, one or two partial steps, 100% typed),
+      reusing `scripts/typed-regression-check.sh`'s 5%-threshold/noise-budget
+      formula and failing loudly (nonzero exit) on any unexplained
+      step-over-step regression. Canonical run: all three benchmarks are
+      monotonic or explained end to end (zero unexplained `FAIL` rows, exit
+      0) - `loop_sum` 1077ms (.lua) -> 974ms (.sol, 0%) -> 28.7ms (return-type
+      only) -> 29.1ms (fully typed); `function_calls` 16431ms -> 18291ms (0%,
+      **EXPLAINED** +11.3% - both steps are 0%-annotation, root-caused to
+      `local function work(x)` (upvalue read, zero guard,
+      `lua_bytecode/compile_calls.rs`'s `Resolved::Local`/`Upval`) vs this
+      step's top-level `function work(x)` (`_ENV`-probed `GetGlobal`,
+      `lua_runtime/dispatch/bytecode.rs:309-430`), not an annotation cost -
+      isolated via a same-binary A/B/C (lua/local-fn 16.4s, sol/local-fn
+      17.4s, sol/global-fn 18.2s)) -> 17.4ms (signature only) -> 17.3ms
+      (fully typed); `hashmap_lookup` 11.8ms -> 11.5ms (0%) -> 3.8ms (map
+      type only) -> 3.5ms (fully typed). The fail-loudly gate was verified
+      for real against a manifest with the `explained` field removed, which
+      reproduced the `function_calls` `FAIL` row and nonzero exit.
+      See `benchmarks/RESULTS.md`'s dated gradual-benchmark section for the
+      full table.
 
 **Exit gate:** typed advantage is measured, explained, and compatible with
 mixed dynamic behavior.

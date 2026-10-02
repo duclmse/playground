@@ -1170,3 +1170,84 @@ states plainly that it has not yet achieved the dynamic-parity goal rather
 than rounding up partial, narrowly-shaped wins into a broader claim. See
 [`docs/features/milestones/u10-optimizing-jit-osr.md`](../docs/features/milestones/u10-optimizing-jit-osr.md)'s
 item-8 note for the full per-item breakdown this section summarizes.
+
+## U11 item 6 — the gradually-typed benchmark suite (2026-10-02)
+
+`docs/features/unified-sol-runtime-plan.md`'s §7.1 requires a benchmark suite
+measuring "the same programs with increasing annotation coverage, measuring
+each step"; every existing benchmark here was either fully `.lua` or fully
+`.sol`, with no intermediate steps. `benchmarks/gradual-manifest.json` now
+defines, per benchmark, an ordered list of steps from 0% annotation coverage
+up to the existing 100%-typed `.sol` file, each step a strict superset of
+annotations over the previous one with identical program logic and
+observable output. `scripts/gradual-benchmark.sh` runs every step through the
+same `sol run` binary via `hyperfine`, reusing
+`scripts/typed-regression-check.sh`'s regression formula and 5% threshold,
+and fails loudly (nonzero exit, a `FAIL` row) on any step that regresses
+beyond that budget unless the manifest documents a principled `explained`
+reason for that specific step.
+
+Three benchmarks were selected (the plan's own suggestion, confirmed to exist
+as both `.lua` and `.sol` beforehand): `loop_sum`, `function_calls`, and
+`hashmap_lookup`. None use the `any` type, so U11 item 2's speculative-guard
+elimination is not exercised by any step here. `loop_sum` and
+`hashmap_lookup` each get one partial step, since a single annotation is
+enough to seed `typeck/inference.rs`'s whole-file flow inference, which here
+already infers every remaining type on its own (`hashmap_lookup`'s partial
+step annotates the map's declared type first, since a bare `{}` table
+literal is a hard `[EDYNLUA]` compile error once any other annotation exists
+in the file). `function_calls` keeps the pre-existing `function_calls.sol`
+(typed call signature, inferred locals) as its partial step and adds a new
+fully-annotated twin, bracketing it on both sides.
+
+Canonical measured run (release binary, `--warmup 3 --min-runs 10` per step;
+all rows monotonic or explained, exit 0):
+
+| Benchmark | Step (annotation coverage) | Mean | StdDev | Delta | Verdict |
+|---|---|---|---|---|---|
+| `loop_sum` | 0% (`.lua`, dynamic) | 1077.458 ms | 11.953 ms | - | baseline |
+| `loop_sum` | 0% (`.sol`, no annotations) | 973.764 ms | 2.820 ms | -9.6% | ok |
+| `loop_sum` | partial (return type only) | 28.716 ms | 0.710 ms | -97.1% | ok |
+| `loop_sum` | 100% (fully typed) | 29.084 ms | 1.255 ms | +1.3% | ok |
+| `function_calls` | 0% (`.lua`, dynamic) | 16431.232 ms | 147.113 ms | - | baseline |
+| `function_calls` | 0% (`.sol`, no annotations) | 18290.561 ms | 123.657 ms | +11.3% | **EXPLAINED** |
+| `function_calls` | partial (`work`'s signature only) | 17.427 ms | 0.822 ms | -99.9% | ok |
+| `function_calls` | 100% (fully typed, all locals annotated) | 17.343 ms | 0.725 ms | +1.8% | ok |
+| `hashmap_lookup` | 0% (`.lua`, dynamic) | 11.775 ms | 0.784 ms | - | baseline |
+| `hashmap_lookup` | 0% (`.sol`, no annotations) | 11.490 ms | 3.200 ms | -2.4% | ok |
+| `hashmap_lookup` | partial (map type only) | 3.801 ms | 1.015 ms | -66.9% | ok |
+| `hashmap_lookup` | 100% (fully typed) | 3.549 ms | 0.782 ms | -6.6% | ok |
+
+The one flagged regression - `function_calls`'s two 0%-coverage steps,
+`.lua` vs `.sol` - is not an annotation-coverage cost (both steps have 0%
+coverage) but a function-dispatch-cost difference: `function_calls.lua`
+declares `work` as `local function work(x)` (Lua idiom; resolves to a direct
+upvalue/register read via `crate/sol/src/lua_bytecode/compile_calls.rs`'s
+`Resolved::Local`/`Upval`, executed by
+`crate/sol/src/lua_runtime/dispatch/bytecode.rs`'s zero-guard
+`GetUpval`/`Move`). The gradual step instead declares a top-level
+`function work(x)` (matching `function_calls.sol`'s own pre-existing
+convention, kept so only annotations vary across this suite's own steps),
+which compiles to `SetGlobal`/`GetGlobal`
+(`crate/sol/src/lua_bytecode/compile_stmt.rs`'s `GlobalFunction` path) and
+pays a per-call `_ENV`-table probe on all 10,000,000 hot-loop calls
+(`crate/sol/src/lua_runtime/dispatch/bytecode.rs:309-430`, inline-cached per
+pc via `crate/sol/src/lua_runtime/ic.rs`'s `Proto::global_cache`, but still a
+table/`ObjectId` guard and possible string-key intern on a miss). An isolated
+same-binary A/B/C (`hyperfine --warmup 1 --min-runs 5`) confirms the
+attribution: `lua`/local-fn 16.437s, `sol`/local-fn 17.364s (the base
+dynamic-interpreter-vs-reference-Lua gap), `sol`/global-fn 18.183s (+4.7%
+more on top of that, isolating the global-vs-local dispatch cost alone) -
+consistent with the full step's measured +11.3%. This is documented as an
+`explained` reason in the manifest rather than suppressed or averaged away.
+
+The fail-loudly gate was verified against a real bad case, not a synthetic
+one: re-running with the `explained` field temporarily removed from
+`function_calls`'s manifest entry reproduced this same regression as an
+unsuppressed `FAIL` row and a nonzero exit code; restoring the field returned
+a clean, all-`ok`/`EXPLAINED` run with exit 0.
+
+`cargo test --manifest-path crate/sol/Cargo.toml` (66 + 2 tests passed, 0
+failed, 0 new warnings) and `scripts/test-lua55-manifest.sh` both pass,
+confirming this benchmark-fixture-and-harness-only item left the typed
+compiler untouched.
