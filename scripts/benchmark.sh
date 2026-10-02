@@ -54,10 +54,31 @@ if [ -n "$EXPORT_MARKDOWN" ]; then
 fi
 
 SUMMARY_FILE="$(mktemp)"
+AOT_TMP_DIR="$(mktemp -d)"
 cleanup_summary() {
   rm -f "$SUMMARY_FILE"
+  rm -rf "$AOT_TMP_DIR"
 }
 trap cleanup_summary EXIT
+
+# U11 item 7: besides `sol run` (the tiered JIT path, labeled "sol" above),
+# also build and measure `sol build`'s standalone AOT output for every typed
+# benchmark - previously nothing in this harness measured AOT at all. Builds
+# once per benchmark, outside any hyperfine timing window (build time is a
+# compile-time cost, not part of the "run this program" comparison the rest
+# of this script measures) - matching how building the `sol` binary itself,
+# above, is also not inside a timed group. Prints a warning and omits the row
+# (rather than aborting the whole benchmark run) if a given `.sol` benchmark
+# fails to AOT-build.
+build_aot_binary() {
+  local sol_script="$1" name="$2"
+  local out="$AOT_TMP_DIR/$name"
+  if "$SOL_BIN" build "$sol_script" -o "$out" >/dev/null 2>&1; then
+    printf '%s\n' "$out"
+  else
+    log "warning: 'sol build' failed for $name.sol - omitting its AOT row"
+  fi
+}
 
 record_summary() {
   local benchmark_name="$1"
@@ -194,6 +215,9 @@ for script in "$ROOT"/benchmarks/*.lua; do
   sol_script="$ROOT/benchmarks/$name.sol"
   if [ -f "$sol_script" ]; then
     commands+=(-n "sol" "'$SOL_BIN' run '$sol_script'")
+    if aot_bin="$(build_aot_binary "$sol_script" "$name")" && [ -n "$aot_bin" ]; then
+      commands+=(-n "sol (aot)" "'$aot_bin'")
+    fi
   fi
 
   run_group "$name" --warmup 3 --min-runs 10 "${commands[@]}"
@@ -213,6 +237,9 @@ for sol_script in "$ROOT"/benchmarks/*.sol; do
   fi
   log "Benchmark: $name (Sol-only)"
   commands=(-n "sol" "'$SOL_BIN' run '$sol_script'")
+  if aot_bin="$(build_aot_binary "$sol_script" "$name")" && [ -n "$aot_bin" ]; then
+    commands+=(-n "sol (aot)" "'$aot_bin'")
+  fi
   run_group "$name" --warmup 3 --min-runs 10 "${commands[@]}"
   run_group "$name (cold)" --warmup 0 --runs 1 "${commands[@]}"
 done

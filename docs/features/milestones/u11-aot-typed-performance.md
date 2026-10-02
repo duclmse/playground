@@ -153,7 +153,47 @@
       See `benchmarks/RESULTS.md`'s dated gradual-benchmark section for the
       full table.
 
+Item 7 (2026-10-02): built the exit gate's own measurement tooling. Nothing in
+the benchmark harness previously measured `sol build` (AOT) output at all, and
+no script computed §7.3's "Typed advantage" ratio. Extended
+`scripts/benchmark.sh` with a `build_aot_binary` helper that AOT-builds each
+benchmark's `.sol` twin once, outside the timed hyperfine window, and adds a
+"sol (aot)" row alongside the existing "sol" (tiered JIT) and Lua-runtime
+rows, degrading gracefully (a warning and an omitted row, not an aborted run)
+on a build failure. New `scripts/typed-advantage-gate.sh` computes the gate
+itself: for the 10 benchmarks with both a `.lua` and typed `.sol` twin (§7.1:
+"a benchmark with no LuaJIT-equivalent behavior may inform Sol tuning but
+cannot support the comparative headline"), it measures LuaJIT's and Sol's AOT
+build's wall-clock mean via hyperfine - AOT, not `sol run`'s tiered JIT, since
+AOT is this milestone's peak-performance path - and reports the geometric
+mean of the per-benchmark ratios. §7.3's "a separately published target": as
+of this writing none has ever actually been published anywhere in `docs/`
+(grepped for it), so rather than invent one, the script reports the measured
+ratio unconditionally and only evaluates pass/fail if a target is explicitly
+supplied via `--target`/`TYPED_ADVANTAGE_TARGET` - matching U10 item 8's
+precedent of an honest current number over a fabricated gate. Canonical
+measured run (release build, 2026-10-02): geometric mean **1.089x** (Sol AOT
+averages ~9% faster than LuaJIT across the suite), but the spread is wide and
+not uniformly favorable - clear wins on `function_calls` (2.36x), `loop_sum`
+(1.75x), `table_array` (1.33x), `matrix` (1.22x), and `fib` (1.12x); losses on
+`objects` (0.59x), `hashmap_lookup` (0.79x), `nested_loop` (0.82x),
+`string_concat` (0.90x), and `gc_alloc` (0.91x). §7.3's other clause,
+"preserving mixed-call and compatibility behavior," is not re-measured by this
+new script - confirmed instead by the full `cargo test --manifest-path
+crate/sol/Cargo.toml` suite (131 lib tests, 70 `programs.rs` tests, 0 failed)
+and a fresh `scripts/typed-regression-check.sh` run, which reproduces the same
+three "REGRESSED" rows (`any_dynamic` +22.4%, `objects` +20.9%, `vector_add`
++44.8%) that item 2's note already investigated and confirmed as pre-existing
+measurement noise predating every U11 item, not a new finding - a third
+independent run, now after items 3/5/6 landed too, stays consistent with that
+conclusion. **Not resolved, left open:** no target has been published for the
+gate to actually pass or fail against, so the "Exit gate" below cannot be
+marked reached on this item alone.
+
 **Exit gate:** typed advantage is measured, explained, and compatible with
-mixed dynamic behavior.
+mixed dynamic behavior. Measurement tooling now exists (item 7) and reports
+geomean 1.089x as of 2026-10-02, but **not yet reached** - no published target
+exists for the gate to pass against, and deliverables 1-4 remain partial,
+open, or stretch scope.
 
 See the [historical U11 ledger](../unified-sol-runtime-plan.md#u11--aot-and-annotation-driven-peak-performance).
