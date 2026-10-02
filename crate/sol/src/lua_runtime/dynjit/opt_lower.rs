@@ -57,7 +57,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::ast::BinaryOp;
-use crate::lua_bytecode::{Const, Instr, Proto};
+use crate::lua_bytecode::{Const, InlineMapEntry, Instr, Proto};
 use crate::sol_ir::{self, Inst, Proof, ValueId};
 use sol_core::{ValueCount, ValueTag};
 
@@ -561,12 +561,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 target,
                 param_value_ids,
                 body,
+                body_pcs,
                 result,
             },
         )) = self.func.value_at_pc.get(&pc)
         else {
             unreachable!("Instr::Call at a value-producing pc must have lifted to Inst::Call")
         };
+
+        // Work item 7b (inline-site bookkeeping): record this splice's own
+        // (callee `Proto`, callee pc) chain on the *caller's* `Proto`, keyed
+        // by this call site's own bytecode pc - copied verbatim from
+        // `body_pcs`, never re-derived. See `InlineMapEntry`'s own doc for
+        // why nothing reads this yet.
+        self.proto.inline_map.borrow_mut().insert(
+            pc,
+            InlineMapEntry {
+                callee: target.prototype.clone(),
+                value_pcs: body_pcs.iter().map(|(id, pc)| (id.0, *pc)).collect(),
+            },
+        );
 
         let tag = self.load_tag(base);
         let payload = self.load_payload(base);
@@ -770,4 +784,112 @@ fn lower_proto_from(
         .map_err(|e| e.to_string())?;
     module.clear_context(&mut ctx);
     Ok(func_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::lua_bytecode::{CallCacheEntry, Compiler};
+
+    use super::super::DynJit;
+    use super::Proto;
+
+    /// Mirrors `tests/fixtures/dynjit_inline_call_stable.lua` (the real,
+    /// already-proven-inlinable integration fixture `lua55_dynamic_runtime_jit.rs`'s
+    /// `a_monomorphic_call_site_is_inlined_to_native_code_with_no_behavior_change`
+    /// drives end-to-end): the callee is taken as `caller`'s own *parameter*,
+    /// never defined inside `caller`'s own body, so `caller`'s own `Proto` has
+    /// no `Instr::NewClosure` of its own and can be `fully_lifted` - unlike
+    /// defining the callee as a `local function` directly inside the function
+    /// under test, which `sol_ir`'s own module doc (`opt_lower.rs` top) notes
+    /// is itself outside `sol_ir`'s modeled subset.
+    fn compile_caller_proto() -> (Rc<Proto>, Rc<Proto>) {
+        let program = crate::parser::parse_lua(
+            crate::lexer::lex_bytes(
+                b"local function add_one(x) return x + 1 end\n\
+                  local function caller(f) local x = 5 + 2 local r = f(x) return r end\n\
+                  print(caller(add_one))",
+            )
+            .expect("test source lexes"),
+        )
+        .expect("test source parses")
+        .functions;
+        let top_level =
+            Compiler::compile_top_level(&program[0]).expect("test source compiles");
+        let callee = top_level.nested[0].clone();
+        let caller = top_level.nested[1].clone();
+        (caller, callee)
+    }
+
+    fn warm_call_cache(caller: &Proto, callee: Rc<Proto>, guard_raw: u64) -> usize {
+        let call_pc = caller
+            .instrs
+            .iter()
+            .position(|i| matches!(i, super::Instr::Call(..)))
+            .expect("caller calls exactly one function");
+        caller.call_cache[call_pc].insert(CallCacheEntry {
+            guard: sol_core::ObjectId::from_raw(guard_raw).expect("nonzero raw id"),
+            prototype: callee,
+            upvalues: Rc::from(Vec::new()),
+        });
+        call_pc
+    }
+
+    /// Work item 7b, end-to-end: compiling a real inline-eligible call site
+    /// through the actual `lower_call` path above (not `sol_ir`'s own
+    /// hand-inspected IR, which `sol_ir.rs`'s own
+    /// `body_pcs_attributes_the_spliced_binary_to_the_callees_own_bytecode_pc`
+    /// test already covers) must leave `Proto::inline_map` populated with
+    /// exactly the callee/pc chain the splice actually used.
+    #[test]
+    fn compiling_an_inlined_call_site_populates_the_callers_inline_map() {
+        let (caller, callee) = compile_caller_proto();
+        let call_pc = warm_call_cache(&caller, callee.clone(), 1);
+
+        assert!(
+            caller.inline_map.borrow().is_empty(),
+            "nothing has been compiled yet"
+        );
+
+        let mut dynjit = DynJit::new().expect("DynJit::new must succeed in a test process");
+        dynjit
+            .optimize(&caller)
+            .expect("this call site meets callee_is_inlinable's shape and must compile");
+
+        let inline_map = caller.inline_map.borrow();
+        let entry = inline_map
+            .get(&call_pc)
+            .expect("the inlined call site's own pc must have an entry");
+        assert!(
+            Rc::ptr_eq(&entry.callee, &callee),
+            "the recorded callee must be the exact Proto that was spliced in"
+        );
+        // `add_one`'s body (`return x + 1`) lifts to exactly two real,
+        // pc-attributable instructions - the `1` constant load and the
+        // `x + 1` binary - so `value_pcs` must have exactly that many
+        // entries, each pointing at one of those two positions in the
+        // callee's own bytecode (never at `x`'s own parameter nil-seed,
+        // which `sol_ir.rs`'s own
+        // `body_pcs_attributes_the_spliced_binary_to_the_callees_own_bytecode_pc`
+        // test already checks has no `body_pcs`/`value_pcs` entry at all).
+        assert_eq!(
+            entry.value_pcs.len(),
+            2,
+            "both of the callee's real instructions (the `1` constant load and \
+             the `x + 1` binary) should be attributed"
+        );
+        for pc in entry.value_pcs.values() {
+            assert!(
+                matches!(
+                    callee.instrs[*pc],
+                    super::Instr::Binary(..)
+                        | super::Instr::IntegerBinary(..)
+                        | super::Instr::LoadConst(..)
+                ),
+                "every attributed pc must point at a real value-producing callee instruction, got {:?} at pc {pc}",
+                callee.instrs[*pc]
+            );
+        }
+    }
 }

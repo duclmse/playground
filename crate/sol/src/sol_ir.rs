@@ -159,6 +159,19 @@ pub enum Inst {
         target: CallCacheEntry,
         param_value_ids: Vec<ValueId>,
         body: Vec<(ValueId, Inst)>,
+        /// Work item 7b (inline-site bookkeeping): `body`'s own
+        /// `ValueId -> callee bytecode pc` chain, for every `body` entry that
+        /// actually originated from a real callee instruction (everything
+        /// except the callee's own parameter nil-seeds - see
+        /// `callee_is_inlinable`'s doc on how those are found positionally;
+        /// they have no entry here because they are not themselves a callee
+        /// bytecode position, only a substitution point for the caller's own
+        /// argument values). Built once, by inverting the callee's own
+        /// `Function::value_at_pc` during `callee_is_inlinable`, and carried
+        /// here unchanged - `opt_lower.rs`'s `lower_call` copies it verbatim
+        /// into `Proto::inline_map` (`lua_bytecode::instr::InlineMapEntry`)
+        /// rather than re-deriving it.
+        body_pcs: HashMap<ValueId, usize>,
         result: Option<ValueId>,
     },
     /// A bytecode instruction at this `pc` the bounded lifter does not model.
@@ -529,6 +542,7 @@ fn lift_proto_impl(proto: &Proto, inline_calls: bool) -> Function {
                                 target: entry,
                                 param_value_ids: plan.param_value_ids,
                                 body: plan.body,
+                                body_pcs: plan.body_pcs,
                                 result: plan.result,
                             };
                             blocks[b].insts.push((call_id, call_inst.clone()));
@@ -677,6 +691,7 @@ fn lift_proto_impl(proto: &Proto, inline_calls: bool) -> Function {
 struct InlinePlan {
     param_value_ids: Vec<ValueId>,
     body: Vec<(ValueId, Inst)>,
+    body_pcs: HashMap<ValueId, usize>,
     result: Option<ValueId>,
 }
 
@@ -720,7 +735,27 @@ fn callee_is_inlinable(entry: &CallCacheEntry, nargs: u32, nresults: u32, arg_pr
         (Some(Terminator::Return(Some(id))), 1) => Some(*id),
         _ => None,
     };
-    Some(InlinePlan { param_value_ids, body: callee_func.blocks[0].insts.clone(), result })
+    // Work item 7b: invert the callee's own `value_at_pc` (pc -> (id, inst))
+    // once, then keep only the entries `blocks[0]`'s own instruction list
+    // actually contains - this naturally excludes the `nargs` parameter
+    // nil-seeds at the front of `blocks[0].insts` (seeded directly by the
+    // register-0 seeding loop in `lift_proto_impl`, never recorded in
+    // `value_at_pc` - see that loop's own comment), leaving exactly the
+    // callee bytecode positions `body_ok`'s check above already confirmed are
+    // real `Const`/`Binary` instructions.
+    let pc_of_value: HashMap<ValueId, usize> =
+        callee_func.value_at_pc.iter().map(|(pc, (id, _))| (*id, *pc)).collect();
+    let body_pcs: HashMap<ValueId, usize> = callee_func.blocks[0]
+        .insts
+        .iter()
+        .filter_map(|(id, _)| pc_of_value.get(id).map(|pc| (*id, *pc)))
+        .collect();
+    Some(InlinePlan {
+        param_value_ids,
+        body: callee_func.blocks[0].insts.clone(),
+        body_pcs,
+        result,
+    })
 }
 
 /// A conservative, recursive proof lookup over a (possibly still
@@ -1425,6 +1460,55 @@ mod tests {
                 ),
             "every inlined Inst::Call must be immediately preceded by its own ClosureIdentity guard"
         );
+    }
+
+    /// Work item 7b (inline-site bookkeeping): `Inst::Call::body_pcs` must
+    /// attribute the one spliced arithmetic instruction to the callee's own
+    /// real bytecode `pc` - not the caller's call-site `pc`, and not absent -
+    /// while the callee's two parameter nil-seeds (never real callee
+    /// instructions, see `body_pcs`'s own doc) must have no entry at all.
+    #[test]
+    fn body_pcs_attributes_the_spliced_binary_to_the_callees_own_bytecode_pc() {
+        let proto = compile(b"local function add(a, b) return a + b end local r = add(1, 2) return r");
+        let call_pc = warm_call_cache(&proto, 1);
+        let callee = proto.nested[0].clone();
+
+        let func = lift_proto(&proto);
+        let (_, call_inst) = func.value_at_pc.get(&call_pc).expect("call site must be inlined");
+        let Inst::Call { param_value_ids, body, body_pcs, .. } = call_inst else {
+            panic!("expected Inst::Call, got {call_inst:?}");
+        };
+
+        // Independently re-derive the callee's own expected pc by lifting it
+        // directly (never trusting the already-built map under test).
+        let callee_func = lift_proto_impl(&callee, false);
+        let expected_binary_pc = callee
+            .instrs
+            .iter()
+            .position(|i| matches!(i, Instr::Binary(..) | Instr::IntegerBinary(..)))
+            .expect("callee's body is `a + b`, a single Binary instruction");
+        let (expected_binary_id, _) = callee_func
+            .value_at_pc
+            .get(&expected_binary_pc)
+            .expect("the callee's own lift must record that pc");
+
+        assert_eq!(body_pcs.len(), 1, "only the one real Binary instruction should be attributed, not the param seeds");
+        assert_eq!(
+            body_pcs.get(expected_binary_id),
+            Some(&expected_binary_pc),
+            "the spliced Binary's ValueId must map back to the callee's own bytecode pc"
+        );
+        for param_id in param_value_ids {
+            assert!(
+                !body_pcs.contains_key(param_id),
+                "a parameter nil-seed is not a real callee instruction and must have no body_pcs entry"
+            );
+        }
+        // `body_pcs` must only ever reference `ValueId`s `body` itself
+        // contains - no stray/unused entries.
+        for id in body_pcs.keys() {
+            assert!(body.iter().any(|(bid, _)| bid == id), "every body_pcs key must also appear in body");
+        }
     }
 
     #[test]

@@ -72,8 +72,8 @@ mod instr;
 mod tests;
 
 pub use instr::{
-    BoundedCache, CallCacheEntry, Const, FieldCacheEntry, Instr, LocalDebug, NativeStatus, Proto,
-    UpvalSource, IC_SLOTS,
+    BoundedCache, CallCacheEntry, Const, FieldCacheEntry, InlineMapEntry, Instr, LocalDebug,
+    NativeStatus, Proto, UpvalSource, IC_SLOTS,
 };
 
 use func_state::{FuncState, GlobalScanState, LocalOrGlobal};
@@ -340,6 +340,7 @@ impl Compiler {
             promotion_failed: std::cell::Cell::new(false),
             optimization_failed: std::cell::Cell::new(false),
             osr_failed: std::cell::RefCell::new(std::collections::HashSet::new()),
+            inline_map: std::cell::RefCell::new(std::collections::HashMap::new()),
         }))
     }
 

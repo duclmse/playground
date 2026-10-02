@@ -477,6 +477,47 @@ pub struct Proto {
     /// per-header-pc keying. A `Proto` can have some loop headers
     /// permanently OSR-failed while others still succeed independently.
     pub osr_failed: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// U10 work item 7b (inline-site bookkeeping - see
+    /// `docs/features/milestones/u10-optimizing-jit-osr.md`'s item-7b note,
+    /// and don't confuse with the differently-numbered "item 7 note" left by
+    /// an earlier commit that actually completed item 6's real inlining):
+    /// one entry per call-site `pc` that `opt_lower::lower_call` has ever
+    /// spliced inline, recording the (callee `Proto`, callee bytecode `pc`)
+    /// chain `sol_ir::Inst::Call::body_pcs` already carries for that splice.
+    /// Parallel in spirit to `call_cache`/`osr_entries` - a side table on
+    /// `Proto`, populated during compilation, not reconstructed later. See
+    /// `InlineMapEntry`'s own doc for why nothing reads this yet.
+    pub inline_map: std::cell::RefCell<std::collections::HashMap<usize, InlineMapEntry>>,
+}
+
+/// One inlined call site's bookkeeping entry (`Proto::inline_map`'s value
+/// type). `value_pcs` maps a spliced-in `sol_ir::ValueId`'s raw `u32` to the
+/// bytecode `pc` inside `callee` it was lifted from - built once, in
+/// `sol_ir::callee_is_inlinable`, by inverting the callee's own
+/// `sol_ir::Function::value_at_pc` (see `Inst::Call::body_pcs`'s doc), so
+/// every entry here is correct by construction, never independently
+/// re-derived from a native address. A spliced value with no entry here (one
+/// of the callee's own parameter nil-seed `ValueId`s, substituted directly
+/// from the caller's argument registers rather than originating from any
+/// real callee instruction) simply isn't itself a callee bytecode position
+/// to attribute to.
+///
+/// Nothing reads this map yet: it exists so a *future* consumer (the plan's
+/// actual work item 7 - reconstructing inlined frames for errors,
+/// coroutines, profiling, and debug) has the (`Proto`, pc) chain already
+/// available rather than needing to rebuild it. Today's inlining shape
+/// (`sol_ir::callee_is_inlinable`'s doc: constant/integer-arithmetic-only,
+/// single-block, non-branching callee bodies) has no instruction that can
+/// raise a Lua error, yield a coroutine, or be observed by `debug.getinfo`/
+/// any profiler hook from inside the splice - see that milestone note for
+/// the full argument - so there is deliberately no live caller of this map
+/// yet, the same "wiring exercised and correct, no repro constructed yet"
+/// posture work item 4's own OSR note already documented for its `Deopt`
+/// path.
+#[derive(Debug, Clone)]
+pub struct InlineMapEntry {
+    pub callee: Rc<Proto>,
+    pub value_pcs: std::collections::HashMap<u32, usize>,
 }
 
 /// A `Proto`'s current dynamic-JIT (U9/U10) promotion state. Defined in

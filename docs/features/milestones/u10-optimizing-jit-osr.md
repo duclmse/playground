@@ -48,6 +48,9 @@
 - [x] Enter optimized loops with OSR and exit through precise side exits.
       See the item-4 note below.
 - [ ] Reconstruct inlined frames for errors, coroutines, profiling, and debug.
+      **Bookkeeping only - no live caller yet, and today's inlining shape has
+      no real target for the reconstruction itself. See the item-7b note
+      below.**
 - [ ] Bound recompilation with failure counters and widening.
       No real falsifiable `Inst::Guard` exists yet (see the unchecked guard
       bullet above), so there is no tag-guard *widening* to build - widening
@@ -458,5 +461,116 @@ inlined guard-and-splice path with no per-call deopt): 32.98s real vs. 16.73s
 real, both producing the identical correct `160000000` total - roughly a 2x
 wall-clock improvement on a call-dominated loop, from eliminating the
 deopt-to-interpreter round trip on every call once the guard proves stable.
+
+**Item 7b note (inline-site bookkeeping, not frame reconstruction - don't
+confuse with the above "Item 7 note", which despite its own label actually
+completed item 6's real-inlining scope):** the plan
+(`docs/features/unified-sol-runtime-plan.md` is the roadmap; the authoring
+plan document's own "7. Error/coroutine/profiler/debugger frame
+reconstruction through an inlined region" section is the governing spec here)
+asks for reconstructing an interpreter-visible frame chain when an error,
+coroutine yield, or debug/profiler read happens from inside an inlined
+region, and warns up front that this is "the highest-complexity-per-line item
+in the milestone" with "no partial 'ship something, measure, refine'
+version."
+
+Before building that reconstruction, this item checked whether today's
+inlining shape (the Item 7 note above: constant/integer-arithmetic-only,
+single-block, non-branching, no-upvalue callees) has any real instruction
+inside an inlined splice that could actually trigger an error, a yield, or be
+observed by any existing introspection surface. It does not, for three
+independent, structural (not just currently-untested) reasons:
+
+1. **No instruction inside an inlined splice can call anything.**
+   `callee_is_inlinable` (`sol_ir.rs:683`) only accepts an entry block of
+   `Const` and proof-provably-`Integer` `Add`/`Sub`/`Mul` `Binary`
+   instructions - there is categorically no `Instr::Call` in an inlinable
+   callee body, so nothing inside a splice can ever call `error()`,
+   `assert()`, `debug.getinfo()`, or `coroutine.yield()`. This isn't an
+   empirical property of the fixtures tested so far; it's enforced by
+   `callee_is_inlinable`'s own whitelist.
+2. **The lowered arithmetic cannot trap.** `opt_lower.rs`'s `lower_call`
+   splices `Add`/`Sub`/`Mul` as plain Cranelift `iadd`/`isub`/`imul` (not the
+   trapping `*_overflow` forms), matching Lua 5.5's own wrapping
+   two's-complement integer semantics - so even integer overflow inside a
+   spliced binary produces a silent wraparound value, never a trap, never an
+   error.
+3. **`debug.getinfo` has no tier-awareness to begin with.**
+   `NativeFunction::DebugGetinfo` (`lua_runtime/natives_debug.rs`) reads
+   frame info directly from the interpreter's own `self.frames`/`Frame::Lua`/
+   `frame.header.pc` state; it has no notion of native, optimized, or inlined
+   execution at all. U9's own milestone doc already recorded this same
+   finding for its own item 7 ("no `debug.getinfo` (or other) surface was
+   added to read tier info... none of the dynamic runtime's existing
+   introspection exposes tier information today") - rechecked here and still
+   true, and it means there is no existing profiler/debug hook that could
+   even be made to fire mid-splice without first building that hook, which is
+   out of this item's own charter.
+
+Given that, this item built the one thing the plan's own "Inline-site
+bookkeeping" bullet (plan §6) asks for as a prerequisite to the real
+reconstruction, and nothing more: an `InlineMap` recording, for every
+call site a caller has ever spliced inline, the (callee `Proto`, callee
+bytecode pc) chain for each of the callee's own real instructions the splice
+used.
+
+What was built, all new:
+
+- `lua_bytecode::instr::InlineMapEntry` (`lua_bytecode/instr.rs`): `{ callee:
+  Rc<Proto>, value_pcs: HashMap<u32, usize> }` - a caller-side `ValueId`'s raw
+  `u32` to the callee bytecode `pc` it represents. Uses only `Rc<Proto>`/
+  `u32`/`usize`, not `sol_ir::ValueId`, because `lua_bytecode` has no
+  dependency on `sol_ir`/`lua_runtime` (an existing, explicitly documented
+  boundary) and this follows the same "side table directly on `Proto`"
+  pattern as `call_cache`/`osr_entries`/`native_status` rather than inventing
+  a parallel map owned elsewhere.
+- `Proto::inline_map: RefCell<HashMap<usize, InlineMapEntry>>` - one entry per
+  caller bytecode pc that has ever been spliced inline, populated purely
+  during compilation, mirroring `call_cache`'s own lifecycle.
+- `sol_ir::Inst::Call::body_pcs: HashMap<ValueId, usize>` (`sol_ir.rs`) -
+  threaded through the existing `InlinePlan`/`callee_is_inlinable`
+  (`sol_ir.rs:683`), built once by inverting the callee's own already-computed
+  `Function::value_at_pc` and keeping only the entries `blocks[0]`'s real
+  instruction list actually contains - which naturally excludes the callee's
+  own parameter nil-seed `ValueId`s (`lift_proto_impl`'s block-0 seeding never
+  populates `value_at_pc` for those, so inverting it already does the
+  exclusion for free, nothing extra needed). `opt_lower.rs`'s `lower_call`
+  copies this verbatim into the caller's `Proto::inline_map` rather than
+  re-deriving it - the one real call site that creates an `InlineMapEntry`.
+
+Tests: `sol_ir.rs`'s
+`body_pcs_attributes_the_spliced_binary_to_the_callees_own_bytecode_pc`
+independently re-derives the callee's expected bytecode pc (never trusting
+the code under test) and confirms the one real `Binary` instruction in a
+`local function add(a, b) return a + b end` callee is attributed to its own
+pc while both parameter nil-seeds have no entry at all.
+`opt_lower.rs`'s new
+`compiling_an_inlined_call_site_populates_the_callers_inline_map` drives the
+real end-to-end path - `DynJit::optimize` on the same caller/callee shape the
+differential integration fixture `dynjit_inline_call_stable.lua` already
+proves actually inlines (callee taken as the caller's own parameter, never
+defined inline, so the caller's own `Proto` has no `NewClosure` and stays
+`fully_lifted`) - and reads back `Proto::inline_map` afterward, confirming
+both the exact callee `Proto` identity (`Rc::ptr_eq`) and that both of the
+callee's real instructions (`add_one`'s own `1` constant load and its `x + 1`
+binary) are attributed to real callee bytecode positions.
+
+**No live caller of `Proto::inline_map` exists yet, deliberately.** Per the
+reasoning above, there is currently no error, yield, or debug/profiler read
+that can originate from inside today's narrow inlined region, so there is
+nothing honest to wire the map up to - matching item 4's own precedent for
+its `Deopt` snapshot/resume-pc mechanism ("nothing speculative can go
+wrong... so the wiring is exercised and correct... but an actual runtime
+misspeculation triggering it has no constructed repro yet"). Building a
+synthetic error/yield capability inside an inlined region purely to exercise
+this map would be scope creep (table/call/error support) belonging to a much
+later item, not this one. The actual frame-reconstruction logic the plan's
+item 7 describes remains unbuilt; it has no real target until a future item
+widens `callee_is_inlinable`'s shape to admit an instruction that can
+actually error, yield, or be introspected.
+
+Full suite: 130 lib tests (up from 128), every integration suite including
+`lua55_dynamic_runtime_jit.rs` at 19/19, `sol-core`'s 37, and the Lua 5.5
+manifest check, all green, zero new warnings.
 
 See the [historical U10 ledger](../unified-sol-runtime-plan.md#u10--optimizing-ssa-jit-osr-and-deoptimization).
