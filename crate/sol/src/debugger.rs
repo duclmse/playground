@@ -635,6 +635,21 @@ impl DebugSession {
         renderer.expand(ty, reference)
     }
 
+    /// U12 item 6: renders one raw `u64` word (e.g. one of `expand`'s
+    /// returned `(String, Type, u64)` entries) through this session's own
+    /// `ValueRenderer` - the same renderer `locals_at`/`evaluate` already
+    /// build internally. Exposed as its own method because `program` is a
+    /// private field: a caller outside this module (the wasm wrapper in
+    /// `wasm_api.rs`, in particular) has no other way to render an
+    /// `expand()` entry's raw word into a `DisplayValue` without duplicating
+    /// `self.program.structs` access it cannot have.
+    pub fn render(&self, ty: &Type, raw: u64) -> DisplayValue {
+        let renderer = ValueRenderer {
+            structs: &self.program.structs,
+        };
+        renderer.render(ty, raw)
+    }
+
     /// U12 item 4, deliverable 1: evaluates a standalone Sol expression
     /// against the scalar locals recorded at trace index `at` - see this
     /// module's "deliverable 1" section comment above for the full

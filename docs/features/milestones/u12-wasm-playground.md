@@ -913,3 +913,295 @@ established by items 3/4.
 - No wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
   wiring — out of this item's explicit scope, not attempted, same as every
   prior item in this milestone.
+
+## Work item 6 — canonical WASM playground and debugger
+
+**Goal:** take items 1-5's native, non-wasm `DebugSession` spike and give it
+a real product surface: `packages/sol-runtime` (a wasm-bindgen package built
+from `crate/sol`, parallel to `packages/lua-runtime`), a build script
+(`scripts/build-sol-wasm.sh`), new `#[wasm_bindgen]` entry points
+(`crate/sol/src/wasm_api.rs`), and a minimal, default-off wiring point in
+`apps/web` proving the whole chain actually runs in a browser.
+
+**The product surface** (`crate/sol/src/wasm_api.rs:1-595`, below the
+item-2 `run_sol` spike which stays unchanged): a non-throwing
+`execute(source: &str) -> ExecuteResult { result: Option<String>, error:
+Option<String> }`, and `WasmDebugSession` wrapping
+`crate::debugger::DebugSession` with a one-run-per-session convention
+matching the native type. Wire-shape mirror types
+(`WasmValue`, `WasmBreakpoint`, `WasmTraceStep`, `WasmLocalView`,
+`WasmTableEntry`, `WasmEvalResult`, `WasmMemoryStats`, `WasmThreadInfo`,
+`WasmFunctionStats`, `WasmTimelineEvent`, `WasmBurstResult`) each carry
+private fields plus `#[wasm_bindgen(getter)]` accessors, the pattern
+established by the retired `crate/lua-vm/src/session/types.rs`.
+`WasmDebugSession` exposes: `launch`, `run`, `trace_length`/`trace_step`,
+`set_breakpoint`, `first_breakpoint_hit`/`continue_to_breakpoint`,
+`continue_burst`, `step_into`/`step_over`/`step_out`, `locals_at`/`expand`,
+`evaluate`, `memory_stats`/`force_gc`, `threads`, `profile`,
+`record_timeline` — the full item 3-5 feature set, modulo the honest gaps
+below.
+
+**Honest scope, stated in `wasm_api.rs`'s own top-of-file doc comment
+(lines 29-127) and restated here with the file:line evidence behind each
+claim:**
+
+- **Single-file `.sol` source only, no multi-file project loading.**
+  `crate::modules::compile_project`/`Loader` resolve `import`s via real
+  `std::fs::read` + path canonicalization (`modules.rs:4,
+  lua_runtime/mod.rs` pattern). `modules.rs` is not feature- or
+  target-gated, so it already *compiles* for `wasm32-unknown-unknown` —
+  but it would *fail at runtime*: `apps/web`'s worker protocol hands in
+  in-memory `names: string[]`/`contents: string[]` with no backing
+  filesystem, and `wasm32-unknown-unknown`'s `std::fs` backend returns an
+  `Unsupported` `io::Error` for every operation rather than acting as a
+  working no-op. Parameterizing `Loader::load` over an injected
+  `Fn(&Path) -> Result<Vec<u8>, String>` instead of a hardcoded
+  `fs::read` call is a real, bounded follow-up, deliberately not attempted
+  here so this item lands a working single-file slice rather than a
+  half-wired multi-file path.
+- **`.sol` source only, not idiomatic `.lua`.** `compile_bytes` with
+  `parser::SourceMode::Lua` does route through the same `TProgram`/
+  `tier0::Engine` pipeline (`lib.rs::compile_program_with_config`: both
+  profiles share `typeck::check`, just with `allow_dynamic_fallback`
+  flipped) — but verified directly, not assumed: a bare `print("hello")`
+  fails to even typecheck via this path (`"unknown function 'print'
+  [EDYNLUA]"`), because `print`/Lua's standard library are wired up only
+  inside the separate, dynamic `LuaRuntime` (`lua_runtime/init.rs`'s
+  global-table setup), which this path never constructs. So `.lua` source
+  is not hard-rejected, but nothing here is tested or product-ready for it.
+- **No output-buffer/`take_output` equivalent, for either language.**
+  Checked directly: typed `.sol` has no `print`/`io.write`/any builtin that
+  writes anything at all reachable from `.sol` source — confirmed by
+  grepping `"print"` across `typeck.rs`/`codegen.rs` (zero matches: no
+  `print` builtin is wired into the typed language at all). The
+  `#[no_mangle] sol_print_i64`/`sol_print_f64`/`sol_print_bool`/
+  `sol_print_string`/`sol_print_any` functions (`runtime.rs:271-284`,
+  `strings.rs:147-154`, `dynamic.rs:188-202`) do get compiled into the
+  wasm32 build and appear as harmless *exports* in `sol_bg.wasm` (not
+  reachable imports) — but their only call sites in the whole crate are
+  `aot.rs` (jit-feature-gated, excluded from this build) and `main.rs` (the
+  CLI binary, `required-features = ["jit"]`, also excluded) — confirmed by
+  grepping every call site of each symbol. Nothing in `wasm_api.rs`'s own
+  call graph (`crate::debugger`, `crate::types` only — confirmed by its own
+  `use` list) reaches them. A further, previously-undocumented finding
+  worth flagging precisely because it would otherwise look like silent data
+  loss: `sol_print_string` (`strings.rs:151`) calls `std::io::stdout()`,
+  and `wasm32-unknown-unknown`'s std backend treats stdout as an inert
+  no-op sink (writes succeed, bytes go nowhere) rather than erroring — so
+  if a future item ever wires a `print` builtin into typed `.sol`, calling
+  it in the browser would not crash and would not raise `wasm_api.rs`'s own
+  `env` import problem (see below), but would also produce **zero visible
+  output** without further work to redirect it through a `console.log`
+  import. Not a problem today (unreachable), but a trap for whoever adds
+  that builtin later if this note is skipped.
+- **No globals/upvalues/metatables, no `set_variable`, no breakpoint
+  conditions/hit-conditions/log-messages/removal** — items 3/4's own
+  findings restated here because this file is the first place those gaps
+  become *missing wasm methods* rather than prose. Conditions in
+  particular look implementable without a live interpreter (a predicate
+  evaluated via `DebugSession::evaluate` at each candidate trace index —
+  the whole trace already exists), but doing it honestly means extending
+  `debugger.rs`'s `breakpoints` storage and its
+  `continue_to_breakpoint`/`first_breakpoint_hit` matching logic with its
+  own differential tests — a real, bounded follow-up left for later.
+- **`continue_burst` is implemented, honestly bounded.** Unlike the gaps
+  above, this one needs no `debugger.rs` change at all:
+  `tier0::DEFAULT_INSTRUCTION_BUDGET` (10,000,000, unconditionally enforced
+  inside `interp::Runtime::interpret`'s dispatch loop since item 2) already
+  makes `DebugSession::run` incapable of hanging forever. `continue_burst`
+  pages through chunks of that already-complete, already-bounded trace —
+  not truly incremental execution, stated in its own doc comment
+  (`wasm_api.rs`'s `WasmDebugSession::continue_burst`) as well as here.
+
+**A real, previously-undetected defect found and fixed in the course of
+this item: the `lua_runtime`/`c_api` wasm32 `env` import leak.**
+`cargo check --no-default-features --features wasm --target
+wasm32-unknown-unknown` was already clean *before* this item started (item
+1's baseline) — but `cargo check` never performs the final link step, so
+it cannot detect an unresolved-extern-symbol problem. Actually building
+`packages/sol-runtime/pkg` via `scripts/build-sol-wasm.sh` and inspecting
+the real output revealed one: `lua_runtime::c_api` (`crate/sol/src/
+lua_runtime/c_api.rs`) implements a real embeddable Lua C API
+(`luaL_newstate`, `lua_pushfstring`, etc.) as `#[no_mangle] pub extern "C"
+fn`s, which Rust never dead-code-eliminates (`#[no_mangle]` makes a symbol
+externally reachable by definition, regardless of whether anything in the
+crate calls it). Those functions reference `sol_c_api_shim_anchor`
+(`c_api.rs:727-728,746,759`, resolved only by `build.rs`'s **host**-only C
+compile of `c_api_shim.c` via raw `Command::new("cc")` — not the `cc`
+crate, so it ignores Cargo's `TARGET` and always compiles for the host
+architecture) and `lua_runtime/c_api/auxlib.rs:561-575`'s raw
+`extern "C" { fn malloc/free/realloc }` declarations (meant to resolve
+against a real host libc). `wasm32-unknown-unknown` has no implicit libc
+and no native shim, so these stayed unresolved, surfacing as required
+`env.*` imports on the compiled `.wasm` — confirmed via `strings -a
+sol_bg.wasm | grep -iE "malloc|free|realloc|sol_c_api_shim_anchor"`
+(all four present) and via `sol.js` containing
+`import * as __wbg_star0 from 'env';`, an unsatisfiable bare module
+specifier in a browser (there is no real `env` module to import from).
+
+**Fix:** `crate/sol/src/lib.rs:31-65` gates `pub mod lua_runtime;` behind
+`#[cfg(not(target_arch = "wasm32"))]` — a target-arch gate, not a new
+Cargo feature, chosen specifically because a feature-based approach risks
+the mandatory `--no-default-features` native baseline: `--no-default-features`
+disables every feature in `default`, so a new feature meant to be "on
+under `--no-default-features` but off for wasm32" cannot be expressed as a
+feature at all without a non-feature condition backing it — `target_arch`
+affects only wasm32 builds and leaves every native invocation, regardless
+of feature flags, untouched. `lua_runtime` (the dynamic `.lua` interpreter
+this gates) is not reachable at all from `wasm_api.rs`'s own entry points
+regardless of this fix (see the `.lua`-source finding above), so excluding
+it from the wasm32 build loses nothing this item claims to support.
+Verified empirically, not just by re-running `cargo check`: after the fix,
+rebuilding `packages/sol-runtime/pkg` and re-running the same `strings`/
+`sol.js`-grep checks found zero matches for
+`malloc`/`free`/`realloc`/`sol_c_api_shim_anchor`, zero `import` statements
+of any kind in `sol.js`, and the release `sol_bg.wasm` shrank from 1.7 MB
+to 726.8 KB (`lua_runtime` actually leaving the binary, not just becoming
+unreachable dead code the linker still happened to keep).
+
+**Capabilities audit** (zero ambient I/O reachable from `execute()`/
+`WasmDebugSession`, confirmed by grep across the whole crate, not assumed
+from the module list): `wasm_api.rs` only imports `crate::debugger` and
+`crate::types`; `debugger.rs` only imports `crate::gc`, `crate::interp::
+Hooks`, `crate::tier0`, `crate::types`. None of the modules actually on
+that call graph (`lexer.rs`, `parser.rs`, `ast.rs`, `typeck.rs`,
+`verify.rs`, `optimize.rs`, `escape.rs`, `aliases.rs`, `closures.rs`,
+`bytecode.rs`, `bccompile.rs`, `interp.rs`, `tier0.rs`, `gc.rs`,
+`debugger.rs`, `types.rs`, `value.rs`, `strings.rs`, `numeric.rs`) contain
+any `std::fs`/`std::net`/`std::process::{exit,Command}` usage at all,
+confirmed by a crate-wide grep for each. What the grep *did* turn up,
+and why each is harmless or already excluded:
+- `aot.rs`, `tier.rs`, `jit.rs`, `codegen.rs`, `main.rs` — all
+  `#[cfg(feature = "jit")]`-gated at their `lib.rs` module declaration (or,
+  for `main.rs`, a separate `[[bin]]` with `required-features = ["jit"]`),
+  so none of them compile at all under this item's `--no-default-features
+  --features wasm` build. (Their own `std::fs`/`std::env`/`std::process`
+  usage — AOT object-file writes, profile-file I/O, `SOL_*` tuning env
+  vars — is real but entirely absent from this build.)
+- `lua_runtime/*` — now excluded from any wasm32 build in full (the fix
+  above), so its own `std::fs` (module loading, `io.open`/`io.lines`),
+  `std::process::exit`/`std::process::id` (`os.exit`/`os.tmpname`), and
+  `std::io::stdout/stdin/stderr` (`print`/`io.write`/`io.read`) are not
+  merely unreachable from `wasm_api.rs` — they are not compiled in at all
+  for that target.
+- `dynamic.rs`/`interp.rs`/`runtime.rs`'s `std::process::abort()` calls —
+  intentional traps on an internal invariant violation (an impossible
+  type-tag value, a GC allocation-size overflow), the same category
+  `debugger.rs:684`'s own doc comment already documents as "calls `trap()`"
+  for the zero-instruction-budget case — equivalent to a wasm
+  `unreachable` trap that halts the module, not ambient OS process
+  control.
+- `gc.rs:733-737`'s `std::env::var_os("SOL_GC_DEBUG")` — a read-only
+  diagnostic toggle; a browser has no process environment, so this always
+  reads `None` and silently falls back to default (non-debug) behavior.
+- `runtime.rs:271-284`/`strings.rs:147-154`/`dynamic.rs:188-202`'s
+  `sol_print_*` functions — covered above (compiled in as harmless unused
+  exports, unreachable from `.sol` source, and, for the one that touches
+  `std::io`, a no-op on this target even if it were somehow reached).
+
+**`packages/sol-runtime`** (`packages/sol-runtime/package.json`,
+`scripts/build-sol-wasm.sh`): parallel to `packages/lua-runtime`'s
+pre-wasm-pack shape — a raw `cargo build --release --no-default-features
+--features wasm --target wasm32-unknown-unknown` against
+`crate/sol/Cargo.toml`, then the standalone `wasm-bindgen` CLI
+(`--target web`) into `packages/sol-runtime/pkg`. npm name
+`@lua-playground/sol-runtime`, matching `@lua-playground/runtime`'s naming
+convention.
+
+**`apps/web` wiring — a single, default-off import-site switch**
+(`apps/web/src/lua-worker.ts`): added one static import
+(`import initSol, { execute as executeSol } from
+"@lua-playground/sol-runtime"`) and one module-level constant,
+`SOL_ENGINE_ENABLED = import.meta.env.VITE_SOL_ENGINE === "1"`, read once.
+Default (the env var unset) leaves every existing message handler,
+including every other branch of the `"run"` case, completely unchanged.
+When the flag is on *and* the worker's `"run"` message carries exactly one
+file whose name ends in `.sol`, that one case is answered by `executeSol`
+instead of `execute_project`, converting `ExecuteResult` into the same
+`WorkerEvent` shape the existing path already produces. Every other
+combination (multiple files, a `.lua`/other entry, or the flag off) falls
+through to the pre-existing `@lua-playground/runtime` path, byte-for-byte
+unchanged — this is intentionally the one worker message with a direct,
+honest equivalent on the new engine's surface (`execute()`'s own doc
+comment: "matching `crate/lua-vm`'s own `execute()` calling convention so
+`apps/web`'s existing `"run"` worker-message handler can be adapted to
+call this with a minimal diff").
+
+One caveat worth stating plainly: because the new import is static (not a
+dynamic `import()`), `sol_bg.wasm` (~744 KB raw, ~233 KB gzipped) is now
+bundled as a binary asset in every build's `dist/assets/`, regardless of
+the flag — it is only ever actually *fetched over the network* by a real
+browser when `init()`/`initSol()` runs, which only happens when the flag
+is on, but it does add to the built artifact's on-disk footprint
+unconditionally. Scoped as acceptable for this item (a working, provably
+real wiring point) rather than invested in code-splitting the worker
+bundle, which is a separate, pre-existing concern this app already flags
+in its own build output ("Some chunks are larger than 500 kB...").
+
+**Verified outcomes:**
+- `cargo test --manifest-path crate/sol/Cargo.toml` (default features,
+  `jit` only) — 546 passed, 0 failed, across 25 test binaries. Identical
+  total to item 5's baseline: `wasm_api.rs` is behind `#[cfg(feature =
+  "wasm")]`, not part of this build at all.
+- `cargo test --manifest-path crate/sol/Cargo.toml --no-default-features`
+  — 539 passed, 0 failed, across 24 test binaries. Identical total to item
+  5's baseline, and specifically re-run *after* the `lib.rs` `lua_runtime`
+  wasm32-gating fix to confirm that a target-arch gate (as opposed to a
+  feature gate) cannot regress a native, non-wasm32 build under any
+  feature combination — confirmed.
+- `cargo test --manifest-path crate/sol/Cargo.toml --no-default-features
+  --features wasm` (native, exercising the new surface's own tests) — 546
+  passed, 0 failed, across 24 test binaries: 137 unit tests (130 existing
+  + 7 new in `wasm_api.rs`'s own `#[cfg(test)]` module, exercisable
+  natively because `#[wasm_bindgen]` compiles as plain Rust off
+  `wasm32`), the remainder identical to the `--no-default-features`
+  baseline above.
+- `cargo check --manifest-path crate/sol/Cargo.toml --no-default-features
+  --features wasm --target wasm32-unknown-unknown` (the lib target,
+  the item's actual required baseline) — clean.
+- The same check with `--tests` added fails — expected and not a defect:
+  the native-only integration tests `tests/lua55_dynamic_runtime_*.rs`
+  reference `sol::lua_runtime` directly (that is what they test), and
+  `lua_runtime` is correctly excluded from wasm32 by this item's own fix.
+  Those tests were never meant to target wasm32 and are not part of this
+  item's required baseline; the native `cargo test` runs above already
+  compile and pass them.
+- `bash scripts/build-sol-wasm.sh` — succeeds, producing
+  `packages/sol-runtime/pkg/{sol.js, sol.d.ts, sol_bg.wasm (726.8 KB),
+  sol_bg.wasm.d.ts}`. Re-inspected post-fix per the "fix" paragraph above:
+  no `env` import, no `malloc`/`free`/`realloc`/`sol_c_api_shim_anchor`
+  symbols, zero `import` statements of any kind in `sol.js`.
+- `npm run build --workspace=apps/web` — passes both with the flag at its
+  default (unset/off) position and with `VITE_SOL_ENGINE=1` set; `tsc -b`
+  (part of that script) reports no type errors from the new code in
+  either position.
+- **Real-browser verification**, not merely a build check: served the
+  `VITE_SOL_ENGINE=1` production build via `vite preview`, launched a
+  headless Chromium (Playwright, already a devDependency) against it, and
+  instantiated the real built worker chunk
+  (`dist/assets/lua-worker-*.js`) directly, posting the exact `"run"`
+  worker message `apps/web`'s UI itself sends. Two cases, both against the
+  actual shipped bundle, not a mock: `function main(): i64 return 40 + 2
+  end` → `{"output":"42","error":null}` (the success path, genuinely
+  executed inside the browser's own wasm instance); a deliberately
+  ill-typed program → `{"output":"","error":"line 2: expected type i64,
+  found f64 [ETYPE001]","errorSource":"main.sol"}` (the error path,
+  correctly surfaced through to the worker's `"result"` event rather than
+  throwing an uncaught exception). Confirms genuine end-to-end
+  reachability: wasm32 build → `wasm-bindgen` glue → bundled worker →
+  real browser execution.
+- `scripts/test-lua55-manifest.sh` — passes (`Lua 5.5 manifest regression
+  checks passed`), unaffected.
+
+**Explicitly not done here** (beyond the honest-scope list above):
+- No code-splitting/dynamic `import()` for `@lua-playground/sol-runtime`
+  in `apps/web` — the static-import bundle-size caveat above is accepted,
+  not solved, in this item.
+- No UI affordance to toggle `VITE_SOL_ENGINE` at runtime — it is a
+  build-time env var today, set before `npm run build`/`npm run dev`, not
+  a user-facing switch; adding one is a separate, small follow-up once the
+  underlying engine gap list above is smaller.
+- No multi-file `.sol` project support, no idiomatic `.lua` support, no
+  output buffer, no globals/upvalues/metatables/`set_variable`, no
+  breakpoint conditions/hit-conditions/log-messages/removal — see the
+  honest-scope list above for each; none were invented as disguised stubs.

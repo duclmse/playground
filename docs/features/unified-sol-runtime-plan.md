@@ -2890,8 +2890,11 @@ Deliverables:
 
 Exit gate: existing web end-to-end debugger scenarios pass on the canonical
 runtime; native/WASM portable-profile fixtures agree; the production worker no
-longer imports `@lua-playground/runtime`. **Not yet reached** - only the item-1
-boundary spike below has landed.
+longer imports `@lua-playground/runtime`. **Not yet reached** - items 1-6
+below have landed a working, narrowly-scoped single-file `.sol`
+execute/debug surface reachable from a real browser behind a default-off
+flag; multi-file projects, `.lua` support, the remaining debugger parity
+gaps, and the actual flag-default flip/Piccolo removal are not yet done.
 
 Item 1 (2026-10-02): `crate/sol` wasm32 boundary spike - the blocking item
 every other U12 item depends on. Found `interp.rs` already fully decoupled
@@ -3104,6 +3107,54 @@ explicitly: real per-thread/coroutine stack scoping (no applicable target in
 this spike, per the finding above); no wall-clock timing (instruction counts
 only, matching this codebase's existing `MAX_INSTRUCTIONS` convention); no
 wasm-bindgen/browser/worker wiring (explicitly out of scope for this item).
+
+Item 6 (2026-10-02): the real `packages/sol-runtime` product surface,
+closing items 1-5's native spike out to an actual browser. Added
+`#[wasm_bindgen]` bindings in `crate/sol/src/wasm_api.rs` (a non-throwing
+`execute()` plus `WasmDebugSession` wrapping `debugger::DebugSession` with
+the full item 3-5 feature set - breakpoints without conditions, stepping,
+locals/table expansion, frame-scoped eval, memory stats, the constant
+one-thread report, profiling, timeline), a build script
+(`scripts/build-sol-wasm.sh`) producing `packages/sol-runtime/pkg`, and a
+single default-off import-site switch in `apps/web/src/lua-worker.ts`
+(`VITE_SOL_ENGINE=1`) routing the worker's single-file-`.sol` `"run"` case
+through the new engine - every other case, and the flag's default (unset)
+position, stay byte-for-byte unchanged. In the course of actually building
+the wasm package (not just `cargo check`-ing it), found and fixed the real
+defect item 2 had flagged but deferred: `lua_runtime::c_api`'s
+`#[no_mangle]` Lua C-API shim functions reference a host-only linker anchor
+and raw `malloc`/`free`/`realloc` externs that stay unresolved on
+`wasm32-unknown-unknown`, surfacing as an unsatisfiable `import * as
+__wbg_star0 from 'env'` in the generated JS - invisible to `cargo check`
+since type-checking never performs the final link step. Fixed by gating
+`pub mod lua_runtime;` behind `#[cfg(not(target_arch = "wasm32"))]` in
+`lib.rs` (a target-arch gate rather than a new Cargo feature, so the
+mandatory `--no-default-features` native baseline can't be affected by it);
+confirmed empirically afterward (not just re-running `cargo check`) that
+the rebuilt `sol_bg.wasm` has zero such symbols and `sol.js` has zero
+`import` statements at all. `cargo test` stays at 546/0 (default features)
+and 539/0 (`--no-default-features`), both re-confirmed after the fix; the
+new surface's own native tests (`--no-default-features --features wasm`)
+add 7 passing unit tests for 546/0 total; the wasm32 `cargo check` (lib
+target, the item's actual required baseline) stays clean;
+`scripts/test-lua55-manifest.sh` stays clean. `npm run build
+--workspace=apps/web` passes with the flag in both positions, and a
+headless-Chromium (Playwright) smoke test against the real shipped
+production worker bundle confirmed genuine browser execution end to end,
+both a success case and a type-error case. See
+`docs/features/milestones/u12-wasm-playground.md`'s "Work item 6" section
+for full file:line detail, the complete capabilities audit, and the
+complete not-done list. Not done, stated explicitly: multi-file `.sol`
+project loading (`std::fs` has no browser-compatible backing today - a
+real, bounded follow-up, not attempted); idiomatic `.lua` support (no
+stdlib wired into this engine at all); an output buffer (no `print`
+builtin exists in typed `.sol` to begin with); globals/upvalues/
+metatables/`set_variable`; breakpoint conditions/hit-conditions/
+log-messages/removal; code-splitting the new wasm asset out of the
+worker's static bundle; a user-facing UI toggle for the engine switch
+(build-time env var only, for now); old/new browser differentials and
+removing the Piccolo production dependency (the flag exists but is
+default-off and narrow-scoped, not yet a basis for that cutover).
 
 ### U13 — Semantic LSP and first-party VS Code client
 

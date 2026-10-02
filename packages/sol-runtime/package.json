@@ -1,0 +1,10 @@
+{
+  "name": "@lua-playground/sol-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "pkg/sol.js",
+  "module": "pkg/sol.js",
+  "types": "pkg/sol.d.ts",
+  "files": ["pkg"]
+}

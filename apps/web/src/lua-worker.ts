@@ -1,15 +1,26 @@
 /// <reference lib="webworker" />
 import init, { execute_project, DebugSession, profile_project, record_timeline_project } from "@lua-playground/runtime";
+import initSol, { execute as executeSol } from "@lua-playground/sol-runtime";
 import type { DebugRequest, WorkerEvent } from "./debug-protocol";
 
 export type { WorkerEvent } from "./debug-protocol";
+
+// U12 item 6: opt-in-only switch to the new canonical `crate/sol` wasm
+// engine (`packages/sol-runtime`, built by `scripts/build-sol-wasm.sh`) for
+// the single-file-`.sol` "run" case only - this is the only existing worker
+// message with a direct honest equivalent on that engine's wasm surface (see
+// `crate/sol/src/wasm_api.rs`'s top doc comment: no multi-file project
+// loading, no debug-session protocol parity with `DebugSession` below).
+// Default is OFF (unset env var): every existing behavior, including every
+// other message type, is completely unchanged. Flip with `VITE_SOL_ENGINE=1`.
+const SOL_ENGINE_ENABLED = import.meta.env.VITE_SOL_ENGINE === "1";
 
 let ready: Promise<unknown> | null = null;
 let session: DebugSession | null = null;
 
 async function ensureReady() {
   if (!ready) {
-    ready = init();
+    ready = SOL_ENGINE_ENABLED ? Promise.all([init(), initSol()]) : init();
   }
   await ready;
 }
@@ -34,6 +45,21 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       case "run": {
         const names = Object.keys(message.files);
         const contents = names.map((name) => message.files[name]);
+        if (SOL_ENGINE_ENABLED && names.length === 1 && names[0].endsWith(".sol")) {
+          // Narrow, explicit path: single `.sol` file only (see this file's
+          // top doc comment on `SOL_ENGINE_ENABLED`). Anything outside that
+          // (multiple files, or a `.lua`/other entry) falls through to the
+          // existing `@lua-playground/runtime` path below unchanged.
+          const solResult = executeSol(contents[0]);
+          post({
+            type: "result",
+            output: solResult.result ?? "",
+            error: solResult.error ?? null,
+            errorSource: solResult.error ? names[0] : null,
+            errorLine: null,
+          });
+          return;
+        }
         const result = execute_project(names, contents, message.entry);
         post({
           type: "result",

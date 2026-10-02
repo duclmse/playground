@@ -7,6 +7,9 @@ target/
 # Generated wasm-bindgen output (regenerate with `npm run build:wasm`)
 packages/lua-runtime/pkg/
 
+# Generated wasm-bindgen output (regenerate with `scripts/build-sol-wasm.sh`)
+packages/sol-runtime/pkg/
+
 # App build output
 dist/
 
