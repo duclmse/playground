@@ -5,12 +5,14 @@
 // and its own `sol` CLI binary (main.rs).
 
 pub mod aliases;
+#[cfg(feature = "jit")]
 pub mod aot;
 pub mod ast;
 pub mod bccompile;
 pub mod binder;
 pub mod bytecode;
 pub mod closures;
+#[cfg(feature = "jit")]
 pub mod codegen;
 pub mod debug;
 pub mod diagnostic;
@@ -18,6 +20,7 @@ pub mod dynamic;
 pub mod escape;
 pub mod gc;
 pub mod interp;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod lexer;
 pub mod lua_bridge;
@@ -33,6 +36,7 @@ pub mod profile;
 pub mod runtime;
 pub mod sol_ir;
 pub mod strings;
+#[cfg(feature = "jit")]
 pub mod tier;
 pub mod typeck;
 pub mod types;

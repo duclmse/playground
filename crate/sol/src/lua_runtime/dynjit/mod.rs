@@ -24,14 +24,20 @@
 //! interpreted forever - the same graceful-fallback shape as an individual
 //! `Proto` failing to compile (see `NativeStatus::Interpreted`'s doc below).
 
+#[cfg(feature = "jit")]
 mod abi;
+#[cfg(feature = "jit")]
 mod lower;
+#[cfg(feature = "jit")]
 mod opt_lower;
+#[cfg(feature = "jit")]
 mod stubs;
 
 use std::rc::Rc;
 
+#[cfg(feature = "jit")]
 use cranelift_frontend::FunctionBuilderContext;
+#[cfg(feature = "jit")]
 use cranelift_jit::{JITBuilder, JITModule};
 
 use crate::lua_bytecode::Proto;
@@ -40,13 +46,23 @@ use super::LuaRuntime;
 
 // `NativeStatus` is defined on the `lua_bytecode` side (it lives directly as
 // a field on `Proto`, and `lua_bytecode` has no dependency on
-// `lua_runtime`); re-exported here so callers can write
-// `dynjit::NativeStatus` without reaching across module boundaries.
+// `lua_runtime`); re-exported here so the `jit`-gated `impl LuaRuntime`
+// block below can write bare `NativeStatus::...` instead of reaching across
+// module boundaries. `dispatch.rs` imports the same type straight from
+// `crate::lua_bytecode` itself, so this re-export has no non-`jit` reader -
+// without the `jit` feature, `Proto::native_status` simply never leaves
+// `NativeStatus::Interpreted` (see the non-`jit` `DynJitState`/
+// `try_promote`/`try_optimize`/`try_osr` below), and nothing in this module
+// pattern-matches on it.
+#[cfg(feature = "jit")]
 pub use crate::lua_bytecode::NativeStatus;
 
 // `abi::NativeFn` is `LuaRuntime::run_native`'s (`lua_runtime/dispatch.rs`)
 // only reader outside this module; re-exported here for the same reason as
-// `NativeStatus` above.
+// `NativeStatus` above. Only meaningful when `run_native` can actually be
+// reached, i.e. when native code exists to run - see `run_native`'s own
+// `#[cfg(feature = "jit")]` twin in dispatch.rs.
+#[cfg(feature = "jit")]
 pub(super) use abi::NativeFn;
 
 /// Reads `SOL_LUA_PROMOTE_THRESHOLD` (distinct from the typed tier's own
@@ -69,6 +85,7 @@ pub fn promote_threshold() -> u32 {
     })
 }
 
+#[cfg_attr(not(feature = "jit"), allow(dead_code))]
 fn jit_log_enabled() -> bool {
     std::env::var_os("SOL_LUA_JIT_LOG").is_some()
 }
@@ -132,6 +149,7 @@ pub fn osr_threshold() -> u32 {
     })
 }
 
+#[cfg(feature = "jit")]
 pub struct DynJit {
     /// U9 item 7 (code-cache lifecycle, "confirm don't newly build"): a
     /// `Proto`'s native code, once `promote`d into this `module`, is never
@@ -163,6 +181,7 @@ pub struct DynJit {
     jit_log: bool,
 }
 
+#[cfg(feature = "jit")]
 impl DynJit {
     /// Builds the module and registers every stub symbol it can ever call
     /// (`stubs::register`) up front, mirroring `crate::jit::Jit::new`'s own
@@ -346,6 +365,7 @@ impl DynJit {
 /// construction is deferred until the first `Proto` actually earns it (see
 /// this module's own doc comment) rather than built eagerly in the
 /// infallible `LuaRuntime::with_budgets` constructor.
+#[cfg(feature = "jit")]
 pub(super) enum DynJitState {
     /// No promotion attempted yet this runtime's lifetime.
     Uninit,
@@ -359,6 +379,35 @@ pub(super) enum DynJitState {
     Unavailable,
 }
 
+/// Without the `jit` feature there is no `DynJit` to ever become `Ready` -
+/// this build target (e.g. wasm32-unknown-unknown, see
+/// docs/features/milestones/u12-wasm-playground.md) cannot JIT native code
+/// at all, so every `Proto` stays interpreted permanently, the same
+/// graceful-fallback end state `DynJitState::Unavailable` already models
+/// for a runtime-detected failure (e.g. no executable-memory permission)
+/// above - this is that same state, just known at compile time instead of
+/// after a failed `DynJit::new()` call.
+#[cfg(not(feature = "jit"))]
+pub(super) enum DynJitState {
+    Unavailable,
+}
+
+/// `LuaRuntime::with_budgets`'s initial `dynjit` field value - a free
+/// function (rather than each `DynJitState` variant construction inline at
+/// the call site in `init.rs`) so that site stays identical across both
+/// `cfg`s despite the two configs' enums not sharing a variant name for
+/// their starting state.
+#[cfg(feature = "jit")]
+pub(super) fn initial_state() -> DynJitState {
+    DynJitState::Uninit
+}
+
+#[cfg(not(feature = "jit"))]
+pub(super) fn initial_state() -> DynJitState {
+    DynJitState::Unavailable
+}
+
+#[cfg(feature = "jit")]
 impl LuaRuntime {
     /// Called from `new_lua_frame` once `proto.call_count` has just crossed
     /// `promote_threshold()`. Lazily builds this runtime's `DynJit` on first
@@ -541,6 +590,25 @@ impl LuaRuntime {
             }
             Err(_) => None,
         }
+    }
+}
+
+/// Without the `jit` feature, promotion/optimization/OSR can never succeed
+/// (there is no `DynJit` to compile anything) - every `Proto` simply stays
+/// `NativeStatus::Interpreted` forever, mirroring the `DynJitState::Unavailable`
+/// runtime-failure path above, just decided at compile time.
+#[cfg(not(feature = "jit"))]
+impl LuaRuntime {
+    pub(super) fn try_promote(&mut self, _proto: &Rc<Proto>, _function: sol_core::FunctionId) -> bool {
+        false
+    }
+
+    pub(super) fn try_optimize(&mut self, _proto: &Rc<Proto>, _function: sol_core::FunctionId) -> bool {
+        false
+    }
+
+    pub(super) fn try_osr(&mut self, _proto: &Rc<Proto>, _header_pc: usize) -> Option<*const u8> {
+        None
     }
 }
 

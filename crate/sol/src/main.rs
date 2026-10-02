@@ -692,7 +692,7 @@ fn try_run_mixed_main(
     let called_dynamic: HashSet<String> = partition
         .mixed
         .iter()
-        .flat_map(sol::jit::called_functions)
+        .flat_map(sol::typeck::called_functions)
         .filter(|name| partition.interpreted.contains(name))
         .collect();
     let mut dynamic_signatures = HashMap::new();
@@ -743,7 +743,7 @@ fn try_run_mixed_main(
     }
     if typed_functions
         .iter()
-        .flat_map(|function| sol::jit::called_functions(function))
+        .flat_map(|function| sol::typeck::called_functions(function))
         .any(|name| !function_ids.contains_key(&name))
     {
         return Ok(false);

@@ -78,7 +78,7 @@ impl LuaRuntime {
             hook_interrupted_locals: None,
             hook_transfer: None,
             hook_event_callee: None,
-            dynjit: dynjit::DynJitState::Uninit,
+            dynjit: dynjit::initial_state(),
             pending_error_stack: None,
             prototype_ids: HashMap::new(),
             chunk_sources: HashMap::new(),

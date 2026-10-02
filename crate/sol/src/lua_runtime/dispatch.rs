@@ -1141,6 +1141,7 @@ impl LuaRuntime {
     /// call protocol to resume mid-function from) and that no debug hook
     /// could fire (native code cannot check `active_hook`/C instruction
     /// hooks per-instruction the way the interpreter does).
+    #[cfg(feature = "jit")]
     fn run_native(&mut self, frame: &mut LuaFrame) -> LuaResult<StepResult> {
         let ptr = match frame.proto.native_status.get() {
             NativeStatus::Native(ptr) | NativeStatus::Optimized(ptr) => ptr,
@@ -1197,6 +1198,15 @@ impl LuaRuntime {
             frame.header.pc = out_pc as u32;
             self.dispatch_step(frame, None)
         }
+    }
+
+    /// Without the `jit` feature, `frame.proto.native_status` can never be
+    /// `Native`/`Optimized` (see `dynjit`'s non-`jit` `try_promote`/
+    /// `try_optimize` stubs) - this guard's only caller (`drive_result`)
+    /// never takes the `use_native` branch, so this never actually runs.
+    #[cfg(not(feature = "jit"))]
+    fn run_native(&mut self, _frame: &mut LuaFrame) -> LuaResult<StepResult> {
+        unreachable!("native_status never leaves Interpreted without the `jit` feature")
     }
 
     /// Drives `LuaRuntime::frames` from its current top down to (but not

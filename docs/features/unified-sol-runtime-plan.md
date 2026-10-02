@@ -2890,7 +2890,33 @@ Deliverables:
 
 Exit gate: existing web end-to-end debugger scenarios pass on the canonical
 runtime; native/WASM portable-profile fixtures agree; the production worker no
-longer imports `@lua-playground/runtime`.
+longer imports `@lua-playground/runtime`. **Not yet reached** - only the item-1
+boundary spike below has landed.
+
+Item 1 (2026-10-02): `crate/sol` wasm32 boundary spike - the blocking item
+every other U12 item depends on. Found `interp.rs` already fully decoupled
+from JIT-tier types (opaque `*const u8` native pointers, promotion via an
+injected closure), so chose feature-gating `crate/sol` in place (a new `jit`
+Cargo feature, default-on, covering the six `cranelift-*` deps and
+`aot`/`codegen`/`jit`/`tier`) over physically extracting a new crate, since the
+actual coupling surface was shallow. Beyond the typed tier, found one
+real load-bearing Tier-0 coupling the initial grep sweep missed -
+`lua_runtime/dynjit`, U9's baseline JIT for the *dynamic* `.lua` tier,
+unconditionally held as a `LuaRuntime` field - cfg-split into a real and a
+permanently-`Unavailable` stub implementation, mirroring that module's own
+pre-existing runtime-failure fallback shape. Also found and fixed one
+genuine architecture-level (not JIT-related) blocker: `gc.rs`'s module-level
+64-bit-`usize` assert was broader than its own stated rationale
+(`flush_callee_saved_registers`'s aarch64/x86_64 scope, which already has a
+portable zero-register fallback for every other architecture); narrowed it to
+match. `cargo check --manifest-path crate/sol/Cargo.toml --no-default-features
+--target wasm32-unknown-unknown` is now clean (zero errors, zero warnings);
+the native default build and full `cargo test --manifest-path
+crate/sol/Cargo.toml` suite plus `scripts/test-lua55-manifest.sh` are
+unaffected. See `docs/features/milestones/u12-wasm-playground.md`'s own
+"Work item 1" section for full file:line detail. Not done: no `sol-wasm`
+crate, no wasm-bindgen bindings, no execution-parity harness - the Tier-0
+module set has only been proven to *compile* for wasm32, never run there.
 
 ### U13 — Semantic LSP and first-party VS Code client
 

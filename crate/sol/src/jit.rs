@@ -373,7 +373,7 @@ impl Jit {
             // inlinable callees here left their `FuncId` declared but never
             // defined, so `finalize_definitions` failed to resolve the
             // fallback call's target symbol.
-            for callee in called_functions(&f) {
+            for callee in crate::typeck::called_functions(&f) {
                 if !self.compiled.contains(&callee) {
                     worklist.push(callee);
                 }
@@ -552,124 +552,6 @@ impl Jit {
         deps.retain(|(n, _)| n != name);
         Ok((ptr, deps))
     }
-}
-
-/// Every distinct function name `f` calls, direct or nested - the
-/// dependency set `promote`'s worklist walk needs.
-pub fn called_functions(f: &TFunction) -> HashSet<String> {
-    fn walk_expr(e: &TExpr, out: &mut HashSet<String>) {
-        match &e.kind {
-            TExprKind::Call(name, args) => {
-                out.insert(name.clone());
-                args.iter().for_each(|a| walk_expr(a, out));
-            }
-            TExprKind::FunctionRef(name) => {
-                out.insert(name.clone());
-            }
-            TExprKind::CallIndirect { callee, args } => {
-                walk_expr(callee, out);
-                args.iter().for_each(|a| walk_expr(a, out));
-            }
-            TExprKind::Truth(e)
-            | TExprKind::Neg(e)
-            | TExprKind::Not(e)
-            | TExprKind::IntToFloat(e)
-            | TExprKind::Len(e) => walk_expr(e, out),
-            TExprKind::Arith(_, l, r)
-            | TExprKind::Compare(_, l, r)
-            | TExprKind::Logical(_, l, r)
-            | TExprKind::Index(l, r) => {
-                walk_expr(l, out);
-                walk_expr(r, out);
-            }
-            TExprKind::NewArray { len, .. } => walk_expr(len, out),
-            TExprKind::ArrayLiteral { values, .. } => {
-                values.iter().for_each(|value| walk_expr(value, out))
-            }
-            TExprKind::ArrayMap { array, callback, .. } => {
-                walk_expr(array, out);
-                walk_expr(callback, out);
-            }
-            TExprKind::NewMap { .. } => {}
-            TExprKind::MapLiteral { entries, .. } => {
-                for (key, value) in entries {
-                    walk_expr(key, out);
-                    walk_expr(value, out);
-                }
-            }
-            TExprKind::MapNext { map, cursor }
-            | TExprKind::MapKey { map, cursor }
-            | TExprKind::MapValue { map, cursor } => {
-                walk_expr(map, out);
-                walk_expr(cursor, out);
-            }
-            TExprKind::StructLiteral { fields, .. } => {
-                fields.iter().for_each(|f| walk_expr(f, out))
-            }
-            TExprKind::Field { base, .. } => walk_expr(base, out),
-            TExprKind::Box(inner) | TExprKind::Unbox(inner, _) => walk_expr(inner, out),
-            TExprKind::StringLit(_)
-            | TExprKind::NilLit
-            | TExprKind::IntLit(_)
-            | TExprKind::FloatLit(_)
-            | TExprKind::BoolLit(_)
-            | TExprKind::Local(_) => {}
-        }
-    }
-    fn walk_stmts(stmts: &[TStmt], out: &mut HashSet<String>) {
-        for s in stmts {
-            match s {
-                TStmt::Break => {}
-                TStmt::Local { value, .. } | TStmt::Assign { value, .. } => walk_expr(value, out),
-                TStmt::AssignIndex {
-                    array,
-                    index,
-                    value,
-                } => {
-                    walk_expr(array, out);
-                    walk_expr(index, out);
-                    walk_expr(value, out);
-                }
-                TStmt::AssignField { base, value, .. } => {
-                    walk_expr(base, out);
-                    walk_expr(value, out);
-                }
-                TStmt::If {
-                    cond,
-                    then_block,
-                    else_block,
-                } => {
-                    walk_expr(cond, out);
-                    walk_stmts(then_block, out);
-                    walk_stmts(else_block, out);
-                }
-                TStmt::While { cond, body } => {
-                    walk_expr(cond, out);
-                    walk_stmts(body, out);
-                }
-                TStmt::NumericFor {
-                    start,
-                    stop,
-                    step,
-                    body,
-                    ..
-                } => {
-                    walk_expr(start, out);
-                    walk_expr(stop, out);
-                    walk_expr(step, out);
-                    walk_stmts(body, out);
-                }
-                TStmt::Return { value } => {
-                    if let Some(v) = value {
-                        walk_expr(v, out);
-                    }
-                }
-            }
-        }
-    }
-    let mut out = HashSet::new();
-    walk_stmts(&f.body, &mut out);
-    out
 }
 
 /// A function's `any`-typed parameter is a speculative candidate if every

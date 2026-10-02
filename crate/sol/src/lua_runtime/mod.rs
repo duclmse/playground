@@ -493,6 +493,7 @@ pub struct LuaRuntime {
     /// `with_budgets` constructor, since most runtimes (short scripts, most
     /// of this crate's own tests) never reach that threshold and so never
     /// need to pay for a `cranelift_jit::JITModule`. See `DynJitState`.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     dynjit: dynjit::DynJitState,
 }
 

@@ -188,6 +188,130 @@ pub fn check(program: &ast::Program, lua_mode: bool) -> Result<TProgram, String>
     })
 }
 
+/// Every distinct function name `f` calls, direct or nested - the
+/// dependency set `jit::promote`'s worklist walk needs, and (via
+/// `add_builtin_externs`/`check_partitioned` below) the Tier-0-reachable
+/// extern-collection and native/dynamic demotion logic also needs. Lives
+/// here rather than in `jit.rs` because it's pure `TFunction`/`TExpr` AST
+/// walking with no Cranelift dependency, and `check_partitioned` must stay
+/// reachable from a `--no-default-features` (no `jit` feature) build - see
+/// docs/features/milestones/u12-wasm-playground.md.
+pub fn called_functions(f: &TFunction) -> HashSet<String> {
+    fn walk_expr(e: &TExpr, out: &mut HashSet<String>) {
+        match &e.kind {
+            TExprKind::Call(name, args) => {
+                out.insert(name.clone());
+                args.iter().for_each(|a| walk_expr(a, out));
+            }
+            TExprKind::FunctionRef(name) => {
+                out.insert(name.clone());
+            }
+            TExprKind::CallIndirect { callee, args } => {
+                walk_expr(callee, out);
+                args.iter().for_each(|a| walk_expr(a, out));
+            }
+            TExprKind::Truth(e)
+            | TExprKind::Neg(e)
+            | TExprKind::Not(e)
+            | TExprKind::IntToFloat(e)
+            | TExprKind::Len(e) => walk_expr(e, out),
+            TExprKind::Arith(_, l, r)
+            | TExprKind::Compare(_, l, r)
+            | TExprKind::Logical(_, l, r)
+            | TExprKind::Index(l, r) => {
+                walk_expr(l, out);
+                walk_expr(r, out);
+            }
+            TExprKind::NewArray { len, .. } => walk_expr(len, out),
+            TExprKind::ArrayLiteral { values, .. } => {
+                values.iter().for_each(|value| walk_expr(value, out))
+            }
+            TExprKind::ArrayMap { array, callback, .. } => {
+                walk_expr(array, out);
+                walk_expr(callback, out);
+            }
+            TExprKind::NewMap { .. } => {}
+            TExprKind::MapLiteral { entries, .. } => {
+                for (key, value) in entries {
+                    walk_expr(key, out);
+                    walk_expr(value, out);
+                }
+            }
+            TExprKind::MapNext { map, cursor }
+            | TExprKind::MapKey { map, cursor }
+            | TExprKind::MapValue { map, cursor } => {
+                walk_expr(map, out);
+                walk_expr(cursor, out);
+            }
+            TExprKind::StructLiteral { fields, .. } => {
+                fields.iter().for_each(|f| walk_expr(f, out))
+            }
+            TExprKind::Field { base, .. } => walk_expr(base, out),
+            TExprKind::Box(inner) | TExprKind::Unbox(inner, _) => walk_expr(inner, out),
+            TExprKind::StringLit(_)
+            | TExprKind::NilLit
+            | TExprKind::IntLit(_)
+            | TExprKind::FloatLit(_)
+            | TExprKind::BoolLit(_)
+            | TExprKind::Local(_) => {}
+        }
+    }
+    fn walk_stmts(stmts: &[TStmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                TStmt::Break => {}
+                TStmt::Local { value, .. } | TStmt::Assign { value, .. } => walk_expr(value, out),
+                TStmt::AssignIndex {
+                    array,
+                    index,
+                    value,
+                } => {
+                    walk_expr(array, out);
+                    walk_expr(index, out);
+                    walk_expr(value, out);
+                }
+                TStmt::AssignField { base, value, .. } => {
+                    walk_expr(base, out);
+                    walk_expr(value, out);
+                }
+                TStmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    walk_expr(cond, out);
+                    walk_stmts(then_block, out);
+                    walk_stmts(else_block, out);
+                }
+                TStmt::While { cond, body } => {
+                    walk_expr(cond, out);
+                    walk_stmts(body, out);
+                }
+                TStmt::NumericFor {
+                    start,
+                    stop,
+                    step,
+                    body,
+                    ..
+                } => {
+                    walk_expr(start, out);
+                    walk_expr(stop, out);
+                    walk_expr(step, out);
+                    walk_stmts(body, out);
+                }
+                TStmt::Return { value } => {
+                    if let Some(v) = value {
+                        walk_expr(v, out);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk_stmts(&f.body, &mut out);
+    out
+}
+
 /// Appends the runtime-library externs (`strings.rs`'s helpers,
 /// `__sol_any_is`) actually referenced by `functions`' bodies. Shared by
 /// `check()` and `check_partitioned()`, which each call it over their own
@@ -195,7 +319,7 @@ pub fn check(program: &ast::Program, lua_mode: bool) -> Result<TProgram, String>
 fn add_builtin_externs(functions: &[TFunction], externs: &mut Vec<TExternFunction>) {
     let used: HashSet<_> = functions
         .iter()
-        .flat_map(crate::jit::called_functions)
+        .flat_map(called_functions)
         .collect();
     for (name, params, ret) in crate::strings::signatures() {
         if used.contains(name) {
@@ -218,7 +342,7 @@ fn add_builtin_externs(functions: &[TFunction], externs: &mut Vec<TExternFunctio
 /// Per-function typed/dynamic split for `.lua` files. Unlike `check()`, a
 /// function whose body needs the dynamic runtime doesn't fail the whole
 /// program - it's set aside in `dynamic`, and any native candidate that
-/// (directly or transitively, via `jit::called_functions`) calls one of
+/// (directly or transitively, via `called_functions` above) calls one of
 /// those set-aside names is itself demoted, so the returned `native`
 /// program never contains a call to a dynamic-only function. A genuine
 /// type error (anything not tagged `EDYNLUA`) still fails the whole
@@ -273,7 +397,7 @@ pub fn check_partitioned(program: &ast::Program) -> Result<LuaPartition, String>
         let demoted: Vec<String> = native
             .iter()
             .filter(|(_, tf)| {
-                crate::jit::called_functions(tf)
+                called_functions(tf)
                     .iter()
                     .any(|callee| dynamic.contains(callee))
             })
@@ -1800,7 +1924,7 @@ mod tests {
             "function inc(x: i64): i64 return x + 1 end\nfunction use(f: fn(i64) -> i64): i64 return f(1) end\nfunction main(): i64 local f: fn(i64) -> i64 = inc return use(f) end",
         )
         .unwrap();
-        let called = crate::jit::called_functions(&prog.functions[2]);
+        let called = called_functions(&prog.functions[2]);
         assert!(called.contains("inc"), "{called:?}");
         assert!(called.contains("use"), "{called:?}");
     }

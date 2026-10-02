@@ -15,8 +15,10 @@ enum OsrOutcome {
     /// flushed its registers back to `frame.regs` before returning here -
     /// resume ordinary interpretation at this bytecode pc, reusing the exact
     /// same deopt mechanism `run_native`'s own `outcome == 0` branch does.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     Deopt(usize),
     /// The OSR entry ran the rest of the function to completion.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     Done(Vec<LuaValue>),
 }
 
@@ -37,7 +39,7 @@ impl LuaRuntime {
     /// precondition `run_native` relies on for ordinary native entry).
     fn try_osr_backedge(
         &mut self,
-        frame: &mut LuaFrame,
+        #[cfg_attr(not(feature = "jit"), allow(unused_variables))] frame: &mut LuaFrame,
         proto: &Rc<Proto>,
         header_pc: usize,
     ) -> LuaResult<OsrOutcome> {
@@ -79,51 +81,64 @@ impl LuaRuntime {
             return Ok(OsrOutcome::NotAttempted);
         };
 
-        let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
-        // Same encode/decode shape as `run_native` (`dispatch.rs`) - see that
-        // method's own comment on why a captured register is seeded from its
-        // cell rather than `frame.regs` directly. `opt_lower::is_eligible`
-        // excludes any `Proto` with a captured register at all, so every
-        // `frame.cells[i]` here is always `None` in practice; kept general
-        // rather than assumed, since nothing here enforces that exclusion
-        // locally.
-        let mut regs: Vec<sol_core::Value> = Vec::with_capacity(frame.regs.len());
-        for (i, value) in frame.regs.iter().enumerate() {
-            let encoded = match frame.cells[i] {
-                Some(id) => self
-                    .canonical_heap
-                    .borrow()
-                    .upvalue_value(id)
-                    .expect("cell id must address a live upvalue object"),
-                None => self.encode_value(value)?,
-            };
-            regs.push(encoded);
+        // `ptr` is only ever `Some` when the `jit` feature actually compiled
+        // and ran a `DynJit` (the non-`jit` `LuaRuntime::try_osr` stub above
+        // always returns `None`, taking the early return above instead), so
+        // the native-call body below is unreachable without it - gated
+        // rather than deleted so this stays a single function.
+        #[cfg(feature = "jit")]
+        {
+            let native_fn: dynjit::NativeFn = unsafe { std::mem::transmute(ptr) };
+            // Same encode/decode shape as `run_native` (`dispatch.rs`) - see that
+            // method's own comment on why a captured register is seeded from its
+            // cell rather than `frame.regs` directly. `opt_lower::is_eligible`
+            // excludes any `Proto` with a captured register at all, so every
+            // `frame.cells[i]` here is always `None` in practice; kept general
+            // rather than assumed, since nothing here enforces that exclusion
+            // locally.
+            let mut regs: Vec<sol_core::Value> = Vec::with_capacity(frame.regs.len());
+            for (i, value) in frame.regs.iter().enumerate() {
+                let encoded = match frame.cells[i] {
+                    Some(id) => self
+                        .canonical_heap
+                        .borrow()
+                        .upvalue_value(id)
+                        .expect("cell id must address a live upvalue object"),
+                    None => self.encode_value(value)?,
+                };
+                regs.push(encoded);
+            }
+
+            let mut out_pc: i64 = 0;
+            let mut out_base: i64 = 0;
+            let mut out_count: i64 = 0;
+            let rt_ptr: *mut LuaRuntime = self;
+            let frame_ptr: *mut LuaFrame = frame;
+            let outcome = native_fn(
+                rt_ptr,
+                frame_ptr,
+                regs.as_mut_ptr(),
+                &mut out_pc,
+                &mut out_base,
+                &mut out_count,
+            );
+
+            for (slot, value) in frame.regs.iter_mut().zip(regs) {
+                *slot = self.decode_value(value)?;
+            }
+
+            if outcome == 1 {
+                let base = out_base as usize;
+                let count = out_count as usize;
+                Ok(OsrOutcome::Done(frame.regs[base..base + count].to_vec()))
+            } else {
+                Ok(OsrOutcome::Deopt(out_pc as usize))
+            }
         }
-
-        let mut out_pc: i64 = 0;
-        let mut out_base: i64 = 0;
-        let mut out_count: i64 = 0;
-        let rt_ptr: *mut LuaRuntime = self;
-        let frame_ptr: *mut LuaFrame = frame;
-        let outcome = native_fn(
-            rt_ptr,
-            frame_ptr,
-            regs.as_mut_ptr(),
-            &mut out_pc,
-            &mut out_base,
-            &mut out_count,
-        );
-
-        for (slot, value) in frame.regs.iter_mut().zip(regs) {
-            *slot = self.decode_value(value)?;
-        }
-
-        if outcome == 1 {
-            let base = out_base as usize;
-            let count = out_count as usize;
-            Ok(OsrOutcome::Done(frame.regs[base..base + count].to_vec()))
-        } else {
-            Ok(OsrOutcome::Deopt(out_pc as usize))
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = ptr;
+            unreachable!("try_osr never returns Some(ptr) without the `jit` feature")
         }
     }
 

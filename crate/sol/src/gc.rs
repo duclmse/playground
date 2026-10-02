@@ -42,6 +42,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const ALIGN: usize = 8;
 const HEADER: usize = 8;
 
+// Scoped to exactly the two architectures `flush_callee_saved_registers`
+// below actually spills 64-bit registers on. Other architectures (including
+// the zero-register wasm32 fallback - `init_stack_base` is only ever called
+// from the JIT/AOT native-call path, so `STACK_BASE` stays 0 and the
+// conservative stack scan is a documented no-op there, same as in a unit
+// test) never relied on this width.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const _: () = assert!(
     std::mem::size_of::<usize>() == 8,
     "gc.rs assumes a 64-bit target (matches flush_callee_saved_registers's aarch64/x86_64 scope)"

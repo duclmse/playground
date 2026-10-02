@@ -175,6 +175,7 @@ pub fn signature(name: &str) -> Option<(&'static str, Vec<Type>, Type)> {
         .find(|(symbol, _, _)| symbol.strip_prefix("__sol_string_") == Some(suffix))
 }
 
+#[cfg(feature = "jit")]
 pub fn register(builder: &mut cranelift_jit::JITBuilder) {
     builder.symbol("__sol_string_concat", __sol_string_concat as *const u8);
     builder.symbol("__sol_string_i64", __sol_string_i64 as *const u8);
