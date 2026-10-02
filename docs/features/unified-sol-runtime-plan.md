@@ -2597,7 +2597,10 @@ item-8 note and [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md)'s
 
 Deliverables:
 
-- [ ] feed checked annotations and static inference directly into shared SSA;
+- [ ] feed checked annotations and static inference directly into shared SSA -
+      explicitly skipped as the plan's own decoupled stretch item (cut once
+      items 2-7 confirmed it wasn't a prerequisite for any of them), not
+      forgotten;
 - [ ] remove guards and generic runtime calls proven unnecessary - the typed
       tier's only runtime guard (`interp.rs`'s `try_speculative` call-boundary
       tag check on a speculatively-specialized `any` parameter) is now

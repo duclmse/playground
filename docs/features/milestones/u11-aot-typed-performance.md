@@ -1,10 +1,16 @@
 # U11 — AOT and annotation-driven peak performance
 
-**Status:** planned
+**Status:** in progress
 
 **Purpose:** make optional types a predictable accelerator on the same engine.
 
-- [ ] Feed checked annotations and inference into shared SSA.
+- [ ] Feed checked annotations and inference into shared SSA. Explicitly
+      skipped, not forgotten: the plan's own item 1 scoped this as an
+      optional, decoupled stretch goal ("not a prerequisite for items 2-5...
+      if schedule pressure hits, cut this item entirely and the rest of the
+      plan still delivers every U11 checklist line") - items 2-7 all landed
+      without it, confirming the plan's own prediction, so it was cut rather
+      than attempted as a partial slice.
 - [ ] Remove proven-unnecessary guards and generic calls. Item 2
       (2026-10-02): the typed tier's only runtime guard - the per-call tag
       re-check in `interp::try_speculative` before entering a
