@@ -265,3 +265,251 @@ wiring (item 6), no fix for the `SourceMap`/line-granularity gap above (item
 3's problem to account for), no fix for the `env.malloc`/`env.free`/
 `env.realloc`/`sol_c_api_shim_anchor` wasm import leakage beyond a throwaway
 stub (item 6's problem).
+
+## Work item 3 — Tier-0 debugger engine (breakpoints, stepping, stack frames)
+
+**Goal:** prototype the underlying native engine pieces a future browser
+debugger protocol (`apps/web/src/debug-protocol.ts`, read for understanding
+only — not touched) would call into: breakpoint verification, stack-frame/
+locals inspection with real typed display, and stepping (over/into/out), on
+top of item 2's `tier0::Engine`. Explicitly a native, non-wasm Rust spike —
+no wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
+machinery. Flagged in the plan as the single highest-risk/most-uncertain
+item in this milestone.
+
+**Deliverable 1 — closing the typed-tier `SourceMap` gap.** Item 2 found
+`bccompile.rs` building `SourceMap::single_line(b.code.len(), f.source_line)`
+for every typed `.sol` function — every instruction reporting the same,
+function-declaration line — because `types::TStmt`/`TExpr` carried no
+per-node line field. Rather than add a line field to every `TStmt`/`TExpr`
+variant (a much larger, more invasive change touching every arm of every
+pass), added one `u32` line alongside each top-level statement instead:
+`types.rs` now defines `TBlock = Vec<(u32, TStmt)>` and every block-typed
+field (`TFunction::body`, `TStmt::If`'s `then_block`/`else_block`,
+`TStmt::While`/`NumericFor`'s `body`, etc.) uses it in place of
+`Vec<TStmt>`/`&[TStmt]`. The line comes from a new `typeck.rs` function,
+`ast_stmt_line(stmt: &ast::Stmt) -> u32`, which reads the real per-statement
+line every `ast::Stmt` variant already carries (`ast.rs`'s fields) — for the
+one variant with no line of its own, `ast::Stmt::Block` (a Lua `do...end`),
+it takes the first inner statement's line, or `0` for an empty block (which
+compiles to no bytecode, so it never needs a breakpoint slot). `check_block`
+(`typeck.rs`) now returns `Result<TBlock, String>`, pairing each lowered
+`TStmt` with `ast_stmt_line(s)`.
+
+`bccompile.rs`'s `Builder` gained a parallel `lines: Vec<u32>` built 1:1 with
+`code` by `emit()` (each push records `current_line`, which `compile_block`
+sets from each `(line, stmt)` pair just before compiling that statement), so
+every inline operand word an instruction emits inherits its instruction's
+line — those words are never valid pcs for the interpreter to stop at
+anyway. At the end of `compile_function`, this becomes a real
+`sol_core::SourceMap::new(lines.iter().map(|&line| SourceLocation::new(line,
+0)).collect())` instead of the old function-wide stub. `SourceMap::single_line`
+itself still exists (used only as a test-fixture default elsewhere), but is
+no longer `bccompile.rs`'s production path.
+
+Every other pass that pattern-matches a block of statements needed updating
+to the new `(u32, TStmt)` shape: `typeck.rs` (`check_block`, `called_functions`'s
+`walk_stmts`, `positive_narrowing`, `check_conditional`), `optimize.rs`,
+`escape.rs`, `verify.rs`, and — under the `jit` feature — `codegen.rs`
+(`visit_stmts`, `uses_function_value`, `count_stmts`, `stmts_call`,
+`translate_block`, `try_vectorize_elementwise_loop`,
+`detect_vectorizable_loop`, `assigns_to_local`, `compile_osr_entry`) and
+`jit.rs` (`walk_stmts`, `walk_stmts_for_exhaustiveness`, `rewrite_stmts`).
+None of these change *what* they compute — every one simply unwraps the line
+and ignores it except `bccompile.rs` itself — confirmed by both
+`cargo test --manifest-path crate/sol/Cargo.toml` and
+`--no-default-features` passing unchanged (see "Verified outcome" below).
+`codegen.rs`'s `collect_local_types` (a pure `TFunction`/`TBlock` walker with
+no Cranelift dependency, needed by the jit-free debugger for locals' types)
+was relocated from `codegen.rs` (jit-gated, unreachable without `jit`) to
+`types.rs` (always compiled); `codegen.rs`/`jit.rs` now call it via the
+existing glob re-export, zero call-site changes beyond the move itself.
+
+A regression test, `distinct_statement_lines_map_to_distinct_pcs`
+(`crate/sol/src/debugger.rs`'s `#[cfg(test)]` module), compiles a
+two-`local`-statement function and asserts the pcs mapping to line 2 and
+line 3 differ — i.e. not the old single-line stub, which would have made
+every line resolve to the same (or no) pc.
+
+**Confirmed finding, as scoped: the dynamic `.lua` tier was not touched.**
+`lua_bytecode/mod.rs`'s `state.lines: Vec<u32>` already tracks a real
+per-instruction line end to end (confirmed by reading, not assumed) — this
+item added nothing there and changed no dynamic-tier behavior.
+
+**Deliverable 2 — per-line debug-hook mechanism.** `interp::Hooks` gained a
+new method, `on_instruction(&self, func_id: u8, pc: u32, line: u32, regs:
+&[u64])`, with an empty default body (the same zero-cost-when-unattached
+pattern as the trait's existing call-boundary hooks: `H = ()`'s impl inlines
+away entirely). Wired into `interpret()`'s dispatch loop immediately after
+`frame.pc = pc as u32` — it resolves `pc`'s line from the function's real
+`SourceMap` (deliverable 1) and passes the *whole* register file (named
+locals plus temporaries) as it exists at that exact instant, so a debugger
+reads real interpreter state, not a reconstruction. No existing `Hooks`
+implementor overrides it, so no existing caller's behavior changes; not
+separately re-benchmarked this session beyond the full `cargo test` suites
+passing unchanged. `interp::Runtime` also gained a `bytecode_function(&self,
+func_id: u8) -> Option<Rc<BcFunction>>` accessor so a debugger can read the
+exact `SourceMap`/bytecode a given `Runtime` is actually executing against,
+rather than a separately recompiled copy that might disagree with it;
+`tier0::Engine` exposes the same lookup by name via two new accessors,
+`function_id`/`function_bytecode`.
+
+**Scope cut, stated up front because it shapes deliverables 2, 3, 5, and 6
+together: this is a full-trace-recording design, not true interactive
+pause/resume.** Tier-0 bytecode interpretation is deterministic with
+respect to everything this spike's fixtures observe, and `interp::Runtime`'s
+dispatch loop is not written as an externally-driven state machine — pausing
+it mid-execution and resuming later would need either a coroutine/fiber
+runtime or a substantial rewrite of `interp.rs`'s control flow, which is a
+far larger change than an engine *spike* calls for. Instead,
+`crate/sol/src/debugger.rs`'s `DebugSession::run` executes the target call
+once to completion while a `TraceRecorder` (implementing `Hooks`) records
+one `TraceStep { func_id, pc, line, depth, regs }` per instruction via
+`on_instruction`, plus call depth via `on_call_enter`/`on_call_exit`.
+Breakpoint hits, stepping, and locals inspection then all answer by
+indexing into this recorded trace — not by querying a live, paused
+interpreter. This is the single biggest intentional scope cut in this item.
+It is sound for this spike's differential tests (Tier-0 execution has no
+externally-visible nondeterminism here) but does **not** demonstrate that a
+real browser debugger can actually suspend a long-running or
+infinite-looping script mid-flight and let a user inspect it before
+deciding whether to continue — that capability gap is real and is left
+entirely to a later item (most likely needing either the coroutine/fiber
+approach or budget-interval re-entrant execution, neither prototyped here).
+
+**Deliverable 3 — breakpoint matching.** `debugger::verify_breakpoint(function_name,
+line, source_map)` linearly scans the real per-instruction `SourceMap` built
+above for the first pc whose mapped line equals the requested line, and
+returns a `VerifiedBreakpoint { function_name, line, verified, pc }`. A line
+with no mapped instruction (blank line, comment, or a statement
+`optimize.rs` folded away) reports `verified: false`, `pc: None` — confirmed
+by the `a_line_with_no_mapped_instruction_is_not_verified` unit test
+(a blank line between two `local` statements). `DebugSession::set_breakpoint`
+wraps this against the exact `SourceMap` its own engine is executing
+(`tier0::Engine::function_bytecode`), so a verified pc is guaranteed
+consistent with what `trace()` later records.
+
+**Deliverable 4 — stack frame walk + locals with real typed display.**
+`debugger::ValueRenderer::render(ty, raw)` turns a raw register word plus
+its static `Type` into a `DisplayValue` (`Scalar(String)` or
+`Reference { reference, summary }`), reading `sol_core`/the runtime's actual
+representations directly rather than reimplementing them: `i64`/`f64`/`bool`
+reinterpret the untagged word per the register file's static-type
+convention; `String` reads `strings.rs`'s `[length: u64][bytes...]` layout
+via its own `strings::bytes` helper; `Array`/`Map`/`Struct`/`Function`
+become `Reference` handles (the raw pointer/payload word itself, stable for
+the paused frame's lifetime) a caller can later expand.
+`ValueRenderer::expand(ty, reference)` implements the "lazy/paginated
+expansion for tables" requirement for the two layouts this spike can read
+directly from outside their owning module: `Array` (the same
+`{len: i64, data: *const u8}` header `interp.rs`'s own `Op::Index` reads,
+then 8-byte words at `data + index*8`) and `Struct` (the same
+`*(base as *const u64).add(field_index)` access `Op::GetField` uses, keyed
+by `StructLayout::fields` from the program's struct table).
+`DebugSession::locals_at(trace_index)` reports every local visible at a
+given paused point as a `LocalView { local_id, is_param, ty, type_name,
+value }`, built from `types::collect_local_types` (every `LocalId`'s static
+type) plus that trace step's own captured register snapshot.
+
+Two findings, stated explicitly rather than silently worked around:
+- **Locals have no name table.** `TStmt::Local` only carries a numeric
+  `LocalId`; no source identifier survives typed lowering anywhere in
+  `types.rs`. `LocalView` reports each local by its numeric id
+  (`local<id>`-style), not a source name — recovering real names would need
+  a separate name table threaded through typeck.rs's lowering, not
+  attempted here.
+- **No separate "upvalue" concept exists at Tier-0 for typed `.sol`.**
+  Non-escaping closures are lambda-lifted away and escaping captures become
+  ordinary struct-typed locals before codegen/bccompile (`escape.rs`) — by
+  the time a function reaches Tier-0 bytecode, captured state already *is* a
+  local, not a distinct upvalue slot a debugger would need to list
+  separately. `types.rs`'s own comment notes closures arrive with M11; this
+  is an architectural finding about the current lowering, not a gap this
+  item left open.
+- **Not done:** unboxing an `Any`-typed local's real underlying type (no
+  reverse tag→type registry exists over `value.rs`'s `TAG_*` constants —
+  building one is a real feature, not attempted here) and `Map` expansion
+  (`runtime.rs`'s hash-table layout is a private implementation detail with
+  no public C-layout contract to read from outside it, unlike `Array`'s
+  simple header+elements layout). Both report as an opaque `Reference`
+  summary and stop there.
+
+**Deliverable 5 — stepping and continue.** `crate/sol/src/debugger.rs`'s
+`DebugSession` (constructed from a `TProgram`, wrapping a
+`tier0::Engine<TraceRecorder>`) is the standalone, testable Rust type this
+deliverable asked for — no wasm-bindgen, no browser, no worker, exercised by
+its own `#[cfg(test)]` module plus the differential integration tests below.
+`step_into(from)` finds the next trace index whose line or function differs
+from `from`'s, at any depth. `step_over(from)` finds the next trace index at
+a call depth no deeper than `from`'s with a different line — skipping
+entirely over a nested (non-tail) call's own instructions. `step_out(from)`
+finds the next trace index at a strictly shallower depth than `from`'s.
+`continue_to_breakpoint(from)`/`first_breakpoint_hit()` scan the trace for
+the next/first index whose `(func_id, pc)` matches a verified breakpoint.
+Tail calls reuse the caller's depth (`interp::Runtime::dispatch`'s loop
+never recurses for a tail call), matching real tail-call semantics, though
+this was not separately fixture-tested here.
+
+**Deliverable 6 — differential tests.** `crate/sol/tests/debugger.rs`
+(three fixtures: a simple multi-statement function, a function with a local
+and a `while` loop, and a nested call between two functions) implements the
+two required differential assertions:
+- `breakpoint_hit_locals_match_the_non_paused_interpreted_run`: sets a
+  breakpoint just before a function's final `local` assignment, runs the
+  session, and confirms the locals visible at that paused point already
+  show their prior statements' correct values, then confirms the *last*
+  trace index's locals agree exactly with what an independent, non-paused
+  `tier0::Engine::call_outcome` run on the same program computes.
+- `stepping_over_a_loop_body_produces_the_expected_line_sequence`:
+  repeatedly `step_into`s from the top of a 5-iteration `while` loop and
+  asserts the exact per-line visit counts (condition line visited 6 times —
+  5 true checks plus 1 final false check — body lines 5 times each,
+  surrounding statements once each), proving the loop actually iterates in
+  the recorded trace with the real per-line `SourceMap`.
+- `stepping_over_into_and_out_of_a_nested_call_behave_differently`: at a
+  call site, confirms `step_over` lands back in the caller without ever
+  visiting the callee's own `func_id`, `step_into` lands inside the callee
+  at strictly greater depth, and `step_out` from inside the callee returns
+  to the caller at its original depth.
+
+**Verified outcome:**
+`cargo test --manifest-path crate/sol/Cargo.toml` — 538 passed, 0 failed,
+across 25 test binaries (unit tests plus every integration suite, including
+the 3 new tests in `tests/debugger.rs` and the 2 new unit tests in
+`src/debugger.rs`).
+`cargo test --manifest-path crate/sol/Cargo.toml --no-default-features` —
+531 passed, 0 failed, across 24 test binaries (one fewer binary: the `sol`
+CLI's own doc/integration surface that requires `jit`).
+`cargo check --manifest-path crate/sol/Cargo.toml --no-default-features
+--target wasm32-unknown-unknown` — clean. `scripts/test-lua55-manifest.sh`
+— passes (`Lua 5.5 manifest regression checks passed`). `debugger.rs` is
+declared in `lib.rs` with no `#[cfg(feature = "jit")]` gate, so it is part
+of the same always-compiled, always-wasm32-checked module set as `tier0.rs`
+— not an assumption, confirmed by the wasm32 check above actually including
+it.
+
+**Explicitly not done here:**
+- No true interactive suspend/resume of a live interpreter — see the
+  full-trace-recording scope cut above. This is the biggest gap: a real
+  browser debugger needs to pause a *running* script, not replay a
+  completed trace.
+- **The dynamic `.lua` tier did not receive per-line debug-hook support.**
+  Per the task's scope boundary ("prioritize a complete, well-tested typed
+  Tier-0 engine first... if not reached, that's an acceptable, explicitly
+  documented gap"), all of this item's time went to the typed `.sol` path.
+  `lua_bytecode`/`dispatch.rs` already has real per-instruction lines
+  (`state.lines`), so the `SourceMap` half of deliverable 1 would not be
+  needed again there, but `interp::Hooks::on_instruction` is specific to
+  `interp.rs`'s bytecode interpreter (the typed tier's execution engine) —
+  the dynamic tier's own dispatch loop (`dispatch.rs`) is a structurally
+  different interpreter with no equivalent hook, and none was added.
+  `DebugSession` only accepts a typed `TProgram`, not a dynamic `.lua`
+  runtime. Extending to `.lua` is unstarted, not partially done.
+- No name table for locals, no `Any`/`Map` expansion — see deliverable 4's
+  findings above.
+- No wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
+  wiring — out of this item's explicit scope, not attempted.
+- No fuzzing or stress-testing of stepping across deeply recursive or
+  exception/error-raising (`CallOutcome::Raised`) programs — the fixtures
+  are small and all return normally; behavior of stepping through a trace
+  that ends in a raised error was not exercised.

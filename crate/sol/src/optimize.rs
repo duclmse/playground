@@ -10,8 +10,11 @@ pub fn optimize(program: &mut TProgram) {
     }
 }
 
-fn fold_block(stmts: Vec<TStmt>) -> Vec<TStmt> {
-    stmts.into_iter().map(fold_stmt).collect()
+fn fold_block(stmts: TBlock) -> TBlock {
+    stmts
+        .into_iter()
+        .map(|(line, s)| (line, fold_stmt(s)))
+        .collect()
 }
 
 fn fold_stmt(stmt: TStmt) -> TStmt {
@@ -397,7 +400,7 @@ mod tests {
     #[test]
     fn constant_integer_arithmetic_folds_to_a_literal() {
         let prog = optimized("function main(): i64\n  return 2 + 3 * 4\nend\n");
-        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0] else {
+        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert!(matches!(v.kind, TExprKind::IntLit(14)), "{:?}", v.kind);
@@ -406,7 +409,7 @@ mod tests {
     #[test]
     fn constant_comparison_folds_to_a_bool_literal() {
         let prog = optimized("function main(): bool\n  return 3 < 5\nend\n");
-        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0] else {
+        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert!(matches!(v.kind, TExprKind::BoolLit(true)), "{:?}", v.kind);
@@ -415,7 +418,7 @@ mod tests {
     #[test]
     fn division_by_a_literal_zero_is_left_unfolded() {
         let prog = optimized("function main(): i64\n  return 1 // 0\nend\n");
-        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0] else {
+        let TStmt::Return { value: Some(v) } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert!(
@@ -430,7 +433,7 @@ mod tests {
         let prog = optimized("function main(): i64\n  if 1 + 1 == 2 then\n    return 10 * 10\n  end\n  return 0\nend\n");
         let TStmt::If {
             cond, then_block, ..
-        } = &prog.functions[0].body[0]
+        } = &prog.functions[0].body[0].1
         else {
             panic!()
         };
@@ -439,7 +442,7 @@ mod tests {
             "{:?}",
             cond.kind
         );
-        let TStmt::Return { value: Some(v) } = &then_block[0] else {
+        let TStmt::Return { value: Some(v) } = &then_block[0].1 else {
             panic!()
         };
         assert!(matches!(v.kind, TExprKind::IntLit(100)), "{:?}", v.kind);

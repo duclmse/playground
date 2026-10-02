@@ -138,6 +138,23 @@ impl<H: interp::Hooks> Engine<H> {
     pub fn hooks(&self) -> &H {
         self.runtime.hooks()
     }
+
+    /// U12 item 3: `name`'s numeric function id, as assigned by
+    /// `bccompile::function_index` - `debugger.rs` needs this to translate a
+    /// breakpoint/trace lookup keyed by function name into the `func_id` the
+    /// interpreter and its hooks actually use.
+    pub fn function_id(&self, name: &str) -> Option<u8> {
+        self.name_to_id.get(name).copied()
+    }
+
+    /// U12 item 3: `name`'s compiled bytecode (source map included), if it's
+    /// still interpreted. See `interp::Runtime::bytecode_function`'s doc
+    /// comment for why the debugger reads this instead of recompiling.
+    pub fn function_bytecode(&self, name: &str) -> Option<std::rc::Rc<crate::bytecode::BcFunction>> {
+        self.name_to_id
+            .get(name)
+            .and_then(|&id| self.runtime.bytecode_function(id))
+    }
 }
 
 #[cfg(test)]

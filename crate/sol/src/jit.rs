@@ -12,7 +12,9 @@ use cranelift_module::{FuncId, Module};
 
 use crate::codegen;
 use crate::runtime;
-use crate::types::{LocalId, TExpr, TExprKind, TFunction, TProgram, TStmt, Type};
+use crate::types::{
+    collect_local_types, LocalId, TBlock, TExpr, TExprKind, TFunction, TProgram, TStmt, Type,
+};
 
 /// `promote`'s result: the primary function's wrapper pointer, plus
 /// `(name, wrapper_pointer)` for every dependency also compiled.
@@ -488,7 +490,7 @@ impl Jit {
             runtime: &self.runtime_funcs,
         };
         let call_conv = self.module.target_config().default_call_conv;
-        let local_types = codegen::collect_local_types(&f);
+        let local_types = collect_local_types(&f);
 
         let osr_sig = codegen::signature_of(call_conv, &local_types, &f.return_type);
         let osr_id = self
@@ -647,8 +649,8 @@ fn infer_unbox_type(f: &TFunction, id: LocalId) -> Option<Type> {
             | TExprKind::FunctionRef(_) => {}
         }
     }
-    fn walk_stmts(stmts: &[TStmt], id: LocalId, found: &mut Option<Type>, ok: &mut bool) {
-        for s in stmts {
+    fn walk_stmts(stmts: &TBlock, id: LocalId, found: &mut Option<Type>, ok: &mut bool) {
+        for (_, s) in stmts {
             if !*ok {
                 return;
             }
@@ -752,14 +754,14 @@ fn is_speculative_exhaustive(program: &TProgram, name: &str, param_index: usize,
 }
 
 fn walk_stmts_for_exhaustiveness(
-    stmts: &[TStmt],
+    stmts: &TBlock,
     name: &str,
     param_index: usize,
     target: &Type,
     call_sites: &mut usize,
     sound: &mut bool,
 ) {
-    for s in stmts {
+    for (_, s) in stmts {
         if !*sound {
             return;
         }
@@ -1084,10 +1086,10 @@ fn specialize(f: &TFunction, id: LocalId, target: &Type) -> TFunction {
             | TExprKind::FunctionRef(_) => e.clone(),
         }
     }
-    fn rewrite_stmts(stmts: &[TStmt], id: LocalId, target: &Type) -> Vec<TStmt> {
+    fn rewrite_stmts(stmts: &TBlock, id: LocalId, target: &Type) -> TBlock {
         stmts
             .iter()
-            .map(|s| match s {
+            .map(|(line, s)| (*line, match s {
                 TStmt::Break => TStmt::Break,
                 TStmt::Local { id: lid, value } => TStmt::Local {
                     id: *lid,
@@ -1148,7 +1150,7 @@ fn specialize(f: &TFunction, id: LocalId, target: &Type) -> TFunction {
                 TStmt::Return { value } => TStmt::Return {
                     value: value.as_ref().map(|v| rewrite_expr(v, id, target)),
                 },
-            })
+            }))
             .collect()
     }
     let mut params = f.params.clone();

@@ -15,6 +15,7 @@ pub mod closures;
 #[cfg(feature = "jit")]
 pub mod codegen;
 pub mod debug;
+pub mod debugger;
 pub mod diagnostic;
 pub mod dynamic;
 pub mod escape;

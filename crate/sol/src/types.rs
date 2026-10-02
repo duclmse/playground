@@ -156,10 +156,22 @@ pub struct TFunction {
     pub source_span: SourceSpan,
     pub params: Vec<(LocalId, Type)>,
     pub return_type: Type,
-    pub body: Vec<TStmt>,
+    pub body: TBlock,
     /// Every declared `LocalId` (params included) is in `0..local_count`.
     pub local_count: usize,
 }
+
+/// A typed statement paired with the source line it lowered from (U12 item
+/// 3: closes the Tier-0 debugger's SourceMap gap - see
+/// `docs/features/milestones/u12-wasm-playground.md`'s Work item 3 section).
+/// `TStmt` itself carries no line field: adding one to every enum variant
+/// would force exhaustive-pattern-match edits at ~224 call sites across both
+/// jit-gated (`codegen.rs`, `jit.rs`) and always-compiled files. Wrapping the
+/// *block* type instead keeps every existing `TStmt::Variant { .. }` match
+/// arm unchanged - only the handful of functions that iterate over a block
+/// need a one-line destructuring change (`for (line, stmt) in block` instead
+/// of `for stmt in block`).
+pub type TBlock = Vec<(u32, TStmt)>;
 
 #[derive(Debug, Clone)]
 pub enum TStmt {
@@ -184,12 +196,12 @@ pub enum TStmt {
     },
     If {
         cond: TExpr,
-        then_block: Vec<TStmt>,
-        else_block: Vec<TStmt>,
+        then_block: TBlock,
+        else_block: TBlock,
     },
     While {
         cond: TExpr,
-        body: Vec<TStmt>,
+        body: TBlock,
     },
     /// Desugared counted loop; `start`/`stop`/`step` all `i64`.
     NumericFor {
@@ -199,11 +211,61 @@ pub enum TStmt {
         start: TExpr,
         stop: TExpr,
         step: TExpr,
-        body: Vec<TStmt>,
+        body: TBlock,
     },
     Return {
         value: Option<TExpr>,
     },
+}
+
+/// Every `LocalId`'s type, indexed by id. Moved here from `codegen.rs` (U12
+/// item 3): this function has no Cranelift/codegen dependency - it only
+/// walks `TFunction`/`TBlock`/`TStmt`/`Type`, all defined in this file - but
+/// previously lived in a `jit`-feature-gated module, which made it
+/// unreachable from the jit-free Tier-0 debugger (`debugger.rs`) needed for
+/// `--no-default-features`/wasm32 builds. `codegen.rs`'s own callers
+/// (`declare_var` needs every local's type up front) keep working via this
+/// file's glob re-export, now sourced from one place instead of two copies.
+pub fn collect_local_types(f: &TFunction) -> Vec<Type> {
+    let mut types = vec![Type::I64; f.local_count]; // placeholder, all overwritten below
+    for (id, ty) in &f.params {
+        types[*id] = ty.clone();
+    }
+    fn walk(stmts: &TBlock, types: &mut [Type]) {
+        for (_, s) in stmts {
+            match s {
+                TStmt::Local { id, value } => types[*id] = value.ty.clone(),
+                TStmt::NumericFor {
+                    id,
+                    stop_id,
+                    step_id,
+                    body,
+                    ..
+                } => {
+                    types[*id] = Type::I64;
+                    types[*stop_id] = Type::I64;
+                    types[*step_id] = Type::I64;
+                    walk(body, types);
+                }
+                TStmt::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    walk(then_block, types);
+                    walk(else_block, types);
+                }
+                TStmt::While { body, .. } => walk(body, types),
+                TStmt::Break
+                | TStmt::Assign { .. }
+                | TStmt::AssignIndex { .. }
+                | TStmt::AssignField { .. }
+                | TStmt::Return { .. } => {}
+            }
+        }
+    }
+    walk(&f.body, &mut types);
+    types
 }
 
 #[derive(Debug, Clone)]

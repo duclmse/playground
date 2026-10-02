@@ -45,6 +45,8 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
     }
     let mut b = Builder {
         code: Vec::new(),
+        lines: Vec::new(),
+        current_line: f.source_line,
         consts: Vec::new(),
         next_reg: f.local_count,
         max_reg: f.local_count,
@@ -61,7 +63,26 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
     if b.max_reg > 256 {
         return None;
     }
-    let source_map = sol_core::SourceMap::single_line(b.code.len(), f.source_line);
+    // U12 item 3: a real per-instruction SourceMap, built from the line each
+    // instruction's originating `TStmt` carried through `TBlock` (see
+    // `types.rs`'s `TBlock` doc comment). Before this, every typed `.sol`
+    // function got `SourceMap::single_line(..., f.source_line)` - every pc
+    // mapped to the function's *definition* line, so a debugger could never
+    // distinguish one statement from another inside the same function (see
+    // `docs/features/milestones/u12-wasm-playground.md`'s Work item 2
+    // section). `b.lines` is built 1:1 with `b.code` by `emit()`, so this
+    // mapping is exact at every instruction boundary the interpreter can
+    // stop at - including the inline operand words some instructions emit
+    // (e.g. `Box`'s tag/pointer-mask words), which just inherit the
+    // enclosing instruction's line and are never themselves a valid `pc` for
+    // the interpreter to stop at.
+    debug_assert_eq!(b.lines.len(), b.code.len());
+    let source_map = sol_core::SourceMap::new(
+        b.lines
+            .iter()
+            .map(|&line| sol_core::SourceLocation::new(line, 0))
+            .collect(),
+    );
     Some(BcFunction {
         metadata: sol_core::PrototypeMetadata::new(&f.name, f.params.len(), false, b.max_reg)
             .expect("typed bytecode metadata fits the compiler's narrower register limits"),
@@ -79,6 +100,13 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
 
 struct Builder<'a> {
     code: Vec<Instr>,
+    /// Parallel to `code`: `lines[pc]` is the source line that produced
+    /// `code[pc]`, maintained 1:1 by `emit()`. Fed into `sol_core::SourceMap`
+    /// at the end of `compile_function` (U12 item 3).
+    lines: Vec<u32>,
+    /// The line of the `TStmt` currently being compiled; every `emit()`
+    /// records this. Set by `compile_block` before each statement.
+    current_line: u32,
     consts: Vec<u64>,
     next_reg: usize,
     max_reg: usize,
@@ -90,6 +118,7 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn emit(&mut self, i: Instr) -> usize {
         self.code.push(i);
+        self.lines.push(self.current_line);
         self.code.len() - 1
     }
 
@@ -114,11 +143,12 @@ impl<'a> Builder<'a> {
     /// nested loops are never recorded (OSR only handles top-level loops).
     fn compile_block(
         &mut self,
-        stmts: &[TStmt],
+        stmts: &TBlock,
         floor: usize,
         mut top_level_loops: Option<&mut Vec<(usize, usize)>>,
     ) -> bool {
-        for (i, s) in stmts.iter().enumerate() {
+        for (i, (line, s)) in stmts.iter().enumerate() {
+            self.current_line = *line;
             let (terminated, loop_header) = self.compile_stmt(s, floor);
             if let (Some(loops), Some(header)) = (top_level_loops.as_deref_mut(), loop_header) {
                 loops.push((header, i));

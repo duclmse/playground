@@ -36,12 +36,12 @@ fn verify_function(
 }
 
 fn verify_block(
-    block: &[TStmt],
+    block: &TBlock,
     function: &TFunction,
     program: &TProgram,
     externs: &HashMap<&str, (&[Type], &Type)>,
 ) -> Result<(), String> {
-    for statement in block {
+    for (_, statement) in block {
         match statement {
             TStmt::Break => {}
             TStmt::Local { id, value } | TStmt::Assign { id, value } => {
@@ -426,7 +426,7 @@ mod tests {
             "function inc(x: i64): i64 return x end\nfunction main(): i64 return inc(1) end";
         let mut program =
             typeck::check(&parser::parse(lexer::lex(source).unwrap()).unwrap(), false).unwrap();
-        let TStmt::Return { value: Some(call) } = &mut program.functions[1].body[0] else {
+        let TStmt::Return { value: Some(call) } = &mut program.functions[1].body[0].1 else {
             panic!("expected a direct call return");
         };
         let TExprKind::Call(_, args) = &mut call.kind else {

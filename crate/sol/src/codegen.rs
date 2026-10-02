@@ -224,49 +224,11 @@ pub fn declare_functions(
     Ok(ids)
 }
 
-/// Every `LocalId`'s type, indexed by id - needed up front since
-/// `declare_var` requires the type before any use is translated.
-pub fn collect_local_types(f: &TFunction) -> Vec<Type> {
-    let mut types = vec![Type::I64; f.local_count]; // placeholder, all overwritten below
-    for (id, ty) in &f.params {
-        types[*id] = ty.clone();
-    }
-    fn walk(stmts: &[TStmt], types: &mut [Type]) {
-        for s in stmts {
-            match s {
-                TStmt::Local { id, value } => types[*id] = value.ty.clone(),
-                TStmt::NumericFor {
-                    id,
-                    stop_id,
-                    step_id,
-                    body,
-                    ..
-                } => {
-                    types[*id] = Type::I64;
-                    types[*stop_id] = Type::I64;
-                    types[*step_id] = Type::I64;
-                    walk(body, types);
-                }
-                TStmt::If {
-                    then_block,
-                    else_block,
-                    ..
-                } => {
-                    walk(then_block, types);
-                    walk(else_block, types);
-                }
-                TStmt::While { body, .. } => walk(body, types),
-                TStmt::Break
-                | TStmt::Assign { .. }
-                | TStmt::AssignIndex { .. }
-                | TStmt::AssignField { .. }
-                | TStmt::Return { .. } => {}
-            }
-        }
-    }
-    walk(&f.body, &mut types);
-    types
-}
+// `collect_local_types` moved to `types.rs` (U12 item 3): it has no
+// Cranelift/codegen dependency, and the jit-free debugger module
+// (`debugger.rs`) needs it too. Already in scope here via this file's
+// `use crate::types::*;` above, so every existing `collect_local_types(...)`
+// call site below keeps working unchanged.
 
 /// Inline a callee if its body has this many statements or fewer (§7).
 const INLINE_MAX_STMTS: usize = 20;
@@ -374,8 +336,8 @@ fn function_references(function: &TFunction) -> HashSet<String> {
             | TExprKind::Local(_) => {}
         }
     }
-    fn visit_stmts(stmts: &[TStmt], refs: &mut HashSet<String>) {
-        for stmt in stmts {
+    fn visit_stmts(stmts: &TBlock, refs: &mut HashSet<String>) {
+        for (_, stmt) in stmts {
             match stmt {
                 TStmt::Break => {}
                 TStmt::Local { value, .. } | TStmt::Assign { value, .. } => visit_expr(value, refs),
@@ -434,7 +396,7 @@ fn function_references(function: &TFunction) -> HashSet<String> {
 /// transitive pointer targets to be added to the caller's dependency set.
 /// Keep those bodies out of the small direct-call inliner until closure
 /// conversion owns that dependency analysis in M11.
-fn uses_function_value(stmts: &[TStmt]) -> bool {
+fn uses_function_value(stmts: &TBlock) -> bool {
     fn expr_uses_function_value(expr: &TExpr) -> bool {
         match &expr.kind {
             TExprKind::FunctionRef(_) | TExprKind::CallIndirect { .. } => true,
@@ -476,7 +438,7 @@ fn uses_function_value(stmts: &[TStmt]) -> bool {
             | TExprKind::Local(_) => false,
         }
     }
-    stmts.iter().any(|stmt| match stmt {
+    stmts.iter().any(|(_, stmt)| match stmt {
         TStmt::Break => false,
         TStmt::Local { value, .. } | TStmt::Assign { value, .. } => expr_uses_function_value(value),
         TStmt::AssignIndex {
@@ -517,10 +479,10 @@ fn uses_function_value(stmts: &[TStmt]) -> bool {
     })
 }
 
-fn count_stmts(stmts: &[TStmt]) -> usize {
+fn count_stmts(stmts: &TBlock) -> usize {
     stmts
         .iter()
-        .map(|s| {
+        .map(|(_, s)| {
             1 + match s {
                 TStmt::If {
                     then_block,
@@ -585,8 +547,8 @@ fn is_directly_recursive(f: &TFunction) -> bool {
             | TExprKind::FunctionRef(_) => false,
         }
     }
-    fn stmts_call(stmts: &[TStmt], name: &str) -> bool {
-        stmts.iter().any(|s| match s {
+    fn stmts_call(stmts: &TBlock, name: &str) -> bool {
+        stmts.iter().any(|(_, s)| match s {
             TStmt::Break => false,
             TStmt::Local { value, .. } | TStmt::Assign { value, .. } => expr_calls(value, name),
             TStmt::AssignIndex {
@@ -805,7 +767,7 @@ pub fn compile_osr_entry(
         break_targets: vec![],
         resume_for: false,
     };
-    fc.resume_for = matches!(tfunc.body[from_stmt], TStmt::NumericFor { .. });
+    fc.resume_for = matches!(tfunc.body[from_stmt].1, TStmt::NumericFor { .. });
     let terminated = fc.translate_block(&tfunc.body[from_stmt..]);
     if !terminated {
         return Err(format!("function '{}' does not return a value on every path (OSR entry at statement {from_stmt})", tfunc.name));
@@ -908,8 +870,8 @@ impl<'a, 'b> FuncCtx<'a, 'b> {
     }
     /// Translates a statement sequence; returns `true` if it ends terminated
     /// (by a `return`), so the caller skips appending an unreachable jump.
-    fn translate_block(&mut self, stmts: &[TStmt]) -> bool {
-        for stmt in stmts {
+    fn translate_block(&mut self, stmts: &[(u32, TStmt)]) -> bool {
+        for (_, stmt) in stmts {
             if self.translate_stmt(stmt) {
                 return true;
             }
@@ -1197,7 +1159,7 @@ impl<'a, 'b> FuncCtx<'a, 'b> {
         start: &TExpr,
         stop: &TExpr,
         step: &TExpr,
-        body: &[TStmt],
+        body: &[(u32, TStmt)],
     ) -> bool {
         if std::env::var_os("SOL_NO_VECTORIZE")
             .or_else(|| std::env::var_os("SOL_NO_VECTORIZE"))
@@ -1870,16 +1832,19 @@ struct VectorizablePattern {
 fn detect_vectorizable_loop(
     id: LocalId,
     step: &TExpr,
-    body: &[TStmt],
+    body: &[(u32, TStmt)],
 ) -> Option<VectorizablePattern> {
     if !matches!(step.kind, TExprKind::IntLit(1)) {
         return None;
     }
-    let [TStmt::AssignIndex {
-        array,
-        index,
-        value,
-    }] = body
+    let [(
+        _,
+        TStmt::AssignIndex {
+            array,
+            index,
+            value,
+        },
+    )] = body
     else {
         return None;
     };
@@ -1956,12 +1921,17 @@ mod inline_budget_tests {
     /// distinguish the two budgets.
     fn function_with_stmt_count(name: &str, stmt_count: usize) -> TFunction {
         let body = (0..stmt_count)
-            .map(|_| TStmt::Local {
-                id: 0,
-                value: TExpr {
-                    kind: TExprKind::IntLit(0),
-                    ty: Type::I64,
-                },
+            .map(|_| {
+                (
+                    1,
+                    TStmt::Local {
+                        id: 0,
+                        value: TExpr {
+                            kind: TExprKind::IntLit(0),
+                            ty: Type::I64,
+                        },
+                    },
+                )
             })
             .collect();
         TFunction {
@@ -2012,8 +1982,8 @@ mod inline_budget_tests {
 
 /// True if `stmts` (recursively) assigns to local `id` - used to bail out
 /// of bounds-check elimination if the array or loop variable is reassigned.
-fn assigns_to_local(stmts: &[TStmt], id: LocalId) -> bool {
-    stmts.iter().any(|s| match s {
+fn assigns_to_local(stmts: &TBlock, id: LocalId) -> bool {
+    stmts.iter().any(|(_, s)| match s {
         TStmt::Break => false,
         TStmt::Assign { id: assigned, .. } => *assigned == id,
         TStmt::AssignIndex { .. }

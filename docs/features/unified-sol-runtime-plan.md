@@ -2953,6 +2953,54 @@ for full file:line detail. Not done: no debugger, no `packages/sol-runtime`/
 worker wiring, no fix for the SourceMap or wasm-import-leakage gaps above
 (both explicitly deferred to later items).
 
+Item 3 (2026-10-02): native, non-wasm Tier-0 debugger engine spike - the
+item this milestone's plan flags as highest-risk. Closed item 2's SourceMap
+gap first: added `types::TBlock = Vec<(u32, TStmt)>` (one line per
+top-level statement, sourced from a new `typeck.rs::ast_stmt_line` reading
+the real per-statement line every `ast::Stmt` already carries) in place of
+every `Vec<TStmt>`/`&[TStmt]` across `typeck.rs`, `optimize.rs`, `escape.rs`,
+`verify.rs`, and (jit-gated) `codegen.rs`/`jit.rs`, then threaded it through
+`bccompile.rs`'s `Builder` (a parallel `lines: Vec<u32>` built 1:1 with
+`code`) to build a real `sol_core::SourceMap` instead of the old
+function-wide `single_line` stub. Confirmed by reading, not assumed: the
+dynamic `.lua` tier's own per-instruction lines (`lua_bytecode`'s
+`state.lines`) were already real and were not touched. Generalized
+`interp::Hooks` with a new `on_instruction(func_id, pc, line, regs)` hook,
+zero-cost when unattached (no existing implementor overrides it). Built
+`crate/sol/src/debugger.rs` (always-compiled, not jit-gated) with breakpoint
+verification against the real SourceMap (`verify_breakpoint`), a typed
+value renderer reading `sol_core`/the runtime's actual layouts
+(`ValueRenderer`, with lazy/paginated `Array`/`Struct` expansion), and
+`DebugSession`, a native, independently-testable type wrapping
+`tier0::Engine`. The central design choice, stated plainly: `DebugSession`
+is a full-trace-recording engine, not true interactive pause/resume - `run`
+executes a call once to completion while a `TraceRecorder` hook captures
+one `TraceStep` per instruction, and breakpoint hits/stepping/locals all
+answer by indexing that recorded trace, not by suspending a live
+interpreter. This is sound for differential testing but does not prove a
+real debugger can pause a long-running script mid-flight; that gap is left
+to a later item. Found two architectural facts about the typed tier worth
+recording: locals carry no source-name table past lowering (`TStmt::Local`
+is id-only), and there is no separate "upvalue" concept at Tier-0 - escape
+analysis (`escape.rs`) turns captured state into ordinary struct-typed
+locals before bytecode compilation. Added three fixture-based differential
+tests (`crate/sol/tests/debugger.rs`): a breakpoint hit's locals match an
+independent non-paused run's result; stepping through a loop produces the
+exact expected per-line visit counts; step over/into/out across a nested
+call land in the right function at the right depth. `cargo test` passes
+538/0 (default features, 25 binaries) and 531/0 (`--no-default-features`,
+24 binaries); the wasm32 `cargo check` and
+`scripts/test-lua55-manifest.sh` both stay clean. See
+`docs/features/milestones/u12-wasm-playground.md`'s "Work item 3" section
+for full file:line detail and the complete not-done list. Not done,
+stated explicitly per this item's own scope boundary: the dynamic `.lua`
+tier did not receive any per-line debug-hook support (time went to a
+complete typed-tier engine first, as the item's own priority order
+required) - `DebugSession` only accepts a typed `TProgram`; no true
+interactive suspend/resume; no `Any`/`Map` value expansion; no
+wasm-bindgen/browser/worker wiring (explicitly out of scope for this
+item).
+
 ### U13 — Semantic LSP and first-party VS Code client
 
 **Purpose:** ship supported editor tooling, not only a generic-server binary.

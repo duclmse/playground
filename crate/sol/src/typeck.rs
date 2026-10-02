@@ -256,8 +256,8 @@ pub fn called_functions(f: &TFunction) -> HashSet<String> {
             | TExprKind::Local(_) => {}
         }
     }
-    fn walk_stmts(stmts: &[TStmt], out: &mut HashSet<String>) {
-        for s in stmts {
+    fn walk_stmts(stmts: &TBlock, out: &mut HashSet<String>) {
+        for (_, s) in stmts {
             match s {
                 TStmt::Break => {}
                 TStmt::Local { value, .. } | TStmt::Assign { value, .. } => walk_expr(value, out),
@@ -585,12 +585,42 @@ fn check_function(
     })
 }
 
-fn check_block(checker: &mut Checker, block: &ast::Block) -> Result<Vec<TStmt>, String> {
+/// Every `ast::Stmt` variant carries its own source line - either directly
+/// (the common case) or via a nested `Function`/`Expr`/`Block` that does.
+/// `Block(Block)` (a Lua `do ... end`) has no line of its own; it takes its
+/// first inner statement's line, or `0` for an empty block (an empty block
+/// compiles to no bytecode at all, so this never needs a breakpoint slot -
+/// `bccompile.rs`'s per-instruction SourceMap only ever sees lines that this
+/// function actually reports for a statement that emits bytecode).
+fn ast_stmt_line(stmt: &ast::Stmt) -> u32 {
+    match stmt {
+        ast::Stmt::Global { line, .. }
+        | ast::Stmt::Label { line, .. }
+        | ast::Stmt::Goto { line, .. }
+        | ast::Stmt::MultiLocal { line, .. }
+        | ast::Stmt::MultiAssign { line, .. }
+        | ast::Stmt::Repeat { line, .. }
+        | ast::Stmt::Break { line }
+        | ast::Stmt::Local { line, .. }
+        | ast::Stmt::Assign { line, .. }
+        | ast::Stmt::If { line, .. }
+        | ast::Stmt::While { line, .. }
+        | ast::Stmt::NumericFor { line, .. }
+        | ast::Stmt::GenericFor { line, .. }
+        | ast::Stmt::Return { line, .. }
+        | ast::Stmt::MultiReturn { line, .. } => *line,
+        ast::Stmt::GlobalFunction(f) | ast::Stmt::LocalFunction(f) => f.line,
+        ast::Stmt::Expr(e) => e.line,
+        ast::Stmt::Block(body) => body.first().map(ast_stmt_line).unwrap_or(0),
+    }
+}
+
+fn check_block(checker: &mut Checker, block: &ast::Block) -> Result<TBlock, String> {
     checker.push_scope();
     let result = block
         .iter()
-        .map(|s| check_stmt(checker, s))
-        .collect::<Result<Vec<_>, _>>();
+        .map(|s| Ok((ast_stmt_line(s), check_stmt(checker, s)?)))
+        .collect::<Result<TBlock, String>>();
     checker.pop_scope();
     result
 }
@@ -599,7 +629,7 @@ fn positive_narrowing(
     checker: &mut Checker,
     condition: &ast::Expr,
     line: u32,
-) -> Result<Vec<TStmt>, String> {
+) -> Result<TBlock, String> {
     let ast::ExprKind::TypeTest(value, target) = &condition.kind else {
         return Ok(Vec::new());
     };
@@ -611,7 +641,7 @@ fn positive_narrowing(
     };
     let target = lower_type(target, &checker.struct_names, line)?;
     let narrowed_id = checker.declare(name, target.clone());
-    Ok(vec![TStmt::Local {
+    Ok(vec![(line, TStmt::Local {
         id: narrowed_id,
         value: TExpr {
             kind: TExprKind::Unbox(
@@ -623,7 +653,7 @@ fn positive_narrowing(
             ),
             ty: target,
         },
-    }])
+    })])
 }
 
 /// Lower an `if` while preserving short-circuiting and making positive type
@@ -634,20 +664,20 @@ fn check_conditional(
     checker: &mut Checker,
     condition: &ast::Expr,
     then_block: &ast::Block,
-    else_block: Vec<TStmt>,
+    else_block: TBlock,
     line: u32,
 ) -> Result<TStmt, String> {
     if let ast::ExprKind::Binary(BinaryOp::And, left, right) = &condition.kind {
         let typed_left = truth(check_expr(checker, left)?);
         checker.push_scope();
         let mut narrowed = positive_narrowing(checker, left, line)?;
-        narrowed.push(check_conditional(
+        narrowed.push((line, check_conditional(
             checker,
             right,
             then_block,
             else_block.clone(),
             line,
-        )?);
+        )?));
         checker.pop_scope();
         return Ok(TStmt::If {
             cond: typed_left,
@@ -701,7 +731,7 @@ fn coerce(expr: TExpr, target: &Type, line: u32) -> Result<TExpr, String> {
     ))
 }
 
-fn sequence(body: Vec<TStmt>) -> TStmt {
+fn sequence(body: TBlock) -> TStmt {
     TStmt::If {
         cond: TExpr {
             kind: TExprKind::BoolLit(true),
@@ -715,7 +745,7 @@ fn sequence(body: Vec<TStmt>) -> TStmt {
 fn materialize_values(
     checker: &mut Checker,
     values: &[ast::Expr],
-    body: &mut Vec<TStmt>,
+    body: &mut TBlock,
 ) -> Result<Vec<TExpr>, String> {
     values
         .iter()
@@ -723,7 +753,7 @@ fn materialize_values(
             let value = check_expr(checker, e)?;
             let ty = value.ty.clone();
             let id = checker.declare("$value", ty.clone());
-            body.push(TStmt::Local { id, value });
+            body.push((e.line, TStmt::Local { id, value }));
             Ok(TExpr {
                 kind: TExprKind::Local(id),
                 ty,
@@ -734,12 +764,12 @@ fn materialize_values(
 fn materialize_ast(
     checker: &mut Checker,
     e: &ast::Expr,
-    body: &mut Vec<TStmt>,
+    body: &mut TBlock,
 ) -> Result<ast::Expr, String> {
     let value = check_expr(checker, e)?;
     let name = format!("$temp{}", checker.next_local);
     let id = checker.declare(&name, value.ty.clone());
-    body.push(TStmt::Local { id, value });
+    body.push((e.line, TStmt::Local { id, value }));
     Ok(ast::Expr {
         kind: ast::ExprKind::Name(name),
         line: e.line,
@@ -764,7 +794,7 @@ fn check_stmt(checker: &mut Checker, stmt: &ast::Stmt) -> Result<TStmt, String> 
                     "line {line}: '{name}' has <close>, which is parsed, but requires the dynamic Lua runtime's scope-exit closing semantics [{DYNAMIC_RUNTIME_CODE}]"
                 ));
             }
-            let mut body=vec![];
+            let mut body: TBlock=vec![];
             let values=materialize_values(checker,values,&mut body)?;
             for (i,(name,ty,constant,_)) in names.iter().enumerate() {
                 let value=values.get(i).cloned().unwrap_or(TExpr{kind:TExprKind::NilLit,ty:Type::Nil});
@@ -772,12 +802,12 @@ fn check_stmt(checker: &mut Checker, stmt: &ast::Stmt) -> Result<TStmt, String> 
                 let value=coerce(value,&ty,*line)?;
                 let id=checker.declare(name,ty);
                 if *constant {checker.constants.insert(id);}
-                body.push(TStmt::Local{id,value});
+                body.push((*line, TStmt::Local{id,value}));
             }
             Ok(sequence(body))
         },
         ast::Stmt::MultiAssign { targets, values, line } => {
-            let mut body=vec![];
+            let mut body: TBlock=vec![];
             // Freeze lvalue addresses before any assignment can change them.
             let mut frozen=vec![];
             for target in targets {
@@ -791,7 +821,7 @@ fn check_stmt(checker: &mut Checker, stmt: &ast::Stmt) -> Result<TStmt, String> 
             for value in values {temps.push(materialize_ast(checker,value,&mut body)?);}
             for (i,target) in frozen.into_iter().enumerate() {
                 let value=temps.get(i).cloned().unwrap_or(ast::Expr{kind:ast::ExprKind::NilLit,line:*line});
-                body.push(check_stmt(checker,&ast::Stmt::Assign{target,value,line:*line})?);
+                body.push((*line, check_stmt(checker,&ast::Stmt::Assign{target,value,line:*line})?));
             }
             Ok(sequence(body))
         },
@@ -803,11 +833,11 @@ fn check_stmt(checker: &mut Checker, stmt: &ast::Stmt) -> Result<TStmt, String> 
             if checker.loop_depth == 0 { return Err(format!("line {line}: break outside a loop")); }
             Ok(TStmt::Break)
         },
-        ast::Stmt::Repeat { body, cond, line: _ } => {
+        ast::Stmt::Repeat { body, cond, line } => {
             checker.push_scope(); checker.loop_depth += 1;
             let mut body = block_in_current_scope(checker, body)?;
             let cond = truth(check_expr(checker, cond)?);
-            body.push(TStmt::If { cond, then_block: vec![TStmt::Break], else_block: vec![] });
+            body.push((*line, TStmt::If { cond, then_block: vec![(*line, TStmt::Break)], else_block: vec![] }));
             checker.loop_depth -= 1; checker.pop_scope();
             Ok(TStmt::While { cond: TExpr { kind: TExprKind::BoolLit(true), ty: Type::Bool }, body })
         },
@@ -964,10 +994,10 @@ fn check_generic_for(
         kind: TExprKind::Local(collection_id),
         ty: collection_ty.clone(),
     };
-    let mut statements = vec![TStmt::Local {
+    let mut statements: TBlock = vec![(line, TStmt::Local {
         id: collection_id,
         value: collection,
-    }];
+    })];
 
     match (iterator.as_str(), &collection_ty) {
         ("ipairs", Type::Array(element)) => {
@@ -986,7 +1016,7 @@ fn check_generic_for(
             if let Some(value_id) = value_id {
                 body.insert(
                     0,
-                    TStmt::Local {
+                    (line, TStmt::Local {
                         id: value_id,
                         value: TExpr {
                             ty: (**element).clone(),
@@ -998,14 +1028,14 @@ fn check_generic_for(
                                 }),
                             ),
                         },
-                    },
+                    }),
                 );
             }
             let length = TExpr {
                 kind: TExprKind::Len(Box::new(collection_ref())),
                 ty: Type::I64,
             };
-            statements.push(TStmt::NumericFor {
+            statements.push((line, TStmt::NumericFor {
                 id: index_id,
                 stop_id,
                 step_id,
@@ -1029,7 +1059,7 @@ fn check_generic_for(
                     ty: Type::I64,
                 },
                 body,
-            });
+            }));
         }
         ("pairs", Type::Map(key, value)) => {
             let key_ty = (**key).clone();
@@ -1044,33 +1074,33 @@ fn check_generic_for(
             } else {
                 None
             };
-            statements.push(TStmt::Local {
+            statements.push((line, TStmt::Local {
                 id: cursor_id,
                 value: TExpr {
                     kind: TExprKind::IntLit(0),
                     ty: Type::I64,
                 },
-            });
-            statements.push(TStmt::Local {
+            }));
+            statements.push((line, TStmt::Local {
                 id: key_id,
                 value: TExpr {
                     kind: TExprKind::IntLit(0),
                     ty: key_ty.clone(),
                 },
-            });
+            }));
             if let Some(value_id) = value_id {
                 let zero = match value_ty {
                     Type::F64 => TExprKind::FloatLit(0.0),
                     Type::Bool => TExprKind::BoolLit(false),
                     _ => TExprKind::IntLit(0),
                 };
-                statements.push(TStmt::Local {
+                statements.push((line, TStmt::Local {
                     id: value_id,
                     value: TExpr {
                         kind: zero,
                         ty: value_ty.clone(),
                     },
-                });
+                }));
             }
             checker.loop_depth += 1;
             let body = block_in_current_scope(checker, source_body)?;
@@ -1079,8 +1109,8 @@ fn check_generic_for(
                 kind: TExprKind::Local(cursor_id),
                 ty: Type::I64,
             };
-            let mut loop_body = vec![
-                TStmt::Assign {
+            let mut loop_body: TBlock = vec![
+                (line, TStmt::Assign {
                     id: cursor_id,
                     value: TExpr {
                         kind: TExprKind::MapNext {
@@ -1089,8 +1119,8 @@ fn check_generic_for(
                         },
                         ty: Type::I64,
                     },
-                },
-                TStmt::If {
+                }),
+                (line, TStmt::If {
                     cond: TExpr {
                         kind: TExprKind::Compare(
                             BinaryOp::Eq,
@@ -1102,10 +1132,10 @@ fn check_generic_for(
                         ),
                         ty: Type::Bool,
                     },
-                    then_block: vec![TStmt::Break],
+                    then_block: vec![(line, TStmt::Break)],
                     else_block: vec![],
-                },
-                TStmt::Assign {
+                }),
+                (line, TStmt::Assign {
                     id: key_id,
                     value: TExpr {
                         kind: TExprKind::MapKey {
@@ -1114,10 +1144,10 @@ fn check_generic_for(
                         },
                         ty: key_ty,
                     },
-                },
+                }),
             ];
             if let Some(value_id) = value_id {
-                loop_body.push(TStmt::Assign {
+                loop_body.push((line, TStmt::Assign {
                     id: value_id,
                     value: TExpr {
                         kind: TExprKind::MapValue {
@@ -1126,16 +1156,16 @@ fn check_generic_for(
                         },
                         ty: value_ty,
                     },
-                });
+                }));
             }
             loop_body.extend(body);
-            statements.push(TStmt::While {
+            statements.push((line, TStmt::While {
                 cond: TExpr {
                     kind: TExprKind::BoolLit(true),
                     ty: Type::Bool,
                 },
                 body: loop_body,
-            });
+            }));
         }
         ("ipairs", other) => {
             // `.lua` tables are usually `any`-typed statically (their real
@@ -1240,8 +1270,11 @@ fn check_expr_expected(
 
 /// Like `check_block`, but reuses the caller's scope (for a `for` body,
 /// sharing the scope its loop variable was already declared in).
-fn block_in_current_scope(checker: &mut Checker, block: &ast::Block) -> Result<Vec<TStmt>, String> {
-    block.iter().map(|s| check_stmt(checker, s)).collect()
+fn block_in_current_scope(checker: &mut Checker, block: &ast::Block) -> Result<TBlock, String> {
+    block
+        .iter()
+        .map(|s| Ok((ast_stmt_line(s), check_stmt(checker, s)?)))
+        .collect()
 }
 
 fn check_expr(checker: &mut Checker, expr: &ast::Expr) -> Result<TExpr, String> {
@@ -1756,7 +1789,7 @@ mod tests {
     #[test]
     fn local_without_annotation_infers_i64_for_an_integer_literal() {
         let prog = check_source("function main(): i64\n  local x = 10\n  return x\nend\n").unwrap();
-        let TStmt::Local { value, .. } = &prog.functions[0].body[0] else {
+        let TStmt::Local { value, .. } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert_eq!(value.ty, Type::I64);
@@ -1766,7 +1799,7 @@ mod tests {
     fn local_without_annotation_infers_f64_for_a_float_literal() {
         let prog =
             check_source("function main(): f64\n  local y = 20.0\n  return y\nend\n").unwrap();
-        let TStmt::Local { value, .. } = &prog.functions[0].body[0] else {
+        let TStmt::Local { value, .. } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert_eq!(value.ty, Type::F64);
@@ -1778,7 +1811,7 @@ mod tests {
             "function main(): f64\n  local x: i64 = 1\n  local y: f64 = 2.0\n  return x + y\nend\n",
         )
         .unwrap();
-        let TStmt::Return { value: Some(v) } = prog.functions[0].body.last().unwrap() else {
+        let TStmt::Return { value: Some(v) } = &prog.functions[0].body.last().unwrap().1 else {
             panic!()
         };
         assert_eq!(v.ty, Type::F64);
@@ -1822,7 +1855,7 @@ mod tests {
     #[test]
     fn struct_literal_fields_are_reordered_to_the_declared_layout() {
         let prog = check_source("struct P { x: i64, y: i64 }\nfunction main(): i64\n  local p = P { y = 2, x = 1 }\n  return p.x\nend\n").unwrap();
-        let TStmt::Local { value, .. } = &prog.functions[0].body[0] else {
+        let TStmt::Local { value, .. } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         let TExprKind::StructLiteral { fields, .. } = &value.kind else {
@@ -1861,12 +1894,12 @@ mod tests {
             "function main(): i64\n  local y: any = 42\n  local z: i64 = y\n  return z\nend\n",
         )
         .unwrap();
-        let TStmt::Local { value, .. } = &prog.functions[0].body[0] else {
+        let TStmt::Local { value, .. } = &prog.functions[0].body[0].1 else {
             panic!()
         };
         assert!(matches!(value.kind, TExprKind::Box(_)), "{:?}", value.kind);
         assert_eq!(value.ty, Type::Any);
-        let TStmt::Local { value, .. } = &prog.functions[0].body[1] else {
+        let TStmt::Local { value, .. } = &prog.functions[0].body[1].1 else {
             panic!()
         };
         assert!(
@@ -1883,7 +1916,7 @@ mod tests {
             "struct P { x: i64 }\nfunction main(): i64\n  local p = P { x = 1 }\n  local a: any = p\n  return 0\nend\n",
         )
         .unwrap();
-        let TStmt::Local { value, .. } = &program.functions[0].body[1] else {
+        let TStmt::Local { value, .. } = &program.functions[0].body[1].1 else {
             panic!()
         };
         assert!(matches!(value.kind, TExprKind::Box(_)), "{:?}", value.kind);
@@ -1896,7 +1929,7 @@ mod tests {
             "function inc(x: i64): i64 return x + 1 end\nfunction apply(f: fn(i64) -> i64, x: i64): i64 return f(x) end\nfunction main(): i64 local f: fn(i64): i64 = inc return apply(f, 41) end",
         )
         .unwrap();
-        let TStmt::Return { value: Some(value) } = &prog.functions[1].body[0] else {
+        let TStmt::Return { value: Some(value) } = &prog.functions[1].body[0].1 else {
             panic!()
         };
         assert!(
@@ -1954,13 +1987,13 @@ mod tests {
         .unwrap();
         // `x` is already `any`, so returning it needs no box/unbox.
         let identity = &prog.functions[0];
-        let TStmt::Return { value: Some(v) } = &identity.body[0] else {
+        let TStmt::Return { value: Some(v) } = &identity.body[0].1 else {
             panic!()
         };
         assert!(matches!(v.kind, TExprKind::Local(_)), "{:?}", v.kind);
 
         let main = &prog.functions[1];
-        let TStmt::Local { value, .. } = &main.body[1] else {
+        let TStmt::Local { value, .. } = &main.body[1].1 else {
             panic!()
         };
         // `identity(y)` is `any`, unboxed by the `i64` annotation.

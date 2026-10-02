@@ -50,8 +50,8 @@ fn scalar_replace_function(f: &mut TFunction, structs: &HashMap<String, StructLa
 }
 
 /// Every `local id = StructName { ... }` literal, paired with the struct name.
-fn collect_struct_literal_locals(stmts: &[TStmt], out: &mut Vec<(LocalId, String)>) {
-    for s in stmts {
+fn collect_struct_literal_locals(stmts: &TBlock, out: &mut Vec<(LocalId, String)>) {
+    for (_, s) in stmts {
         match s {
             TStmt::Break => {}
             TStmt::Local { id, value } => {
@@ -80,8 +80,8 @@ fn collect_struct_literal_locals(stmts: &[TStmt], out: &mut Vec<(LocalId, String
 
 /// True if `id` is ever the target of a whole-value `Assign` (`p = ...`);
 /// a field-level write (`p.x = ...`) doesn't count.
-fn is_reassigned_as_whole(stmts: &[TStmt], id: LocalId) -> bool {
-    stmts.iter().any(|s| match s {
+fn is_reassigned_as_whole(stmts: &TBlock, id: LocalId) -> bool {
+    stmts.iter().any(|(_, s)| match s {
         TStmt::Assign { id: assigned, .. } => *assigned == id,
         TStmt::Break
         | TStmt::AssignIndex { .. }
@@ -99,8 +99,8 @@ fn is_reassigned_as_whole(stmts: &[TStmt], id: LocalId) -> bool {
     })
 }
 
-fn block_leaks_local(stmts: &[TStmt], id: LocalId) -> bool {
-    stmts.iter().any(|s| stmt_leaks_local(s, id))
+fn block_leaks_local(stmts: &TBlock, id: LocalId) -> bool {
+    stmts.iter().any(|(_, s)| stmt_leaks_local(s, id))
 }
 
 fn stmt_leaks_local(s: &TStmt, id: LocalId) -> bool {
@@ -206,20 +206,20 @@ fn expr_leaks_local(e: &TExpr, id: LocalId) -> bool {
 
 // -- the transform itself (only reached for functions with >=1 eligible local) --
 
-fn transform_block(stmts: Vec<TStmt>, field_ids: &HashMap<LocalId, Vec<LocalId>>) -> Vec<TStmt> {
+fn transform_block(stmts: TBlock, field_ids: &HashMap<LocalId, Vec<LocalId>>) -> TBlock {
     let mut out = Vec::with_capacity(stmts.len());
-    for stmt in stmts {
+    for (line, stmt) in stmts {
         match stmt {
-            TStmt::Break => out.push(TStmt::Break),
+            TStmt::Break => out.push((line, TStmt::Break)),
             TStmt::Local { id, value } if field_ids.contains_key(&id) => {
                 let TExprKind::StructLiteral { fields, .. } = value.kind else {
                     unreachable!("collect_struct_literal_locals only ever collects StructLiteral-initialized locals")
                 };
                 for (field_id, field_expr) in field_ids[&id].iter().zip(fields) {
-                    out.push(TStmt::Local {
+                    out.push((line, TStmt::Local {
                         id: *field_id,
                         value: transform_expr(field_expr, field_ids),
-                    });
+                    }));
                 }
             }
             TStmt::AssignField {
@@ -229,49 +229,49 @@ fn transform_block(stmts: Vec<TStmt>, field_ids: &HashMap<LocalId, Vec<LocalId>>
             } => {
                 if let TExprKind::Local(base_id) = &base.kind {
                     if let Some(ids) = field_ids.get(base_id) {
-                        out.push(TStmt::Assign {
+                        out.push((line, TStmt::Assign {
                             id: ids[field_index],
                             value: transform_expr(value, field_ids),
-                        });
+                        }));
                         continue;
                     }
                 }
-                out.push(TStmt::AssignField {
+                out.push((line, TStmt::AssignField {
                     base: transform_expr(base, field_ids),
                     field_index,
                     value: transform_expr(value, field_ids),
-                });
+                }));
             }
-            TStmt::Local { id, value } => out.push(TStmt::Local {
+            TStmt::Local { id, value } => out.push((line, TStmt::Local {
                 id,
                 value: transform_expr(value, field_ids),
-            }),
-            TStmt::Assign { id, value } => out.push(TStmt::Assign {
+            })),
+            TStmt::Assign { id, value } => out.push((line, TStmt::Assign {
                 id,
                 value: transform_expr(value, field_ids),
-            }),
+            })),
             TStmt::AssignIndex {
                 array,
                 index,
                 value,
-            } => out.push(TStmt::AssignIndex {
+            } => out.push((line, TStmt::AssignIndex {
                 array: transform_expr(array, field_ids),
                 index: transform_expr(index, field_ids),
                 value: transform_expr(value, field_ids),
-            }),
+            })),
             TStmt::If {
                 cond,
                 then_block,
                 else_block,
-            } => out.push(TStmt::If {
+            } => out.push((line, TStmt::If {
                 cond: transform_expr(cond, field_ids),
                 then_block: transform_block(then_block, field_ids),
                 else_block: transform_block(else_block, field_ids),
-            }),
-            TStmt::While { cond, body } => out.push(TStmt::While {
+            })),
+            TStmt::While { cond, body } => out.push((line, TStmt::While {
                 cond: transform_expr(cond, field_ids),
                 body: transform_block(body, field_ids),
-            }),
+            })),
             TStmt::NumericFor {
                 id,
                 stop_id,
@@ -280,7 +280,7 @@ fn transform_block(stmts: Vec<TStmt>, field_ids: &HashMap<LocalId, Vec<LocalId>>
                 stop,
                 step,
                 body,
-            } => out.push(TStmt::NumericFor {
+            } => out.push((line, TStmt::NumericFor {
                 id,
                 stop_id,
                 step_id,
@@ -288,10 +288,10 @@ fn transform_block(stmts: Vec<TStmt>, field_ids: &HashMap<LocalId, Vec<LocalId>>
                 stop: transform_expr(stop, field_ids),
                 step: transform_expr(step, field_ids),
                 body: transform_block(body, field_ids),
-            }),
-            TStmt::Return { value } => out.push(TStmt::Return {
+            })),
+            TStmt::Return { value } => out.push((line, TStmt::Return {
                 value: value.map(|v| transform_expr(v, field_ids)),
-            }),
+            })),
         }
     }
     out
@@ -509,17 +509,17 @@ mod tests {
         );
         let body = &prog.functions[0].body;
         assert_eq!(body.len(), 3, "{body:?}"); // 2 field locals + return
-        assert!(matches!(body[0], TStmt::Local { .. }));
-        assert!(matches!(body[1], TStmt::Local { .. }));
-        let TStmt::Local { value: v0, .. } = &body[0] else {
+        assert!(matches!(body[0].1, TStmt::Local { .. }));
+        assert!(matches!(body[1].1, TStmt::Local { .. }));
+        let TStmt::Local { value: v0, .. } = &body[0].1 else {
             panic!()
         };
-        let TStmt::Local { value: v1, .. } = &body[1] else {
+        let TStmt::Local { value: v1, .. } = &body[1].1 else {
             panic!()
         };
         assert!(matches!(v0.kind, TExprKind::IntLit(1)), "{:?}", v0.kind);
         assert!(matches!(v1.kind, TExprKind::IntLit(2)), "{:?}", v1.kind);
-        let TStmt::Return { value: Some(ret) } = &body[2] else {
+        let TStmt::Return { value: Some(ret) } = &body[2].1 else {
             panic!()
         };
         fn contains_field_or_struct(e: &TExpr) -> bool {
@@ -540,8 +540,8 @@ mod tests {
     fn a_struct_returned_by_value_is_not_scalar_replaced() {
         let prog = replaced("struct Point { x: i64, y: i64 }\nfunction make(): Point\n  local p = Point { x = 1, y = 2 }\n  return p\nend\nfunction main(): i64\n  local p = make()\n  return p.x\nend\n");
         let body = &prog.functions[0].body; // `make`
-        assert!(matches!(body[0], TStmt::Local { .. }));
-        let TStmt::Local { value, .. } = &body[0] else {
+        assert!(matches!(body[0].1, TStmt::Local { .. }));
+        let TStmt::Local { value, .. } = &body[0].1 else {
             panic!()
         };
         assert!(
@@ -556,7 +556,7 @@ mod tests {
             "struct Point { x: i64, y: i64 }\nfunction sum(p: Point): i64\n  return p.x + p.y\nend\nfunction main(): i64\n  local p = Point { x = 1, y = 2 }\n  return sum(p)\nend\n",
         );
         let body = &prog.functions[1].body; // `main`
-        let TStmt::Local { value, .. } = &body[0] else {
+        let TStmt::Local { value, .. } = &body[0].1 else {
             panic!()
         };
         assert!(

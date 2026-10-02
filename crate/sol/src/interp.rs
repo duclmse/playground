@@ -61,6 +61,22 @@ pub trait Hooks {
     fn on_call_exit(&self, _func_id: u8, _result: u64) {}
     fn on_frame_state(&self, _frame: &sol_core::FrameHeader) {}
     fn on_tail_call(&self, _from: u8, _to: u8, _args: &[u64]) {}
+    /// U12 item 3 (deliverable 2): fires once per bytecode instruction, right
+    /// before it executes, with the source line the real per-instruction
+    /// `SourceMap` maps its pc to (see `bccompile.rs`'s `compile_function`).
+    /// `regs` is the *whole* register file (named locals 0..local_count, plus
+    /// temporaries beyond it) at this exact instant - the debugger's
+    /// stack-frame/locals rendering (`debugger.rs`) reads straight out of it,
+    /// so this is real interpreter state, not a reconstruction.
+    ///
+    /// The default empty body is the same zero-cost argument as every other
+    /// hook here: `H = ()`'s impl inlines to nothing, so `sol run`'s normal
+    /// path (no debug session attached) compiles this call away. Not
+    /// separately re-benchmarked this session beyond the existing
+    /// `cargo test` suite passing unchanged (see
+    /// `docs/features/milestones/u12-wasm-playground.md`'s Work item 3
+    /// section for exactly what was and wasn't measured).
+    fn on_instruction(&self, _func_id: u8, _pc: u32, _line: u32, _regs: &[u64]) {}
 }
 
 impl Hooks for () {}
@@ -236,6 +252,18 @@ impl<'a, H: Hooks> Runtime<'a, H> {
     pub fn preload_native(&self, func_id: u8, ptr: *const u8) {
         *self.slots[func_id as usize].borrow_mut() = Slot::Native(ptr);
         self.mark_native(func_id);
+    }
+
+    /// U12 item 3: the compiled bytecode behind `func_id`, if it's still
+    /// interpreted (not promoted to native) - `debugger.rs` needs the real
+    /// `SourceMap` this exact `Runtime` is executing against, not a
+    /// separately recompiled copy, so a breakpoint's verified pc and the
+    /// trace's recorded pcs are guaranteed to agree.
+    pub fn bytecode_function(&self, func_id: u8) -> Option<Rc<BcFunction>> {
+        match &*self.slots[func_id as usize].borrow() {
+            Slot::Bytecode(bf) => Some(bf.clone()),
+            _ => None,
+        }
     }
 
     pub fn function_descriptor(&self, func_id: u8) -> Option<sol_core::FunctionDescriptor> {
@@ -425,6 +453,12 @@ impl<'a, H: Hooks> Runtime<'a, H> {
             self.instructions_remaining.set(remaining - 1);
 
             frame.pc = pc as u32;
+            let line = bf
+                .source_map
+                .location(pc as u32)
+                .map(|loc| loc.line)
+                .unwrap_or(bf.source_line);
+            self.hooks.on_instruction(func_id, pc as u32, line, &regs);
             let instr = bf.code[pc];
             pc += 1;
             let a = instr.a() as usize;
