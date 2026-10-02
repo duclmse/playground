@@ -721,3 +721,195 @@ always-wasm32-checked module set as item 3's own additions.
 - `externalAllocation`/`allocationDebt` (the wire protocol's
   `MemoryStatsInfo` fields beyond `live_bytes`/`live_blocks`) have no
   implemented equivalent here — noted above, not invented.
+
+## Work item 5 — profiling, execution timeline, and the coroutine/thread scope boundary
+
+**Goal:** extend item 3/4's native, non-wasm `DebugSession` spike with
+`profile`/`debugGetThreads`-equivalent coverage, still a native Rust spike
+(no wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
+wiring), built directly on item 3's `TraceStep`/`Hooks` recording
+machinery.
+
+**Correction to this item's own plan text: `debugGetThreads`/per-thread
+stack scoping has no applicable target in this spike.** The plan's wording
+("reuse whatever Sol's own coroutine representation — `closures.rs`/`gc.rs`
+— already exposes for suspended-thread stacks... confirm it's walkable
+per-thread") assumes the typed `.sol` tier has some coroutine/thread
+representation to walk. Checked directly before assuming otherwise (not
+just trusting a prior grep summary): `grep -rn
+"coroutine\|Coroutine" crate/sol/src/*.rs` outside `lua_runtime/*`/
+`lua_bytecode/*` turns up exactly two files —
+- `interp.rs:795-863`: a mixed-module `#[cfg(test)]` helper
+  (`dynamic_coroutine_round_trip_through_a_typed_boundary`-style test) that
+  calls `runtime.create_global_coroutine(name)`/
+  `runtime.resume_coroutine_outcome(handle, arguments)` from typed `.sol`
+  code through the FFI bridge — i.e. invoking the *separate dynamic `.lua`
+  tier's own* coroutine machinery from a typed caller, not a typed-tier
+  coroutine primitive of its own. Read in full to confirm: the coroutine
+  object itself (`create_global_coroutine`) is created and resumed entirely
+  within `LuaRuntime`/`lua_runtime/*`'s dynamic interpreter; the typed side
+  only ever sees an opaque handle and an integer result.
+- `main.rs`: one comment plus one error message
+  ("attempt to yield from main outside a coroutine") about *dynamic*
+  `.lua` yielding outside a coroutine — also part of the
+  dynamic/mixed-module path (`main.rs`'s mixed native/dynamic entry point),
+  not the typed Tier-0 engine `DebugSession` wraps.
+
+`closures.rs`/`gc.rs` (the plan's cited location) were also read directly:
+neither defines or references a coroutine/thread/fiber concept at all —
+`closures.rs` is escape analysis for typed-tier closures (lambda-lifting,
+scalar replacement), `gc.rs` is the tracing collector, and `sol-core`'s own
+"suspended thread stacks are part of reachability semantics" invariant (the
+plan's cited justification) describes the *dynamic* `.lua` tier's
+coroutines (`lua_runtime/canonical.rs`'s adapter), which do root a
+suspended Lua thread's stack — not anything the typed tier or
+`tier0::Engine` touches.
+
+So: the typed `.sol` language and its Tier-0 bytecode interpreter
+(`interp.rs`'s main dispatch, `bccompile.rs`, `types.rs`) have **no
+coroutine/thread concept of their own at all** — "coroutine" in this
+codebase is exclusively a dynamic-`.lua`-tier concept, confirmed separately
+by `docs/phase-4-8-implementation.md`'s own coroutine-debugging examples
+(`Thread::debug_frames`/`debug_read_register`, `Executor::debug_thread_stack`)
+all being about the retired `crates/vm`/piccolo-fork `.lua` runtime, not Sol's
+typed tier. `DebugSession` (item 3/4) only ever runs a typed `TProgram`
+through `tier0::Engine` — confirmed again here, not just inherited as an
+assumption: `tier0::Engine::call`/`call_outcome` is one synchronous Rust
+call with no suspended-coroutine state to enumerate, by construction. There
+is therefore nothing to "confirm is walkable per-thread": the typed tier
+this `DebugSession` wraps is single-threaded unconditionally, not merely
+"currently only exercises one thread in these fixtures." Per this item's own
+instructions, no fake/stub multi-thread model was invented to satisfy the
+plan's wording.
+
+**A small, honestly-scoped addition anyway:** `DebugSession::threads()`
+(`crate/sol/src/debugger.rs`) always returns exactly one `ThreadInfo { id:
+0, status: "running" }` — a constant, single-element report, loosely
+shaped after `apps/web/src/debug-protocol.ts`'s `ThreadInfo` (`id`,
+`status`) for wire-protocol-shape compatibility if a later item wants it.
+Its doc comment states explicitly, in the same place a caller would read
+it, that this is not real multi-thread/coroutine support — not a disguised
+stub pretending otherwise. Covered by a trivial unit test
+(`threads_always_reports_exactly_one_main_thread`,
+`crate/sol/src/debugger.rs`'s `#[cfg(test)]` module).
+
+**The profiling/timeline half of the plan is the real substance of this
+item, and it did hold up:** item 3's `TraceStep`/`TraceRecorder`/`Hooks`
+infrastructure already records every bytecode instruction visited
+(`func_id`, `pc`, `line`, `depth`) during one complete run — already
+"record everything, don't pause," the plan's own suggested approach for
+this part. Built directly on it, no second instrumentation path.
+
+**`DebugSession::profile(function_name, args) -> Vec<FunctionStats>`**
+(`crate/sol/src/debugger.rs`): a one-shot instrumented run (resets and
+re-runs `function_name(args)` via the same `run` mechanism item 3 built),
+then aggregates the resulting trace. `FunctionStats { function_name, calls,
+self_instructions, total_instructions }` is loosely shaped after
+`apps/web/src/debug-protocol.ts`'s `FunctionStatsInfo` (`functionId`,
+`calls`, `totalInstructions`, `selfInstructions`), read for field-naming
+guidance only — this stays a native spike, no wasm-bindgen bindings, no
+`apps/web` changes, same boundary item 3/4 kept.
+
+Attribution choice, stated explicitly per the task's own request to pick
+one and document why: **`self_instructions`** = the count of recorded
+`TraceStep`s whose `func_id` is this function — instructions dispatched
+while this function's own frame was the one actually executing, excluding
+anything spent inside a callee (which records its own, different `func_id`
+instead). **`total_instructions`** = `self_instructions` plus every
+instruction recorded while any call this function made, directly or
+transitively, was active. This is the standard self-time/total-time split
+(and matches the retired `crates/lua-vm/src/profiler.rs`'s own
+`self_instructions`/`total_instructions` design, confirmed by reading
+`docs/phase-4-8-implementation.md`'s "Profiler" section: "on a return...
+add `duration - child_instructions` to `self_instructions`... credit the
+duration to its caller's `child_instructions`" — the same self-vs-total
+distinction, re-derived here from a full trace rather than tracked
+incrementally during a single pass, since this item already has a full
+trace sitting in memory and does not need to re-earn the same bookkeeping
+during execution). Implementation walks the trace once, reconstructing a
+call stack (`Vec<func_id>`, one entry per active depth) purely from each
+step's own `depth`/`func_id`: a step whose depth is one deeper than the
+stack's current height pushes a new frame and charges one `calls` to that
+function (this includes the session's own top-level call, which always
+gets exactly one); a step whose depth is shallower truncates the stack back
+down with no new call charged (continuing an already-counted ancestor frame
+after a nested call returned); a step at the *same* depth as the stack's
+current top but a *different* `func_id` is a tail call
+(`TraceStep::depth`'s own doc comment: tail calls reuse the caller's depth)
+— the old frame is replaced in place and the new function is charged one
+`calls`. Every step then adds one to `self_instructions` for its own
+`func_id` alone, and one to `total_instructions` for every function
+currently on the reconstructed stack (itself plus every live ancestor).
+
+**`DebugSession::record_timeline(function_name, args) -> Vec<TimelineEvent>`**
+(`crate/sol/src/debugger.rs`): same one-shot-run mechanism, deriving a
+chronological event list from the same trace's `depth`/`func_id`
+transitions rather than a second recording pass. `TimelineEvent { kind,
+function_name, depth, step_index }` is loosely shaped after
+`apps/web/src/debug-protocol.ts`'s `TimelineEventInfo` (`eventType`, `line`,
+`duration`, ...), read for field-naming guidance only. `TimelineEventKind`
+covers `CallEnter`/`CallExit` (the task's stated minimum) plus `TailCall`
+(a same-depth, different-`func_id` transition, which falls directly out of
+the same walk at no extra cost — not a separate line-level "line stepped"
+event, since a caller wanting per-line detail already has `trace()` itself,
+which carries a per-instruction `line`). The one synthetic event:
+the top-level call's own closing `CallExit` has no following instruction to
+observe it at (the run is over once it returns), so it reports
+`trace().len()` — one index past the end, not a real trace index; every
+other event's `step_index` is a real index into `trace()`.
+
+**Differential tests** (`crate/sol/tests/debugger.rs`):
+- `profile_attributes_self_and_total_instructions_correctly_across_a_looped_call`:
+  a leaf function (`helper`) called 3 times from a loop in `main`. Cross-checks
+  `profile`'s `calls`/`self_instructions` against an independent recount
+  directly over the raw trace (not by calling `profile` again) — the same
+  cross-checking spirit as item 3's breakpoint test. Also asserts three
+  algebraic identities the attribution algorithm must satisfy, checked
+  directly rather than only asserted in prose: a leaf function's
+  `total_instructions` equals its `self_instructions`; the top-level
+  function's `total_instructions` equals the whole trace's length; and
+  summing `self_instructions` across every returned function equals the
+  trace's length too (every instruction belongs to exactly one frame's self
+  time).
+- `record_timeline_produces_the_expected_call_enter_exit_sequence`: a
+  `f(); g(); f();` sequential-call fixture (no nesting, no recursion) —
+  asserts the exact `(kind, function_name)` sequence end to end
+  (`CallEnter(main)`, `CallEnter(f)`, `CallExit(f)`, `CallEnter(g)`,
+  `CallExit(g)`, `CallEnter(f)`, `CallExit(f)`, `CallExit(main)`), and that
+  the final synthetic `CallExit`'s `step_index` is exactly `trace().len()`.
+
+**Verified outcome:**
+`cargo test --manifest-path crate/sol/Cargo.toml` — 546 passed, 0 failed,
+across 25 test binaries (543 from item 4 plus 2 new integration tests in
+`tests/debugger.rs` and 1 new unit test in `src/debugger.rs`).
+`cargo test --manifest-path crate/sol/Cargo.toml --no-default-features` —
+539 passed, 0 failed, across 24 test binaries (536 from item 4 plus the same
+3 new tests).
+`cargo check --manifest-path crate/sol/Cargo.toml --no-default-features
+--target wasm32-unknown-unknown` — clean, after `touch`ing `debugger.rs` and
+`tests/debugger.rs` first to rule out a stale-cache false pass.
+`scripts/test-lua55-manifest.sh` — passes (`Lua 5.5 manifest regression
+checks passed`). All new code lives in `debugger.rs`/`tests/debugger.rs`,
+both already part of the always-compiled, always-wasm32-checked module set
+established by items 3/4.
+
+**Explicitly not done here:**
+- Real per-thread/coroutine stack scoping — no applicable target in this
+  spike, per the finding above; `DebugSession::threads()` is a constant
+  one-thread shape-compatibility accessor, not a step toward real support.
+- No wall-clock timing for `profile`/`record_timeline` — instruction counts
+  only, the same timing proxy this codebase already uses everywhere
+  (`MAX_INSTRUCTIONS`), and for the same reason the retired `lua-vm`
+  profiler gave for choosing it (stable run to run, unlike wall-clock time
+  under a WASM-hosted interpreter with no JIT warmup to account for).
+- No bounded/truncating recording for `record_timeline` — the retired
+  `crates/lua-vm/src/debug_events.rs`'s `max_events`/`truncated` cap (for an
+  unboundedly long-running script) has no equivalent here; this spike's
+  trace is already fully materialized in memory by `run`/`DebugSession`
+  before `record_timeline` ever sees it, so there is no separate recording
+  pass to cap — a real concern for a long-running script, left to whichever
+  later item actually wires this to a worker/browser context with a memory
+  budget.
+- No wasm-bindgen bindings, no `apps/web` changes, no worker-protocol
+  wiring — out of this item's explicit scope, not attempted, same as every
+  prior item in this milestone.

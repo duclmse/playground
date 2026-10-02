@@ -3049,6 +3049,62 @@ equivalent (does not apply to the typed tier); no `Any` unboxing in
 `ValueRenderer` (unchanged from item 3); no wasm-bindgen/browser/worker
 wiring (explicitly out of scope for this item).
 
+Item 5 (2026-10-02): profiling, execution timeline, and the coroutine/thread
+scope boundary - extends item 3/4's `DebugSession` spike, still native/
+non-wasm. The plan's own wording asked to "reuse whatever Sol's own
+coroutine representation already exposes for suspended-thread stacks";
+checked directly (grepping `coroutine|Coroutine` across `crate/sol/src/*.rs`
+outside `lua_runtime/*`/`lua_bytecode/*`, then reading every hit) and found
+the premise does not hold: the typed `.sol` tier and its Tier-0 bytecode
+interpreter have no coroutine/thread concept of their own at all -
+"coroutine" in this codebase is exclusively a dynamic-`.lua`-tier concept,
+confirmed by `interp.rs:795-863` (a mixed-module test helper that calls into
+the dynamic tier's own coroutine machinery through the FFI bridge, not a
+typed-tier primitive) and by `docs/phase-4-8-implementation.md`'s own
+coroutine-debugging examples all being `.lua` syntax. Since `DebugSession`
+only ever runs a typed `TProgram` through `tier0::Engine` - one synchronous
+Rust call, single-threaded by construction - there is nothing for
+`debugGetThreads`/per-thread stack scoping to apply to; stated this plainly
+rather than inventing a stub multi-thread model to satisfy the plan's
+wording. Added `DebugSession::threads()` anyway as a small, honestly-scoped
+addition: a constant, single-element "main thread" report for wire-protocol
+*shape* compatibility, explicitly documented as exactly that, not real
+multi-thread support.
+
+The profiling/timeline half of the plan did hold up: built
+`DebugSession::profile`/`record_timeline`, both one-shot instrumented runs
+("record everything, don't pause") reusing item 3's `TraceStep`/`Hooks`
+recording machinery rather than a second instrumentation path, matching the
+plan's own suggested approach. `profile` walks the recorded trace once,
+reconstructing a call stack purely from each step's own `depth`/`func_id`
+fields, and reports per-function `calls`/`self_instructions` (instructions
+where that function's own frame was executing) /`total_instructions` (self
+plus every live ancestor call's instructions) - a leaf function's total
+always equals its self time, the top-level function's total always covers
+the whole trace, and self times across every function always sum to the
+trace's full length (all three checked directly, not just asserted in
+prose). `record_timeline` derives a chronological `CallEnter`/`CallExit`
+(plus same-depth-different-`func_id` `TailCall`) event list from the same
+trace's depth transitions, closing with one synthetic `CallExit` for the
+top-level call's own return (which has no following instruction to observe
+it at). Both shapes were checked against `apps/web/src/debug-protocol.ts`'s
+`FunctionStatsInfo`/`TimelineEventInfo` for field-naming guidance only, per
+item 3/4's own scope boundary (no wasm-bindgen, no `apps/web` changes here).
+Two new differential tests added to `crate/sol/tests/debugger.rs`: a
+looped-call fixture cross-checking `profile`'s self/total attribution
+against an independent recount of the raw trace; a three-sequential-calls
+fixture (`f(); g(); f();`) asserting `record_timeline`'s exact
+call-enter/exit sequence. `cargo test` passes 546/0 (default features, 25
+binaries) and 539/0 (`--no-default-features`, 24 binaries); the wasm32
+`cargo check` (after touching the changed files) and
+`scripts/test-lua55-manifest.sh` both stay clean. See
+`docs/features/milestones/u12-wasm-playground.md`'s "Work item 5" section
+for full file:line detail and the complete not-done list. Not done, stated
+explicitly: real per-thread/coroutine stack scoping (no applicable target in
+this spike, per the finding above); no wall-clock timing (instruction counts
+only, matching this codebase's existing `MAX_INSTRUCTIONS` convention); no
+wasm-bindgen/browser/worker wiring (explicitly out of scope for this item).
+
 ### U13 — Semantic LSP and first-party VS Code client
 
 **Purpose:** ship supported editor tooling, not only a generic-server binary.

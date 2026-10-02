@@ -82,6 +82,46 @@ const ALLOCATION_HEAVY: &str = "function main(): i64
     return m[1999]
 end";
 
+/// Fixture 7 (U12 item 5): a leaf function (`helper`) called 3 times from a
+/// loop in `main` - for the profiling self/total-instruction attribution
+/// test. `helper` calls nothing, so its total time must equal its self time;
+/// `main` is the top-level call, so its total time must cover the whole
+/// trace.
+const LOOP_CALLING_HELPER: &str = "function helper(x: i64): i64
+    local y: i64 = x * 2
+    return y
+end
+
+function main(): i64
+    local total: i64 = 0
+    local i: i64 = 0
+    while i < 3 do
+        total = total + helper(i)
+        i = i + 1
+    end
+    return total
+end";
+
+/// Fixture 8 (U12 item 5): three sequential (non-nested, non-recursive)
+/// calls from `main` - `f()`, then `g()`, then `f()` again - for the
+/// timeline call-enter/call-exit sequence test.
+const SEQUENTIAL_CALLS: &str = "function f(): i64
+    local x: i64 = 1
+    return x
+end
+
+function g(): i64
+    local y: i64 = 2
+    return y
+end
+
+function main(): i64
+    local a: i64 = f()
+    local b: i64 = g()
+    local c: i64 = f()
+    return a + b + c
+end";
+
 #[test]
 fn breakpoint_hit_locals_match_the_non_paused_interpreted_run() {
     let program = compile(MULTI_STATEMENT);
@@ -374,5 +414,128 @@ fn memory_stats_report_plausible_values_and_force_gc_does_not_crash() {
     assert_eq!(
         after_gc, after,
         "force_gc must be a safe no-op in a jit-free DebugSession context, not reclaim anything"
+    );
+}
+
+// -----------------------------------------------------------------------
+// U12 item 5: profiling + timeline differential tests. See
+// `docs/features/milestones/u12-wasm-playground.md`'s Work item 5 section
+// for the attribution algorithm and the coroutine/thread scope-boundary
+// finding (`DebugSession::threads` always reports exactly one thread - the
+// typed tier this session wraps has no coroutine concept at all).
+// -----------------------------------------------------------------------
+
+#[test]
+fn profile_attributes_self_and_total_instructions_correctly_across_a_looped_call() {
+    let program = compile(LOOP_CALLING_HELPER);
+    let session = DebugSession::new(program).expect("session builds");
+    let stats = session.profile("main", &[]);
+
+    let main_id = session.function_id("main").expect("main has a func_id");
+    let helper_id = session.function_id("helper").expect("helper has a func_id");
+
+    let main_stats = stats
+        .iter()
+        .find(|s| s.function_name == "main")
+        .expect("main must appear in the profile");
+    let helper_stats = stats
+        .iter()
+        .find(|s| s.function_name == "helper")
+        .expect("helper must appear in the profile");
+
+    // Independently recomputed directly from the raw recorded trace (not by
+    // calling `profile` again), the same cross-checking spirit as
+    // `breakpoint_hit_locals_match_the_non_paused_interpreted_run` above.
+    let trace = session.trace();
+    let independent_self_main = trace.iter().filter(|s| s.func_id == main_id).count() as u64;
+    let independent_self_helper = trace.iter().filter(|s| s.func_id == helper_id).count() as u64;
+    let mut independent_calls_helper = 0u64;
+    let mut prev_was_helper = false;
+    for step in &trace {
+        let is_helper = step.func_id == helper_id;
+        if is_helper && !prev_was_helper {
+            independent_calls_helper += 1;
+        }
+        prev_was_helper = is_helper;
+    }
+
+    assert_eq!(
+        main_stats.calls, 1,
+        "main is the session's own top-level call, invoked exactly once"
+    );
+    assert_eq!(
+        helper_stats.calls, independent_calls_helper,
+        "helper's call count must match the independently-counted contiguous helper-frame runs in the trace"
+    );
+    assert_eq!(helper_stats.calls, 3, "the fixture's loop calls helper exactly 3 times");
+
+    assert_eq!(
+        main_stats.self_instructions, independent_self_main,
+        "main's self_instructions must match an independent count of main-owned trace steps"
+    );
+    assert_eq!(
+        helper_stats.self_instructions, independent_self_helper,
+        "helper's self_instructions must match an independent count of helper-owned trace steps"
+    );
+
+    // helper calls nothing, so its total time is exactly its self time.
+    assert_eq!(
+        helper_stats.total_instructions, helper_stats.self_instructions,
+        "a leaf function's total_instructions must equal its self_instructions"
+    );
+    // main is the top-level call, so it is an ancestor of every single
+    // recorded instruction - its total_instructions must cover the entire
+    // trace.
+    assert_eq!(
+        main_stats.total_instructions,
+        trace.len() as u64,
+        "the top-level function's total_instructions must cover the entire trace"
+    );
+    // Self/total partition identity: every instruction belongs to exactly
+    // one function's self_instructions (whichever frame was actually
+    // executing at that instant), so self times across every profiled
+    // function must sum to the trace's full length.
+    let self_time_sum: u64 = stats.iter().map(|s| s.self_instructions).sum();
+    assert_eq!(
+        self_time_sum,
+        trace.len() as u64,
+        "self_instructions across all functions must partition the whole trace"
+    );
+}
+
+#[test]
+fn record_timeline_produces_the_expected_call_enter_exit_sequence() {
+    let program = compile(SEQUENTIAL_CALLS);
+    let session = DebugSession::new(program).expect("session builds");
+    let events = session.record_timeline("main", &[]);
+
+    let sequence: Vec<(sol::debugger::TimelineEventKind, String)> = events
+        .iter()
+        .map(|e| (e.kind, e.function_name.clone()))
+        .collect();
+
+    use sol::debugger::TimelineEventKind::{CallEnter, CallExit};
+    assert_eq!(
+        sequence,
+        vec![
+            (CallEnter, "main".to_string()),
+            (CallEnter, "f".to_string()),
+            (CallExit, "f".to_string()),
+            (CallEnter, "g".to_string()),
+            (CallExit, "g".to_string()),
+            (CallEnter, "f".to_string()),
+            (CallExit, "f".to_string()),
+            (CallExit, "main".to_string()),
+        ],
+        "f(); g(); f(); must produce exactly this chronological call-enter/exit sequence: {events:?}"
+    );
+
+    // The top-level call's own closing CallExit has no following instruction
+    // to observe it at, so it reports one index past the end of the trace.
+    let trace = session.trace();
+    assert_eq!(
+        events.last().unwrap().step_index,
+        trace.len(),
+        "the synthetic closing CallExit must report trace().len(), not a real trace index"
     );
 }

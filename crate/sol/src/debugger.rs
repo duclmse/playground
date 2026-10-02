@@ -791,6 +791,271 @@ impl DebugSession {
             .iter()
             .find(|f| self.engine.function_id(&f.name) == Some(func_id))
     }
+
+    // -------------------------------------------------------------------
+    // U12 item 5: profiling, execution timeline, and the coroutine/thread
+    // scope boundary. See
+    // `docs/features/milestones/u12-wasm-playground.md`'s Work item 5
+    // section for the full design rationale and the coroutine-scope finding
+    // this documents rather than papers over.
+    // -------------------------------------------------------------------
+
+    /// U12 item 5: `debugGetThreads`-equivalent. **Always reports exactly
+    /// one thread, the main thread - this is not real multi-thread/coroutine
+    /// support, and is not meant to look like it.**
+    ///
+    /// Checked directly before writing this (not assumed): grepping
+    /// `coroutine|Coroutine` across `crate/sol/src/*.rs` outside
+    /// `lua_runtime/*`/`lua_bytecode/*` turns up only `interp.rs:795-863` (a
+    /// mixed-module test helper that calls into the separate *dynamic*
+    /// `.lua` tier's own coroutine machinery via the FFI bridge -
+    /// `create_global_coroutine`/`resume_coroutine_outcome` - not a
+    /// typed-tier primitive) and a `main.rs` comment/error message about
+    /// yielding outside a coroutine, also part of the dynamic/mixed-module
+    /// path. The typed `.sol` language and its Tier-0 bytecode interpreter
+    /// (`interp.rs`'s dispatch loop, `bccompile.rs`, `types.rs`) have **no
+    /// coroutine/thread concept of their own at all** - "coroutine" in this
+    /// codebase is exclusively a dynamic-`.lua`-tier concept
+    /// (`lua_runtime/*`), confirmed separately by
+    /// `docs/phase-4-8-implementation.md`'s own coroutine-debugging examples
+    /// all being `.lua` syntax (`coroutine.create`/`coroutine.resume`).
+    /// `DebugSession` only ever runs a typed `TProgram` through
+    /// `tier0::Engine` (item 3's own scope boundary, unchanged by this item)
+    /// - it never touches `lua_runtime`'s dynamic interpreter or its
+    /// coroutine machinery at all.
+    ///
+    /// So `debugGetThreads`/per-thread stack scoping has no applicable
+    /// target in this spike: there is nothing to "confirm is walkable
+    /// per-thread," because the typed tier this `DebugSession` wraps is
+    /// single-threaded *by construction* - `tier0::Engine::call`/
+    /// `call_outcome` is one synchronous Rust call, with no suspended
+    /// coroutine state to enumerate, ever. Real per-thread stack scoping is
+    /// simply not implemented here, not silently dropped - adding it for a
+    /// tier that cannot suspend a thread at all would mean inventing a stub
+    /// to satisfy the plan's wording, which this item deliberately does not
+    /// do.
+    ///
+    /// This accessor exists anyway, as a small, honestly-scoped addition: a
+    /// constant, single-element "main thread" report, for wire-protocol
+    /// *shape* compatibility with `apps/web/src/debug-protocol.ts`'s
+    /// `ThreadInfo` (`id`, `status`) if a later item wants one - not a
+    /// disguised stub pretending to support suspended or multiple threads.
+    pub fn threads(&self) -> Vec<ThreadInfo> {
+        vec![ThreadInfo {
+            id: 0,
+            status: "running".to_string(),
+        }]
+    }
+
+    /// U12 item 5: one-shot profiling run. Resets and re-runs
+    /// `function_name(args)` (same recording mechanism as `run`), then
+    /// aggregates the resulting trace into per-function `FunctionStats` -
+    /// reusing item 3's `TraceStep`/`Hooks` recording machinery in "record
+    /// everything, don't pause" mode, per the plan's own suggested approach,
+    /// rather than building a second instrumentation path. Like `run`, call
+    /// once per session - a fresh `DebugSession` per profiling run keeps this
+    /// run's trace from mixing with a separate stepping/eval session's own.
+    ///
+    /// Attribution algorithm: walks the trace once, reconstructing the call
+    /// stack (`Vec<func_id>`, one entry per active depth) purely from each
+    /// step's own `depth`/`func_id` fields (no second recorded pass): a step
+    /// whose depth is one deeper than the stack's current height pushes a
+    /// new frame (and charges one `calls` to that function - this includes
+    /// the session's own top-level call, which always gets exactly one); a
+    /// step whose depth is shallower truncates the stack back down (no new
+    /// call charged - this is just continuing an already-counted ancestor
+    /// frame after a nested call returned); a step at the *same* depth as
+    /// the stack's current top but with a *different* `func_id` is a tail
+    /// call (`TraceStep::depth`'s own doc comment: tail calls reuse the
+    /// caller's depth) - the old frame is replaced in place and the new
+    /// function is charged one `calls`. Every step then adds one to
+    /// `self_instructions` for its own `func_id` alone, and one to
+    /// `total_instructions` for *every* function currently on the
+    /// reconstructed stack (itself plus every live ancestor). Consequences
+    /// worth stating plainly: a function never called gets no entry at all;
+    /// a leaf function's `total_instructions` always equals its
+    /// `self_instructions`; the top-level function's `total_instructions`
+    /// always equals the whole trace's length; and summing
+    /// `self_instructions` across every returned entry always equals the
+    /// trace's length too (every instruction belongs to exactly one frame's
+    /// self time) - all four are exercised directly, not just asserted in
+    /// prose, by `tests/debugger.rs`'s profiling test.
+    pub fn profile(&self, function_name: &str, args: &[u64]) -> Vec<FunctionStats> {
+        self.run(function_name, args);
+        let trace = self.trace();
+
+        let mut stack: Vec<u8> = Vec::new();
+        let mut calls: HashMap<u8, u64> = HashMap::new();
+        let mut self_instructions: HashMap<u8, u64> = HashMap::new();
+        let mut total_instructions: HashMap<u8, u64> = HashMap::new();
+
+        for step in &trace {
+            let depth = step.depth as usize;
+            if depth == 0 {
+                // Defensive: every recorded instruction is inside some call
+                // (depth starts at 1 for the session's own top-level call -
+                // see `TraceStep::depth`'s doc comment), so this never
+                // actually fires.
+                continue;
+            }
+            if stack.len() < depth {
+                stack.push(step.func_id);
+                *calls.entry(step.func_id).or_insert(0) += 1;
+            } else {
+                if stack.len() > depth {
+                    stack.truncate(depth);
+                }
+                if stack[depth - 1] != step.func_id {
+                    stack[depth - 1] = step.func_id;
+                    *calls.entry(step.func_id).or_insert(0) += 1;
+                }
+            }
+            *self_instructions.entry(step.func_id).or_insert(0) += 1;
+            for &func_id in &stack {
+                *total_instructions.entry(func_id).or_insert(0) += 1;
+            }
+        }
+
+        calls
+            .into_iter()
+            .map(|(func_id, call_count)| FunctionStats {
+                function_name: self
+                    .function_by_id(func_id)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| format!("<unknown func_id {func_id}>")),
+                calls: call_count,
+                self_instructions: *self_instructions.get(&func_id).unwrap_or(&0),
+                total_instructions: *total_instructions.get(&func_id).unwrap_or(&0),
+            })
+            .collect()
+    }
+
+    /// U12 item 5: one-shot timeline recording. Resets and re-runs
+    /// `function_name(args)` (same recording mechanism as `run`/`profile`),
+    /// then derives a chronological call-enter/call-exit (plus tail-call)
+    /// event list from the resulting trace's `depth`/`func_id` transitions -
+    /// again, no second instrumentation path, the exact same recorded trace
+    /// `profile` reads. See `TimelineEventKind`'s doc comment for what each
+    /// variant means and `TimelineEvent::step_index`'s doc comment for the
+    /// one synthetic event this emits (the top-level call's own closing
+    /// `CallExit`, which has no following instruction to observe it at).
+    pub fn record_timeline(&self, function_name: &str, args: &[u64]) -> Vec<TimelineEvent> {
+        self.run(function_name, args);
+        let trace = self.trace();
+        if trace.is_empty() {
+            return Vec::new();
+        }
+
+        let name_of = |func_id: u8| {
+            self.function_by_id(func_id)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| format!("<unknown func_id {func_id}>"))
+        };
+
+        let mut events = vec![TimelineEvent {
+            kind: TimelineEventKind::CallEnter,
+            function_name: name_of(trace[0].func_id),
+            depth: trace[0].depth,
+            step_index: 0,
+        }];
+
+        for i in 1..trace.len() {
+            let prev = &trace[i - 1];
+            let cur = &trace[i];
+            if cur.depth > prev.depth {
+                events.push(TimelineEvent {
+                    kind: TimelineEventKind::CallEnter,
+                    function_name: name_of(cur.func_id),
+                    depth: cur.depth,
+                    step_index: i,
+                });
+            } else if cur.depth < prev.depth {
+                events.push(TimelineEvent {
+                    kind: TimelineEventKind::CallExit,
+                    function_name: name_of(prev.func_id),
+                    depth: prev.depth,
+                    step_index: i,
+                });
+            } else if cur.func_id != prev.func_id {
+                events.push(TimelineEvent {
+                    kind: TimelineEventKind::TailCall,
+                    function_name: name_of(cur.func_id),
+                    depth: cur.depth,
+                    step_index: i,
+                });
+            }
+        }
+
+        let last = trace.last().expect("checked non-empty above");
+        events.push(TimelineEvent {
+            kind: TimelineEventKind::CallExit,
+            function_name: name_of(last.func_id),
+            depth: last.depth,
+            step_index: trace.len(),
+        });
+
+        events
+    }
+}
+
+/// U12 item 5: one function's aggregated profiling stats - loosely shaped
+/// after `apps/web/src/debug-protocol.ts`'s `FunctionStatsInfo` (`functionId`,
+/// `calls`, `totalInstructions`, `selfInstructions`), read for field-naming
+/// guidance only (this is still a native Rust spike - no wasm-bindgen
+/// bindings, no `apps/web` changes, per item 3/4's own scope boundary, kept
+/// here too). See `DebugSession::profile`'s doc comment for exactly how
+/// `self_instructions`/`total_instructions` are attributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionStats {
+    pub function_name: String,
+    pub calls: u64,
+    pub self_instructions: u64,
+    pub total_instructions: u64,
+}
+
+/// U12 item 5: one execution-timeline event - loosely shaped after
+/// `apps/web/src/debug-protocol.ts`'s `TimelineEventInfo` (`eventType`,
+/// `line`, `duration`, ...), read for field-naming guidance only. This
+/// item's scope is call-enter/call-exit "at minimum" (per the task's own
+/// wording); `TailCall` is included too since it falls directly out of the
+/// same depth/`func_id` walk at no extra cost, not a separate line-level
+/// "line stepped" event - a caller wanting per-line detail already has
+/// `trace()` itself, which already carries a per-instruction `line`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineEventKind {
+    CallEnter,
+    CallExit,
+    /// Same call depth, but `func_id` changed - `interp::Runtime::dispatch`
+    /// reuses the caller's frame for a tail call (see `TraceStep::depth`'s
+    /// doc comment), so a tail call never shows up as a `CallEnter`/
+    /// `CallExit` pair of its own.
+    TailCall,
+}
+
+/// U12 item 5: one event in `DebugSession::record_timeline`'s output. See
+/// `TimelineEventKind`'s doc comment for what `kind` means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineEvent {
+    pub kind: TimelineEventKind,
+    pub function_name: String,
+    pub depth: u32,
+    /// The trace index this event was derived from observing: for
+    /// `CallEnter`/`TailCall`, the first instruction of the (new) frame; for
+    /// `CallExit`, the instruction immediately *after* the one that
+    /// returned - except the top-level call's own closing `CallExit`, which
+    /// has no following instruction at all (the run is over), so it reports
+    /// `trace().len()`: one index past the end, not a real trace entry.
+    pub step_index: usize,
+}
+
+/// U12 item 5: `debugGetThreads`-equivalent wire-shape, loosely matching
+/// `apps/web/src/debug-protocol.ts`'s `ThreadInfo` (`id`, `status`). See
+/// `DebugSession::threads`'s doc comment for why this always reports exactly
+/// one, constant entry rather than real multi-thread/coroutine support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadInfo {
+    pub id: u32,
+    pub status: String,
 }
 
 /// U12 item 4, deliverable 3: `DebugSession::memory_stats`'s report. See
@@ -866,5 +1131,18 @@ mod tests {
             line2_pc, line3_pc,
             "distinct source lines must map to distinct pcs, not the old single_line stub"
         );
+    }
+
+    #[test]
+    fn threads_always_reports_exactly_one_main_thread() {
+        let program = compile("function main(): i64 return 1 end");
+        let session = DebugSession::new(program).expect("session builds");
+        let threads = session.threads();
+        assert_eq!(
+            threads.len(),
+            1,
+            "the typed tier is single-threaded by construction: {threads:?}"
+        );
+        assert_eq!(threads[0].id, 0);
     }
 }
