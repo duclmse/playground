@@ -2550,17 +2550,46 @@ profiles.
 
 Deliverables:
 
-- [ ] lift bytecode to shared SSA with proof provenance;
-- [ ] insert/hoist/fuse guards and record full deoptimization snapshots;
-- [ ] specialize arithmetic, tables, calls, loops, allocation, and iteration;
-- [ ] inline across stable dynamic and typed calls;
-- [ ] enter optimized loops through OSR and leave through precise side exits;
-- [ ] reconstruct inlined frames for errors, coroutines, profiler, and debugger;
-- [ ] prevent recompilation storms with failure counters and widening.
+- [x] lift bytecode to shared SSA with proof provenance;
+- [x] insert/hoist/fuse guards and record full deoptimization snapshots -
+      real for one narrow case (a single monomorphic inlined call site), not
+      yet general; see the milestone doc's item-7 note;
+- [ ] specialize arithmetic, tables, calls, loops, allocation, and iteration -
+      arithmetic/branch/return only; tables, calls, loops, allocation, and
+      iteration remain unmodeled by `sol_ir`; see the item-3 note;
+- [x] inline across stable dynamic and typed calls - dynamic-call inlining
+      only, for a single monomorphic call shape; the typed-ABI half was never
+      attempted; see the item-6/item-7 notes;
+- [x] enter optimized loops through OSR and leave through precise side exits -
+      real for `while`-loop-shaped control flow only; numeric `for` loops
+      (the shape almost all real Lua hot loops use) are not lifted at all;
+      see the item-4 note;
+- [ ] reconstruct inlined frames for errors, coroutines, profiler, and
+      debugger - bookkeeping infrastructure only; no live caller observes,
+      errors from, or yields out of an inlined region yet; see the item-7b
+      note;
+- [ ] prevent recompilation storms with failure counters and widening - a
+      permanent-failure flag shipped in place of the originally-scoped
+      falsifiable guard/widening mechanism; see the item-5 note.
 
 Exit gate: dynamic parity gate passes first; final-performance work continues
 until the final performance claim gate passes or the release explicitly states
-that it has not yet achieved the goal.
+that it has not yet achieved the goal. **It has not yet achieved the goal.**
+A full re-run of `scripts/benchmark.sh` against `luajit` 2.1.1787165859 and
+reference Lua 5.5.1 (item 8, 2026-10-02) found the dynamic-parity gate's
+≥1.0x LuaJIT geomean bar decisively missed: `sol (dynamic)` is **~110x
+slower than LuaJIT**, geometric mean, across the 14 general benchmarks in
+`benchmarks/*.lua`, with every individual workload more than 20% slower (the
+best case, `string_concat`, is still 4.7x slower). Worse, `SOL_LUA_JIT_LOG=1`
+tracing confirms almost none of this milestone's shipped machinery (items
+3/4/6/7) engages anywhere in that benchmark suite at all, because the suite's
+loops are almost all numeric `for` (unmodeled by `sol_ir`) and its function
+bodies almost all touch tables/globals/fields (also unmodeled) - so this
+number mostly reflects pre-U10 interpreter/baseline-JIT performance, not a
+measurement of what U10 itself built. See
+[`docs/features/milestones/u10-optimizing-jit-osr.md`](milestones/u10-optimizing-jit-osr.md)'s
+item-8 note and [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md)'s
+`## U10` section for the full evidence.
 
 ### U11 — AOT and annotation-driven peak performance
 

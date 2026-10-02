@@ -573,4 +573,84 @@ Full suite: 130 lib tests (up from 128), every integration suite including
 `lua55_dynamic_runtime_jit.rs` at 19/19, `sol-core`'s 37, and the Lua 5.5
 manifest check, all green, zero new warnings.
 
+**Item 8 note (documentation pass + full benchmark re-run; exit-gate
+determination):** this item is verification/documentation only - no new Rust
+was written. It re-ran every differential suite (`crate/sol`'s 130 lib tests,
+every integration suite including `lua55_dynamic_runtime_jit.rs` at 19/19,
+`crate/sol-core`'s 37, the Lua 5.5 manifest check, the full pinned
+`lua-5.5.1-tests` corpus via `scripts/test-lua55-suite.sh` - 16 passed, 1
+pending, 10 host-required/skipped, 7 documented divergences, **0 failed**, no
+regression against the manifest's own expectations - and `scripts/
+test-sol-c-api.sh`, all green) and then ran the full `scripts/benchmark.sh`
+suite (`hyperfine`, warmup 3/min-runs 10, both warm and cold) with `luajit`
+2.1.1787165859 and reference Lua 5.5.1 both present on this machine, exported
+to `/tmp/u10-item8/full-suite.md` (scratch, not committed) and consolidated
+into [`benchmarks/RESULTS.md`](../../benchmarks/RESULTS.md)'s new `## U10`
+section.
+
+**The §7.3 dynamic-parity gate (≥1.0x LuaJIT geomean, no workload >20%
+slower) is not reached - not close.** Across the 14 general-Lua benchmarks in
+`benchmarks/*.lua` that have both a `luajit` and `sol (dynamic)` row, the
+geometric mean of `sol (dynamic)`'s time over `luajit`'s is **~110x slower**,
+ranging from 4.7x (`string_concat`) to 587x (`vararg_calls`) - every single
+workload is far more than 20% slower, not a subset. See `benchmarks/
+RESULTS.md`'s new section for the full table.
+
+**A more important finding than the raw gap: `SOL_LUA_JIT_LOG=1` traces
+confirm none of U10's shipped optimizations (items 3/4/6/7) engage in
+*almost any* of these benchmarks at all**, for the same structural reasons
+the item-3/4 notes above already predicted in the abstract - this pass
+confirmed it empirically, benchmark by benchmark, rather than leaving it as a
+theoretical gap:
+
+- `loop_sum`, `nested_loop`, `matrix`, `hashmap_lookup`, `table_array`,
+  `string_concat` log **no dynjit activity whatsoever** - each is a bare
+  top-level numeric-`for` loop with no function call in its hot path, so the
+  one `Proto` that would need to promote (the main chunk) is only ever
+  activated once; `call_count` never crosses any threshold regardless of
+  loop iteration count (the exact U9-era limitation `RESULTS.md`'s own U9
+  section already documented).
+- `objects` (`dist_squared`), `metatable_dispatch` (`Circle:area`/`Square:
+  area`/`Triangle:area`), `vararg_calls` (`triple`), and `gc_alloc` (`make`)
+  all reach U9's baseline `Native` tier but are explicitly logged as **not
+  eligible for item-3 optimizing lowering** ("anything beyond
+  arithmetic/branch/return - calls, table/global/upvalue access, closures, or
+  `for` loops") - every one of these bodies touches a table/global/field,
+  which `sol_ir::lift_proto` still doesn't model at all.
+- `coroutine_resume`'s `while`-loop body is logged as **OSR-requested but not
+  eligible** - its `coroutine.yield()` call breaks the same eligible-
+  instruction-set item 3 requires, so item 4's OSR (which only needs the
+  instructions item 3 already covers) can't engage either.
+- `function_calls` and `function_calls_closure` are the **only** two
+  benchmarks in the suite where anything U10 shipped actually fires: `work`/
+  `<anonymous@4>`'s own bodies (pure chained-`Binary`-add arithmetic) reach
+  item 3's `Optimized` tier. But no inlining ever engages for either - their
+  *callers* each contain a numeric `for` loop, which `sol_ir::lift_proto`
+  does not model, so the caller `Proto` is never `fully_lifted`/`opt_lower`-
+  eligible and items 6/7's call-splicing is never attempted at that call
+  site at all. These two benchmarks' real ~420x/~378x LuaJIT gap is
+  therefore the per-call marshaling/trampoline/counter overhead item 3's own
+  note already named as the dominant cost - exactly reproducing that note's
+  "no measurable difference" finding on a real end-to-end benchmark rather
+  than only a scratch micro-benchmark.
+
+**Conclusion, stated plainly rather than rounded up**: this milestone's own
+real, measured wins (item 4's ~2.7x OSR speedup, item 7's ~2x inlining
+speedup) are both real but live entirely in hand-built fixtures
+(`dynjit_osr_while_sum.lua`'s `while`-loop shape, `dynjit_inline_call_stable.
+lua`'s monomorphic-call shape) deliberately constructed to land inside each
+item's narrow eligible subset - **none of the checked-in general-purpose
+`benchmarks/*.lua` suite happens to have that shape**, because real-world
+idiomatic Lua favors numeric `for` over `while` for counted loops and
+routinely touches tables/globals/fields, both of which fall outside every
+one of `sol_ir::lift_proto`'s modeled instructions. U10 has not reached (and
+on this evidence is not close to) the dynamic-parity gate; per the plan's own
+exit-gate language, this release states plainly that it has not yet achieved
+that goal rather than waiving or rounding up the claim. Widening
+`sol_ir::lift_proto` to model `ForPrep`/`ForLoop` and table/field/global
+access is the highest-leverage next investment to make any of this
+milestone's real machinery (guards, OSR, inlining) reachable from ordinary,
+unmodified Lua code - not a new item within U10 itself, but the natural
+starting point for whatever milestone picks this back up.
+
 See the [historical U10 ledger](../unified-sol-runtime-plan.md#u10--optimizing-ssa-jit-osr-and-deoptimization).
