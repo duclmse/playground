@@ -9,7 +9,7 @@
 // Only tested on macOS ARM64 this session - Linux linking may need extra
 // system libs (pthread/dl/m) not yet verified.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Signature};
@@ -20,13 +20,28 @@ use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::codegen;
+use crate::tier::Profile;
 use crate::types::{TFunction, TProgram, Type};
 
 /// sol's own `main` function can't share the object-file symbol "main" with the
 /// generated C entry point below.
 const SOL_MAIN_SYMBOL: &str = "__sol_main";
 
-pub fn build(program: TProgram, return_type: Type, output_path: &str) -> Result<(), String> {
+/// U11 item 5: profile-guided AOT, scoped to the one lever that's correct
+/// regardless of whether the profile is stale (see `codegen::
+/// INLINE_MAX_STMTS_HOT`'s doc comment) - `profile.promoted` from a prior
+/// `sol run --profile-out` names functions that crossed the JIT tier's call-
+/// count promotion threshold, which doubles as "this ran a lot" for AOT's
+/// own, unrelated inlining-budget decision. `profile: None` (the `sol build`
+/// default, with no `--profile-in`) must produce byte-identical codegen
+/// decisions to before this item - verified by
+/// `profile_guided_aot_build_prints_identical_output_with_or_without_a_profile`.
+pub fn build(
+    program: TProgram,
+    return_type: Type,
+    output_path: &str,
+    profile: Option<&Profile>,
+) -> Result<(), String> {
     let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
     let mut flag_builder = cranelift_codegen::settings::builder();
     // A real executable must be position-independent (macOS's linker
@@ -84,7 +99,10 @@ pub fn build(program: TProgram, return_type: Type, output_path: &str) -> Result<
         },
         types::I64,
     )?;
-    let inlinable = codegen::compute_inlinable(&program);
+    let hot: HashSet<String> = profile
+        .map(|p| p.promoted.iter().cloned().collect())
+        .unwrap_or_default();
+    let inlinable = codegen::compute_inlinable(&program, &hot);
     let functions: HashMap<String, &TFunction> = program
         .functions
         .iter()

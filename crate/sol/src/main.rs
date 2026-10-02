@@ -23,7 +23,7 @@ use std::{
 };
 
 const USAGE: &str = r#"usage: sol run [--diagnostic-format human|json] [--type-policy off|infer|strict] [--explain-types] [--dump-ir] [--dump-asm] [--jit-log] [--target-info] [--profile-out <file>] [--profile-in <file>] [--profile-time <file>] <file.lua|file.sol>
-    sol build [--diagnostic-format human|json] [--type-policy off|infer|strict] [--explain-types] <file.lua|file.sol> -o <output>
+    sol build [--diagnostic-format human|json] [--type-policy off|infer|strict] [--explain-types] [--profile-in <file>] <file.lua|file.sol> -o <output>
     sol debug [--diagnostic-format human|json] [--type-policy off|infer|strict] [--explain-types] <file.lua|file.sol>"#;
 
 fn set_diagnostic_format(value: Option<&String>) {
@@ -439,6 +439,7 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 fn build_cmd(args: &[String]) -> Result<(), String> {
     let mut path = None;
     let mut output = None;
+    let mut profile_in = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -453,6 +454,10 @@ fn build_cmd(args: &[String]) -> Result<(), String> {
             "--explain-types" => {
                 env::set_var("SOL_EXPLAIN_TYPES", "1");
                 i += 1;
+            }
+            "--profile-in" => {
+                profile_in = Some(args.get(i + 1).cloned().unwrap_or_else(|| usage_error()));
+                i += 2;
             }
             "-o" => {
                 output = args.get(i + 1).cloned();
@@ -471,7 +476,10 @@ fn build_cmd(args: &[String]) -> Result<(), String> {
     let source = read_source(&path)?;
     explain_source_if_requested(&path, &source, language_config(&path))?;
     let (tprogram, return_type) = compile_typed_only(&path, &source, "build")?;
-    sol::aot::build(tprogram, return_type, &output)
+    // U11 item 5: a prior `sol run --profile-out`'s `promoted` list doubles
+    // as AOT's "demonstrably hot" signal - see `aot::build`'s doc comment.
+    let profile = profile_in.map(|p| sol::tier::Profile::load(&p)).transpose()?;
+    sol::aot::build(tprogram, return_type, &output, profile.as_ref())
 }
 
 fn debug_cmd(args: &[String]) -> Result<(), String> {

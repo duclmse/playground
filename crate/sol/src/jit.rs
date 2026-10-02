@@ -116,7 +116,7 @@ impl Jit {
         let runtime_funcs = codegen::declare_runtime(&mut module)?;
         let func_ids = codegen::declare_functions(&mut module, &program)?;
         let wrapper_ids = declare_wrappers(&mut module, &program)?;
-        let inlinable = codegen::compute_inlinable(&program);
+        let inlinable = codegen::compute_inlinable(&program, &HashSet::new());
         let dump_clif = std::env::var_os("SOL_DUMP_CLIF")
             .or_else(|| std::env::var_os("SOL_DUMP_CLIF"))
             .is_some();

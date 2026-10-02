@@ -83,7 +83,51 @@
       but that was exploratory, not a committed fixture, and is not an
       exhaustive proof. Left unchecked and flagged here rather than claimed
       as verified.
-- [ ] Support profile-guided AOT with safe profile-change fallback.
+- [x] Support profile-guided AOT with safe profile-change fallback. Item 5
+      (2026-10-02): `aot.rs`'s own header (`aot.rs:1-10`) notes AOT has no
+      interpreter/JIT tier to promote into, so U10's guard/deopt-snapshot
+      mechanism (the usual meaning of "profile-change fallback") is
+      structurally inapplicable here - there is no bytecode tier to fall back
+      to. Scoped instead to the one AOT decision that's correct regardless of
+      whether the profile is stale or wrong, per the plan's own guidance
+      (`unified-sol-runtime-plan.md` §3's item-5 scope note): inlining is a
+      pure code-shape transform that never changes a program's output
+      (`codegen.rs`'s `compute_inlinable` only gates *whether* a call site's
+      body is substituted in, never alters it), so a function a prior
+      `sol run --profile-out` recorded as `promoted` (crossed
+      `SOL_PROMOTE_THRESHOLD` calls, `tier.rs:16-24`) gets a wider inlining
+      budget in `sol build --profile-in` - `INLINE_MAX_STMTS_HOT = 40` vs the
+      default `INLINE_MAX_STMTS = 20` (`codegen.rs`'s constants above
+      `compute_inlinable`). A wrong "was hot" guess costs only extra code
+      size, never incorrect behavior - the "safe...fallback" property holds
+      by construction rather than needing a runtime check. Reused
+      `Profile::promoted` (`tier.rs:59-62`) as the hot-function signal rather
+      than adding a new counter/format: it already means "demonstrably hot in
+      a representative run." `aot::build` takes `profile: Option<&Profile>`
+      (`aot.rs:39-44`) and derives the hot set at `aot.rs:102-105`; `sol build
+      --profile-in <file>` (`main.rs`'s `build_cmd`) loads it via the same
+      `Profile::load` text format `sol run --profile-in` already uses - no
+      new CLI surface beyond the one flag. `profile: None` (`sol build`'s
+      default, no `--profile-in`) computes an empty hot set, so inlining
+      decisions are byte-identical to before this item - pinned by
+      `tests/programs.rs`'s
+      `profile_guided_aot_build_prints_identical_output_with_or_without_a_profile`,
+      and the budget-widening logic itself by `codegen.rs`'s
+      `inline_budget_tests::a_function_between_the_default_and_hot_budgets_is_only_inlinable_when_marked_hot`.
+      **Measured, not just landed:** `benchmarks/function_calls.sol`'s `work`
+      (22 statements - between the two budgets) called 2,000,000,000 times:
+      disassembly (`otool -tV`) confirms the baseline AOT build keeps a real
+      `call _work` in `__sol_main`, while the profile-guided build inlines it
+      away entirely (0 calls, optimizer folds the 21 chained `+1`s into
+      direct arithmetic on the caller's value) - user time dropped from
+      ~2.49s to ~1.24s (roughly 2x) across 3 runs each, both builds printing
+      the identical correct answer. **Explicitly out of scope** (per the
+      plan's own item-5 note): compiling a speculative-and-fallback path
+      alongside a runtime dispatch guard for a true speculative profile-guided
+      optimization (e.g. a profile-informed type/shape guess) - AOT has no
+      bytecode tier to bail into if such a guess were wrong, so that shape of
+      profile guidance is left to a future milestone, not attempted as an
+      unsound partial slice here.
 - [x] Compare gradually typed programs to their unchanged Lua versions. Item 6
       (2026-10-02): `benchmarks/gradual-manifest.json` + new
       `scripts/gradual-benchmark.sh` measure `loop_sum`, `function_calls`, and

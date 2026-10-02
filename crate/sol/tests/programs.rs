@@ -1529,6 +1529,10 @@ fn an_extern_with_a_non_scalar_type_is_a_clear_error() {
 /// `run` would - covering arrays, structs+GC, `any`, and FFI, the same
 /// fixtures already exercised through the tiered JIT.
 fn build_and_run(fixture: &str) -> (String, std::process::ExitStatus) {
+    build_and_run_with_args(fixture, &[])
+}
+
+fn build_and_run_with_args(fixture: &str, extra_args: &[&str]) -> (String, std::process::ExitStatus) {
     ensure_staticlib();
     let src = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
     let safe_fixture = fixture.replace('/', "_");
@@ -1539,6 +1543,7 @@ fn build_and_run(fixture: &str) -> (String, std::process::ExitStatus) {
     ));
     let build_output = Command::new(env!("CARGO_BIN_EXE_sol"))
         .args(["build", &src, "-o", out.to_str().unwrap()])
+        .args(extra_args)
         .output()
         .unwrap();
     assert!(
@@ -1621,6 +1626,32 @@ fn profile_out_then_profile_in_preloads_promotion_and_skips_warm_up() {
         stderr.contains("[jit] promoting 'fib'"),
         "expected the profile to preload fib's promotion:\n{stderr}"
     );
+}
+
+/// U11 item 5: `sol build --profile-in` widens the inlining budget for a
+/// function the profile names as `promoted`, but that's a pure code-shape
+/// decision (see `codegen::INLINE_MAX_STMTS_HOT`'s doc comment) - it must
+/// never change a program's observable output, whether or not the profile
+/// is stale or even accurate. Written directly in `Profile::load`'s text
+/// format (`aot::build` only reads `promoted`/`speculative` names, so there's
+/// no need to actually run `sol run --profile-out` to produce one).
+#[test]
+fn profile_guided_aot_build_prints_identical_output_with_or_without_a_profile() {
+    let prof = std::env::temp_dir().join(format!(
+        "sol_aot_profile_test_{}.prof",
+        std::process::id()
+    ));
+    std::fs::write(&prof, "promoted fib\npromoted main\n").unwrap();
+
+    let (without_profile, status_without) = build_and_run("fib.sol");
+    let (with_profile, status_with) =
+        build_and_run_with_args("fib.sol", &["--profile-in", prof.to_str().unwrap()]);
+    std::fs::remove_file(&prof).ok();
+
+    assert!(status_without.success());
+    assert!(status_with.success());
+    assert_eq!(without_profile, "2178309");
+    assert_eq!(with_profile, without_profile);
 }
 
 /// M7 §21: `codegen::try_vectorize_elementwise_loop`'s matched pattern

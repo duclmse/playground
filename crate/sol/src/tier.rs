@@ -50,6 +50,12 @@ fn speculative_threshold() -> u32 {
 /// speculative candidate's type is re-derived from static analysis
 /// (`jit::speculative_candidate`), not stored, so the file only ever
 /// needs a name.
+///
+/// U11 item 5 adds a second consumer, `aot::build`: `promoted` already means
+/// "crossed `SOL_PROMOTE_THRESHOLD` calls in a representative run," which is
+/// exactly the "demonstrably hot" signal profile-guided AOT inlining needs -
+/// no new counter or line format required, since AOT has no interpreted tier
+/// to preload `promoted` into the way the JIT tier does.
 pub struct Profile {
     pub promoted: Vec<String>,
     pub speculative: Vec<String>,

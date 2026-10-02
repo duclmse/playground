@@ -2611,7 +2611,10 @@ Deliverables:
       verified the `debug.rs` REPL boundary and found the FFI extern boundary
       already covered; the `require()`-boundary question is investigated but
       left open, see the item-4 note;
-- [ ] support profile-guided AOT with safe fallback when profiles change;
+- [x] support profile-guided AOT with safe fallback when profiles change -
+      item 5 scoped this to the one AOT decision that's safe regardless of
+      profile staleness (inlining budget), since AOT has no tier to fall back
+      into for a true speculative guess; see the item-5 note below;
 - [x] compare each gradually typed program against its unchanged Lua version -
       item 6, see the dated note below.
 
@@ -2780,6 +2783,46 @@ exploratory, not a committed fixture, and is not an exhaustive proof - left
 unchecked rather than claimed as verified. Full `cargo test --manifest-path
 crate/sol/Cargo.toml` suite (130 lib tests, 69 `programs.rs` tests, 0
 failed, 0 new warnings) and `scripts/test-lua55-manifest.sh` both pass.
+
+Item 5 (2026-10-02): `aot.rs`'s own header (`aot.rs:1-10`) states AOT has no
+interpreter/JIT tier to promote into, so U10's guard/deopt-snapshot mechanism
+- the usual shape of "safe profile-change fallback" - is structurally
+inapplicable: there's no bytecode tier to fall back to if a profile-informed
+guess were wrong. Scoped instead to the one AOT decision that's correct
+regardless of whether the profile is stale, per the plan's own item-5 note:
+inlining is a pure code-shape transform that never changes a program's
+output, so a function a prior `sol run --profile-out` recorded as `promoted`
+(crossed `SOL_PROMOTE_THRESHOLD` calls, `tier.rs:16-24`) gets a wider
+inlining-eligibility budget in `sol build --profile-in` -
+`codegen::INLINE_MAX_STMTS_HOT = 40` vs the default `INLINE_MAX_STMTS = 20`.
+A wrong "was hot" guess costs only extra code size, never incorrect
+behavior - "safe...fallback" holds by construction, not a runtime check.
+Reused the existing `Profile::promoted` (`tier.rs:59-62`, already populated
+by every `sol run --profile-out`) as the hot-function signal instead of
+adding a new counter or file format - it already means "demonstrably hot in
+a representative run," which is exactly what the budget decision needs.
+`aot::build` takes `profile: Option<&Profile>` (`aot.rs:39-44`); `profile:
+None` (the `sol build` default, no `--profile-in`) computes an empty hot
+set, making this a byte-identical no-op unless a profile was actually
+supplied - pinned by `tests/programs.rs`'s
+`profile_guided_aot_build_prints_identical_output_with_or_without_a_profile`,
+and the budget-widening logic itself by `codegen.rs`'s
+`inline_budget_tests::a_function_between_the_default_and_hot_budgets_is_only_inlinable_when_marked_hot`.
+Measured, not just landed: `benchmarks/function_calls.sol`'s `work` (22
+statements, between the two budgets) called 2,000,000,000 times - `otool -tV`
+disassembly confirms the baseline AOT build keeps a real `call _work` in
+`__sol_main` while the profile-guided build inlines it away entirely (the
+optimizer folds the 21 chained `+1`s into direct arithmetic on the caller's
+value), and wall-clock user time dropped from ~2.49s to ~1.24s (roughly 2x)
+across 3 runs each, both builds printing the identical correct answer.
+**Explicitly out of scope**, per the plan's own item-5 note: compiling a
+speculative-and-fallback path alongside a runtime dispatch guard for a true
+speculative profile-guided optimization (e.g. a profile-informed type/shape
+guess) - AOT has no bytecode tier to bail into if such a guess were wrong, so
+that shape of profile guidance is left to a future milestone rather than
+attempted as an unsound partial slice. Full `cargo test --manifest-path
+crate/sol/Cargo.toml` suite (131 lib tests, 70 `programs.rs` tests, 0 failed,
+0 new warnings) and `scripts/test-lua55-manifest.sh` both pass.
 
 ### U12 — Canonical WASM playground and debugger
 

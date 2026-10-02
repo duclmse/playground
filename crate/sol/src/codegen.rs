@@ -270,13 +270,26 @@ pub fn collect_local_types(f: &TFunction) -> Vec<Type> {
 
 /// Inline a callee if its body has this many statements or fewer (§7).
 const INLINE_MAX_STMTS: usize = 20;
+/// Wider budget for a function a profile reports as demonstrably hot (U11
+/// item 5): inlining is a pure code-shape transform (never changes which
+/// value a call produces), so applying it more aggressively to a function
+/// that *was* hot in a prior run is correct even if the profile is stale or
+/// the function is no longer actually hot - the worst case is extra code
+/// size for no benefit, never wrong output. This is why profile-guided AOT
+/// can use this lever with no runtime guard or fallback: unlike a
+/// speculative type/shape guess, a wrong "was hot" guess has no incorrect
+/// outcome to fall back from.
+const INLINE_MAX_STMTS_HOT: usize = 40;
 /// Caps inlining depth - guards against a mutual-recursion cycle
 /// `is_directly_recursive` doesn't catch (it only detects direct self-calls).
 const MAX_INLINE_DEPTH: usize = 8;
 
-/// Functions eligible for inlining: not `main`, small enough, not
-/// directly self-recursive.
-pub fn compute_inlinable(program: &TProgram) -> HashSet<String> {
+/// Functions eligible for inlining: not `main`, small enough (or, for a name
+/// in `hot`, small enough under the wider hot budget), not directly
+/// self-recursive. `hot` is empty outside profile-guided AOT (`aot::build`);
+/// every other caller (`jit.rs`) passes an empty set, so this is a no-op
+/// widening unless a profile actually said a function ran a lot.
+pub fn compute_inlinable(program: &TProgram, hot: &HashSet<String>) -> HashSet<String> {
     let address_taken: HashSet<String> = program
         .functions
         .iter()
@@ -286,11 +299,16 @@ pub fn compute_inlinable(program: &TProgram) -> HashSet<String> {
         .functions
         .iter()
         .filter(|f| {
+            let budget = if hot.contains(&f.name) {
+                INLINE_MAX_STMTS_HOT
+            } else {
+                INLINE_MAX_STMTS
+            };
             f.name != "main"
                 && !is_directly_recursive(f)
                 && !uses_function_value(&f.body)
                 && !address_taken.contains(&f.name)
-                && count_stmts(&f.body) <= INLINE_MAX_STMTS
+                && count_stmts(&f.body) <= budget
         })
         .map(|f| f.name.clone())
         .collect()
@@ -1925,6 +1943,70 @@ fn recognize_safe_for_loop(start: &TExpr, stop: &TExpr, step: &TExpr) -> Option<
     match &inner.kind {
         TExprKind::Local(array_id) => Some(*array_id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod inline_budget_tests {
+    use super::*;
+    use crate::diagnostic::SourceSpan;
+
+    /// A function with `stmt_count` trivial `Local` statements - between
+    /// `INLINE_MAX_STMTS` (20) and `INLINE_MAX_STMTS_HOT` (40) lets a test
+    /// distinguish the two budgets.
+    fn function_with_stmt_count(name: &str, stmt_count: usize) -> TFunction {
+        let body = (0..stmt_count)
+            .map(|_| TStmt::Local {
+                id: 0,
+                value: TExpr {
+                    kind: TExprKind::IntLit(0),
+                    ty: Type::I64,
+                },
+            })
+            .collect();
+        TFunction {
+            name: name.to_string(),
+            source_file: None,
+            source_line: 1,
+            source_span: SourceSpan::new(0, 0, 1, 1),
+            params: Vec::new(),
+            return_type: Type::I64,
+            body,
+            local_count: 1,
+        }
+    }
+
+    /// U11 item 5: a function too big for the default budget (20) but
+    /// within the profile-guided "hot" budget (40) is excluded from
+    /// `compute_inlinable` with an empty `hot` set and included once its
+    /// name is in `hot` - `aot::build` passes `profile.promoted` as `hot`,
+    /// everything else (including every `jit.rs` call site) passes an empty
+    /// set, so this is a no-op widening unless a profile said the function
+    /// ran a lot.
+    #[test]
+    fn a_function_between_the_default_and_hot_budgets_is_only_inlinable_when_marked_hot() {
+        let program = TProgram {
+            structs: HashMap::new(),
+            functions: vec![
+                function_with_stmt_count("main", 1),
+                function_with_stmt_count("warm", 30),
+            ],
+            externs: Vec::new(),
+        };
+
+        let cold = compute_inlinable(&program, &HashSet::new());
+        assert!(
+            !cold.contains("warm"),
+            "a 30-statement function exceeds the default 20-statement budget"
+        );
+
+        let mut hot = HashSet::new();
+        hot.insert("warm".to_string());
+        let warmed = compute_inlinable(&program, &hot);
+        assert!(
+            warmed.contains("warm"),
+            "a 30-statement function fits the hot 40-statement budget"
+        );
     }
 }
 
