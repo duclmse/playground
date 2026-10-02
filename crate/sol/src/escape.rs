@@ -186,7 +186,7 @@ fn expr_leaks_local(e: &TExpr, id: LocalId) -> bool {
         TExprKind::ArrayLiteral { values, .. } => {
             values.iter().any(|value| expr_leaks_local(value, id))
         }
-        TExprKind::ArrayMap { array, callback } => {
+        TExprKind::ArrayMap { array, callback, .. } => {
             expr_leaks_local(array, id) || expr_leaks_local(callback, id)
         }
         TExprKind::NewMap { .. } => false,
@@ -385,11 +385,16 @@ fn transform_expr(e: TExpr, field_ids: &HashMap<LocalId, Vec<LocalId>>) -> TExpr
                     .collect(),
             },
         },
-        TExprKind::ArrayMap { array, callback } => TExpr {
+        TExprKind::ArrayMap {
+            array,
+            callback,
+            elem,
+        } => TExpr {
             ty: e.ty,
             kind: TExprKind::ArrayMap {
                 array: Box::new(transform_expr(*array, field_ids)),
                 callback: Box::new(transform_expr(*callback, field_ids)),
+                elem,
             },
         },
         TExprKind::NewMap { key, value } => TExpr {

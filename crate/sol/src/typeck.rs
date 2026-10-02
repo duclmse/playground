@@ -1480,22 +1480,36 @@ fn check_call(
         }
         let array = check_expr(checker, &args[0])?;
         let callback = check_expr(checker, &args[1])?;
-        let expected_callback = Type::Function {
-            params: vec![Type::I64],
-            return_type: Box::new(Type::I64),
+        // Monomorphize at this call site: `map` is generic over any scalar
+        // `T` the runtime has a dedicated unboxed array representation for
+        // (`I64`/`F64`, same set `new_array_i64`/`new_array_f64` cover),
+        // instead of being hard-coded to `T = I64`.
+        let elem = match &array.ty {
+            Type::Array(elem) if matches!(**elem, Type::I64 | Type::F64) => (**elem).clone(),
+            _ => {
+                return Err(format!(
+                    "line {line}: map expects an Array<i64> or Array<f64>, found {}",
+                    array.ty
+                ));
+            }
         };
-        if array.ty != Type::Array(Box::new(Type::I64)) || callback.ty != expected_callback {
+        let expected_callback = Type::Function {
+            params: vec![elem.clone()],
+            return_type: Box::new(elem.clone()),
+        };
+        if callback.ty != expected_callback {
             return Err(format!(
-                "line {line}: this map specialization expects Array<i64> and fn(i64) -> i64, found {} and {}",
-                array.ty, callback.ty
+                "line {line}: this map call expects fn({elem}) -> {elem}, found {}",
+                callback.ty
             ));
         }
         return Ok(TExpr {
             kind: TExprKind::ArrayMap {
                 array: Box::new(array),
                 callback: Box::new(callback),
+                elem: elem.clone(),
             },
-            ty: Type::Array(Box::new(Type::I64)),
+            ty: Type::Array(Box::new(elem)),
         });
     }
     if let Some((

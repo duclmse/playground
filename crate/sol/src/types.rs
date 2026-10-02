@@ -250,10 +250,13 @@ pub enum TExprKind {
         elem: Type,
         values: Vec<TExpr>,
     },
-    /// Monomorphized `map(Array<i64>, fn(i64) -> i64)`.
+    /// Monomorphized `map(Array<T>, fn(T) -> T)`, instantiated per call site
+    /// on the concrete scalar `elem` type found there (`I64` or `F64`) -
+    /// see `typeck.rs`'s `check_call` "map" branch.
     ArrayMap {
         array: Box<TExpr>,
         callback: Box<TExpr>,
+        elem: Type,
     },
     NewMap {
         key: Type,

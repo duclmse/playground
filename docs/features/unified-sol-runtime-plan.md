@@ -2603,7 +2603,10 @@ Deliverables:
       tag check on a speculatively-specialized `any` parameter) is now
       statically elided when a whole-program proof holds; narrower than the
       bullet's full scope - see the item-2 note;
-- [ ] specialize generics, records, arrays, maps, and callbacks across modules;
+- [ ] specialize generics, records, arrays, maps, and callbacks across modules -
+      item 3 generalized the one existing specialization (`ArrayMap`) to
+      monomorphize over more than one concrete type; narrower than the
+      bullet's full "user-defined generics" scope - see the item-3 note;
 - [ ] retain dynamic adapters for exported/reflective entry points;
 - [ ] support profile-guided AOT with safe fallback when profiles change;
 - [x] compare each gradually typed program against its unchanged Lua version -
@@ -2698,6 +2701,49 @@ crate/sol/Cargo.toml` (66 + 2 passed, 0 failed, 0 new warnings) and
 `scripts/test-lua55-manifest.sh` both pass, confirming this benchmark-fixture
 and harness-only item left the typed compiler untouched. Full table:
 `benchmarks/RESULTS.md`'s 2026-10-02 gradual-benchmark section.
+
+Item 3 (2026-10-02): the only generic-shaped specialization mechanism in the
+typed tier was `typeck.rs`'s `check_call` "map" branch
+(`types.rs:253-257`'s `TExprKind::ArrayMap`), hard-coded to exactly one
+monomorphization - `Array<i64>` + `fn(i64) -> i64`. Generalized it to
+monomorphize at each call site over either scalar type the runtime already
+has a dedicated unboxed array representation for (`I64` or `F64`, the same
+split `new_array_i64`/`new_array_f64` already draw), rather than being fixed
+to `i64`: `TExprKind::ArrayMap` now carries its resolved `elem: Type`, set by
+`typeck.rs` from the array/callback's actual checked types and threaded
+through `escape.rs`/`optimize.rs`/`jit.rs`'s tree-walkers and `verify.rs`'s
+IR check (which now validates against the stored `elem` instead of a
+hard-coded `I64`); `codegen.rs`'s one real lowering site picks between the
+existing `sol_array_map_i64` runtime call and a new `sol_array_map_f64`
+(`runtime.rs`, byte-for-byte the same shape as the `i64` version with
+`f64`-typed loads/stores and callback ABI, registered as a JIT symbol in
+`jit.rs` alongside the existing one) based on that field - no change needed
+at the bytecode-interpreter tier, since its register file is already
+untagged `u64` bit patterns and its callback call already goes through the
+uniform-ABI native wrapper (`interp.rs`'s `call_native`), so the same
+`Op::ArrayMapI64` opcode is representation-agnostic across `i64`/`f64`
+regardless of which concrete type `typeck.rs` resolved. Verified via
+`--dump-ir`: a new `generic_map_f64.sol` fixture's `f64` instantiation calls
+`sol_array_map_f64` and never `sol_array_map_i64` or any `sol_dynamic_*`
+boxing path (`tests/programs.rs`'s
+`generic_map_over_f64_arrays_is_specialized_in_all_tiers`, checked across
+bytecode/native/OSR tiers plus AOT, matching the existing `i64` test's
+coverage shape); a new `generic_map_type_mismatch.sol` fixture confirms a
+callback typed against the wrong element type is still rejected at
+type-check time. **Scope cut, stated plainly:** this generalizes *which
+concrete type* the one existing built-in specializes on - it does not build
+real user-definable generic-function syntax (type parameters on `function`
+declarations, call-site type inference, a per-instantiation compilation
+cache) that the deliverable's fuller wording ("user-defined generic
+functions and callback parameters generally", per the working plan) actually
+describes. There is no generic-function syntax anywhere in
+`ast.rs`/`parser.rs` today; designing and building one is a language feature
+in its own right, not a bounded follow-on to generalizing a single
+hard-coded intrinsic, so it is left for a future milestone rather than
+attempted as a partial or unsound slice - measured, not adopted. Full `cargo
+test --manifest-path crate/sol/Cargo.toml` suite (130 lib tests, 68
+`programs.rs` tests [66 + 2 new], 0 failed, 0 new warnings) and
+`scripts/test-lua55-manifest.sh` both pass.
 
 ### U12 — Canonical WASM playground and debugger
 

@@ -57,6 +57,7 @@ impl Jit {
         builder.symbol("sol_new_array_f64", runtime::sol_new_array_f64 as *const u8);
         builder.symbol("sol_new_array_ptr", runtime::sol_new_array_ptr as *const u8);
         builder.symbol("sol_array_map_i64", runtime::sol_array_map_i64 as *const u8);
+        builder.symbol("sol_array_map_f64", runtime::sol_array_map_f64 as *const u8);
         builder.symbol("sol_new_map_i64", runtime::sol_new_map_i64 as *const u8);
         builder.symbol("sol_map_get_i64", runtime::sol_map_get_i64 as *const u8);
         builder.symbol("sol_map_set_i64", runtime::sol_map_set_i64 as *const u8);
@@ -585,7 +586,7 @@ pub fn called_functions(f: &TFunction) -> HashSet<String> {
             TExprKind::ArrayLiteral { values, .. } => {
                 values.iter().for_each(|value| walk_expr(value, out))
             }
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
                 walk_expr(array, out);
                 walk_expr(callback, out);
             }
@@ -736,7 +737,7 @@ fn infer_unbox_type(f: &TFunction, id: LocalId) -> Option<Type> {
             TExprKind::ArrayLiteral { values, .. } => values
                 .iter()
                 .for_each(|value| walk_expr(value, id, found, ok)),
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
                 walk_expr(array, id, found, ok);
                 walk_expr(callback, id, found, ok);
             }
@@ -980,7 +981,7 @@ fn walk_expr_for_exhaustiveness(
         TExprKind::ArrayLiteral { values, .. } => values
             .iter()
             .for_each(|v| walk_expr_for_exhaustiveness(v, name, param_index, target, call_sites, sound)),
-        TExprKind::ArrayMap { array, callback } => {
+        TExprKind::ArrayMap { array, callback, .. } => {
             walk_expr_for_exhaustiveness(array, name, param_index, target, call_sites, sound);
             walk_expr_for_exhaustiveness(callback, name, param_index, target, call_sites, sound);
         }
@@ -1118,10 +1119,15 @@ fn specialize(f: &TFunction, id: LocalId, target: &Type) -> TFunction {
                 },
                 ty,
             },
-            TExprKind::ArrayMap { array, callback } => TExpr {
+            TExprKind::ArrayMap {
+                array,
+                callback,
+                elem,
+            } => TExpr {
                 kind: TExprKind::ArrayMap {
                     array: Box::new(rewrite_expr(array, id, target)),
                     callback: Box::new(rewrite_expr(callback, id, target)),
+                    elem: elem.clone(),
                 },
                 ty,
             },

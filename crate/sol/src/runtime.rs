@@ -168,6 +168,23 @@ pub extern "C" fn sol_new_array_f64(len: i64) -> *mut ArrayHeader {
     new_array(len, true)
 }
 
+#[no_mangle]
+/// # Safety
+/// `input` must be a live `Array<f64>` and `callback` must use the declared
+/// `fn(f64) -> f64` ABI.
+pub unsafe extern "C" fn sol_array_map_f64(
+    input: *mut ArrayHeader,
+    callback: unsafe extern "C" fn(f64) -> f64,
+) -> *mut ArrayHeader {
+    let output = sol_new_array_f64(unsafe { (*input).len });
+    for index in 0..unsafe { (*input).len as usize } {
+        let value = unsafe { *((*input).data.add(index * 8) as *const f64) };
+        let mapped = unsafe { callback(value) };
+        unsafe { *((*output).data.add(index * 8) as *mut f64) = mapped };
+    }
+    output
+}
+
 /// `Array<T>` where `T` is pointer-bearing (struct/string/array/map/any) -
 /// unlike `sol_new_array_i64`/`sol_new_array_f64`, the data buffer must not
 /// be atomic: it holds real GC pointers the collector needs to trace into.

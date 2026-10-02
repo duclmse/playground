@@ -231,11 +231,16 @@ fn fold_expr(expr: TExpr) -> TExpr {
                 values: values.into_iter().map(fold_expr).collect(),
             },
         },
-        TExprKind::ArrayMap { array, callback } => TExpr {
+        TExprKind::ArrayMap {
+            array,
+            callback,
+            elem,
+        } => TExpr {
             ty: expr.ty,
             kind: TExprKind::ArrayMap {
                 array: Box::new(fold_expr(*array)),
                 callback: Box::new(fold_expr(*callback)),
+                elem,
             },
         },
         TExprKind::NewMap { key, value } => TExpr {

@@ -549,7 +549,14 @@ impl<'a> Builder<'a> {
                 }
                 array
             }
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
+                // One opcode covers both I64 and F64 element types: tier-0's
+                // register file is untagged u64 bit patterns, and the
+                // callback call goes through the uniform-ABI native wrapper
+                // (see interp.rs's `call_native`), so no element-type
+                // dispatch is needed at this tier - only the native-codegen
+                // tier (codegen.rs) calls a typed C-ABI function pointer
+                // directly and needs a per-type runtime symbol.
                 let array = self.compile_expr(array);
                 let callback = self.compile_expr(callback);
                 let result = self.alloc();

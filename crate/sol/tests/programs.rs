@@ -560,6 +560,65 @@ fn generic_map_over_i64_arrays_is_specialized_in_all_tiers() {
 }
 
 #[test]
+fn generic_map_over_f64_arrays_is_specialized_in_all_tiers() {
+    let path = format!(
+        "{}/tests/fixtures/generic_map_f64.sol",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    for (tier, promote, osr) in [
+        ("bytecode", "4294967295", "4294967295"),
+        ("native", "1", "4294967295"),
+        ("OSR", "4294967295", "1"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+            .args(["run", &path])
+            .env("SOL_PROMOTE_THRESHOLD", promote)
+            .env("SOL_OSR_THRESHOLD", osr)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{tier}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "16",
+            "{tier}"
+        );
+    }
+    let (stdout, status) = build_and_run("generic_map_f64.sol");
+    assert!(status.success());
+    assert_eq!(stdout, "16");
+
+    let ir = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", "--dump-ir", &path])
+        .env("SOL_PROMOTE_THRESHOLD", "1")
+        .output()
+        .unwrap();
+    assert!(ir.status.success());
+    let stderr = String::from_utf8_lossy(&ir.stderr);
+    assert!(
+        !stderr.contains("sol_dynamic"),
+        "map used dynamic dispatch:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("sol_array_map_i64"),
+        "f64 map specialization called the i64 runtime helper:\n{stderr}"
+    );
+}
+
+#[test]
+fn generic_map_rejects_a_callback_whose_type_does_not_match_the_array_element_type() {
+    let (_, stderr, ok) = run_fixture("generic_map_type_mismatch.sol");
+    assert!(!ok, "expected a type-check error, program ran successfully");
+    assert!(
+        stderr.contains("map"),
+        "expected a map-related type error, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn maps_support_unboxed_float_and_bool_values_in_all_tiers() {
     let path = format!(
         "{}/tests/fixtures/map_scalar_values.sol",

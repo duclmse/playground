@@ -50,6 +50,7 @@ pub struct RuntimeFuncs {
     pub new_array_f64: FuncId,
     pub new_array_ptr: FuncId,
     pub array_map_i64: FuncId,
+    pub array_map_f64: FuncId,
     pub new_map_i64: FuncId,
     pub map_get_i64: FuncId,
     pub map_set_i64: FuncId,
@@ -88,6 +89,15 @@ pub fn declare_runtime(module: &mut dyn Module) -> Result<RuntimeFuncs, String> 
     let array_map_sig = signature_of(call_conv, &[array_i64.clone(), callback_i64], &array_i64);
     let array_map_i64 = module
         .declare_function("sol_array_map_i64", Linkage::Import, &array_map_sig)
+        .map_err(|e| e.to_string())?;
+    let array_f64 = Type::Array(Box::new(Type::F64));
+    let callback_f64 = Type::Function {
+        params: vec![Type::F64],
+        return_type: Box::new(Type::F64),
+    };
+    let array_map_f64_sig = signature_of(call_conv, &[array_f64.clone(), callback_f64], &array_f64);
+    let array_map_f64 = module
+        .declare_function("sol_array_map_f64", Linkage::Import, &array_map_f64_sig)
         .map_err(|e| e.to_string())?;
     let map_ty = Type::Map(Box::new(Type::I64), Box::new(Type::I64));
     let map_new_sig = signature_of(call_conv, &[], &map_ty);
@@ -168,6 +178,7 @@ pub fn declare_runtime(module: &mut dyn Module) -> Result<RuntimeFuncs, String> 
         new_array_f64,
         new_array_ptr,
         array_map_i64,
+        array_map_f64,
         new_map_i64,
         map_get_i64,
         map_set_i64,
@@ -317,7 +328,7 @@ fn function_references(function: &TFunction) -> HashSet<String> {
             TExprKind::ArrayLiteral { values, .. } => {
                 values.iter().for_each(|value| visit_expr(value, refs))
             }
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
                 visit_expr(array, refs);
                 visit_expr(callback, refs);
             }
@@ -426,7 +437,7 @@ fn uses_function_value(stmts: &[TStmt]) -> bool {
             TExprKind::Call(_, args) => args.iter().any(expr_uses_function_value),
             TExprKind::NewArray { len, .. } => expr_uses_function_value(len),
             TExprKind::ArrayLiteral { values, .. } => values.iter().any(expr_uses_function_value),
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
                 expr_uses_function_value(array) || expr_uses_function_value(callback)
             }
             TExprKind::NewMap { .. } => false,
@@ -532,7 +543,7 @@ fn is_directly_recursive(f: &TFunction) -> bool {
             TExprKind::ArrayLiteral { values, .. } => {
                 values.iter().any(|value| expr_calls(value, name))
             }
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap { array, callback, .. } => {
                 expr_calls(array, name) || expr_calls(callback, name)
             }
             TExprKind::NewMap { .. } => false,
@@ -1606,10 +1617,18 @@ impl<'a, 'b> FuncCtx<'a, 'b> {
                 }
                 array
             }
-            TExprKind::ArrayMap { array, callback } => {
+            TExprKind::ArrayMap {
+                array,
+                callback,
+                elem,
+            } => {
                 let array = self.translate_expr(array);
                 let callback = self.translate_expr(callback);
-                self.runtime_call(self.runtime.array_map_i64, &[array, callback])
+                let target = match elem {
+                    Type::F64 => self.runtime.array_map_f64,
+                    _ => self.runtime.array_map_i64,
+                };
+                self.runtime_call(target, &[array, callback])
             }
             TExprKind::NewMap { .. } => {
                 let function = self

@@ -19,6 +19,34 @@
       scope for this bullet: generic runtime calls elsewhere in the typed
       tier are untouched by this item.
 - [ ] Specialize generics, records, arrays, maps, and callbacks across modules.
+      Item 3 (2026-10-02): the only generic-shaped specialization mechanism
+      in the typed tier was `typeck.rs`'s `check_call` "map" branch
+      (`types.rs:253-257`'s `TExprKind::ArrayMap`), hard-coded to exactly one
+      monomorphization, `Array<i64>` + `fn(i64) -> i64`. Generalized it to
+      monomorphize per call site over either scalar type the runtime already
+      has a dedicated unboxed array representation for (`I64` or `F64`,
+      matching `new_array_i64`/`new_array_f64`'s existing split) instead of
+      being fixed to `i64`: `TExprKind::ArrayMap` now carries its resolved
+      `elem: Type` (`typeck.rs`'s `check_call`), threaded through
+      `escape.rs`/`optimize.rs`/`jit.rs`'s tree-walkers and `verify.rs`'s IR
+      check, with `codegen.rs` choosing between a new `sol_array_map_f64`
+      runtime helper (`runtime.rs`, registered in `jit.rs`'s JIT symbol
+      table alongside the existing `sol_array_map_i64`) and the original one
+      based on that field - confirmed via `--dump-ir` that an `f64`
+      instantiation calls `sol_array_map_f64`, never `sol_array_map_i64` or
+      any `sol_dynamic_*` boxing path (`tests/programs.rs`'s
+      `generic_map_over_f64_arrays_is_specialized_in_all_tiers`).
+      **Remaining scope, explicitly not attempted here:** this generalizes
+      *which concrete type* the one existing built-in specializes on, not
+      *the mechanism* into real user-definable generic function syntax
+      (type parameters on `function` declarations, call-site type inference,
+      an instantiation cache) that the plan's fuller framing ("applies to
+      user-defined generic functions and callback parameters generally")
+      describes - there is no generic-function syntax anywhere in
+      `ast.rs`/`parser.rs` today, and building one is a language-design-sized
+      feature, not a bounded follow-on to the existing single-intrinsic
+      mechanism. Measured, not adopted: left for a future milestone rather
+      than attempted as a partial/unsound slice.
 - [ ] Retain dynamic adapters at exported and reflective boundaries.
 - [ ] Support profile-guided AOT with safe profile-change fallback.
 - [x] Compare gradually typed programs to their unchanged Lua versions. Item 6

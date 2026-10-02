@@ -243,13 +243,23 @@ fn verify_expr(
             }
             Ok(())
         }
-        TExprKind::ArrayMap { array, callback } => {
+        TExprKind::ArrayMap {
+            array,
+            callback,
+            elem,
+        } => {
             verify_expr(array, function, program, externs)?;
             verify_expr(callback, function, program, externs)?;
-            let expected_array = Type::Array(Box::new(Type::I64));
+            if !matches!(elem, Type::I64 | Type::F64) {
+                return Err(format!(
+                    "IR verification: function '{}' has an array map specialized on unsupported element type {elem}",
+                    function.name
+                ));
+            }
+            let expected_array = Type::Array(Box::new(elem.clone()));
             let expected_callback = Type::Function {
-                params: vec![Type::I64],
-                return_type: Box::new(Type::I64),
+                params: vec![elem.clone()],
+                return_type: Box::new(elem.clone()),
             };
             if array.ty != expected_array
                 || callback.ty != expected_callback
