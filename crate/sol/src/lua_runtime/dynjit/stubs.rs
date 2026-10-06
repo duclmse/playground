@@ -1209,6 +1209,8 @@ mod tests {
             hook_last_line: -1,
             c_hook_last_pc: -1,
             c_hook_last_line: -1,
+            debugger_last_pc: None,
+            debugger_last_line: None,
         }
     }
 

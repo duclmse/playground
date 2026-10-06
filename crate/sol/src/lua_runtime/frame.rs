@@ -183,6 +183,8 @@ pub(super) struct LuaFrame {
     pub(super) hook_last_line: i64,
     pub(super) c_hook_last_pc: i64,
     pub(super) c_hook_last_line: i64,
+    pub(super) debugger_last_pc: Option<u32>,
+    pub(super) debugger_last_line: Option<u32>,
 }
 
 /// One entry of the explicit call stack. `Native` holds a reentrant native
@@ -245,6 +247,9 @@ pub(super) enum NativeCont {
     /// inside a coroutine must propagate out of `resume`/`wrap`, not be
     /// silently swallowed by its own top-level marker.
     Once,
+    /// In-memory require loader; cache publication and cleanup happen when
+    /// the module's live Lua frame returns or is unwound.
+    Require { name: Vec<u8>, key: LuaValue },
     /// `table.sort`'s in-progress TimSort - see `SortState`/
     /// `LuaRuntime::sort_step`. Resumed with the just-completed comparison
     /// call's boolean result (`less`).
@@ -359,6 +364,10 @@ pub(super) enum GsubOutcome {
 
 /// What `LuaRuntime::dispatch_step` produced for the frame it just ran.
 pub(super) enum StepResult {
+    DebugResume(DebugResumeRequest),
+    /// Embedding debugger suspension before the next instruction. Unlike a
+    /// Lua yield, no pending call results are created or consumed.
+    DebugPause,
     /// The frame returned; these are its final result values.
     Done(Vec<LuaValue>),
     /// The frame issued `Instr::Call` against a `LuaValue::Closure` callee -
@@ -429,6 +438,12 @@ pub(super) enum StepResult {
 /// across a C-call boundary"), matching real Lua; `LuaRuntime::resume_coroutine`
 /// is the only caller that treats it as a normal, expected outcome.
 pub(super) type DriveOutcome = sol_core::CallOutcome<LuaValue, LuaError>;
+
+pub(super) struct DebugResumeRequest {
+    pub thread: ThreadRef,
+    pub args: Vec<LuaValue>,
+    pub wrapped: bool,
+}
 
 /// What resolving a call (`LuaRuntime::resolve_call`/`push_native_call`)
 /// produced, for callers that need to distinguish "nothing is ready yet, a

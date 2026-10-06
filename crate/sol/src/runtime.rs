@@ -14,6 +14,8 @@ use crate::gc;
 pub struct ArrayHeader {
     pub len: i64,
     pub data: *mut u8,
+    #[cfg(target_pointer_width = "32")]
+    data_padding: u32,
 }
 
 #[repr(C)]
@@ -21,9 +23,24 @@ pub struct MapI64Header {
     len: i64,
     capacity: i64,
     keys: *mut i64,
+    #[cfg(target_pointer_width = "32")]
+    keys_padding: u32,
     values: *mut i64,
+    #[cfg(target_pointer_width = "32")]
+    values_padding: u32,
     occupied: *mut u8,
+    #[cfg(target_pointer_width = "32")]
+    occupied_padding: u32,
 }
+
+// Pointer fields occupy whole interpreter/GC slots on every target. In
+// particular wasm32 must not pack two pointers into one traced 64-bit word.
+const _: () = assert!(std::mem::size_of::<ArrayHeader>() == 16);
+const _: () = assert!(std::mem::size_of::<MapI64Header>() == 40);
+const _: () = assert!(std::mem::offset_of!(ArrayHeader, data) == 8);
+const _: () = assert!(std::mem::offset_of!(MapI64Header, keys) == 16);
+const _: () = assert!(std::mem::offset_of!(MapI64Header, values) == 24);
+const _: () = assert!(std::mem::offset_of!(MapI64Header, occupied) == 32);
 
 impl MapI64Header {
     /// U12 item 4, deliverable 2: every occupied `(key, value)` pair, read
@@ -73,6 +90,12 @@ unsafe fn alloc_map(capacity: usize) -> *mut MapI64Header {
     (*header).keys = gc::sol_gc_alloc_atomic((capacity * 8) as i64) as *mut i64;
     (*header).values = gc::sol_gc_alloc_atomic((capacity * 8) as i64) as *mut i64;
     (*header).occupied = gc::sol_gc_alloc_atomic(capacity as i64);
+    #[cfg(target_pointer_width = "32")]
+    {
+        (*header).keys_padding = 0;
+        (*header).values_padding = 0;
+        (*header).occupied_padding = 0;
+    }
     header
 }
 
@@ -240,6 +263,10 @@ fn new_array(len: i64, atomic_data: bool) -> *mut ArrayHeader {
     unsafe {
         (*header).len = len;
         (*header).data = data;
+        #[cfg(target_pointer_width = "32")]
+        {
+            (*header).data_padding = 0;
+        }
     }
     header
 }

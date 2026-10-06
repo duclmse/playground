@@ -15,15 +15,100 @@ struct LoadedModule {
     dynamic: bool,
 }
 
-struct Loader {
+enum SourceProvider<'a> {
+    Disk,
+    Memory(&'a HashMap<PathBuf, Vec<u8>>),
+}
+
+impl SourceProvider<'_> {
+    fn resolve(&self, name: &str, relative_to: &Path) -> Option<PathBuf> {
+        let relative = name.replace('.', "/");
+        ["sol", "lua"]
+            .into_iter()
+            .map(|extension| relative_to.join(format!("{relative}.{extension}")))
+            .find(|candidate| match self {
+                Self::Disk => candidate.is_file(),
+                Self::Memory(files) => files.contains_key(candidate),
+            })
+    }
+
+    fn read(&self, path: &Path) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Disk => fs::read(path).map_err(|error| error.to_string()),
+            Self::Memory(files) => files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| "file is not present in the in-memory project".to_string()),
+        }
+    }
+
+    fn key(&self, path: &Path) -> PathBuf {
+        match self {
+            Self::Disk => path.canonicalize().unwrap_or_else(|_| path.to_owned()),
+            Self::Memory(_) => path.to_owned(),
+        }
+    }
+}
+
+struct Loader<'a> {
     visiting: Vec<PathBuf>,
     loaded: HashMap<PathBuf, LoadedModule>,
     order: Vec<PathBuf>,
+    source_provider: SourceProvider<'a>,
 }
 
 pub fn compile_project(path: &str, source: &[u8]) -> Result<(TProgram, Type), String> {
     let project = load_project_program(path, source)?;
     crate::compile_program(project.program)
+}
+
+/// Compiles a project whose complete file set is supplied by the embedding
+/// host. This is the browser-safe counterpart to [`compile_project`]: it
+/// performs no filesystem access and resolves imports only within `files`.
+/// Paths must be relative, slash-separated project paths such as
+/// `main.sol` and `math/base.sol`.
+pub fn compile_project_from_sources(
+    entry: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<(TProgram, Type), String> {
+    compile_memory_project(entry, files, false)
+}
+
+/// The same in-memory graph and language contracts, without transformations
+/// which erase the paused source-local representation.
+pub fn compile_debug_project_from_sources(
+    entry: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<(TProgram, Type), String> {
+    compile_memory_project(entry, files, true)
+}
+
+fn compile_memory_project(
+    entry: &str,
+    files: &[(String, Vec<u8>)],
+    debug: bool,
+) -> Result<(TProgram, Type), String> {
+    let mut sources = HashMap::new();
+    for (name, contents) in files {
+        let path = virtual_path(name)?;
+        if sources.insert(path, contents.clone()).is_some() {
+            return Err(format!("duplicate in-memory project file '{name}'"));
+        }
+    }
+    let root = virtual_path(entry)?;
+    let source = sources
+        .get(&root)
+        .ok_or_else(|| format!("entry file '{entry}' is not present in the in-memory project"))?
+        .clone();
+    let project = load_project_program_with_provider(root, &source, SourceProvider::Memory(&sources))?;
+    if project.has_dynamic_modules {
+        return Err("Tier-0 in-memory projects support .sol modules only; imported .lua modules require the native dynamic runtime".to_string());
+    }
+    if debug {
+        crate::compile_debug_program(project.program, crate::parser::SourceMode::Sol.into())
+    } else {
+        crate::compile_program(project.program)
+    }
 }
 
 /// Canonicalized source-level module graph used by mixed-tier execution.
@@ -43,13 +128,21 @@ pub struct DynamicModuleContract {
 }
 
 pub fn load_project_program(path: &str, source: &[u8]) -> Result<ProjectProgram, String> {
-    let root = PathBuf::from(path);
-    let root_key = root.canonicalize().unwrap_or_else(|_| root.clone());
+    load_project_program_with_provider(PathBuf::from(path), source, SourceProvider::Disk)
+}
+
+fn load_project_program_with_provider(
+    root: PathBuf,
+    source: &[u8],
+    source_provider: SourceProvider<'_>,
+) -> Result<ProjectProgram, String> {
+    let root_key = source_provider.key(&root);
     let mut root_program = parse_source(&root, source)?;
     let mut loader = Loader {
         visiting: vec![root_key],
         loaded: HashMap::new(),
         order: Vec::new(),
+        source_provider,
     };
     let root_dir = root.parent().unwrap_or_else(|| Path::new("."));
     for import in &root_program.imports {
@@ -138,7 +231,7 @@ pub fn load_project_program(path: &str, source: &[u8]) -> Result<ProjectProgram,
     })
 }
 
-impl Loader {
+impl Loader<'_> {
     fn load(
         &mut self,
         name: &str,
@@ -146,7 +239,7 @@ impl Loader {
         importer: &Path,
         import_line: u32,
     ) -> Result<(), String> {
-        let path = resolve(name, relative_to).ok_or_else(|| {
+        let path = self.source_provider.resolve(name, relative_to).ok_or_else(|| {
             let relative = name.replace('.', "/");
             format!(
                 "{}:{import_line}: module '{name}' not found; tried '{}' then '{}'",
@@ -155,7 +248,7 @@ impl Loader {
                 relative_to.join(format!("{relative}.lua")).display()
             )
         })?;
-        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let key = self.source_provider.key(&path);
         if let Some(start) = self.visiting.iter().position(|entry| entry == &key) {
             let mut cycle = self.visiting[start..]
                 .iter()
@@ -179,7 +272,7 @@ impl Loader {
             }
             return Ok(());
         }
-        let source = fs::read(&path).map_err(|error| {
+        let source = self.source_provider.read(&path).map_err(|error| {
             format!(
                 "{}:{import_line}: failed to read module '{name}': {error}",
                 importer.display()
@@ -229,12 +322,25 @@ impl Loader {
     }
 }
 
-fn resolve(name: &str, relative_to: &Path) -> Option<PathBuf> {
-    let relative = name.replace('.', "/");
-    ["sol", "lua"]
-        .into_iter()
-        .map(|extension| relative_to.join(format!("{relative}.{extension}")))
-        .find(|candidate| candidate.is_file())
+fn virtual_path(name: &str) -> Result<PathBuf, String> {
+    let path = Path::new(name);
+    if path.is_absolute() || name.is_empty() {
+        return Err(format!("in-memory project path '{name}' must be a non-empty relative path"));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("in-memory project path '{name}' must not escape its project root"));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(format!("in-memory project path '{name}' must name a file"));
+    }
+    Ok(normalized)
 }
 
 fn parse_file(path: &Path, source: &[u8]) -> Result<ast::Program, String> {

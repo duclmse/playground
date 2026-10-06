@@ -16,6 +16,8 @@ use crate::bytecode::{BcFunction, Op};
 use crate::gc;
 use crate::runtime;
 
+pub mod live;
+
 /// `None` = keep interpreting (not an error). `Some` = wrapper pointer plus
 /// `(id, pointer)` for every dependency also compiled along the way.
 type PromoteResult = Option<(*const u8, Vec<(u8, *const u8)>)>;
@@ -80,6 +82,23 @@ pub trait Hooks {
 }
 
 impl Hooks for () {}
+
+enum InstructionStep {
+    Continue,
+    Call {
+        target: u8,
+        destination: usize,
+        args: Vec<u64>,
+    },
+    ArrayMap {
+        input: *const runtime::ArrayHeader,
+        output: *mut runtime::ArrayHeader,
+        target: u8,
+        destination: usize,
+    },
+    Returned(u64),
+    TailCall(sol_core::CallRequest<u64>),
+}
 
 /// Speculative-specialization state for one function - see
 /// `jit::speculative_candidate`. `ptr` starts `None` and is set once,
@@ -446,9 +465,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         loop {
             let remaining = self.instructions_remaining.get();
             if remaining == 0 {
-                return sol_core::CallOutcome::Raised(
-                    "instruction budget exceeded".to_string(),
-                );
+                return sol_core::CallOutcome::Raised("instruction budget exceeded".to_string());
             }
             self.instructions_remaining.set(remaining - 1);
 
@@ -459,136 +476,182 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 .map(|loc| loc.line)
                 .unwrap_or(bf.source_line);
             self.hooks.on_instruction(func_id, pc as u32, line, &regs);
-            let instr = bf.code[pc];
-            pc += 1;
-            let a = instr.a() as usize;
-            let b = instr.b() as usize;
-            let c = instr.c() as usize;
+            match self.execute_instruction(func_id, bf, &mut regs, &mut pc, &mut frame, true) {
+                InstructionStep::Continue => {}
+                InstructionStep::Call {
+                    target,
+                    destination,
+                    args,
+                } => match self.call_outcome(target, &args) {
+                    sol_core::CallOutcome::Returned(values) => {
+                        regs[destination] = values.into_iter().next().unwrap_or(0)
+                    }
+                    outcome => return outcome,
+                },
+                InstructionStep::ArrayMap {
+                    input,
+                    output,
+                    target,
+                    destination,
+                } => {
+                    let map_roots = [input as u64, output as u64];
+                    let _map_roots = gc::RootGuard::new(map_roots.as_ptr(), map_roots.len());
+                    for index in 0..unsafe { (*input).len as usize } {
+                        let value = unsafe { *((*input).data.add(index * 8) as *const u64) };
+                        let mapped = self.call(target, &[value]);
+                        unsafe { *((*output).data.add(index * 8) as *mut u64) = mapped };
+                    }
+                    regs[destination] = output as u64;
+                }
+                InstructionStep::Returned(value) => {
+                    return sol_core::CallOutcome::Returned(vec![value])
+                }
+                InstructionStep::TailCall(request) => {
+                    return sol_core::CallOutcome::TailCall(request)
+                }
+            }
+        }
+    }
 
-            macro_rules! ri {
-                ($r:expr) => {
-                    regs[$r] as i64
-                };
-            }
-            macro_rules! rf {
-                ($r:expr) => {
-                    f64::from_bits(regs[$r])
-                };
-            }
-            macro_rules! seti {
-                ($v:expr) => {
-                    regs[a] = ($v) as u64
-                };
-            }
-            macro_rules! setf {
-                ($v:expr) => {
-                    regs[a] = ($v).to_bits()
-                };
-            }
-            macro_rules! setb {
-                ($v:expr) => {
-                    regs[a] = ($v) as u64
-                };
-            }
+    fn execute_instruction(
+        &self,
+        func_id: u8,
+        bf: &BcFunction,
+        regs: &mut [u64],
+        cursor: &mut usize,
+        frame: &mut sol_core::FrameHeader,
+        allow_osr: bool,
+    ) -> InstructionStep {
+        let mut pc = *cursor;
+        let mut outcome = InstructionStep::Continue;
+        let instr = bf.code[pc];
+        pc += 1;
+        let a = instr.a() as usize;
+        let b = instr.b() as usize;
+        let c = instr.c() as usize;
 
-            match instr.op() {
-                Op::DynamicBinary | Op::DynamicCompare => {
-                    let op = bf.code[pc].0 as i64;
-                    pc += 1;
-                    regs[a] = unsafe {
-                        if instr.op() == Op::DynamicBinary {
-                            crate::dynamic::sol_dynamic_binary(
-                                regs[b] as *const u64,
-                                regs[c] as *const u64,
-                                op,
-                            ) as u64
-                        } else {
-                            crate::dynamic::sol_dynamic_compare(
-                                regs[b] as *const u64,
-                                regs[c] as *const u64,
-                                op,
-                            )
-                        }
-                    };
-                }
-                Op::DynamicNeg => {
-                    regs[a] =
-                        unsafe { crate::dynamic::sol_dynamic_neg(regs[b] as *const u64) as u64 }
-                }
-                Op::DynamicTruth => {
-                    regs[a] = unsafe { crate::dynamic::sol_truth(regs[b] as *const u64) }
-                }
-                Op::StringOrder => {
-                    regs[a] = unsafe {
-                        crate::strings::sol_string_compare(
-                            regs[b] as *const u8,
-                            regs[c] as *const u8,
+        macro_rules! ri {
+            ($r:expr) => {
+                regs[$r] as i64
+            };
+        }
+        macro_rules! rf {
+            ($r:expr) => {
+                f64::from_bits(regs[$r])
+            };
+        }
+        macro_rules! seti {
+            ($v:expr) => {
+                regs[a] = ($v) as u64
+            };
+        }
+        macro_rules! setf {
+            ($v:expr) => {
+                regs[a] = ($v).to_bits()
+            };
+        }
+        macro_rules! setb {
+            ($v:expr) => {
+                regs[a] = ($v) as u64
+            };
+        }
+
+        match instr.op() {
+            Op::DynamicBinary | Op::DynamicCompare => {
+                let op = bf.code[pc].0 as i64;
+                pc += 1;
+                regs[a] = unsafe {
+                    if instr.op() == Op::DynamicBinary {
+                        crate::dynamic::sol_dynamic_binary(
+                            regs[b] as *const u64,
+                            regs[c] as *const u64,
+                            op,
                         ) as u64
+                    } else {
+                        crate::dynamic::sol_dynamic_compare(
+                            regs[b] as *const u64,
+                            regs[c] as *const u64,
+                            op,
+                        )
                     }
+                };
+            }
+            Op::DynamicNeg => {
+                regs[a] = unsafe { crate::dynamic::sol_dynamic_neg(regs[b] as *const u64) as u64 }
+            }
+            Op::DynamicTruth => {
+                regs[a] = unsafe { crate::dynamic::sol_truth(regs[b] as *const u64) }
+            }
+            Op::StringOrder => {
+                regs[a] = unsafe {
+                    crate::strings::sol_string_compare(regs[b] as *const u8, regs[c] as *const u8)
+                        as u64
                 }
-                Op::TrapIfZero => {
-                    if regs[a] == 0 {
-                        trap();
-                    }
+            }
+            Op::TrapIfZero => {
+                if regs[a] == 0 {
+                    trap();
                 }
-                Op::AddNoOverflow => {
-                    let (next, overflow) = ri!(b).overflowing_add(ri!(c));
-                    regs[a] = next as u64;
-                    regs[a + 1] = (!overflow) as u64;
+            }
+            Op::AddNoOverflow => {
+                let (next, overflow) = ri!(b).overflowing_add(ri!(c));
+                regs[a] = next as u64;
+                regs[a + 1] = (!overflow) as u64;
+            }
+            Op::LoadK => regs[a] = bf.consts[instr.bx() as usize],
+            Op::LoadBool => regs[a] = b as u64,
+            Op::Move => regs[a] = regs[b],
+            Op::NegI => seti!(ri!(b).wrapping_neg()),
+            Op::NegF => setf!(-rf!(b)),
+            Op::Not => setb!(regs[b] == 0),
+            Op::IntToFloat => setf!(ri!(b) as f64),
+            Op::AddI => seti!(ri!(b).wrapping_add(ri!(c))),
+            Op::SubI => seti!(ri!(b).wrapping_sub(ri!(c))),
+            Op::MulI => seti!(ri!(b).wrapping_mul(ri!(c))),
+            Op::DivI => {
+                if ri!(c) == 0 {
+                    trap();
                 }
-                Op::LoadK => regs[a] = bf.consts[instr.bx() as usize],
-                Op::LoadBool => regs[a] = b as u64,
-                Op::Move => regs[a] = regs[b],
-                Op::NegI => seti!(ri!(b).wrapping_neg()),
-                Op::NegF => setf!(-rf!(b)),
-                Op::Not => setb!(regs[b] == 0),
-                Op::IntToFloat => setf!(ri!(b) as f64),
-                Op::AddI => seti!(ri!(b).wrapping_add(ri!(c))),
-                Op::SubI => seti!(ri!(b).wrapping_sub(ri!(c))),
-                Op::MulI => seti!(ri!(b).wrapping_mul(ri!(c))),
-                Op::DivI => {
-                    if ri!(c) == 0 {
-                        trap();
-                    }
-                    seti!(crate::numeric::floor_div(ri!(b), ri!(c)))
+                seti!(crate::numeric::floor_div(ri!(b), ri!(c)))
+            }
+            Op::ModI => {
+                if ri!(c) == 0 {
+                    trap();
                 }
-                Op::ModI => {
-                    if ri!(c) == 0 {
-                        trap();
-                    }
-                    seti!(crate::numeric::modulo(ri!(b), ri!(c)))
-                }
-                Op::FloorDivF => setf!((rf!(b) / rf!(c)).floor()),
-                Op::ModF => setf!(crate::numeric::modulo_float(rf!(b), rf!(c))),
-                Op::PowF => setf!(rf!(b).powf(rf!(c))),
-                Op::BandI => seti!(ri!(b) & ri!(c)),
-                Op::BorI => seti!(ri!(b) | ri!(c)),
-                Op::BxorI => seti!(ri!(b) ^ ri!(c)),
-                Op::ShlI => seti!(crate::numeric::shift(ri!(b), ri!(c), true)),
-                Op::ShrI => seti!(crate::numeric::shift(ri!(b), ri!(c), false)),
-                Op::AddF => setf!(rf!(b) + rf!(c)),
-                Op::SubF => setf!(rf!(b) - rf!(c)),
-                Op::MulF => setf!(rf!(b) * rf!(c)),
-                Op::DivF => setf!(rf!(b) / rf!(c)), // IEEE754 inf/NaN on zero, matching Cranelift's fdiv - no trap
-                Op::EqI => setb!(ri!(b) == ri!(c)),
-                Op::NeI => setb!(ri!(b) != ri!(c)),
-                Op::LtI => setb!(ri!(b) < ri!(c)),
-                Op::LeI => setb!(ri!(b) <= ri!(c)),
-                Op::GtI => setb!(ri!(b) > ri!(c)),
-                Op::GeI => setb!(ri!(b) >= ri!(c)),
-                Op::EqF => setb!(rf!(b) == rf!(c)),
-                Op::NeF => setb!(rf!(b) != rf!(c)),
-                Op::LtF => setb!(rf!(b) < rf!(c)),
-                Op::LeF => setb!(rf!(b) <= rf!(c)),
-                Op::GtF => setb!(rf!(b) > rf!(c)),
-                Op::GeF => setb!(rf!(b) >= rf!(c)),
-                Op::EqB => setb!(regs[b] == regs[c]),
-                Op::NeB => setb!(regs[b] != regs[c]),
-                Op::And => regs[a] = regs[b] & regs[c],
-                Op::Or => regs[a] = regs[b] | regs[c],
-                Op::Jump => {
-                    let target = (pc as i64 + instr.sbx() as i64) as usize;
-                    // Linear scan: `top_level_loops` is typically tiny.
+                seti!(crate::numeric::modulo(ri!(b), ri!(c)))
+            }
+            Op::FloorDivF => setf!((rf!(b) / rf!(c)).floor()),
+            Op::ModF => setf!(crate::numeric::modulo_float(rf!(b), rf!(c))),
+            Op::PowF => setf!(rf!(b).powf(rf!(c))),
+            Op::BandI => seti!(ri!(b) & ri!(c)),
+            Op::BorI => seti!(ri!(b) | ri!(c)),
+            Op::BxorI => seti!(ri!(b) ^ ri!(c)),
+            Op::ShlI => seti!(crate::numeric::shift(ri!(b), ri!(c), true)),
+            Op::ShrI => seti!(crate::numeric::shift(ri!(b), ri!(c), false)),
+            Op::AddF => setf!(rf!(b) + rf!(c)),
+            Op::SubF => setf!(rf!(b) - rf!(c)),
+            Op::MulF => setf!(rf!(b) * rf!(c)),
+            Op::DivF => setf!(rf!(b) / rf!(c)), // IEEE754 inf/NaN on zero, matching Cranelift's fdiv - no trap
+            Op::EqI => setb!(ri!(b) == ri!(c)),
+            Op::NeI => setb!(ri!(b) != ri!(c)),
+            Op::LtI => setb!(ri!(b) < ri!(c)),
+            Op::LeI => setb!(ri!(b) <= ri!(c)),
+            Op::GtI => setb!(ri!(b) > ri!(c)),
+            Op::GeI => setb!(ri!(b) >= ri!(c)),
+            Op::EqF => setb!(rf!(b) == rf!(c)),
+            Op::NeF => setb!(rf!(b) != rf!(c)),
+            Op::LtF => setb!(rf!(b) < rf!(c)),
+            Op::LeF => setb!(rf!(b) <= rf!(c)),
+            Op::GtF => setb!(rf!(b) > rf!(c)),
+            Op::GeF => setb!(rf!(b) >= rf!(c)),
+            Op::EqB => setb!(regs[b] == regs[c]),
+            Op::NeB => setb!(regs[b] != regs[c]),
+            Op::And => regs[a] = regs[b] & regs[c],
+            Op::Or => regs[a] = regs[b] | regs[c],
+            Op::Jump => {
+                let target = (pc as i64 + instr.sbx() as i64) as usize;
+                // Linear scan: `top_level_loops` is typically tiny.
+                if allow_osr {
                     if let Some(&(_, stmt_index)) = bf
                         .top_level_loops
                         .iter()
@@ -599,154 +662,142 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                         {
                             frame.state = sol_core::FrameState::Returned;
                             self.hooks.on_frame_state(&frame);
-                            return sol_core::CallOutcome::Returned(vec![result]);
-                        }
-                    }
-                    pc = target;
-                }
-                Op::JumpIfFalse => {
-                    if regs[a] == 0 {
-                        pc = (pc as i64 + instr.sbx() as i64) as usize;
-                    }
-                }
-                Op::Len => {
-                    let len = unsafe { *(regs[b] as *const i64) };
-                    seti!(len)
-                }
-                Op::NewArrayI64 => regs[a] = runtime::sol_new_array_i64(ri!(b)) as u64,
-                Op::NewArrayF64 => regs[a] = runtime::sol_new_array_f64(ri!(b)) as u64,
-                Op::NewArrayPtr => regs[a] = runtime::sol_new_array_ptr(ri!(b)) as u64,
-                Op::ArrayMapI64 => {
-                    let input = regs[b] as *const runtime::ArrayHeader;
-                    let output = runtime::sol_new_array_i64(unsafe { (*input).len });
-                    for index in 0..unsafe { (*input).len as usize } {
-                        let value = unsafe { *((*input).data.add(index * 8) as *const u64) };
-                        let mapped = self.call(regs[c] as u8, &[value]);
-                        unsafe { *((*output).data.add(index * 8) as *mut u64) = mapped };
-                    }
-                    regs[a] = output as u64;
-                }
-                Op::NewMapI64 => regs[a] = runtime::sol_new_map_i64() as u64,
-                Op::MapGetI64 => {
-                    regs[a] = unsafe { runtime::sol_map_get_i64(regs[b] as *mut _, ri!(c)) as u64 }
-                }
-                Op::MapSetI64 => unsafe {
-                    runtime::sol_map_set_i64(regs[a] as *mut _, ri!(b), ri!(c));
-                },
-                Op::MapNextI64 => {
-                    regs[a] = unsafe { runtime::sol_map_next_i64(regs[b] as *mut _, ri!(c)) as u64 }
-                }
-                Op::MapKeyI64 => {
-                    regs[a] =
-                        unsafe { runtime::sol_map_key_at_i64(regs[b] as *mut _, ri!(c)) as u64 }
-                }
-                Op::MapValueI64 => {
-                    regs[a] =
-                        unsafe { runtime::sol_map_value_at_i64(regs[b] as *mut _, ri!(c)) as u64 }
-                }
-                Op::Index => {
-                    let hdr = regs[b] as *const i64;
-                    // Unsigned compare also catches a negative index (wraps huge).
-                    let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *const u8) };
-                    if ri!(c) as u64 >= len {
-                        trap();
-                    }
-                    regs[a] = unsafe { *(data.add(ri!(c) as usize * 8) as *const u64) };
-                }
-                Op::SetIndex => {
-                    let hdr = regs[a] as *const i64;
-                    let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *mut u8) };
-                    if ri!(b) as u64 >= len {
-                        trap();
-                    }
-                    unsafe { *(data.add(ri!(b) as usize * 8) as *mut u64) = regs[c] };
-                    gc::sol_gc_write_barrier(data as i64, regs[c] as i64);
-                }
-                Op::StructAlloc => {
-                    let pointer_mask = bf.code[pc].0 as u64 | ((bf.code[pc + 1].0 as u64) << 32);
-                    pc += 2;
-                    regs[a] = runtime::sol_alloc_layout(instr.bx() as i64, pointer_mask) as u64;
-                }
-                Op::GetField => regs[a] = unsafe { *((regs[b] as *const u64).add(c)) },
-                Op::SetField => {
-                    unsafe { *((regs[a] as *mut u64).add(b)) = regs[c] };
-                    gc::sol_gc_write_barrier(regs[a] as i64, regs[c] as i64);
-                }
-                Op::Box => {
-                    let expected_tag = bf.code[pc].0 as i64;
-                    let pointer_mask = bf.code[pc + 1].0 as u64;
-                    pc += 2;
-                    let ptr = runtime::sol_alloc_layout(16, pointer_mask) as *mut i64;
-                    unsafe {
-                        *ptr = expected_tag;
-                        *(ptr.add(1)) = regs[b] as i64;
-                    }
-                    regs[a] = ptr as u64;
-                }
-                Op::Unbox => {
-                    let expected_tag = bf.code[pc].0 as i64;
-                    pc += 1;
-                    let ptr = regs[b] as *const i64;
-                    let tag = unsafe { *ptr };
-                    if tag != expected_tag {
-                        trap();
-                    }
-                    regs[a] = unsafe { *(ptr.add(1)) as u64 };
-                }
-                Op::Call => {
-                    let argc = c;
-                    match self.call_outcome(b as u8, &regs[a + 1..a + 1 + argc]) {
-                        sol_core::CallOutcome::Returned(values) => {
-                            regs[a] = values.into_iter().next().unwrap_or(0)
-                        }
-                        outcome @ sol_core::CallOutcome::Yielded(_)
-                        | outcome @ sol_core::CallOutcome::Raised(_) => return outcome,
-                        sol_core::CallOutcome::TailCall(_) => {
-                            unreachable!("the dispatcher consumes nested tail calls")
+                            return InstructionStep::Returned(result);
                         }
                     }
                 }
-                Op::LoadFunc => regs[a] = b as u64,
-                Op::CallIndirect => {
-                    let argc = c;
-                    match self.call_outcome(regs[b] as u8, &regs[a + 1..a + 1 + argc]) {
-                        sol_core::CallOutcome::Returned(values) => {
-                            regs[a] = values.into_iter().next().unwrap_or(0)
-                        }
-                        outcome @ sol_core::CallOutcome::Yielded(_)
-                        | outcome @ sol_core::CallOutcome::Raised(_) => return outcome,
-                        sol_core::CallOutcome::TailCall(_) => {
-                            unreachable!("the dispatcher consumes nested tail calls")
-                        }
-                    }
-                }
-                Op::TailCall => {
-                    frame.state = sol_core::FrameState::Returned;
-                    self.hooks.on_frame_state(&frame);
-                    return sol_core::CallOutcome::TailCall(sol_core::CallRequest::new(
-                        sol_core::FunctionId::new(b as u32),
-                        regs[a + 1..a + 1 + c].to_vec(),
-                        sol_core::ValueCount::ONE,
-                        sol_core::CallKind::Tail,
-                    ));
-                }
-                Op::TailCallIndirect => {
-                    frame.state = sol_core::FrameState::Returned;
-                    self.hooks.on_frame_state(&frame);
-                    return sol_core::CallOutcome::TailCall(sol_core::CallRequest::new(
-                        sol_core::FunctionId::new(regs[b] as u32),
-                        regs[a + 1..a + 1 + c].to_vec(),
-                        sol_core::ValueCount::ONE,
-                        sol_core::CallKind::Tail,
-                    ));
-                }
-                Op::Return => {
-                    frame.state = sol_core::FrameState::Returned;
-                    self.hooks.on_frame_state(&frame);
-                    return sol_core::CallOutcome::Returned(vec![regs[a]]);
+                pc = target;
+            }
+            Op::JumpIfFalse => {
+                if regs[a] == 0 {
+                    pc = (pc as i64 + instr.sbx() as i64) as usize;
                 }
             }
+            Op::Len => {
+                let len = unsafe { *(regs[b] as *const i64) };
+                seti!(len)
+            }
+            Op::NewArrayI64 => regs[a] = runtime::sol_new_array_i64(ri!(b)) as u64,
+            Op::NewArrayF64 => regs[a] = runtime::sol_new_array_f64(ri!(b)) as u64,
+            Op::NewArrayPtr => regs[a] = runtime::sol_new_array_ptr(ri!(b)) as u64,
+            Op::ArrayMapI64 => {
+                let input = regs[b] as *const runtime::ArrayHeader;
+                let output = runtime::sol_new_array_i64(unsafe { (*input).len });
+                outcome = InstructionStep::ArrayMap {
+                    input,
+                    output,
+                    target: regs[c] as u8,
+                    destination: a,
+                };
+            }
+            Op::NewMapI64 => regs[a] = runtime::sol_new_map_i64() as u64,
+            Op::MapGetI64 => {
+                regs[a] = unsafe { runtime::sol_map_get_i64(regs[b] as *mut _, ri!(c)) as u64 }
+            }
+            Op::MapSetI64 => unsafe {
+                runtime::sol_map_set_i64(regs[a] as *mut _, ri!(b), ri!(c));
+            },
+            Op::MapNextI64 => {
+                regs[a] = unsafe { runtime::sol_map_next_i64(regs[b] as *mut _, ri!(c)) as u64 }
+            }
+            Op::MapKeyI64 => {
+                regs[a] = unsafe { runtime::sol_map_key_at_i64(regs[b] as *mut _, ri!(c)) as u64 }
+            }
+            Op::MapValueI64 => {
+                regs[a] = unsafe { runtime::sol_map_value_at_i64(regs[b] as *mut _, ri!(c)) as u64 }
+            }
+            Op::Index => {
+                let hdr = regs[b] as *const i64;
+                // Unsigned compare also catches a negative index (wraps huge).
+                let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *const u8) };
+                if ri!(c) as u64 >= len {
+                    trap();
+                }
+                regs[a] = unsafe { *(data.add(ri!(c) as usize * 8) as *const u64) };
+            }
+            Op::SetIndex => {
+                let hdr = regs[a] as *const i64;
+                let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *mut u8) };
+                if ri!(b) as u64 >= len {
+                    trap();
+                }
+                unsafe { *(data.add(ri!(b) as usize * 8) as *mut u64) = regs[c] };
+                gc::sol_gc_write_barrier(data as i64, regs[c] as i64);
+            }
+            Op::StructAlloc => {
+                let pointer_mask = bf.code[pc].0 as u64 | ((bf.code[pc + 1].0 as u64) << 32);
+                pc += 2;
+                regs[a] = runtime::sol_alloc_layout(instr.bx() as i64, pointer_mask) as u64;
+            }
+            Op::GetField => regs[a] = unsafe { *((regs[b] as *const u64).add(c)) },
+            Op::SetField => {
+                unsafe { *((regs[a] as *mut u64).add(b)) = regs[c] };
+                gc::sol_gc_write_barrier(regs[a] as i64, regs[c] as i64);
+            }
+            Op::Box => {
+                let expected_tag = bf.code[pc].0 as i64;
+                let pointer_mask = bf.code[pc + 1].0 as u64;
+                pc += 2;
+                let ptr = runtime::sol_alloc_layout(16, pointer_mask) as *mut i64;
+                unsafe {
+                    *ptr = expected_tag;
+                    *(ptr.add(1)) = regs[b] as i64;
+                }
+                regs[a] = ptr as u64;
+            }
+            Op::Unbox => {
+                let expected_tag = bf.code[pc].0 as i64;
+                pc += 1;
+                let ptr = regs[b] as *const i64;
+                let tag = unsafe { *ptr };
+                if tag != expected_tag {
+                    trap();
+                }
+                regs[a] = unsafe { *(ptr.add(1)) as u64 };
+            }
+            Op::Call => {
+                outcome = InstructionStep::Call {
+                    target: b as u8,
+                    destination: a,
+                    args: regs[a + 1..a + 1 + c].to_vec(),
+                }
+            }
+            Op::LoadFunc => regs[a] = b as u64,
+            Op::CallIndirect => {
+                outcome = InstructionStep::Call {
+                    target: regs[b] as u8,
+                    destination: a,
+                    args: regs[a + 1..a + 1 + c].to_vec(),
+                }
+            }
+            Op::TailCall => {
+                frame.state = sol_core::FrameState::Returned;
+                self.hooks.on_frame_state(&frame);
+                outcome = InstructionStep::TailCall(sol_core::CallRequest::new(
+                    sol_core::FunctionId::new(b as u32),
+                    regs[a + 1..a + 1 + c].to_vec(),
+                    sol_core::ValueCount::ONE,
+                    sol_core::CallKind::Tail,
+                ));
+            }
+            Op::TailCallIndirect => {
+                frame.state = sol_core::FrameState::Returned;
+                self.hooks.on_frame_state(&frame);
+                outcome = InstructionStep::TailCall(sol_core::CallRequest::new(
+                    sol_core::FunctionId::new(regs[b] as u32),
+                    regs[a + 1..a + 1 + c].to_vec(),
+                    sol_core::ValueCount::ONE,
+                    sol_core::CallKind::Tail,
+                ));
+            }
+            Op::Return => {
+                frame.state = sol_core::FrameState::Returned;
+                self.hooks.on_frame_state(&frame);
+                outcome = InstructionStep::Returned(regs[a]);
+            }
         }
+        *cursor = pc;
+        outcome
     }
 }
 
@@ -765,6 +816,7 @@ mod tests {
             code,
             consts: vec![41],
             local_count: 0,
+            debug_locals: Vec::new(),
             top_level_loops: Vec::new(),
         }
     }

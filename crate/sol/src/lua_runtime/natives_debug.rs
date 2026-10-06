@@ -1195,6 +1195,7 @@ impl LuaRuntime {
                                 // in `debug.traceback`; Lua resumes the
                                 // wrapped function directly.
                                 NativeCont::Once => None,
+                                NativeCont::Require { .. } => Some("[C]: in function 'require'".to_owned()),
                             },
                         };
                         if let Some(entry) = entry {

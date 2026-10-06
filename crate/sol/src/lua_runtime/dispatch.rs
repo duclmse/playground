@@ -987,7 +987,7 @@ impl LuaRuntime {
     /// Builds a fresh `LuaFrame` for `proto` - the exact preamble `run_proto`
     /// used to run inline (allocation charge, register/cell buffers, param
     /// binding, vararg collection) before entering its dispatch loop.
-    fn new_lua_frame(
+    pub(super) fn new_lua_frame(
         &mut self,
         closure: ClosureRef,
         proto: Rc<Proto>,
@@ -1068,7 +1068,11 @@ impl LuaRuntime {
                 reg_set(self, &mut regs, &cells, vararg_reg as usize, table);
             }
         }
-        Ok(LuaFrame {
+        if let Some(recording) = self.debug_recording.as_mut() {
+            recording.call(format!("{}:{}", self.chunk_sources.get(&(Rc::as_ptr(&proto) as usize))
+                .map(|source| String::from_utf8_lossy(source).trim_start_matches('@').to_string()).unwrap_or_default(), proto.metadata.name));
+        }
+        let frame = LuaFrame {
             header: FrameHeader::new(function, 0, 0),
             closure,
             proto,
@@ -1086,7 +1090,11 @@ impl LuaRuntime {
             hook_last_line: -1,
             c_hook_last_pc: -1,
             c_hook_last_line: -1,
-        })
+            debugger_last_pc: None,
+            debugger_last_line: None,
+        };
+        self.record_event("call", &frame);
+        Ok(frame)
     }
 
     /// Builds the lazy named-vararg view's real backing `Table` on demand -
@@ -1244,7 +1252,10 @@ impl LuaRuntime {
         depth_charged: &mut usize,
         initial_incoming: Option<Vec<LuaValue>>,
     ) -> DriveOutcome {
-        match self.drive_result(base_depth, depth_charged, initial_incoming) {
+        self.debug_drive_nesting += 1;
+        let result = self.drive_result(base_depth, depth_charged, initial_incoming);
+        self.debug_drive_nesting -= 1;
+        match result {
             Ok(outcome) => outcome,
             Err(error) => DriveOutcome::Raised(error),
         }
@@ -1276,19 +1287,34 @@ impl LuaRuntime {
                             NativeStatus::Native(_) | NativeStatus::Optimized(_)
                         )
                         && self.active_hook.is_none()
+                        && self.debug_slice_remaining.is_none()
                         && !c_api::c_instruction_hooks_active(self);
+                    let analysis_name = self.debug_recording.as_ref().map(|_| self.analysis_name(&frame));
+                    if let Some(name) = analysis_name.as_ref() { self.debug_recording.as_mut().unwrap().active.push(name.clone()); }
                     let step = if use_native {
                         self.run_native(&mut frame)
                     } else {
                         self.dispatch_step(&mut frame, incoming.take())
                     };
+                    if analysis_name.is_some() { self.debug_recording.as_mut().unwrap().active.pop(); }
                     // Only ever `Some` immediately after a dispatch step that
                     // just decided to call a `__index`/`__newindex` metamethod
                     // - see `pending_frame_label`'s field doc. Always taken
                     // here so it never leaks onto some later, unrelated call.
                     let new_frame_label = self.pending_frame_label.take();
                     match step {
+                        Ok(StepResult::DebugPause) => {
+                            self.debug_pause_requested = true;
+                            self.frames.push(Frame::Lua(frame));
+                            return Ok(DriveOutcome::Yielded(Vec::new()));
+                        }
+                        Ok(StepResult::DebugResume(request)) => {
+                            self.frames.push(Frame::Lua(frame));
+                            self.debug_resume_request = Some(request);
+                            return Ok(DriveOutcome::Yielded(Vec::new()));
+                        }
                         Ok(StepResult::Done(values)) => {
+                            self.record_event("return", &frame);
                             // The base frame's own "return" is fired by `call`/
                             // `call_closure`'s caller instead (this
                             // `drive_result` call is itself running inside that
@@ -1623,6 +1649,16 @@ impl LuaRuntime {
                             }
                             incoming = Some(values);
                         }
+                        NativeCont::Require { name, key } => {
+                            self.loading_modules.remove(&name);
+                            let value = values.into_iter().next().unwrap_or(LuaValue::Nil);
+                            let value = if value == LuaValue::Nil { LuaValue::Bool(true) } else { value };
+                            self.table_set(self.package_loaded, key, value.clone())?;
+                            self.fire_hook("return", None)?;
+                            let values = vec![value];
+                            if self.finish_frame(base_depth, depth_charged) { return Ok(DriveOutcome::Returned(values)); }
+                            incoming = Some(values);
+                        }
                         NativeCont::Sort(mut state) => {
                             let less = values.into_iter().next().unwrap_or(LuaValue::Nil).truthy();
                             match self.sort_step(&mut state, Some(less)) {
@@ -1726,7 +1762,7 @@ impl LuaRuntime {
     /// Releases `n` `call_depth` units, clearing `call_depth_overflowed_once`
     /// once the whole call stack has drained back to empty - see that
     /// field's doc for why the flag isn't cleared on every unwind.
-    fn release_call_depth(&mut self, n: usize) {
+    pub(super) fn release_call_depth(&mut self, n: usize) {
         self.call_depth -= n;
         if self.call_depth == 0 {
             self.call_depth_overflowed_once = false;
@@ -1740,7 +1776,7 @@ impl LuaRuntime {
     /// to `call_depth == 0` gets a `double_fault` error instead, matching
     /// real Lua's `luaD_growstack` throwing `LUA_ERRERR` directly the second
     /// time round rather than raising another catchable overflow.
-    fn call_depth_overflow_error(&mut self) -> LuaError {
+    pub(super) fn call_depth_overflow_error(&mut self) -> LuaError {
         if self.call_depth_overflowed_once {
             LuaError::new("error in error handling").make_double_fault()
         } else {
@@ -1778,6 +1814,7 @@ impl LuaRuntime {
         depth_charged: &mut usize,
     ) -> LuaResult<CallStep> {
         if self.call_depth >= self.max_call_depth {
+            self.discard_native_cont(cont);
             let error = self.call_depth_overflow_error();
             return self.unwind_error_to_marker(error, base_depth, depth_charged);
         }
@@ -1854,6 +1891,11 @@ impl LuaRuntime {
     ) -> LuaResult<CallStep> {
         let callee_for_naming = callee.clone();
         match self.step_result_for_call(callee, args) {
+            Ok(StepResult::DebugPause) => unreachable!("call resolution does not execute bytecode"),
+            Ok(StepResult::DebugResume(request)) => {
+                self.debug_resume_request = Some(request);
+                Ok(CallStep::Yielded(Vec::new()))
+            }
             Ok(StepResult::PushClosure {
                 closure,
                 proto,
@@ -1991,9 +2033,12 @@ impl LuaRuntime {
     ) -> Option<LuaError> {
         let mut error = error;
         while self.frames.len() > base_depth {
-            if let Frame::Lua(mut frame) = self.frames.pop().expect("len > base_depth") {
-                let count = frame.to_close.len() as u16;
-                error = self.close_pending(&mut frame, count, error);
+            match self.frames.pop().expect("len > base_depth") {
+                Frame::Lua(mut frame) => {
+                    let count = frame.to_close.len() as u16;
+                    error = self.close_pending(&mut frame, count, error);
+                }
+                Frame::Native(cont) => self.discard_native_cont(cont),
             }
         }
         error
@@ -2014,12 +2059,12 @@ impl LuaRuntime {
         self.frames.iter().any(|frame| {
             matches!(
                 frame,
-                Frame::Native(NativeCont::Gsub(_)) | Frame::Native(NativeCont::Sort(_))
+                Frame::Native(NativeCont::Gsub(_)) | Frame::Native(NativeCont::Sort(_)) | Frame::Native(NativeCont::Require { .. })
             )
         })
     }
 
-    fn unwind_error_to_marker(
+    pub(super) fn unwind_error_to_marker(
         &mut self,
         error: LuaError,
         base_depth: usize,
@@ -2078,11 +2123,14 @@ impl LuaRuntime {
         // entry on a later iteration of this same loop).
         let mut error = error;
         while self.frames.len() > marker_index + 1 {
-            if let Frame::Lua(mut frame) = self.frames.pop().expect("len > marker_index + 1") {
-                if let Some(location) = frame.proto.source_map.location(frame.header.pc) {
-                    error = error.at_outer_frame(&self.traceback_frame_label(&frame.proto, location.line));
+            match self.frames.pop().expect("len > marker_index + 1") {
+                Frame::Lua(mut frame) => {
+                    if let Some(location) = frame.proto.source_map.location(frame.header.pc) {
+                        error = error.at_outer_frame(&self.traceback_frame_label(&frame.proto, location.line));
+                    }
+                    error = self.close_frame_tbc_on_error(&mut frame, error);
                 }
-                error = self.close_frame_tbc_on_error(&mut frame, error);
+                Frame::Native(cont) => self.discard_native_cont(cont),
             }
         }
         let cont = match self
@@ -2205,6 +2253,7 @@ impl LuaRuntime {
             NativeCont::Once => {
                 unreachable!("unwind_error_to_marker: marker search never matches SingleCall")
             }
+            NativeCont::Require { .. } => unreachable!("require is not a protected-call marker"),
             NativeCont::Sort(_) => {
                 unreachable!("unwind_error_to_marker: marker search never matches Sort")
             }
@@ -2963,6 +3012,21 @@ impl LuaRuntime {
         args: Vec<LuaValue>,
     ) -> LuaResult<StepResult> {
         match callee {
+            LuaValue::NativeFunction(NativeFunction::Require) if self.debug_slice_remaining.is_some() => {
+                let Some(argument) = args.first() else { return Err(LuaError::new("bad argument #1 to 'require' (value expected)")); };
+                let name = self.string(argument)?.to_vec();
+                let key = LuaValue::String(self.intern_str(&name));
+                let loaded = self.table_get(self.package_loaded, &key)?;
+                if loaded.truthy() { return Ok(StepResult::Resolved(vec![loaded])); }
+                if self.capabilities.package {
+                    if let Some(source) = self.module_sources.get(&name).cloned() {
+                        let closure = self.prepare_debug_module(&name, &source)?;
+                        self.table_set(self.package_loaded, key.clone(), LuaValue::Bool(true))?;
+                        self.loading_modules.insert(name.clone());
+                        return Ok(StepResult::CallNative { cont: NativeCont::Require { name, key }, callee: closure, args: Vec::new() });
+                    }
+                }
+            }
             LuaValue::NativeFunction(NativeFunction::PCall) => {
                 let mut args = args;
                 if args.is_empty() {
@@ -3247,6 +3311,19 @@ impl LuaRuntime {
         let mut full_args = args;
         let mut hops = 0usize;
         loop {
+            if self.debug_slice_remaining.is_some() && self.debug_drive_nesting <= 1 && !self.running_hook {
+                if matches!(resolved, LuaValue::NativeFunction(NativeFunction::CoroutineResume)) {
+                    let mut arguments = full_args;
+                    if arguments.is_empty() { return Err(LuaError::new("bad argument #1 to 'resume' (value expected)")); }
+                    let thread = Self::expect_coroutine(&arguments.remove(0))?;
+                    self.fire_hook("call", None)?;
+                    return Ok(StepResult::DebugResume(DebugResumeRequest { thread, args: arguments, wrapped: false }));
+                }
+                if let LuaValue::CoroutineWrapper(thread) = resolved {
+                    self.fire_hook("call", None)?;
+                    return Ok(StepResult::DebugResume(DebugResumeRequest { thread, args: full_args, wrapped: true }));
+                }
+            }
             if let LuaValue::Closure(closure) = &resolved {
                 let (proto, upvals, globals) = self.closure_parts(*closure)?;
                 return Ok(StepResult::PushClosure {

@@ -43,7 +43,7 @@ impl LuaRuntime {
         proto: &Rc<Proto>,
         header_pc: usize,
     ) -> LuaResult<OsrOutcome> {
-        if self.active_hook.is_some() || c_api::c_instruction_hooks_active(self) {
+        if self.debug_slice_remaining.is_some() || self.active_hook.is_some() || c_api::c_instruction_hooks_active(self) {
             return Ok(OsrOutcome::NotAttempted);
         }
         // Must not call `.borrow()` directly in this `if let`'s scrutinee:
@@ -234,6 +234,19 @@ impl LuaRuntime {
         let proto = frame.proto.clone();
         let mut top = frame.header.stack_top as usize;
         'exec: loop {
+            // Only the embedding driver's outer invocation may suspend.
+            // Blocking native callbacks complete their own inner drive so
+            // its Rust continuation cannot be lost across worker messages.
+            if self.debug_drive_nesting == 1 && !self.running_hook {
+                if let Some(remaining) = self.debug_slice_remaining.as_mut() {
+                    if *remaining == 0 {
+                        frame.header.pc = pc as u32;
+                        frame.header.stack_top = top as u32;
+                        return Ok(StepResult::DebugPause);
+                    }
+                    *remaining -= 1;
+                }
+            }
             self.tick(&*frame)?;
             // Keep the frame header's pc in step with the instruction about
             // to execute, not just the ones that explicitly save it before
@@ -241,6 +254,7 @@ impl LuaRuntime {
             // via `?` (no call/yield boundary) reports whatever pc was last
             // saved at a suspension point, misattributing the source line.
             frame.header.pc = pc as u32;
+            self.record_instruction(frame);
             self.fire_line_and_count_hooks(frame, pc)?;
             match &proto.instrs[pc] {
                 Instr::LoadConst(dst, k) => {

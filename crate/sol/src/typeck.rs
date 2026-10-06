@@ -481,6 +481,7 @@ struct Checker<'a> {
     struct_names: HashSet<String>,
     scopes: Vec<HashMap<String, (LocalId, Type)>>,
     next_local: LocalId,
+    local_names: Vec<String>,
     return_type: Type,
     constants: HashSet<LocalId>,
     loop_depth: usize,
@@ -506,6 +507,7 @@ impl<'a> Checker<'a> {
     fn declare(&mut self, name: &str, ty: Type) -> LocalId {
         let id = self.next_local;
         self.next_local += 1;
+        self.local_names.push(name.to_string());
         self.scopes
             .last_mut()
             .unwrap()
@@ -532,6 +534,7 @@ fn check_function(
         struct_names,
         scopes: vec![HashMap::new()],
         next_local: 0,
+        local_names: Vec::new(),
         return_type: return_type.clone(),
         constants: HashSet::new(),
         loop_depth: 0,
@@ -582,6 +585,7 @@ fn check_function(
         return_type,
         body,
         local_count: checker.next_local,
+        local_names: checker.local_names,
     })
 }
 

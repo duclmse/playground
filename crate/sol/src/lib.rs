@@ -28,40 +28,10 @@ pub mod lua_bridge;
 pub mod lua_bytecode;
 pub mod lua_pack;
 pub mod lua_pattern;
-// U12 item 6: excluded from any `wasm32` target build (a target-arch gate,
-// not a new Cargo feature - native builds under every existing feature
-// combination, hence every pre-existing test baseline, are completely
-// unaffected). Root cause this documents: `lua_runtime::c_api` exposes a
-// real embeddable Lua C API (`luaL_newstate`, `lua_pushfstring`, etc.) as
-// `#[no_mangle] pub extern "C" fn`s - which the Rust compiler keeps in any
-// build's object code regardless of whether anything else in the crate
-// calls them, since `#[no_mangle]` alone makes a symbol externally
-// reachable by definition. Those functions in turn reference raw,
-// body-less `extern "C" { fn malloc/free/realloc }` declarations
-// (`lua_runtime/c_api/auxlib.rs::default_alloc`) meant to resolve against a
-// real host libc, plus `sol_c_api_shim_anchor` (`lua_runtime/c_api.rs`,
-// satisfied for native builds only by `build.rs`'s host-only C compile of
-// `lua_runtime/c_api_shim.c`). `wasm32-unknown-unknown` has no implicit
-// libc and no native shim: compiling this module in for that target leaves
-// `malloc`/`free`/`realloc`/`sol_c_api_shim_anchor` as unresolved externs,
-// which surface as required (and, in a plain browser `<script type="module">`
-// context, unsatisfiable - there is no real `env` module to import from)
-// `env.*` imports on the compiled `.wasm`. This was *not* caught by
-// `cargo check --target wasm32-unknown-unknown` (type-checking never
-// performs the final link step that would reveal an unresolved-symbol
-// problem like this) - it was only found by actually building
-// `packages/sol-runtime/pkg` via `scripts/build-sol-wasm.sh` and inspecting
-// the resulting `sol.js`/`sol_bg.wasm` directly, which is why this comment
-// calls it out explicitly rather than trusting a clean `cargo check` alone.
-// Since `lua_runtime` (the dynamic `.lua` interpreter this gates) is not
-// reachable at all from `wasm_api.rs`'s own entry points regardless
-// (confirmed in that file's own top doc comment: `.lua` source does not
-// even typecheck through `compile`/`compile_bytes` without a `print`/stdlib
-// it never constructs), excluding it from the wasm32 build loses nothing
-// this item claims to support - see
-// `docs/features/milestones/u12-wasm-playground.md`'s Work item 6 section
-// for the full writeup.
-#[cfg(not(target_arch = "wasm32"))]
+// U12: the dynamic interpreter also builds for WASM. Its native C ABI
+// exports, host allocator and C shim are excluded on wasm32, so browser
+// execution does not require host-libc imports. Verify the linked module's
+// imports as well as cargo check when changing that boundary.
 pub mod lua_runtime;
 pub mod modules;
 pub mod numeric;
@@ -126,8 +96,25 @@ pub fn compile_program_with_mode(
 }
 
 pub fn compile_program_with_config(
+    program: ast::Program,
+    config: parser::LanguageConfig,
+) -> Result<(TProgram, Type), String> {
+    compile_program_for_execution(program, config, true)
+}
+
+/// Keep source locals and assignments intact for a live debug execution.
+/// Normal compilation still applies the existing optimization pipeline.
+pub fn compile_debug_program(
+    program: ast::Program,
+    config: parser::LanguageConfig,
+) -> Result<(TProgram, Type), String> {
+    compile_program_for_execution(program, config, false)
+}
+
+fn compile_program_for_execution(
     mut program: ast::Program,
     config: parser::LanguageConfig,
+    optimize_locals: bool,
 ) -> Result<(TProgram, Type), String> {
     if config.sol_extensions {
         aliases::expand(&mut program)?;
@@ -139,10 +126,12 @@ pub fn compile_program_with_config(
     let mut tprogram = typeck::check(&program, !config.sol_extensions)
         .map_err(|error| with_error_code(error, "ETYPE001"))?;
     verify::verify(&tprogram).map_err(|error| with_error_code(error, "EIR001"))?;
-    optimize::optimize(&mut tprogram);
-    verify::verify(&tprogram).map_err(|error| with_error_code(error, "EIR001"))?;
-    escape::scalar_replace(&mut tprogram);
-    verify::verify(&tprogram).map_err(|error| with_error_code(error, "EIR001"))?;
+    if optimize_locals {
+        optimize::optimize(&mut tprogram);
+        verify::verify(&tprogram).map_err(|error| with_error_code(error, "EIR001"))?;
+        escape::scalar_replace(&mut tprogram);
+        verify::verify(&tprogram).map_err(|error| with_error_code(error, "EIR001"))?;
+    }
 
     let main_func = tprogram
         .functions

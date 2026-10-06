@@ -600,6 +600,30 @@ impl LuaRuntime {
         }
     }
 
+    pub(super) fn prepare_debug_module(&mut self, name: &[u8], source: &[u8]) -> LuaResult<LuaValue> {
+        let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).map_err(LuaError::new)?)
+            .map_err(LuaError::new)?;
+        let module = Globals::module(&self.globals, self);
+        module.define(self, "_NAME", LuaValue::String(self.intern_str(name)), true);
+        let root = self.encode_value(&module.as_value())?;
+        self.pinned_roots.push(vec![root]);
+        let source_name = self.debug_module_names.get(name).cloned()
+            .unwrap_or_else(|| format!("@{}.lua", String::from_utf8_lossy(name).replace('.', "/")).into_bytes());
+        let previous_name = self.default_chunk_name.replace(Rc::new(source_name));
+        let result = self.load_in_globals(&program, &module, &HashSet::new(), &HashMap::new(), None);
+        self.default_chunk_name = previous_name;
+        self.pinned_roots.pop();
+        result?;
+        Ok(module.get(self, "main"))
+    }
+
+    pub(super) fn discard_native_cont(&mut self, cont: super::frame::NativeCont) {
+        if let super::frame::NativeCont::Require { name, key } = cont {
+            self.loading_modules.remove(&name);
+            let _ = self.table_set(self.package_loaded, key, LuaValue::Nil);
+        }
+    }
+
     fn require_search(&mut self, name: Vec<u8>, key: LuaValue) -> LuaResult<Vec<LuaValue>> {
         let searchers_key = LuaValue::String(self.intern_str(b"searchers"));
         let searchers = self.table_get(self.package_table, &searchers_key)?;

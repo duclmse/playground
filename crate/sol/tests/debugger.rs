@@ -126,8 +126,8 @@ end";
 fn breakpoint_hit_locals_match_the_non_paused_interpreted_run() {
     let program = compile(MULTI_STATEMENT);
     // Independent, non-paused run: what the interpreter actually computes.
-    let plain_engine: sol::tier0::Engine = sol::tier0::Engine::new(program.clone(), ())
-        .expect("plain engine builds");
+    let plain_engine: sol::tier0::Engine =
+        sol::tier0::Engine::new(program.clone(), ()).expect("plain engine builds");
     let expected_c = match plain_engine.call_outcome("main", &[]) {
         sol_core::CallOutcome::Returned(values) => values[0] as i64,
         other => panic!("unexpected outcome: {other:?}"),
@@ -153,8 +153,16 @@ fn breakpoint_hit_locals_match_the_non_paused_interpreted_run() {
             other => panic!("expected a scalar local, got {other:?}"),
         }
     };
-    assert_eq!(render(0), "1", "local a must already be assigned: {locals:?}");
-    assert_eq!(render(1), "2", "local b must already be assigned: {locals:?}");
+    assert_eq!(
+        render(0),
+        "1",
+        "local a must already be assigned: {locals:?}"
+    );
+    assert_eq!(
+        render(1),
+        "2",
+        "local b must already be assigned: {locals:?}"
+    );
 
     // Now let the run finish and confirm the breakpoint's own snapshot was
     // consistent with the final, non-paused result by continuing to the end
@@ -167,6 +175,53 @@ fn breakpoint_hit_locals_match_the_non_paused_interpreted_run() {
         sol::debugger::DisplayValue::Scalar(expected_c.to_string()),
         "the final recorded state must match the plain run's result; last step: {last:?}"
     );
+}
+
+#[test]
+fn conditional_and_hit_count_breakpoints_filter_recorded_trace_hits() {
+    let session = DebugSession::new(compile(LOCAL_AND_LOOP)).expect("session builds");
+    let breakpoint = session.set_breakpoint("main", 5);
+    assert!(breakpoint.verified, "loop-body breakpoint must verify");
+    assert!(
+        session.set_breakpoint_condition(breakpoint.id, Some("local1 == 3".to_string())),
+        "a live breakpoint accepts a condition"
+    );
+    session.run("main", &[]);
+    let hit = session
+        .first_breakpoint_hit()
+        .expect("the fourth loop-body visit satisfies local1 == 3");
+    let locals = session.locals_at(hit).expect("condition hit has locals");
+    assert_eq!(
+        locals[1].value,
+        sol::debugger::DisplayValue::Scalar("3".to_string()),
+        "the condition must be checked against this exact trace step"
+    );
+
+    let session = DebugSession::new(compile(LOCAL_AND_LOOP)).expect("session builds");
+    let breakpoint = session.set_breakpoint("main", 5);
+    assert!(session.set_breakpoint_hit_condition(breakpoint.id, Some(3)));
+    session.run("main", &[]);
+    let hit = session
+        .first_breakpoint_hit()
+        .expect("the third candidate visit satisfies the hit threshold");
+    let locals = session.locals_at(hit).expect("threshold hit has locals");
+    assert_eq!(
+        locals[1].value,
+        sol::debugger::DisplayValue::Scalar("2".to_string())
+    );
+}
+
+#[test]
+fn removed_breakpoints_no_longer_match_and_unknown_ids_are_rejected() {
+    let session = DebugSession::new(compile(MULTI_STATEMENT)).expect("session builds");
+    let breakpoint = session.set_breakpoint("main", 4);
+    assert!(breakpoint.verified);
+    assert!(session.remove_breakpoint(breakpoint.id));
+    assert!(!session.remove_breakpoint(breakpoint.id));
+    assert!(!session.set_breakpoint_condition(99_999, Some("true".to_string())));
+    assert!(!session.set_breakpoint_hit_condition(99_999, Some(1)));
+    session.run("main", &[]);
+    assert_eq!(session.first_breakpoint_hit(), None);
 }
 
 #[test]
@@ -194,9 +249,21 @@ fn stepping_over_a_loop_body_produces_the_expected_line_sequence() {
     let count = |line: u32| lines.iter().filter(|&&l| l == line).count();
     assert_eq!(count(2), 1, "line 2 (`local total`) runs once: {lines:?}");
     assert_eq!(count(3), 1, "line 3 (`local i`) runs once: {lines:?}");
-    assert_eq!(count(4), 6, "line 4 (while condition) runs once per iteration plus the final false check: {lines:?}");
-    assert_eq!(count(5), 5, "line 5 (`total = total + i`) runs once per iteration: {lines:?}");
-    assert_eq!(count(6), 5, "line 6 (`i = i + 1`) runs once per iteration: {lines:?}");
+    assert_eq!(
+        count(4),
+        6,
+        "line 4 (while condition) runs once per iteration plus the final false check: {lines:?}"
+    );
+    assert_eq!(
+        count(5),
+        5,
+        "line 5 (`total = total + i`) runs once per iteration: {lines:?}"
+    );
+    assert_eq!(
+        count(6),
+        5,
+        "line 6 (`i = i + 1`) runs once per iteration: {lines:?}"
+    );
     assert_eq!(count(8), 1, "line 8 (`return total`) runs once: {lines:?}");
 }
 
@@ -277,7 +344,10 @@ fn eval_of_a_local_read_matches_locals_at_reported_value() {
         sol::debugger::DisplayValue::Scalar(s) => s.clone(),
         other => panic!("expected a scalar local for `a`, got {other:?}"),
     };
-    assert_eq!(expected_a, "7", "sanity: local a is 7 at this point: {locals:?}");
+    assert_eq!(
+        expected_a, "7",
+        "sanity: local a is 7 at this point: {locals:?}"
+    );
 
     let evaluated = session
         .evaluate(hit, "local0")
@@ -353,7 +423,10 @@ fn map_valued_local_expands_to_its_occupied_entries() {
         }
         other => panic!("expected local 0 (`m`) to render as a Map reference, got {other:?}"),
     };
-    assert_eq!(summary, "Map<i64, i64>", "local 0 must be the Map<i64, i64> local `m`");
+    assert_eq!(
+        summary, "Map<i64, i64>",
+        "local 0 must be the Map<i64, i64> local `m`"
+    );
 
     let mut entries = session
         .expand(&map_local.ty, reference)
@@ -362,7 +435,11 @@ fn map_valued_local_expands_to_its_occupied_entries() {
     let rendered: Vec<(String, i64)> = entries
         .into_iter()
         .map(|(key, ty, raw)| {
-            assert_eq!(ty, sol::types::Type::I64, "Map<i64, i64>'s value type is i64");
+            assert_eq!(
+                ty,
+                sol::types::Type::I64,
+                "Map<i64, i64>'s value type is i64"
+            );
             (key, raw as i64)
         })
         .collect();
@@ -467,7 +544,10 @@ fn profile_attributes_self_and_total_instructions_correctly_across_a_looped_call
         helper_stats.calls, independent_calls_helper,
         "helper's call count must match the independently-counted contiguous helper-frame runs in the trace"
     );
-    assert_eq!(helper_stats.calls, 3, "the fixture's loop calls helper exactly 3 times");
+    assert_eq!(
+        helper_stats.calls, 3,
+        "the fixture's loop calls helper exactly 3 times"
+    );
 
     assert_eq!(
         main_stats.self_instructions, independent_self_main,

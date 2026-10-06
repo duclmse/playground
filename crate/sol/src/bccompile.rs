@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use crate::ast::BinaryOp;
-use crate::bytecode::{BcFunction, Instr, Op};
+use crate::bytecode::{BcFunction, Instr, LocalDebug, Op};
 use crate::types::*;
 use crate::value;
 
@@ -53,6 +53,8 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
         func_ids,
         breaks: vec![],
         literals: vec![],
+        local_names: &f.local_names,
+        debug_locals: Vec::new(),
     };
     let mut top_level_loops = Vec::new();
     if !b.compile_block(&f.body, f.local_count, Some(&mut top_level_loops)) {
@@ -77,6 +79,11 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
     // enclosing instruction's line and are never themselves a valid `pc` for
     // the interpreter to stop at.
     debug_assert_eq!(b.lines.len(), b.code.len());
+    for (id, _) in &f.params {
+        if let Some(index) = b.record_local(*id, 0) {
+            b.debug_locals[index].end_pc = b.code.len() as u32;
+        }
+    }
     let source_map = sol_core::SourceMap::new(
         b.lines
             .iter()
@@ -93,6 +100,7 @@ pub fn compile_function(f: &TFunction, func_ids: &HashMap<String, u8>) -> Option
         code: b.code,
         consts: b.consts,
         local_count: f.local_count,
+        debug_locals: b.debug_locals,
         top_level_loops,
         literals: b.literals,
     })
@@ -113,9 +121,30 @@ struct Builder<'a> {
     func_ids: &'a HashMap<String, u8>,
     breaks: Vec<Vec<usize>>,
     literals: Vec<Box<[u64]>>,
+    local_names: &'a [String],
+    debug_locals: Vec<LocalDebug>,
 }
 
 impl<'a> Builder<'a> {
+    fn record_local(&mut self, id: usize, start_pc: usize) -> Option<usize> {
+        let name = self.local_names.get(id)?;
+        let index = self.debug_locals.len();
+        self.debug_locals.push(LocalDebug {
+            local_id: id,
+            name: name.clone(),
+            start_pc: start_pc as u32,
+            end_pc: u32::MAX,
+        });
+        Some(index)
+    }
+
+    fn close_local_scope(&mut self, start: usize) {
+        for local in &mut self.debug_locals[start..] {
+            if local.end_pc == u32::MAX {
+                local.end_pc = self.code.len() as u32;
+            }
+        }
+    }
     fn emit(&mut self, i: Instr) -> usize {
         self.code.push(i);
         self.lines.push(self.current_line);
@@ -147,6 +176,7 @@ impl<'a> Builder<'a> {
         floor: usize,
         mut top_level_loops: Option<&mut Vec<(usize, usize)>>,
     ) -> bool {
+        let scope_start = self.debug_locals.len();
         for (i, (line, s)) in stmts.iter().enumerate() {
             self.current_line = *line;
             let (terminated, loop_header) = self.compile_stmt(s, floor);
@@ -154,9 +184,11 @@ impl<'a> Builder<'a> {
                 loops.push((header, i));
             }
             if terminated {
+                self.close_local_scope(scope_start);
                 return true; // a Return - nothing valid follows it
             }
         }
+        self.close_local_scope(scope_start);
         false
     }
 
@@ -174,7 +206,11 @@ impl<'a> Builder<'a> {
                 self.next_reg = floor;
                 return (true, None);
             }
-            TStmt::Local { id, value } | TStmt::Assign { id, value } => {
+            TStmt::Local { id, value } => {
+                self.compile_expr_into(value, *id as u8);
+                self.record_local(*id, self.code.len());
+            }
+            TStmt::Assign { id, value } => {
                 self.compile_expr_into(value, *id as u8);
             }
             TStmt::AssignIndex {
@@ -269,6 +305,7 @@ impl<'a> Builder<'a> {
 
                 let header = self.code.len();
                 loop_header = Some(header);
+                let loop_local = self.record_local(*id, header);
                 self.next_reg = loop_floor;
                 let cond_pos = self.alloc();
                 self.emit(Instr::iabc(Op::LeI, cond_pos, *id as u8, stop_r));
@@ -300,6 +337,9 @@ impl<'a> Builder<'a> {
                 self.patch_jump(jexit, self.code.len());
                 for jump in self.breaks.pop().unwrap() {
                     self.patch_jump(jump, self.code.len());
+                }
+                if let Some(index) = loop_local {
+                    self.debug_locals[index].end_pc = self.code.len() as u32;
                 }
             }
             TStmt::Return { value } => {
@@ -579,7 +619,9 @@ impl<'a> Builder<'a> {
                 }
                 array
             }
-            TExprKind::ArrayMap { array, callback, .. } => {
+            TExprKind::ArrayMap {
+                array, callback, ..
+            } => {
                 // One opcode covers both I64 and F64 element types: tier-0's
                 // register file is untagged u64 bit patterns, and the
                 // callback call goes through the uniform-ABI native wrapper

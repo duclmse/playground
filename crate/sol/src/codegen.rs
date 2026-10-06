@@ -1943,6 +1943,7 @@ mod inline_budget_tests {
             return_type: Type::I64,
             body,
             local_count: 1,
+            local_names: vec!["local0".to_string()],
         }
     }
 

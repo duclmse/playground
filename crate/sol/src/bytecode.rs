@@ -246,6 +246,14 @@ impl Instr {
 }
 
 /// A compiled function's bytecode - `bccompile.rs`'s output, `interp.rs`'s input.
+#[derive(Clone, Debug)]
+pub struct LocalDebug {
+    pub local_id: usize,
+    pub name: String,
+    pub start_pc: u32,
+    pub end_pc: u32,
+}
+
 pub struct BcFunction {
     pub metadata: sol_core::PrototypeMetadata,
     pub source_map: sol_core::SourceMap,
@@ -261,6 +269,8 @@ pub struct BcFunction {
     pub consts: Vec<u64>,
     /// `0..local_count` are named locals; the rest are temporaries. OSR hands only the named-locals prefix to a fresh native entry.
     pub local_count: usize,
+    /// Half-open instruction ranges where initialized source locals exist.
+    pub debug_locals: Vec<LocalDebug>,
     /// `(header_pc, stmt_index)` per top-level `While`/`NumericFor` (not nested), for OSR's loop-backedge tracking.
     pub top_level_loops: Vec<(usize, usize)>,
 }

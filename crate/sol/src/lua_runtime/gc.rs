@@ -228,7 +228,7 @@ impl LuaRuntime {
         // against a metric `charge_allocation` never charged from in the
         // first place.
         let live_before = self.canonical_heap.borrow().live_bytes();
-        let started = std::time::Instant::now();
+        let started = clock::Timer::now();
         let collection = self
             .canonical_heap
             .borrow_mut()
@@ -292,7 +292,7 @@ impl LuaRuntime {
     pub(super) fn step_garbage(&mut self, size: usize, active_frame: Option<&LuaFrame>) -> bool {
         let (roots, conditional_roots) = self.frame_roots(active_frame);
         let live_before = self.canonical_heap.borrow().live_bytes();
-        let started = std::time::Instant::now();
+        let started = clock::Timer::now();
         let (finished, collection) = if self.gc_mode == "generational" {
             let collection = self
                 .canonical_heap
@@ -501,6 +501,7 @@ impl LuaRuntime {
         for segment in &self.pinned_roots {
             roots.extend(segment.iter().copied());
         }
+        roots.extend(self.debug_incoming_roots.iter().copied());
         (roots, conditional_roots)
     }
 
@@ -553,6 +554,7 @@ impl LuaRuntime {
             NativeCont::Gsub(state) => {
                 roots.push(self.encode_value(&state.repl).unwrap_or(Value::NIL));
             }
+            NativeCont::Require { key, .. } => roots.push(self.encode_value(key).unwrap_or(Value::NIL)),
             NativeCont::Pcall | NativeCont::Xpcall(_) | NativeCont::Once => {}
         }
     }

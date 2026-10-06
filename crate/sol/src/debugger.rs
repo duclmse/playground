@@ -51,11 +51,23 @@ pub struct SourceBreakpoint {
 /// reports `verified: false`, exactly as item 3's spec requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBreakpoint {
+    /// Stable session-local identifier. It remains valid even when a source
+    /// location cannot be verified, so clients can consistently remove or
+    /// configure a requested breakpoint after a source update.
+    pub id: u32,
     pub function_name: String,
     pub line: u32,
     pub verified: bool,
     /// The first bytecode pc whose mapped line equals `line`, if verified.
     pub pc: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct Breakpoint {
+    func_id: Option<u8>,
+    verdict: VerifiedBreakpoint,
+    condition: Option<String>,
+    hit_condition: Option<u64>,
 }
 
 /// Scans `source_map` for the first pc whose mapped line equals `line`. A
@@ -74,6 +86,7 @@ pub fn verify_breakpoint(
         if let Some(loc) = source_map.location(pc) {
             if loc.line == line {
                 return VerifiedBreakpoint {
+                    id: 0,
                     function_name: function_name.to_string(),
                     line,
                     verified: true,
@@ -83,6 +96,7 @@ pub fn verify_breakpoint(
         }
     }
     VerifiedBreakpoint {
+        id: 0,
         function_name: function_name.to_string(),
         line,
         verified: false,
@@ -209,8 +223,7 @@ impl<'a> ValueRenderer<'a> {
                 Some(
                     (0..len)
                         .map(|index| {
-                            let word =
-                                unsafe { *(data.add(index as usize * 8) as *const u64) };
+                            let word = unsafe { *(data.add(index as usize * 8) as *const u64) };
                             (index.to_string(), (**inner).clone(), word)
                         })
                         .collect(),
@@ -224,8 +237,7 @@ impl<'a> ValueRenderer<'a> {
                         .iter()
                         .enumerate()
                         .map(|(field_index, (field_name, field_ty))| {
-                            let word =
-                                unsafe { *((reference as *const u64).add(field_index)) };
+                            let word = unsafe { *((reference as *const u64).add(field_index)) };
                             (field_name.clone(), field_ty.clone(), word)
                         })
                         .collect(),
@@ -456,7 +468,8 @@ pub struct DebugSession {
     /// matching key against `TraceStep`; `VerifiedBreakpoint` (the public
     /// report) carries the function name instead, since `func_id` is this
     /// session's own internal numbering.
-    breakpoints: RefCell<Vec<(u8, u32, VerifiedBreakpoint)>>,
+    breakpoints: RefCell<Vec<Breakpoint>>,
+    next_breakpoint_id: Cell<u32>,
 }
 
 impl DebugSession {
@@ -466,6 +479,7 @@ impl DebugSession {
             program,
             engine,
             breakpoints: RefCell::new(Vec::new()),
+            next_breakpoint_id: Cell::new(1),
         })
     }
 
@@ -478,30 +492,72 @@ impl DebugSession {
         self.engine.function_id(name)
     }
 
+    /// The lowered function name for a recorded bytecode function id. This
+    /// is intentionally exposed for debugger adapters: a trace id alone is
+    /// not a useful stack-frame label at a protocol boundary.
+    pub fn function_name(&self, func_id: u8) -> Option<&str> {
+        self.function_by_id(func_id).map(|function| function.name.as_str())
+    }
+
     /// Deliverable 3. Verifies against the exact `SourceMap` this session's
     /// engine is executing (via `tier0::Engine::function_bytecode`), so a
     /// verified pc is guaranteed consistent with what `trace()` later
     /// records.
     pub fn set_breakpoint(&self, function_name: &str, line: u32) -> VerifiedBreakpoint {
+        let id = self.next_breakpoint_id.get();
+        self.next_breakpoint_id.set(id.saturating_add(1));
         let verified = match self.engine.function_bytecode(function_name) {
             Some(bf) => verify_breakpoint(function_name, line, &bf.source_map),
             None => VerifiedBreakpoint {
+                id,
                 function_name: function_name.to_string(),
                 line,
                 verified: false,
                 pc: None,
             },
         };
-        if let (true, Some(func_id), Some(pc)) = (
-            verified.verified,
-            self.engine.function_id(function_name),
-            verified.pc,
-        ) {
-            self.breakpoints
-                .borrow_mut()
-                .push((func_id, pc, verified.clone()));
-        }
+        let verified = VerifiedBreakpoint { id, ..verified };
+        self.breakpoints.borrow_mut().push(Breakpoint {
+            func_id: self.engine.function_id(function_name),
+            verdict: verified.clone(),
+            condition: None,
+            hit_condition: None,
+        });
         verified
+    }
+
+    /// Removes a requested breakpoint. Returns false when `id` was never
+    /// allocated by this session (or was already removed).
+    pub fn remove_breakpoint(&self, id: u32) -> bool {
+        let mut breakpoints = self.breakpoints.borrow_mut();
+        let Some(index) = breakpoints.iter().position(|bp| bp.verdict.id == id) else {
+            return false;
+        };
+        breakpoints.remove(index);
+        true
+    }
+
+    /// Sets an optional boolean Sol expression evaluated at each candidate
+    /// trace step. Conditions use the same `local<N>` names as `evaluate`.
+    /// Invalid/non-boolean conditions deliberately do not stop execution.
+    pub fn set_breakpoint_condition(&self, id: u32, condition: Option<String>) -> bool {
+        let mut breakpoints = self.breakpoints.borrow_mut();
+        let Some(bp) = breakpoints.iter_mut().find(|bp| bp.verdict.id == id) else {
+            return false;
+        };
+        bp.condition = condition.filter(|source| !source.trim().is_empty());
+        true
+    }
+
+    /// Sets the minimum raw candidate-hit count before this breakpoint may
+    /// stop. `None` (or zero) disables the filter.
+    pub fn set_breakpoint_hit_condition(&self, id: u32, hit_condition: Option<u64>) -> bool {
+        let mut breakpoints = self.breakpoints.borrow_mut();
+        let Some(bp) = breakpoints.iter_mut().find(|bp| bp.verdict.id == id) else {
+            return false;
+        };
+        bp.hit_condition = hit_condition.filter(|count| *count != 0);
+        true
     }
 
     /// Runs `function_name(args)` to completion, recording a full
@@ -522,24 +578,46 @@ impl DebugSession {
     /// breakpoint hit.
     pub fn first_breakpoint_hit(&self) -> Option<usize> {
         let trace = self.trace();
-        let breakpoints = self.breakpoints.borrow();
-        trace.iter().position(|step| {
-            breakpoints
-                .iter()
-                .any(|&(func_id, pc, _)| func_id == step.func_id && pc == step.pc)
-        })
+        trace
+            .iter()
+            .enumerate()
+            .find_map(|(index, _)| self.breakpoint_matches(&trace, index).then_some(index))
     }
 
     /// "Continue" from a paused trace index to the next breakpoint hit
     /// strictly after it.
     pub fn continue_to_breakpoint(&self, from: usize) -> Option<usize> {
         let trace = self.trace();
-        let breakpoints = self.breakpoints.borrow();
-        trace.iter().enumerate().skip(from + 1).find_map(|(i, step)| {
-            breakpoints
+        trace
+            .iter()
+            .enumerate()
+            .skip(from + 1)
+            .find_map(|(i, _)| self.breakpoint_matches(&trace, i).then_some(i))
+    }
+
+    fn breakpoint_matches(&self, trace: &[TraceStep], trace_index: usize) -> bool {
+        let Some(step) = trace.get(trace_index) else {
+            return false;
+        };
+        let candidates = self.breakpoints.borrow();
+        candidates.iter().any(|bp| {
+            if !bp.verdict.verified
+                || bp.func_id != Some(step.func_id)
+                || bp.verdict.pc != Some(step.pc)
+            {
+                return false;
+            }
+            let raw_hits = trace[..=trace_index]
                 .iter()
-                .any(|&(func_id, pc, _)| func_id == step.func_id && pc == step.pc)
-                .then_some(i)
+                .filter(|candidate| {
+                    candidate.func_id == step.func_id && candidate.pc == step.pc
+                })
+                .count() as u64;
+            let hit_count_matches = bp.hit_condition.map_or(true, |minimum| raw_hits >= minimum);
+            hit_count_matches
+                && bp.condition.as_ref().map_or(true, |source| {
+                    matches!(self.evaluate(trace_index, &source), Ok(DisplayValue::Scalar(value)) if value == "true")
+                })
         })
     }
 
@@ -737,8 +815,8 @@ impl DebugSession {
 
         // Pass 2: recompile with the real type declared directly.
         let program = eval_compile(&synthesize(return_annotation))?;
-        let engine: tier0::Engine =
-            tier0::Engine::new(program, ()).map_err(|e| format!("eval: tier0 engine build failed: {e}"))?;
+        let engine: tier0::Engine = tier0::Engine::new(program, ())
+            .map_err(|e| format!("eval: tier0 engine build failed: {e}"))?;
 
         let args: Vec<u64> = params
             .iter()
@@ -753,7 +831,9 @@ impl DebugSession {
                 };
                 Ok(renderer.render(&real_type, raw))
             }
-            sol_core::CallOutcome::Raised(error) => Err(format!("eval: expression raised: {error}")),
+            sol_core::CallOutcome::Raised(error) => {
+                Err(format!("eval: expression raised: {error}"))
+            }
             other => Err(format!("eval: unexpected call outcome: {other:?}")),
         }
     }

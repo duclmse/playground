@@ -36,10 +36,13 @@ use std::rc::Rc;
 use crate::ast::Program;
 
 pub mod c_api;
+mod analysis;
 mod canonical;
+mod clock;
 mod codec;
 mod coroutine;
 mod diagnostics;
+pub mod debugger;
 mod dispatch;
 mod dynjit;
 mod format;
@@ -157,7 +160,7 @@ pub struct LuaRuntime {
     /// `require` must keep consulting the original table's `preload`/`path`/
     /// `cpath` fields, not whatever the global `package` now points to.
     package_table: TableRef,
-    start_time: std::time::Instant,
+    start_time: clock::Timer,
     /// Every closure's `Globals` (Sol's module-isolation/constants
     /// bookkeeping, which has no equivalent field on canonical
     /// `HeapObject::Closure`'s `ClosureObject{prototype, upvalues,
@@ -247,6 +250,13 @@ pub struct LuaRuntime {
     /// `table.sort`'s comparator, on targets (wasm32) with no fiber/thread
     /// suspension primitive. See `docs/features/lua-debug-frames.md`.
     frames: Vec<Frame>,
+    debug_slice_remaining: Option<u64>,
+    debug_drive_nesting: usize,
+    debug_recording: Option<analysis::Recording>,
+    debug_module_names: HashMap<Vec<u8>, Vec<u8>>,
+    debug_resume_request: Option<frame::DebugResumeRequest>,
+    debug_pause_requested: bool,
+    debug_incoming_roots: Vec<sol_core::Value>,
     /// Extra GC roots pinned for the duration of a reentrant call driven from
     /// inside `collect_garbage_with` (currently: `__gc` finalizer
     /// invocation). A finalizer's own `self.call` drives a fresh nested
@@ -516,6 +526,28 @@ pub fn run_source(source: &[u8]) -> LuaResult<LuaRun> {
     let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).map_err(LuaError::new)?)
         .map_err(LuaError::new)?;
     run_program(&program)
+}
+
+/// Browser embedding counterpart to [`run_source`]. Modules are supplied by
+/// the host and registered as exact `require` names; no filesystem or native
+/// loader is enabled.
+pub fn run_source_with_modules(
+    source: &[u8],
+    modules: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> LuaResult<LuaRun> {
+    let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).map_err(LuaError::new)?)
+        .map_err(LuaError::new)?;
+    let mut runtime = LuaRuntime::with_limits(10_000_000, 1_000);
+    for (name, module_source) in modules {
+        runtime.add_module(name, module_source);
+    }
+    match runtime.run(&program) {
+        Ok(value) => Ok(LuaRun { value, output: runtime.take_output() }),
+        Err(mut error) => {
+            error.output = runtime.take_output();
+            Err(error)
+        }
+    }
 }
 
 /// Runs an already-lexed-and-parsed `.lua` program. Lets callers that must

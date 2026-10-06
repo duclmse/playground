@@ -1166,6 +1166,7 @@ fn specialize(f: &TFunction, id: LocalId, target: &Type) -> TFunction {
         return_type: f.return_type.clone(),
         body: rewrite_stmts(&f.body, id, target),
         local_count: f.local_count,
+        local_names: f.local_names.clone(),
     }
 }
 

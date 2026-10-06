@@ -59,7 +59,7 @@ impl LuaRuntime {
             loading_modules: HashSet::new(),
             package_loaded,
             package_table,
-            start_time: std::time::Instant::now(),
+            start_time: clock::Timer::now(),
             closure_globals: RefCell::new(HashMap::new()),
             coroutine_stack: Vec::new(),
             main_coroutine,
@@ -70,6 +70,13 @@ impl LuaRuntime {
             values_pool: Vec::new(),
             random_state: seeded_random_state(0x534f_4c55_4152_554e, 0),
             frames: Vec::new(),
+            debug_slice_remaining: None,
+            debug_drive_nesting: 0,
+            debug_recording: None,
+            debug_module_names: HashMap::new(),
+            debug_resume_request: None,
+            debug_pause_requested: false,
+            debug_incoming_roots: Vec::new(),
             pinned_roots: Vec::new(),
             pending_frame_label: None,
             hook_callback_frame: None,
@@ -871,7 +878,7 @@ impl LuaRuntime {
         Ok(values.into_iter().next().unwrap_or(LuaValue::Nil))
     }
 
-    fn load_in_globals(
+    pub(super) fn load_in_globals(
         &mut self,
         program: &Program,
         globals: &Globals,

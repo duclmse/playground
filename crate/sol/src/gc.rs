@@ -83,7 +83,9 @@ fn count_set_bits(bits: &[u64]) -> usize {
 }
 
 fn read_usize(bytes: &[u8], off: usize) -> usize {
-    usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap())
+    // Managed slots and allocation headers are always 64-bit, including on
+    // wasm32. Only the decoded address is host-pointer-sized.
+    u64::from_ne_bytes(bytes[off..off + ALIGN].try_into().unwrap()) as usize
 }
 
 /// A chunk's generation - tracked per-chunk, not per-object, since this
@@ -172,7 +174,10 @@ impl Chunk {
         );
         // SAFETY: has_room already confirmed room.
         unsafe {
-            std::ptr::write_unaligned(self.data.as_mut_ptr().add(pos) as *mut usize, payload_size)
+            std::ptr::write_unaligned(
+                self.data.as_mut_ptr().add(pos) as *mut u64,
+                payload_size as u64,
+            )
         };
         self.bump = payload_off + payload_size;
         if needs_zero {
@@ -274,19 +279,30 @@ thread_local! {
 }
 
 /// RAII guard registering `[ptr, ptr + len*8)` as an extra root range.
-pub struct RootGuard;
+pub struct RootGuard {
+    range: (usize, usize),
+}
 
 impl RootGuard {
     pub fn new(ptr: *const u64, len: usize) -> Self {
-        EXTRA_ROOTS.with(|r| r.borrow_mut().push((ptr as usize, len)));
-        RootGuard
+        let range = (ptr as usize, len);
+        EXTRA_ROOTS.with(|r| r.borrow_mut().push(range));
+        RootGuard { range }
     }
 }
 
 impl Drop for RootGuard {
     fn drop(&mut self) {
         EXTRA_ROOTS.with(|r| {
-            r.borrow_mut().pop();
+            let mut roots = r.borrow_mut();
+            // Suspended debugger sessions can be dropped in any order.
+            // Removing the last range unconditionally would unroot a
+            // different, still-live session.
+            let index = roots
+                .iter()
+                .rposition(|range| *range == self.range)
+                .expect("a root guard must still own its registered range");
+            roots.remove(index);
         });
     }
 }
@@ -803,9 +819,9 @@ mod tests {
         let mut chunk = Chunk::new(128);
         let ptr = chunk.carve(24, false, false, 0b010);
         unsafe {
-            *(ptr as *mut usize) = 11;
-            *((ptr as *mut usize).add(1)) = 22;
-            *((ptr as *mut usize).add(2)) = 33;
+            *(ptr as *mut u64) = 11;
+            *((ptr as *mut u64).add(1)) = 22;
+            *((ptr as *mut u64).add(2)) = 33;
         }
         let payload_off = ptr as usize - chunk.base;
         assert_eq!(pointer_contents(&chunk, payload_off, 3, 0b010), vec![22]);
@@ -813,6 +829,24 @@ mod tests {
             pointer_contents(&chunk, payload_off, 3, u64::MAX),
             vec![11, 22, 33]
         );
+    }
+
+    #[test]
+    fn suspended_root_ranges_can_be_released_out_of_order() {
+        let first = [11u64];
+        let second = [22u64];
+        let a = RootGuard::new(first.as_ptr(), first.len());
+        let b = RootGuard::new(second.as_ptr(), second.len());
+        drop(a);
+        EXTRA_ROOTS.with(|roots| {
+            assert!(roots
+                .borrow()
+                .contains(&(second.as_ptr() as usize, second.len())));
+            assert!(!roots
+                .borrow()
+                .contains(&(first.as_ptr() as usize, first.len())));
+        });
+        drop(b);
     }
 
     #[test]

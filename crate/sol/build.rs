@@ -5,6 +5,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=src/lua_runtime/c_api_shim.c");
     println!("cargo:rerun-if-changed=include/lua.h");
+    // Browser builds retain the interpreter but deliberately do not expose
+    // the native Lua C embedding ABI. A host-architecture C archive cannot
+    // be linked into wasm32, and no canonical browser entry point needs it.
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
+    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let object = out.join("c_api_shim.o");
     let archive = out.join("libsol_c_api_shim.a");

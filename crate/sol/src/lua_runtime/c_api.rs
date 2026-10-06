@@ -6,6 +6,7 @@
 //! semantics without placing process pointers in the managed value graph.
 
 #![allow(clippy::missing_safety_doc)]
+#![allow(non_snake_case)] // Lua's C ABI deliberately uses upstream names.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -741,13 +742,13 @@ fn register_owned_state(state: Box<lua_State>) -> *mut lua_State {
     state
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_newstate() -> *mut lua_State {
     unsafe { sol_c_api_shim_anchor() };
     register_owned_state(lua_State::owned(default_alloc, ptr::null_mut()))
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_newstate(
     allocator: Option<LuaAlloc>,
     allocator_data: *mut c_void,
@@ -760,12 +761,12 @@ pub unsafe extern "C" fn lua_newstate(
     register_owned_state(lua_State::owned(allocator, allocator_data))
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_version(_state: *mut lua_State) -> LuaNumber {
     505.0
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_atpanic(
     state: *mut lua_State,
     panic_function: Option<LuaCFunction>,
@@ -774,7 +775,7 @@ pub unsafe extern "C" fn lua_atpanic(
     std::mem::replace(&mut state.panic_function, panic_function)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_setwarnf(
     state: *mut lua_State,
     warning_function: Option<LuaWarnFunction>,
@@ -788,7 +789,7 @@ pub unsafe extern "C" fn lua_setwarnf(
     runtime.c_warning_data = user_data;
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_warning(
     state: *mut lua_State,
     message: *const c_char,
@@ -803,7 +804,7 @@ pub unsafe extern "C" fn lua_warning(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_close(state: *mut lua_State) {
     let Some(state_ref) = (unsafe { state.as_mut() }) else {
         return;
@@ -824,7 +825,7 @@ pub unsafe extern "C" fn lua_close(state: *mut lua_State) {
     unsafe { drop(Box::from_raw(state)) };
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_openlibs(state: *mut lua_State) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -850,14 +851,14 @@ unsafe fn push_library(state: *mut lua_State, name: &str) -> c_int {
     1
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaopen_base(state: *mut lua_State) -> c_int {
     unsafe { push_library(state, "") }
 }
 
 macro_rules! library_opener {
     ($rust:ident, $name:literal) => {
-        #[no_mangle]
+        #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
         pub unsafe extern "C" fn $rust(state: *mut lua_State) -> c_int {
             unsafe { push_library(state, $name) }
         }
@@ -874,7 +875,7 @@ library_opener!(luaopen_utf8, "utf8");
 library_opener!(luaopen_debug, "debug");
 library_opener!(luaopen_package, "package");
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_openselectedlibs(
     state: *mut lua_State,
     _load: c_int,
@@ -883,14 +884,14 @@ pub unsafe extern "C" fn luaL_openselectedlibs(
     unsafe { luaL_openlibs(state) };
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_gettop(state: *mut lua_State) -> c_int {
     unsafe { state_mut(state) }
         .map(|state| state.stack.len() as c_int)
         .unwrap_or(0)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_absindex(state: *mut lua_State, index: c_int) -> c_int {
     if index > 0 || index <= LUA_REGISTRYINDEX {
         index
@@ -899,12 +900,12 @@ pub unsafe extern "C" fn lua_absindex(state: *mut lua_State, index: c_int) -> c_
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_checkstack(_state: *mut lua_State, _extra: c_int) -> c_int {
     1
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_settop(state: *mut lua_State, index: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -930,7 +931,7 @@ pub unsafe extern "C-unwind" fn lua_settop(state: *mut lua_State, index: c_int) 
     state.stack.resize(new_len, LuaValue::Nil);
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_toclose(state: *mut lua_State, index: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -953,7 +954,7 @@ pub unsafe extern "C-unwind" fn lua_toclose(state: *mut lua_State, index: c_int)
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_closeslot(state: *mut lua_State, index: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -970,7 +971,7 @@ pub unsafe extern "C-unwind" fn lua_closeslot(state: *mut lua_State, index: c_in
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushvalue(state: *mut lua_State, index: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -980,7 +981,7 @@ pub unsafe extern "C" fn lua_pushvalue(state: *mut lua_State, index: c_int) {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_rotate(state: *mut lua_State, index: c_int, n: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -996,7 +997,7 @@ pub unsafe extern "C" fn lua_rotate(state: *mut lua_State, index: c_int, n: c_in
     state.stack[start..].rotate_right(right);
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_copy(state: *mut lua_State, from: c_int, to: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -1007,7 +1008,7 @@ pub unsafe extern "C" fn lua_copy(state: *mut lua_State, from: c_int, to: c_int)
     state.stack[to] = state.stack[from].clone();
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_type(state: *mut lua_State, index: c_int) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return LUA_TNONE;
@@ -1026,7 +1027,7 @@ pub unsafe extern "C" fn lua_type(state: *mut lua_State, index: c_int) -> c_int 
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_typename(_state: *mut lua_State, tag: c_int) -> *const c_char {
     match tag {
         LUA_TNIL => c"nil".as_ptr(),
@@ -1041,42 +1042,42 @@ pub unsafe extern "C" fn lua_typename(_state: *mut lua_State, tag: c_int) -> *co
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushnil(state: *mut lua_State) {
     if let Some(state) = unsafe { state_mut(state) } {
         state.stack.push(LuaValue::Nil);
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushboolean(state: *mut lua_State, value: c_int) {
     if let Some(state) = unsafe { state_mut(state) } {
         state.stack.push(LuaValue::Bool(value != 0));
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushinteger(state: *mut lua_State, value: LuaInteger) {
     if let Some(state) = unsafe { state_mut(state) } {
         state.stack.push(LuaValue::Integer(value));
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushnumber(state: *mut lua_State, value: LuaNumber) {
     if let Some(state) = unsafe { state_mut(state) } {
         state.stack.push(LuaValue::Float(value));
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushlightuserdata(state: *mut lua_State, value: *mut c_void) {
     if let Some(state) = unsafe { state_mut(state) } {
         state.stack.push(LuaValue::LightUserdata(value as usize));
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushlstring(
     state: *mut lua_State,
     bytes: *const c_char,
@@ -1101,7 +1102,7 @@ pub unsafe extern "C" fn lua_pushlstring(
     state.c_strings.last().unwrap().as_ptr().cast()
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushstring(
     state: *mut lua_State,
     bytes: *const c_char,
@@ -1114,14 +1115,14 @@ pub unsafe extern "C" fn lua_pushstring(
     unsafe { lua_pushlstring(state, bytes, len) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_toboolean(state: *mut lua_State, index: c_int) -> c_int {
     unsafe { state_mut(state) }
         .and_then(|state| state.value(index))
         .is_some_and(LuaValue::truthy) as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_tointegerx(
     state: *mut lua_State,
     index: c_int,
@@ -1136,7 +1137,7 @@ pub unsafe extern "C" fn lua_tointegerx(
     value.unwrap_or(0)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_tonumberx(
     state: *mut lua_State,
     index: c_int,
@@ -1155,7 +1156,7 @@ pub unsafe extern "C" fn lua_tonumberx(
     value.unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_tolstring(
     state: *mut lua_State,
     index: c_int,
@@ -1187,7 +1188,7 @@ pub unsafe extern "C" fn lua_tolstring(
     state.c_strings.last().unwrap().as_ptr().cast()
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_touserdata(state: *mut lua_State, index: c_int) -> *mut c_void {
     match unsafe { state_mut(state) }.and_then(|state| state.value(index)) {
         Some(LuaValue::Userdata(value)) => value.bytes_ptr(),
@@ -1196,7 +1197,7 @@ pub unsafe extern "C" fn lua_touserdata(state: *mut lua_State, index: c_int) -> 
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_newuserdatauv(
     state: *mut lua_State,
     size: usize,
@@ -1215,7 +1216,7 @@ pub unsafe extern "C" fn lua_newuserdatauv(
     pointer
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushcclosure(
     state: *mut lua_State,
     function: Option<LuaCFunction>,
@@ -1257,7 +1258,7 @@ pub unsafe extern "C" fn lua_pushcclosure(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_iscfunction(state: *mut lua_State, index: c_int) -> c_int {
     matches!(
         unsafe { state_mut(state) }.and_then(|state| state.value(index)),
@@ -1268,7 +1269,7 @@ pub unsafe extern "C" fn lua_iscfunction(state: *mut lua_State, index: c_int) ->
 mod debug;
 pub use debug::*;
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_isinteger(state: *mut lua_State, index: c_int) -> c_int {
     matches!(
         unsafe { state_mut(state) }.and_then(|state| state.value(index)),
@@ -1276,19 +1277,19 @@ pub unsafe extern "C" fn lua_isinteger(state: *mut lua_State, index: c_int) -> c
     ) as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_isnumber(state: *mut lua_State, index: c_int) -> c_int {
     let mut valid = 0;
     unsafe { lua_tonumberx(state, index, &mut valid) };
     valid
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_isstring(state: *mut lua_State, index: c_int) -> c_int {
     matches!(unsafe { lua_type(state, index) }, LUA_TSTRING | LUA_TNUMBER) as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_isuserdata(state: *mut lua_State, index: c_int) -> c_int {
     matches!(
         unsafe { lua_type(state, index) },
@@ -1296,7 +1297,7 @@ pub unsafe extern "C" fn lua_isuserdata(state: *mut lua_State, index: c_int) -> 
     ) as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_rawequal(state: *mut lua_State, left: c_int, right: c_int) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
@@ -1307,7 +1308,7 @@ pub unsafe extern "C" fn lua_rawequal(state: *mut lua_State, left: c_int, right:
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_compare(
     state: *mut lua_State,
     left: c_int,
@@ -1333,7 +1334,7 @@ pub unsafe extern "C-unwind" fn lua_compare(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_arith(state: *mut lua_State, operation: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -1375,7 +1376,7 @@ pub unsafe extern "C-unwind" fn lua_arith(state: *mut lua_State, operation: c_in
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_tocfunction(
     state: *mut lua_State,
     index: c_int,
@@ -1388,7 +1389,7 @@ pub unsafe extern "C" fn lua_tocfunction(
     unsafe { state.runtime() }.c_functions.get(&id).copied()
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_topointer(state: *mut lua_State, index: c_int) -> *const c_void {
     unsafe { state_mut(state) }
         .and_then(|state| state.value(index))
@@ -1396,7 +1397,7 @@ pub unsafe extern "C" fn lua_topointer(state: *mut lua_State, index: c_int) -> *
         .map_or(ptr::null(), |address| address as *const c_void)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_rawlen(state: *mut lua_State, index: c_int) -> usize {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
@@ -1414,7 +1415,7 @@ pub unsafe extern "C" fn lua_rawlen(state: *mut lua_State, index: c_int) -> usiz
 mod table;
 pub use table::*;
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_loadbufferx(
     state: *mut lua_State,
     source: *const c_char,
@@ -1467,7 +1468,7 @@ pub unsafe extern "C" fn luaL_loadbufferx(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_loadstring(state: *mut lua_State, source: *const c_char) -> c_int {
     if source.is_null() {
         return LUA_ERRSYNTAX;
@@ -1476,7 +1477,7 @@ pub unsafe extern "C" fn luaL_loadstring(state: *mut lua_State, source: *const c
     unsafe { luaL_loadbufferx(state, source, size, c"=(string)".as_ptr(), ptr::null()) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn luaL_loadfilex(
     state: *mut lua_State,
     filename: *const c_char,
@@ -1506,7 +1507,7 @@ pub unsafe extern "C" fn luaL_loadfilex(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_load(
     state: *mut lua_State,
     reader: Option<LuaReader>,
@@ -1529,7 +1530,7 @@ pub unsafe extern "C-unwind" fn lua_load(
     unsafe { luaL_loadbufferx(state, source.as_ptr().cast(), source.len(), name, mode) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_dump(
     state: *mut lua_State,
     writer: Option<LuaWriter>,
@@ -1556,7 +1557,7 @@ pub unsafe extern "C-unwind" fn lua_dump(
     unsafe { writer(state, bytes.as_ptr().cast(), bytes.len(), data) }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pcallk(
     state: *mut lua_State,
     nargs: c_int,
@@ -1588,7 +1589,7 @@ pub unsafe extern "C" fn lua_pcallk(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_callk(
     state: *mut lua_State,
     nargs: c_int,
@@ -1599,7 +1600,7 @@ pub unsafe extern "C" fn lua_callk(
     let _ = unsafe { lua_pcallk(state, nargs, nresults, 0, ctx, continuation) };
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_error(state: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return LUA_ERRRUN;
@@ -1611,7 +1612,7 @@ pub unsafe extern "C-unwind" fn lua_error(state: *mut lua_State) -> c_int {
     resume_unwind(Box::new(CApiJump))
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_len(state: *mut lua_State, index: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -1625,7 +1626,7 @@ pub unsafe extern "C-unwind" fn lua_len(state: *mut lua_State, index: c_int) {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_concat(state: *mut lua_State, count: c_int) {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return;
@@ -1652,7 +1653,7 @@ pub unsafe extern "C-unwind" fn lua_concat(state: *mut lua_State, count: c_int) 
     state.stack.push(result);
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_next(state: *mut lua_State, index: c_int) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
@@ -1706,7 +1707,7 @@ pub unsafe extern "C-unwind" fn lua_next(state: *mut lua_State, index: c_int) ->
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_newthread(state: *mut lua_State) -> *mut lua_State {
     let Some(parent) = (unsafe { state_mut(state) }) else {
         return ptr::null_mut();
@@ -1725,7 +1726,7 @@ pub unsafe extern "C-unwind" fn lua_newthread(state: *mut lua_State) -> *mut lua
     child
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_pushthread(state: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
@@ -1736,7 +1737,7 @@ pub unsafe extern "C" fn lua_pushthread(state: *mut lua_State) -> c_int {
     is_main as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_tothread(state: *mut lua_State, index: c_int) -> *mut lua_State {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return ptr::null_mut();
@@ -1753,7 +1754,7 @@ pub unsafe extern "C" fn lua_tothread(state: *mut lua_State, index: c_int) -> *m
         .unwrap_or(ptr::null_mut())
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, count: c_int) {
     if from == to || count <= 0 {
         return;
@@ -1768,7 +1769,7 @@ pub unsafe extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, cou
     to.stack.extend(values);
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_yieldk(
     state: *mut lua_State,
     result_count: c_int,
@@ -1797,7 +1798,7 @@ pub unsafe extern "C-unwind" fn lua_yieldk(
     }))
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_resume(
     state: *mut lua_State,
     from: *mut lua_State,
@@ -1873,7 +1874,7 @@ pub unsafe extern "C-unwind" fn lua_resume(
     status
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_closethread(state: *mut lua_State, _from: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return LUA_ERRRUN;
@@ -1893,14 +1894,14 @@ pub unsafe extern "C" fn lua_closethread(state: *mut lua_State, _from: *mut lua_
     LUA_OK
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_status(state: *mut lua_State) -> c_int {
     unsafe { state.as_ref() }
         .map(|state| state.status)
         .unwrap_or(LUA_ERRRUN)
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_isyieldable(state: *mut lua_State) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return 0;
@@ -1909,7 +1910,7 @@ pub unsafe extern "C" fn lua_isyieldable(state: *mut lua_State) -> c_int {
     (state.thread != main_thread) as c_int
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C-unwind" fn lua_gc(state: *mut lua_State, what: c_int) -> c_int {
     let Some(state) = (unsafe { state_mut(state) }) else {
         return -1;
@@ -1946,7 +1947,7 @@ pub unsafe extern "C-unwind" fn lua_gc(state: *mut lua_State, what: c_int) -> c_
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_numbertocstring(
     state: *mut lua_State,
     index: c_int,
@@ -1964,7 +1965,7 @@ pub unsafe extern "C" fn lua_numbertocstring(
     len as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub unsafe extern "C" fn lua_stringtonumber(state: *mut lua_State, string: *const c_char) -> usize {
     if string.is_null() {
         return 0;

@@ -121,6 +121,7 @@ impl<H: interp::Hooks> Engine<H> {
                         code: Vec::new(),
                         consts: Vec::new(),
                         local_count: f.local_count,
+                        debug_locals: Vec::new(),
                         top_level_loops: Vec::new(),
                     })));
                 }

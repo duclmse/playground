@@ -59,8 +59,7 @@ fn run_on_tier0(name: &str) -> Result<String, String> {
     let source = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let (program, return_type) =
         sol::compile_bytes(&source, sol::parser::SourceMode::Sol).map_err(|e| e.to_string())?;
-    let engine: sol::tier0::Engine =
-        sol::tier0::Engine::new_with_budget(program, (), u64::MAX)?;
+    let engine: sol::tier0::Engine = sol::tier0::Engine::new_with_budget(program, (), u64::MAX)?;
     match engine.call_outcome("main", &[]) {
         sol_core::CallOutcome::Returned(values) => {
             let result = values.first().copied().unwrap_or(0);
@@ -83,6 +82,39 @@ fn run_on_tier0(name: &str) -> Result<String, String> {
 /// milestone item closes. Every other fixture in the corpus is expected to
 /// match exactly.
 const KNOWN_UNSUPPORTED: &[&str] = &["math.sol"];
+
+#[test]
+fn live_execution_matches_the_same_typed_corpus_in_bounded_bursts() {
+    for &(name, expected) in CASES {
+        if KNOWN_UNSUPPORTED.contains(&name) {
+            continue;
+        }
+        let path = format!(
+            "{}/tests/fixtures/sol-conformance/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let source = std::fs::read(path).unwrap();
+        let (program, return_type) =
+            sol::compile_bytes(&source, sol::parser::SourceMode::Sol).unwrap();
+        let engine: sol::tier0::Engine =
+            sol::tier0::Engine::new_with_budget(program, (), u64::MAX).unwrap();
+        let mut live = engine.start_live("main", &[]).unwrap();
+        let value = loop {
+            match live.resume(2048) {
+                sol::interp::live::Stop::Paused => {}
+                sol::interp::live::Stop::Returned(value) => break value,
+                other => panic!("{name}: {other:?}"),
+            }
+        };
+        let output = match return_type {
+            sol::types::Type::I64 => (value as i64).to_string(),
+            sol::types::Type::F64 => f64::from_bits(value).to_string(),
+            sol::types::Type::Bool => (value != 0).to_string(),
+            other => panic!("{name}: unexpected return type {other:?}"),
+        };
+        assert_eq!(output, expected, "{name}");
+    }
+}
 
 #[test]
 fn tier0_bytecode_interpretation_matches_the_tiered_jit_path_on_every_fixture() {

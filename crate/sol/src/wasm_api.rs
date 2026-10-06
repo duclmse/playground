@@ -22,7 +22,9 @@ pub fn run_sol(source: &str) -> Result<String, JsValue> {
             })
         }
         sol_core::CallOutcome::Raised(error) => Err(JsValue::from_str(&error)),
-        other => Err(JsValue::from_str(&format!("unexpected call outcome: {other:?}"))),
+        other => Err(JsValue::from_str(&format!(
+            "unexpected call outcome: {other:?}"
+        ))),
     }
 }
 
@@ -131,6 +133,9 @@ use std::cell::RefCell;
 use crate::debugger::{self, DebugSession, DisplayValue, TimelineEventKind};
 use crate::types::Type;
 
+mod lua_debug;
+pub use lua_debug::*;
+
 // -------------------------------------------------------------------------
 // execute(): one-shot run, non-throwing (mirrors crate/lua-vm's own
 // `execute()`/`ExecuteResult` calling convention, read directly from
@@ -190,17 +195,94 @@ fn render_return(ty: &Type, raw: u64) -> String {
     }
 }
 
-/// Compiles and runs a single `.sol` source string to completion, via
-/// `tier0::Engine` - the same execution path `run_sol` above and
-/// `WasmDebugSession` below both use, just without throwing a JS exception
-/// on failure (errors come back in `ExecuteResult.error` instead, matching
-/// `crate/lua-vm`'s own `execute()` calling convention so `apps/web`'s
-/// existing `"run"` worker-message handler can be adapted to call this with
-/// a minimal diff). See this file's top doc comment for the single-file-only
-/// and `.sol`-only scope of this entry point.
+/// Compiles and runs a single typed Sol source to completion. The live
+/// Tier-0 dispatcher shares the ordinary interpreter's opcode semantics,
+/// but retains explicit rooted frames rather than a recursive Rust stack.
+/// Errors return in `ExecuteResult.error`, not as a JS exception. The older
+/// typed debugger below remains trace-based until its adapter is replaced.
 #[wasm_bindgen]
 pub fn execute(source: &str) -> ExecuteResult {
-    let (program, return_type) = match crate::compile(source) {
+    execute_compiled(crate::compile(source))
+}
+
+/// Runs one browser-sandboxed Lua chunk through Sol's canonical dynamic
+/// runtime. Its standard output is the result, matching the worker's normal
+/// Lua playground contract; filesystem, process, and native-module access
+/// remain disabled by `LuaRuntime`'s default capabilities.
+#[wasm_bindgen]
+pub fn execute_lua(source: &str) -> ExecuteResult {
+    execute_lua_run(crate::lua_runtime::run_source_with_modules(source.as_bytes(), Vec::new()))
+}
+
+#[wasm_bindgen]
+pub fn execute_lua_project(entry: String, names: Vec<String>, contents: Vec<String>) -> ExecuteResult {
+    if let Err(error) = validate_lua_project(&entry, &names, &contents) {
+        return ExecuteResult { result: None, error: Some(error) };
+    }
+    if names.len() != contents.len() {
+        return ExecuteResult { result: None, error: Some("project file names and contents have different lengths".to_string()) };
+    }
+    let Some(entry_index) = names.iter().position(|name| name == &entry) else {
+        return ExecuteResult { result: None, error: Some(format!("entry file '{entry}' is not present in the in-memory project")) };
+    };
+    let modules = names.iter().zip(contents.iter()).enumerate().filter_map(|(index, (name, source))| {
+        (index != entry_index && name.ends_with(".lua")).then(|| {
+            let module = name.strip_suffix(".lua").unwrap().replace('/', ".").into_bytes();
+            (module, source.as_bytes().to_vec())
+        })
+    });
+    execute_lua_run(crate::lua_runtime::run_source_with_modules(contents[entry_index].as_bytes(), modules))
+}
+
+fn validate_lua_project(entry: &str, names: &[String], contents: &[String]) -> Result<(), String> {
+    if names.len() != contents.len() { return Err("project file names and contents have different lengths".into()); }
+    let mut paths = std::collections::HashSet::new();
+    let mut modules = std::collections::HashSet::new();
+    for name in names {
+        if !name.ends_with(".lua") || name.contains('\\') || name.split('/').any(|part| matches!(part, "" | "." | "..")) {
+            return Err(format!("invalid in-memory Lua project path '{name}'"));
+        }
+        if !paths.insert(name) { return Err(format!("duplicate project path '{name}'")); }
+        if !modules.insert(name.strip_suffix(".lua").unwrap().replace('/', ".")) {
+            return Err(format!("ambiguous Lua module path '{name}'"));
+        }
+    }
+    if !paths.contains(&entry.to_string()) { return Err(format!("entry file '{entry}' is not present in the in-memory project")); }
+    Ok(())
+}
+
+fn execute_lua_run(run: crate::lua_runtime::LuaResult<crate::lua_runtime::LuaRun>) -> ExecuteResult {
+    match run {
+        Ok(run) => ExecuteResult {
+            result: Some(String::from_utf8_lossy(&run.output).into_owned()),
+            error: None,
+        },
+        Err(error) => ExecuteResult {
+            result: Some(String::from_utf8_lossy(&error.output).into_owned()),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+/// Browser-safe multi-file `.sol` entry point. `names` and `contents` use
+/// the existing worker protocol's parallel-array shape; imports resolve only
+/// within those supplied files and never access the host filesystem.
+#[wasm_bindgen]
+pub fn execute_project(entry: String, names: Vec<String>, contents: Vec<String>) -> ExecuteResult {
+    if names.len() != contents.len() {
+        return ExecuteResult {
+            result: None,
+            error: Some("project file names and contents have different lengths".to_string()),
+        };
+    }
+    let files = names.into_iter().zip(contents).map(|(name, source)| {
+        (name, source.into_bytes())
+    }).collect::<Vec<_>>();
+    execute_compiled(crate::modules::compile_project_from_sources(&entry, &files))
+}
+
+fn execute_compiled(compiled: Result<(crate::types::TProgram, Type), String>) -> ExecuteResult {
+    let (program, return_type) = match compiled {
         Ok(ok) => ok,
         Err(error) => {
             return ExecuteResult {
@@ -218,22 +300,20 @@ pub fn execute(source: &str) -> ExecuteResult {
             }
         }
     };
-    match engine.call_outcome("main", &[]) {
-        sol_core::CallOutcome::Returned(values) => ExecuteResult {
-            result: Some(render_return(
-                &return_type,
-                values.first().copied().unwrap_or(0),
-            )),
-            error: None,
-        },
-        sol_core::CallOutcome::Raised(error) => ExecuteResult {
-            result: None,
-            error: Some(error),
-        },
-        other => ExecuteResult {
-            result: None,
-            error: Some(format!("unexpected call outcome: {other:?}")),
-        },
+    let mut execution = match engine.start_live("main", &[]) {
+        Ok(execution) => execution,
+        Err(error) => return ExecuteResult { result: None, error: Some(error) },
+    };
+    loop {
+        match execution.resume(10_000) {
+            crate::interp::live::Stop::Paused => {},
+            crate::interp::live::Stop::Returned(value) => return ExecuteResult {
+                result: Some(render_return(&return_type, value)), error: None,
+            },
+            crate::interp::live::Stop::Raised(error) => return ExecuteResult {
+                result: None, error: Some(error),
+            },
+        }
     }
 }
 
@@ -302,6 +382,7 @@ impl From<DisplayValue> for WasmValue {
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct WasmBreakpoint {
+    id: u32,
     function_name: std::string::String,
     line: u32,
     verified: bool,
@@ -310,6 +391,10 @@ pub struct WasmBreakpoint {
 
 #[wasm_bindgen]
 impl WasmBreakpoint {
+    #[wasm_bindgen(getter)]
+    pub fn id(&self) -> u32 {
+        self.id
+    }
     #[wasm_bindgen(getter)]
     pub fn function_name(&self) -> std::string::String {
         self.function_name.clone()
@@ -331,6 +416,7 @@ impl WasmBreakpoint {
 impl From<debugger::VerifiedBreakpoint> for WasmBreakpoint {
     fn from(b: debugger::VerifiedBreakpoint) -> Self {
         WasmBreakpoint {
+            id: b.id,
             function_name: b.function_name,
             line: b.line,
             verified: b.verified,
@@ -343,6 +429,7 @@ impl From<debugger::VerifiedBreakpoint> for WasmBreakpoint {
 #[derive(Debug, Clone)]
 pub struct WasmTraceStep {
     func_id: u8,
+    function_name: std::string::String,
     pc: u32,
     line: u32,
     depth: u32,
@@ -353,6 +440,10 @@ impl WasmTraceStep {
     #[wasm_bindgen(getter)]
     pub fn func_id(&self) -> u8 {
         self.func_id
+    }
+    #[wasm_bindgen(getter)]
+    pub fn function_name(&self) -> std::string::String {
+        self.function_name.clone()
     }
     #[wasm_bindgen(getter)]
     pub fn pc(&self) -> u32 {
@@ -651,15 +742,48 @@ impl WasmDebugSession {
     /// single-file/`.sol`-only scope) and builds a fresh `DebugSession` over
     /// it. Does not run anything yet - call `run()` next.
     pub fn launch(source: &str) -> Result<WasmDebugSession, JsValue> {
-        let (program, return_type) =
-            crate::compile(source).map_err(|e| JsValue::from_str(&e))?;
+        wasm_debug_session_from_compiled(crate::compile(source))
+    }
+
+    /// Browser-safe multi-file counterpart to [`Self::launch`]. It shares
+    /// `execute_project`'s in-memory-only module resolution and accepts only
+    /// all-`.sol` projects that Tier-0 can execute.
+    #[wasm_bindgen]
+    pub fn launch_project(
+        entry: String,
+        names: Vec<String>,
+        contents: Vec<String>,
+    ) -> Result<WasmDebugSession, JsValue> {
+        if names.len() != contents.len() {
+            return Err(JsValue::from_str(
+                "project file names and contents have different lengths",
+            ));
+        }
+        let files = names
+            .into_iter()
+            .zip(contents)
+            .map(|(name, source)| (name, source.into_bytes()))
+            .collect::<Vec<_>>();
+        wasm_debug_session_from_compiled(crate::modules::compile_project_from_sources(
+            &entry, &files,
+        ))
+    }
+}
+
+fn wasm_debug_session_from_compiled(
+    compiled: Result<(crate::types::TProgram, Type), String>,
+) -> Result<WasmDebugSession, JsValue> {
+        let (program, return_type) = compiled.map_err(|e| JsValue::from_str(&e))?;
         let session = DebugSession::new(program).map_err(|e| JsValue::from_str(&e))?;
         Ok(WasmDebugSession {
             session,
             return_type,
             types: RefCell::new(Vec::new()),
         })
-    }
+}
+
+#[wasm_bindgen]
+impl WasmDebugSession {
 
     /// Deliverable 3 (`debugger::DebugSession::set_breakpoint`). Must be
     /// called before `run()` - breakpoint hits are found by scanning the
@@ -667,6 +791,28 @@ impl WasmDebugSession {
     /// never match anything already recorded.
     pub fn set_breakpoint(&self, function_name: &str, line: u32) -> WasmBreakpoint {
         self.session.set_breakpoint(function_name, line).into()
+    }
+
+    /// Removes a breakpoint previously returned by `set_breakpoint`.
+    #[wasm_bindgen]
+    pub fn remove_breakpoint(&self, id: u32) -> bool {
+        self.session.remove_breakpoint(id)
+    }
+
+    /// Applies an optional boolean condition to a breakpoint. The expression
+    /// uses the documented `local<N>` names exposed by `evaluate`.
+    #[wasm_bindgen]
+    pub fn set_breakpoint_condition(&self, id: u32, condition: Option<String>) -> bool {
+        self.session.set_breakpoint_condition(id, condition)
+    }
+
+    /// Requires a breakpoint's candidate source location to have been
+    /// reached at least `hit_condition` times before it may stop. Passing
+    /// `None` or zero disables the threshold.
+    #[wasm_bindgen]
+    pub fn set_breakpoint_hit_condition(&self, id: u32, hit_condition: Option<u32>) -> bool {
+        self.session
+            .set_breakpoint_hit_condition(id, hit_condition.map(u64::from))
     }
 
     /// Runs `main()` to completion, recording the full instruction trace.
@@ -703,12 +849,20 @@ impl WasmDebugSession {
     /// that is only ever consumed internally by `locals_at`/`evaluate`, both
     /// below).
     pub fn trace_step(&self, index: u32) -> Option<WasmTraceStep> {
-        self.session.trace().get(index as usize).map(|step| WasmTraceStep {
-            func_id: step.func_id,
-            pc: step.pc,
-            line: step.line,
-            depth: step.depth,
-        })
+        self.session
+            .trace()
+            .get(index as usize)
+            .map(|step| WasmTraceStep {
+                func_id: step.func_id,
+                function_name: self
+                    .session
+                    .function_name(step.func_id)
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+                pc: step.pc,
+                line: step.line,
+                depth: step.depth,
+            })
     }
 
     pub fn first_breakpoint_hit(&self) -> Option<u32> {
@@ -912,6 +1066,61 @@ mod tests {
     }
 
     #[test]
+    fn execute_lua_runs_with_captured_output() {
+        let result = execute_lua("print('canonical lua')");
+        assert_eq!(result.result(), Some("canonical lua\n".to_string()));
+        assert_eq!(result.error(), None);
+    }
+
+    #[test]
+    fn portable_lua_fixture_contract_matches_the_native_adapter() {
+        for row in include_str!("../tests/wasm-portable.tsv").lines() {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3, "invalid portable fixture row");
+            let expected = fields[2].replace("\\n", "\n").replace("\\t", "\t");
+            let result = execute_lua(fields[1]);
+            assert_eq!(result.error(), None, "{}", fields[0]);
+            assert_eq!(result.result().as_deref(), Some(expected.as_str()), "{}", fields[0]);
+        }
+    }
+
+    #[test]
+    fn execute_lua_preserves_output_on_error_and_denies_host_access() {
+        let result = execute_lua("print(42); error('expected failure')");
+        assert_eq!(result.result(), Some("42\n".into()));
+        assert!(result.error().unwrap().contains("expected failure"));
+        for source in ["os.execute('true')", "io.open('/etc/passwd')"] {
+            assert!(execute_lua(source).error().is_some(), "{source}");
+        }
+        let denied = execute_lua("local f, err = package.loadlib('/tmp/library.so', 'entry'); print(f == nil, err ~= nil)");
+        assert_eq!(denied.result(), Some("true\ttrue\n".into()));
+    }
+
+    #[test]
+    fn lua_project_rejects_escaping_duplicate_and_ambiguous_paths() {
+        for names in [vec!["main.lua", "../escape.lua"], vec!["main.lua", "main.lua"],
+            vec!["main.lua", "math/base.lua", "math.base.lua"]] {
+            let names = names.into_iter().map(String::from).collect::<Vec<_>>();
+            let contents = vec!["print(42)".to_string(); names.len()];
+            assert!(execute_lua_project("main.lua".into(), names, contents).error().is_some());
+        }
+    }
+
+    #[test]
+    fn execute_lua_project_loads_an_in_memory_module() {
+        let result = execute_lua_project(
+            "main.lua".to_string(),
+            vec!["main.lua".to_string(), "math/base.lua".to_string()],
+            vec![
+                "local base = require('math.base'); print(base.answer)".to_string(),
+                "return { answer = 42 }".to_string(),
+            ],
+        );
+        assert_eq!(result.result(), Some("42\n".to_string()));
+        assert_eq!(result.error(), None);
+    }
+
+    #[test]
     fn execute_reports_a_compile_error_without_panicking() {
         let result = execute("function main(): i64 return \"oops\" end");
         assert_eq!(result.result(), None);
@@ -932,6 +1141,48 @@ mod tests {
     }
 
     #[test]
+    fn execute_project_resolves_nested_in_memory_sol_imports() {
+        let result = execute_project(
+            "main.sol".to_string(),
+            vec!["main.sol".to_string(), "math/base.sol".to_string()],
+            vec![
+                "import math.base\nfunction main(): i64 return math.base.answer() end".to_string(),
+                "export function answer(): i64 return 42 end".to_string(),
+            ],
+        );
+        assert_eq!(result.result(), Some("42".to_string()));
+        assert_eq!(result.error(), None);
+    }
+
+    #[test]
+    fn execute_project_rejects_paths_outside_its_in_memory_root() {
+        let result = execute_project(
+            "../main.sol".to_string(),
+            vec!["../main.sol".to_string()],
+            vec!["function main(): i64 return 42 end".to_string()],
+        );
+        assert_eq!(result.result(), None);
+        assert!(result.error().unwrap().contains("must not escape"));
+    }
+
+    #[test]
+    fn debug_project_session_runs_and_breaks_inside_an_imported_module() {
+        let session = WasmDebugSession::launch_project(
+            "main.sol".to_string(),
+            vec!["main.sol".to_string(), "math/base.sol".to_string()],
+            vec![
+                "import math.base\nfunction main(): i64 return math.base.answer() end".to_string(),
+                "export function answer(): i64 return 42 end".to_string(),
+            ],
+        )
+        .expect("in-memory project compiles");
+        let breakpoint = session.set_breakpoint("math.base.answer", 1);
+        assert!(breakpoint.verified());
+        assert_eq!(session.run().result(), Some("42".to_string()));
+        assert!(session.first_breakpoint_hit().is_some());
+    }
+
+    #[test]
     fn debug_session_runs_and_reports_breakpoints_and_locals() {
         let session = WasmDebugSession::launch(
             "function main(): i64
@@ -947,7 +1198,10 @@ mod tests {
         .expect("fixture compiles and builds a session");
 
         let bp = session.set_breakpoint("main", 5);
-        assert!(bp.verified(), "breakpoint on an executable line should verify");
+        assert!(
+            bp.verified(),
+            "breakpoint on an executable line should verify"
+        );
 
         let run_result = session.run();
         assert_eq!(run_result.result(), Some("3".to_string()));
@@ -973,7 +1227,11 @@ mod tests {
         let _ = session.continue_to_breakpoint(first_hit);
 
         let eval = session.evaluate(first_hit, "1 + 1");
-        assert!(eval.ok(), "evaluating a literal expression should succeed: {}", eval.display());
+        assert!(
+            eval.ok(),
+            "evaluating a literal expression should succeed: {}",
+            eval.display()
+        );
         assert_eq!(eval.display(), "2");
 
         let stats = session.memory_stats();
@@ -983,6 +1241,27 @@ mod tests {
         let threads = session.threads();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].status(), "running");
+    }
+
+    #[test]
+    fn wasm_breakpoint_lifecycle_and_filters_are_exposed() {
+        let source = "function main(): i64
+                 local i: i64 = 0
+                 while i < 4 do
+                     i = i + 1
+                 end
+                 return i
+             end";
+        let session = WasmDebugSession::launch(source).expect("fixture compiles");
+        let breakpoint = session.set_breakpoint("main", 4);
+        assert!(breakpoint.verified());
+        assert!(breakpoint.id() > 0);
+        assert!(session.set_breakpoint_condition(breakpoint.id(), Some("local0 == 2".to_string())));
+        assert!(session.set_breakpoint_hit_condition(breakpoint.id(), Some(2)));
+        session.run();
+        assert!(session.first_breakpoint_hit().is_some());
+        assert!(session.remove_breakpoint(breakpoint.id()));
+        assert!(!session.remove_breakpoint(breakpoint.id()));
     }
 
     #[test]
@@ -1038,7 +1317,10 @@ mod tests {
             .find(|l| l.value().is_reference())
             .expect("the array local should render as a reference");
         let entries = session
-            .expand(array_local.type_id(), array_local.value().reference().unwrap())
+            .expand(
+                array_local.type_id(),
+                array_local.value().reference().unwrap(),
+            )
             .expect("an array reference should expand");
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].value().scalar(), Some("10".to_string()));

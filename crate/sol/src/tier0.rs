@@ -24,7 +24,7 @@ use crate::types::TProgram;
 pub const DEFAULT_INSTRUCTION_BUDGET: u64 = 10_000_000;
 
 pub struct Engine<H: interp::Hooks = ()> {
-    runtime: interp::Runtime<'static, H>,
+    runtime: std::rc::Rc<interp::Runtime<'static, H>>,
     name_to_id: HashMap<String, u8>,
 }
 
@@ -124,7 +124,10 @@ impl<H: interp::Hooks> Engine<H> {
             instruction_budget,
         );
 
-        Ok(Engine { runtime, name_to_id })
+        Ok(Engine {
+            runtime: std::rc::Rc::new(runtime),
+            name_to_id,
+        })
     }
 
     pub fn call(&self, name: &str, args: &[u64]) -> u64 {
@@ -139,6 +142,18 @@ impl<H: interp::Hooks> Engine<H> {
         self.runtime.hooks()
     }
 
+    /// A live, bounded Tier-0 execution over the same bytecode and opcode
+    /// semantics as ordinary calls. The execution owns its suspended roots.
+    pub fn start_live(&self, name: &str, args: &[u64]) -> Result<interp::live::Execution<H>, String>
+    where
+        H: 'static,
+    {
+        let id = self
+            .function_id(name)
+            .ok_or_else(|| format!("unknown function '{name}'"))?;
+        interp::live::Execution::new(self.runtime.clone(), id, args)
+    }
+
     /// U12 item 3: `name`'s numeric function id, as assigned by
     /// `bccompile::function_index` - `debugger.rs` needs this to translate a
     /// breakpoint/trace lookup keyed by function name into the `func_id` the
@@ -150,7 +165,10 @@ impl<H: interp::Hooks> Engine<H> {
     /// U12 item 3: `name`'s compiled bytecode (source map included), if it's
     /// still interpreted. See `interp::Runtime::bytecode_function`'s doc
     /// comment for why the debugger reads this instead of recompiling.
-    pub fn function_bytecode(&self, name: &str) -> Option<std::rc::Rc<crate::bytecode::BcFunction>> {
+    pub fn function_bytecode(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<crate::bytecode::BcFunction>> {
         self.name_to_id
             .get(name)
             .and_then(|&id| self.runtime.bytecode_function(id))
@@ -186,7 +204,8 @@ mod tests {
                  return total
              end",
         );
-        let engine: Engine = Engine::new_with_budget(program, (), 1000).expect("tier0 engine builds");
+        let engine: Engine =
+            Engine::new_with_budget(program, (), 1000).expect("tier0 engine builds");
         match engine.call_outcome("main", &[]) {
             sol_core::CallOutcome::Raised(message) => {
                 assert_eq!(message, "instruction budget exceeded");
@@ -204,6 +223,9 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("externs need native linking and should be rejected"),
         };
-        assert!(error.contains("host_fn"), "error should name the extern: {error}");
+        assert!(
+            error.contains("host_fn"),
+            "error should name the extern: {error}"
+        );
     }
 }

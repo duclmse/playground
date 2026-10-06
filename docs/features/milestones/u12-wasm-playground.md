@@ -1,6 +1,6 @@
 # U12 — Canonical WASM playground and debugger
 
-**Status:** planned
+**Status:** in progress
 
 **Purpose:** make the web product use the canonical runtime, not a separate VM.
 
@@ -1203,5 +1203,277 @@ in its own build output ("Some chunks are larger than 500 kB...").
   underlying engine gap list above is smaller.
 - No multi-file `.sol` project support, no idiomatic `.lua` support, no
   output buffer, no globals/upvalues/metatables/`set_variable`, no
-  breakpoint conditions/hit-conditions/log-messages/removal — see the
+  breakpoint log messages — see the
   honest-scope list above for each; none were invented as disguised stubs.
+
+## Work item 7 — breakpoint lifecycle and trace filters
+
+The product wrapper in item 6 deliberately shipped only bare source-location
+matching. This follow-up completes the bounded debugger slice that does not
+require a live suspend/resume interpreter: each `VerifiedBreakpoint` now has a
+stable session-local ID; `DebugSession` retains every requested breakpoint
+(including an unverified one) and supports removal, an optional boolean
+condition, and an optional minimum hit count. `first_breakpoint_hit` and
+`continue_to_breakpoint` use the same matcher, so their behavior cannot drift.
+
+Conditions are evaluated against the candidate recorded trace step through the
+existing frame-scoped evaluator. They deliberately use its documented
+`local<N>` names rather than source identifiers, and a malformed or non-boolean
+condition is non-matching rather than a debugger crash. Hit counts are raw
+candidate source-location visits in the immutable recorded trace. The
+WASM wrapper exposes the stable ID plus `remove_breakpoint`,
+`set_breakpoint_condition`, and `set_breakpoint_hit_condition`; this is an API
+completion only, not worker wiring or a claim of live execution pausing.
+
+`crate/sol/tests/debugger.rs` covers condition evaluation against the exact
+candidate register snapshot, hit-count filtering, removal, and unknown IDs.
+`wasm_api.rs` covers the corresponding exported lifecycle. Breakpoint log
+messages remain open because the Tier-0 wrapper has no debugger-output event
+channel; emitting a fabricated log would be a stub rather than support.
+
+## Work item 8 — in-memory `.sol` project loading
+
+`modules::compile_project_from_sources` adds the browser-safe counterpart to
+filesystem project loading. It accepts an entry path and a complete in-memory
+file set, resolves dotted imports only within that set, and shares the existing
+module validation and namespace lowering with native projects. Virtual paths
+must be non-empty and relative; absolute paths and `..` traversal are rejected.
+Tier-0 rejects imported `.lua` modules explicitly because the browser build has
+no dynamic Lua runtime or native capability fallback.
+
+`wasm_api::execute_project(entry, names, contents)` exposes this path using
+the worker protocol's parallel file-array shape and preserves `execute()`'s
+non-throwing result contract. Regression coverage proves a nested in-memory
+import reaches the expected result and that an escaping entry path is rejected.
+After regenerating `packages/sol-runtime/pkg`, the opt-in worker route now
+uses this API for every all-`.sol` project (and keeps `.lua` or mixed projects
+on the compatibility runtime). A real headless-Chromium run against the
+production worker bundle confirmed a nested `math.base` import returns `42`.
+Debugger project sessions remain on the compatibility runtime.
+
+## Work item 9 — in-memory project debugger sessions
+
+`WasmDebugSession::launch_project(entry, names, contents)` now builds a
+canonical debugger session from the same in-memory typed project graph as
+`execute_project`. The session retains the existing Tier-0 limitations, but
+breakpoints can target namespace-lowered imported functions (for example,
+`math.base.answer`) as well as `main`. The web debug protocol remains on the
+compatibility runtime: its stack, mutable-variable, globals, and output APIs
+do not yet have equivalent canonical project-session methods. A focused WASM
+API regression launches a two-file project, breaks in its imported function,
+and verifies the final result is `42`.
+
+## Work item 10 — defer canonical WASM loading on the compatibility path
+
+The worker now type-imports the canonical package and dynamically imports it
+only when `VITE_SOL_ENGINE=1`; initialization of the old runtime is unchanged.
+The default production build no longer emits `sol_bg.wasm` and its worker is
+25.12 KB, while the opt-in build includes the 808.54 KB raw / 254.52 KB gzipped
+canonical WASM asset and a 42.59 KB worker. This removes the prior static-import
+cost from the normal compatibility build without claiming a runtime UI toggle.
+A real headless-Chromium production-worker smoke test confirms the deferred
+module loads and runs the in-memory nested-import project to `42`.
+
+## Work item 11 — canonical typed-project debugger worker route
+
+When `VITE_SOL_ENGINE=1`, `apps/web/src/lua-worker.ts` now launches
+`WasmDebugSession::launch_project` for all-`.sol` debugger requests as well
+as using `execute_project` for normal runs. The adapter preserves the existing
+worker protocol for the Tier-0 capabilities that have honest equivalents:
+breakpoint lifecycle/filters, stepping over the recorded trace, one main
+thread, current-frame locals, array/map/struct expansion, frame-scoped eval,
+memory statistics, and the existing one-shot profiling/timeline requests. The
+WASM trace now includes its lowered function name,
+so stack entries are intelligible rather than exposing numeric bytecode IDs.
+
+The adapter keeps an opaque `type_id` for each value reference returned by the
+WASM API, allowing later `debugGetTableEntries` messages to call the canonical
+lazy expander without duplicating Rust layouts in JavaScript. Entry-file
+breakpoints map to the required typed `main` function; imported functions can
+be targeted by their namespace-lowered name. A browser regression in
+`apps/web/e2e/sol-engine-differential.mjs` launches a real production worker,
+sets an entry breakpoint, reads `local0`, and evaluates `local0 + 2` to `42`.
+
+This is intentionally not a claim of full debugger parity. Tier-0 still
+records an entire bounded execution before reporting its first stop, so there
+is no live pause; it exposes only the active trace frame rather than a full
+live stack; typed lowering has no upvalue/global scope; and variable mutation,
+metatables, print output, and breakpoint log messages remain unsupported.
+Canonical timeline events currently carry the entry source and instruction
+delta but not a recovered source line or `local0` payload.
+Those requests either report an explicit error or their protocol's empty
+meaningful result, never silently fall back to the retired runtime for a
+canonical `.sol` project. `.lua` and mixed projects remain on the compatibility
+runtime until the dynamic canonical runtime has a browser-safe product path.
+
+## Work item 12 — canonical dynamic Lua execution in WASM
+
+The canonical package now compiles `lua_runtime` for `wasm32` instead of
+excluding the entire dynamic runtime. The native Lua C embedding ABI remains
+present for native builds but its `no_mangle` exports are not wasm roots, and
+`build.rs` does not build/link the host C shim for wasm. This keeps the
+interpreter, tables, closures, coroutines, standard-library output buffer and
+capability checks available in the browser without admitting native loading or
+host allocation imports.
+
+`execute_lua` runs a single Lua chunk under the runtime's default-deny
+capabilities and returns its captured output. `execute_lua_project` registers
+all supplied non-entry `.lua` files as exact dotted `require` names (for
+example `math/base.lua` becomes `require("math.base")`) and runs the supplied
+entry entirely from memory. The opt-in worker now routes all-Lua run projects
+through these canonical APIs. Focused regressions cover captured `print`
+output and a nested in-memory `require` returning `42`.
+
+This closes canonical browser execution for ordinary all-Lua run projects,
+but not the dynamic debugger protocol, mixed `.lua`/`.sol` module calls, or
+the final removal of `@lua-playground/runtime`; those retain explicit scope
+until equivalent canonical adapters and end-to-end differentials exist.
+
+## Work item 13 — live canonical Lua debugger and browser qualification
+
+The opt-in worker now routes all-Lua debug, profiling, and timeline projects
+to the canonical runtime as well as normal runs. `LuaDebugSession` retains
+the actual trampoline frames between instruction slices; it does not run the
+program ahead of a stop or replay a recorded trace. Breakpoints use executable
+source lines, including nested registered module paths. Continue, burst,
+step-into/over/out, conditional and hit-count breakpoints, named locals,
+interpolated logpoints with ordered output,
+upvalues, full live Lua frames, table/metatable expansion, frame-scoped
+evaluation, local/upvalue editing, output polling, and forced precise GC are
+exposed through `WasmLuaDebugSession` and the existing worker protocol.
+Inspector references retain their canonical objects until session disposal.
+Replacing a session releases the previous WASM session and inspection roots.
+
+Registered `require` loaders have an explicit native continuation so a module
+can stop before its next instruction and resume with its cache publication
+still pending. Error unwinds clear the partial module cache before an outer
+protected call retries it. The actual project filename is retained rather
+than inferred from a module's dotted name. Project validation rejects escaping,
+duplicate, ambiguous, and unsupported file paths, and run requests validate
+the entry even for a one-file project. Output emitted before an uncaught error
+is preserved. Browser run and debug instruction budgets are both 10 million.
+
+WASM construction/collection use an internal diagnostic timer that does not
+call unsupported `Instant::now`; browser GC durations remain zero without a
+host clock capability. The native embedding allocator is not a WASM host-libc
+import. `scripts/test-sol-wasm.mjs` instantiates the linked module and audits
+its imports, runs the nine shared portable fixtures in
+`crate/sol/tests/wasm-portable.tsv`, and checks live module debugging and GC.
+The same fixture contract runs against the native adapter in the `wasm`
+feature's Rust tests, including closures, byte strings, metamethods,
+coroutines, collection, and denied native loading.
+
+Analysis uses opt-in bytecode accounting, with per-function activation,
+self/inclusive instruction counts and bounded call/return/source-line timeline events
+carrying source, line, a live first-local snapshot, and instruction delta.
+It does not allocate a complete instruction replay. Native-instruction
+accounting remains separate parity work.
+
+Verified with the focused driver/adapter tests, generated-WASM smoke tests,
+both production web builds, and real Chromium workers. The browser differential
+now includes six genuine old/new Lua-output matches, canonical live-debugger
+inspection/mutation/profiling/timeline checks, a 1,000-instruction runaway-loop
+burst (under 2 ms in the qualification run), and the pre-existing DOM debugger
+regression for upvalue/local editing and memory/GC. The 90 typed fixture
+classifications remain migration diagnostics, not evidence of semantic parity
+with the Lua-only legacy engine. The native Sol crate suite and Lua manifest
+checks pass. Qualification also exposed a mixed-module CLI output regression:
+Lua chunks still print only explicit output, while typed `main()` results are
+again rendered for specialized mixed projects, as required by their tests.
+
+The canonical WASM is currently 1,939,524 bytes raw / 584,296 bytes gzip; the
+opt-in build still ships both runtime assets. This is not the final bundle-size
+or initialization qualification. Full `cargo test --workspace` is currently
+blocked by unrelated private `Analysis` imports in the `ebnf` crate.
+`cargo test --workspace --exclude ebnf` passes for the canonical runtime,
+core, decompiler, and LSP crates.
+
+U12 is still in progress. Live stops inside coroutine `resume`/`wrap` and
+blocking host callbacks, complete thread inspection,
+typed live suspension/full-frame inspection, mixed browser modules, and the
+final production removal of the legacy runtime remain required before its
+exit gate can be checked. The feature flag is still default-off.
+
+## Work item 14 — live coroutine resume chains
+
+The canonical Lua debugger now schedules `coroutine.resume` and `wrap`
+without retaining a Rust resume stack. Parent frames are parked in their
+canonical coroutine state while the child is active; a control outcome hands
+the debugger a pending resume request, distinct from a Lua yield or a debugger
+slice expiration. Yield, completion, protected/wrapped errors, and `<close>`
+self-close restore the parent and its hook/depth accounting. The main frame
+has the same depth charge as normal execution, and a focused low-depth
+native/debug differential verifies the limit behavior.
+
+The worker exposes the entire active resume chain (main thread zero,
+normal parents, running child), with isolated per-thread frames, locals,
+upvalues, evaluation, and mutation. Normal-parent evaluation temporarily
+selects that thread's frames and pins the original active chain, so explicit
+collection cannot lose a parked child. Pending incoming values have precise
+roots until the result is installed in a frame; they are then released rather
+than extending weak-object lifetimes. Zero-instruction continuation settling
+places a resumed frame before its next opcode. Per-frame breakpoint position
+tracking prevents a yielded call from spuriously hitting again upon resume.
+
+Regression coverage includes nested resume chains, child edits surviving
+yield/resume and forced collection, runaway `wrap` bursts, native callable
+coroutine bodies, protected error values, self-close finalizers, dead/running
+resume rejection, weak-object lifetime parity, and depth limits. The real WASM
+smoke test and Chromium worker scenario stop inside a coroutine, inspect both
+threads, edit the child, collect, and resume to the expected output. The
+existing DOM debugger checks remain part of browser qualification.
+
+The item-13 coroutine/thread gap is closed for the active-chain protocol;
+blocking host callbacks still execute atomically, and idle coroutines are not
+invented as inspectable active threads. Typed live suspension/full frames,
+mixed browser projects, final production cutover, and bundle/initialization
+qualification still keep U12's exit gate open.
+
+## Work item 15 — resumable specialized frames and portable typed execution
+
+Typed Tier-0 execution now has an explicit live-frame driver. Its arithmetic,
+memory, and control-flow opcodes use the same dispatcher as the ordinary
+interpreter; calls, proper tail calls, and array-map callbacks return control
+outcomes instead of retaining recursive Rust interpreter/callback stacks.
+Frames retain unboxed registers and registered root ranges across bounded
+bursts. Editing a paused register changes subsequent execution, and runaway
+instruction/depth limits return errors without a native stack overflow.
+Root guards now remove their own ranges, so suspended sessions can be released
+out of order without unrooting another session.
+
+The normal typed WASM `execute`/`execute_project` path uses these live frames.
+All 33 portable typed conformance fixtures match their native expectations in
+the actual linked WASM, in addition to the shared portable Lua fixture
+contract. The native conformance suite independently exercises the live
+driver in bounded bursts against the same typed corpus. Explicit native libm
+FFI remains the documented unsupported browser fixture; it is not silently
+substituted or counted as passing.
+
+Debug compilation retains source assignments and aggregate layouts instead
+of applying constant propagation or scalar replacement. Source-local names
+survive typed lowering, and bytecode has half-open initialized-local scope
+ranges, including parameter, shadowed block-local, and numeric-loop scopes.
+Focused tests cover real nested-frame mutation, map callback suspension,
+tail-call reuse, depth/budget exhaustion, source-local mutation, shadowing,
+initialization visibility, and loop-scope exit.
+
+The typed collector's allocation header decoding/writes are now explicitly
+64-bit on wasm32 as well as native targets. Array/map pointer fields occupy
+whole 64-bit slots, with initialized padding on 32-bit targets and checked
+field offsets. This fixes the latent wasm32 header-width panic and packed-map
+pointer-layout mismatch; it does **not** by itself enable rooted typed
+collection. The existing typed debug `force_gc` remains a no-op until its
+portable collection/root-ownership adapter is implemented.
+
+Verification includes the Sol native crate suite, the jit-free WASM-feature
+library tests, native typed conformance, regenerated WASM smoke tests, the
+opt-in production web build, and real Chromium worker/UI scenarios. The
+linked canonical WASM measures 1,987,960 bytes raw / 602,426 bytes with Node's
+default gzip; both old and canonical runtime assets still ship in the opt-in
+build. These measurements are intermediate, not final bundle qualification.
+
+U12 remains in progress. The typed worker debugger still uses the historical
+trace adapter: it must be connected to the live driver with named full-frame
+inspection, evaluation/mutation, portable rooted collection, and bounded
+analysis. Mixed/generic browser projects, production removal of the legacy
+package, and final bundle/initialization qualification also remain open.

@@ -159,6 +159,9 @@ pub struct TFunction {
     pub body: TBlock,
     /// Every declared `LocalId` (params included) is in `0..local_count`.
     pub local_count: usize,
+    /// Source spelling by LocalId. Optimizer-generated slots may have no
+    /// entry; debug compilation deliberately preserves source slots.
+    pub local_names: Vec<String>,
 }
 
 /// A typed statement paired with the source line it lowered from (U12 item

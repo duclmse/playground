@@ -1,0 +1,9 @@
+output	print(42)	42\n
+closures	local n=40; local function f() n=n+1; return n end; print(f(), f())	41\t42\n
+tables	local t={}; for i=1,10 do t[i]=i end; print(#t,t[4])	10\t4\n
+metamethod	local t=setmetatable({}, {__index=function(_, k) return k..'!' end}); print(t.answer)	answer!\n
+protected-call	local ok=pcall(function() error('expected') end); print(ok)	false\n
+coroutine	local co=coroutine.create(function() coroutine.yield(40); return 42 end); local a,b=coroutine.resume(co); print(a,b); a,b=coroutine.resume(co); print(a,b)	true\t40\ntrue\t42\n
+byte-string	print(string.byte('\255'), string.byte('\0'))	255\t0\n
+gc	local t={answer=42}; collectgarbage(); print(t.answer)	42\n
+native-loader-denied	local f,e=package.loadlib('/tmp/library.so', 'entry'); print(f==nil, e~=nil)	true\ttrue\n
