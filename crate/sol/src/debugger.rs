@@ -30,6 +30,8 @@ use crate::interp::Hooks;
 use crate::tier0;
 use crate::types::{self, StructLayout, TFunction, TProgram, Type};
 
+pub mod live;
+
 // ---------------------------------------------------------------------
 // Deliverable 3: breakpoint matching (sourceId+line -> verified/pending)
 // ---------------------------------------------------------------------
@@ -426,11 +428,13 @@ pub struct TraceStep {
 #[derive(Default)]
 pub struct TraceRecorder {
     steps: RefCell<Vec<TraceStep>>,
+    roots: RefCell<Vec<gc::RootGuard>>,
     depth: Cell<u32>,
 }
 
 impl TraceRecorder {
     fn reset(&self) {
+        self.roots.borrow_mut().clear();
         self.steps.borrow_mut().clear();
         self.depth.set(0);
     }
@@ -446,12 +450,14 @@ impl Hooks for TraceRecorder {
     }
 
     fn on_instruction(&self, func_id: u8, pc: u32, line: u32, regs: &[u64]) {
+        let regs = regs.to_vec();
+        self.roots.borrow_mut().push(gc::RootGuard::new(regs.as_ptr(), regs.len()));
         self.steps.borrow_mut().push(TraceStep {
             func_id,
             pc,
             line,
             depth: self.depth.get(),
-            regs: regs.to_vec(),
+            regs,
         });
     }
 }

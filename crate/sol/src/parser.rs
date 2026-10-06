@@ -83,13 +83,20 @@ impl From<SourceMode> for LanguageConfig {
 }
 
 pub fn parse_with_config(tokens: Vec<Spanned>, config: LanguageConfig) -> Result<Program, String> {
+    parse_with_known_structs(tokens, config, HashSet::new())
+}
+
+/// Internal debugger entry: parse expressions in an already-resolved typed
+/// project without guessing whether `Name {...}` is a record constructor.
+pub(crate) fn parse_with_known_structs(tokens: Vec<Spanned>, config: LanguageConfig,
+    known_structs: HashSet<String>) -> Result<Program, String> {
     Parser {
         tokens,
         pos: 0,
         config,
         vararg_allowed: false,
         generated_structs: Vec::new(),
-        known_structs: HashSet::new(),
+        known_structs,
         imported_modules: HashSet::new(),
         depth: 0,
         lua_local_scopes: vec![LuaLocalScopes {

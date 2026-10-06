@@ -638,12 +638,30 @@ pub fn collect() {
 }
 
 fn collect_heap(heap: &mut Heap) {
+    collect_heap_with_roots(heap, true);
+}
+
+/// WASM has no conservatively scannable native stack. Browser adapters may
+/// collect only after every retained frame/inspection value has a RootGuard.
+///
+/// # Safety
+/// All live managed values must have registered ranges for this entire call.
+#[cfg(target_arch = "wasm32")]
+pub(crate) unsafe fn collect_registered_roots() {
+    HEAP.with(|heap| collect_heap_with_roots(&mut heap.borrow_mut(), false));
+}
+
+fn collect_heap_with_roots(heap: &mut Heap, scan_native_stack: bool) {
     let flushed = flush_callee_saved_registers();
     // The flushed buffer's own address is the scan's lower bound - it's
     // guaranteed at or below every stack slot we need to see.
     let approx_sp = flushed.as_ptr() as usize;
-    let base = STACK_BASE.load(Ordering::Relaxed);
-    if base == 0 || approx_sp >= base {
+    let base = if scan_native_stack {
+        STACK_BASE.load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    if scan_native_stack && (base == 0 || approx_sp >= base) {
         return; // uninitialized - nothing safe to scan
     }
 
@@ -654,7 +672,7 @@ fn collect_heap(heap: &mut Heap) {
 
     let mut worklist: Vec<usize> = Vec::new();
     let mut addr = approx_sp & !(ALIGN - 1);
-    while addr < base {
+    while scan_native_stack && addr < base {
         // SAFETY: within [flushed buffer, recorded base] on this thread's
         // own stack - mapped, readable memory.
         let word = unsafe { std::ptr::read_unaligned(addr as *const usize) };
@@ -668,7 +686,8 @@ fn collect_heap(heap: &mut Heap) {
             for i in 0..len {
                 // SAFETY: [ptr, ptr + len*8) is a still-live register file,
                 // registered by a RootGuard that outlives this collection.
-                let word = unsafe { std::ptr::read_unaligned((ptr + i * ALIGN) as *const usize) };
+                let word =
+                    unsafe { std::ptr::read_unaligned((ptr + i * ALIGN) as *const u64) } as usize;
                 try_mark(heap, word, &mut worklist, false);
             }
         }

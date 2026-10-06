@@ -5,13 +5,10 @@ import type * as SolRuntime from "@lua-playground/sol-runtime";
 
 export type { WorkerEvent } from "./debug-protocol";
 
-// U12 item 6: opt-in-only switch to the new canonical `crate/sol` wasm
-// engine (`packages/sol-runtime`, built by `scripts/build-sol-wasm.sh`) for
-// `.sol`-only requests. Multi-file imports are resolved exclusively from the
-// worker's in-memory file map; the compatible subset of debugger requests is
-// likewise routed through `WasmDebugSession` for those projects.
-// Default is OFF (unset env var): every existing behavior, including every
-// other message type, is completely unchanged. Flip with `VITE_SOL_ENGINE=1`.
+// U12 opt-in canonical runtime. All-Lua and specialized all-Sol projects
+// have live debugger adapters; imports use the worker's in-memory file map.
+// Mixed projects still use the compatibility adapter pending qualification.
+// The production switch remains OFF unless VITE_SOL_ENGINE=1 is supplied.
 const SOL_ENGINE_ENABLED = import.meta.env.VITE_SOL_ENGINE === "1";
 
 let ready: Promise<unknown> | null = null;
@@ -19,6 +16,7 @@ let session: DebugSession | null = null;
 let solRuntime: typeof SolRuntime | null = null;
 let solDebugSession: SolRuntime.WasmDebugSession | null = null;
 let luaDebugSession: SolRuntime.WasmLuaDebugSession | null = null;
+let typedDebugSession: SolRuntime.WasmTypedDebugSession | null = null;
 let solDebugEntry: string | null = null;
 let solDebugCursor = 0;
 let solDebugStarted = false;
@@ -105,8 +103,8 @@ function solBreakpointFunction(sourceId: string): string {
   return sourceId === solDebugEntry ? "main" : sourceId;
 }
 
-function handleCanonicalLuaDebug(message: DebugRequest): boolean {
-  const canonical = luaDebugSession;
+function handleCanonicalLiveDebug(message: DebugRequest): boolean {
+  const canonical = luaDebugSession ?? typedDebugSession;
   if (!canonical || !("id" in message) || message.type === "debugLaunch") return false;
   const id = message.id;
   const variables = (values: SolRuntime.LuaDebugVariable[]) => {
@@ -185,7 +183,7 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
   await ensureReady();
 
   try {
-    if (handleCanonicalLuaDebug(message)) return;
+    if (handleCanonicalLiveDebug(message)) return;
     switch (message.type) {
       case "run": {
         const names = Object.keys(message.files);
@@ -234,6 +232,8 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         const contents = names.map((name) => message.files[name]);
         luaDebugSession?.free();
         luaDebugSession = null;
+        typedDebugSession?.free();
+        typedDebugSession = null;
         solDebugSession?.free();
         solDebugSession = null;
         session?.free();
@@ -246,7 +246,7 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         }
         if (isCanonicalSolProject(message.files, message.entry)) {
           const runtime = requireSolRuntime();
-          solDebugSession = runtime.WasmDebugSession.launch_project(message.entry, names, contents);
+          typedDebugSession = runtime.WasmTypedDebugSession.launch_project(message.entry, names, contents);
           solDebugEntry = message.entry;
           solDebugCursor = 0;
           solDebugStarted = false;

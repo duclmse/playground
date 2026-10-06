@@ -238,9 +238,9 @@ end`;
           if (!message.stopped || message.stop?.reason !== "breakpoint") reject(new Error(`expected canonical breakpoint stop, got ${JSON.stringify(message)}`));
           else send({ id: 4, type: "debugGetLocals", threadId: 0, frameIndex: 0 });
         } else if (message.id === 4 && message.type === "debugVariables") {
-          const local = message.variables.find((variable) => variable.name === "local0");
+          const local = message.variables.find((variable) => variable.name === "value");
           if (!local || local.display !== "40") reject(new Error(`unexpected canonical locals: ${JSON.stringify(message.variables)}`));
-          else send({ id: 5, type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "local0 + 2" });
+          else send({ id: 5, type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "value + 2" });
         } else if (message.id === 5 && message.type === "debugEvalResult") {
           clearTimeout(timeout);
           worker.terminate();
@@ -289,6 +289,40 @@ async function canonicalLuaDebugScenario(page, workerPath) {
     });
     const check = (value, message) => { if (!value) throw new Error(message); };
     try {
+      await rpc({ type: "debugLaunch", entry: "main.sol", files: {
+        "main.sol": "import math.base\nfunction main(): i64\n local base: i64=40\n local result=math.base.add(base)\n return base+result\nend",
+        "math/base.sol": "export function add(x: i64): i64\n local y=x+2\n return y\nend",
+      } });
+      const typedBp = await rpc({ type: "debugSetBreakpoint", sourceId: "math/base.sol", line: 2 });
+      check(typedBp.breakpoint.verified, "typed imported-file breakpoint verification");
+      const typedStop = await rpc({ type: "debugContinueBurst", maxInstructions: 1000 });
+      check(typedStop.stop?.reason === "breakpoint" && typedStop.source === "math/base.sol", "typed live imported-file stop");
+      check((await rpc({ type: "debugTakeOutput" })).text === "", "typed execution must not run ahead of its stop");
+      const typedFrames = await rpc({ type: "debugGetStackTrace", threadId: 0 });
+      check(typedFrames.frames.length === 2 && typedFrames.frames[1].source === "main.sol" && typedFrames.frames[1].line === 4, "typed full live stack and caller call-site");
+      const typedLocals = await rpc({ type: "debugGetLocals", threadId: 0, frameIndex: 0 });
+      check(typedLocals.variables.some((v) => v.name === "x" && v.display === "40"), "typed named locals");
+      for (const [frameIndex, name, valueExpr] of [[0, "x", "41"], [1, "base", "1"]]) {
+        check((await rpc({ type: "debugSetVariable", threadId: 0, frameIndex, name, valueExpr })).result.ok, "typed frame-selected live mutation");
+      }
+      check(!(await rpc({ type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "1//0" })).result.ok, "typed expression trap must be recoverable");
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "terminated", "typed live resume");
+      check((await rpc({ type: "debugTakeOutput" })).text === "44", "typed live edits must affect actual output");
+      await rpc({ type: "debugLaunch", entry: "main.sol", files: { "main.sol":
+        "function main(): i64 local discarded=new_array_i64(200000) return discarded[0] end" } });
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "terminated", "typed discarded-array fixture completion");
+      await rpc({ type: "debugLaunch", entry: "main.sol", files: { "main.sol":
+        "function main(): i64\n local xs: Array<i64> = {40,2}\n local m: Map<i64,i64> = {[1]=2}\n return xs[0]+m[1]\nend" } });
+      await rpc({ type: "debugSetBreakpoint", sourceId: "main.sol", line: 4 });
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "breakpoint", "typed GC fixture live stop");
+      const typedGcLocals = await rpc({ type: "debugGetLocals", threadId: 0, frameIndex: 0 });
+      const typedArray = typedGcLocals.variables.find((v) => v.name === "xs");
+      const typedBeforeGc = await rpc({ type: "debugGetMemoryStats" });
+      const typedAfterGc = await rpc({ type: "debugForceGc" });
+      check(typedBeforeGc.stats.totalAllocation - typedAfterGc.stats.totalAllocation > 1_000_000, "typed worker GC must actually reclaim discarded storage");
+      check((await rpc({ type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "xs[0]+m[1]" })).result.display === "42", "typed live graph must survive GC");
+      const typedArrayEntries = await rpc({ type: "debugGetTableEntries", reference: typedArray.reference, start: 0, count: 10 });
+      check(typedArrayEntries.variables[0].display === "40", "typed inspector reference must survive GC");
       await rpc({ type: "debugLaunch", entry: "main.lua", files: { "main.lua":
         "local x = 40\nlocal function f()\n local t = {answer = x}\n print(t.answer)\nend\nf()" } });
       const bp = await rpc({ type: "debugSetBreakpoint", sourceId: "main.lua", line: 4 });

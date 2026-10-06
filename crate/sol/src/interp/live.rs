@@ -1,6 +1,6 @@
 //! Resumable specialized execution. Registers remain unboxed `u64` slots;
 //! dispatch uses the ordinary interpreter's opcode implementation.
-use super::{call_native, Hooks, InstructionStep, Runtime, Slot};
+use super::{call_native, DispatchMode, Hooks, InstructionStep, Runtime, Slot};
 use crate::{bytecode::BcFunction, gc};
 use std::rc::Rc;
 
@@ -24,6 +24,7 @@ enum Pending {
 }
 
 pub struct Frame {
+    pub identity: u64,
     pub function: u8,
     pub bytecode: Rc<BcFunction>,
     pub registers: Vec<u64>,
@@ -35,6 +36,9 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn is_waiting_for_result(&self) -> bool {
+        self.pending.is_some()
+    }
     /// A caller suspended on a call/map still points at that operation;
     /// `pc` itself is the next dispatch cursor used when its result arrives.
     pub fn instruction_pc(&self) -> u32 {
@@ -65,6 +69,7 @@ pub struct Execution<H: Hooks + 'static> {
     frames: Vec<Frame>,
     terminal: Option<Stop>,
     max_depth: usize,
+    next_identity: u64,
 }
 
 impl<H: Hooks + 'static> Execution<H> {
@@ -78,6 +83,7 @@ impl<H: Hooks + 'static> Execution<H> {
             frames: Vec::new(),
             terminal: None,
             max_depth: 1000,
+            next_identity: 0,
         };
         execution.enter(function, args, None)?;
         Ok(execution)
@@ -144,6 +150,7 @@ impl<H: Hooks + 'static> Execution<H> {
                 header.state = sol_core::FrameState::Running;
                 self.runtime.hooks.on_frame_state(&header);
                 self.frames.push(Frame {
+                    identity: self.next_identity,
                     function,
                     bytecode,
                     registers,
@@ -153,6 +160,7 @@ impl<H: Hooks + 'static> Execution<H> {
                     _guard: guard,
                     pending: None,
                 });
+                self.next_identity += 1;
             }
             Slot::Native(pointer) => {
                 let _roots = gc::RootGuard::new(args.as_ptr(), args.len());
@@ -274,9 +282,10 @@ impl<H: Hooks + 'static> Execution<H> {
                     &mut parent.registers,
                     &mut parent.pc,
                     &mut parent.header,
-                    false,
+                    DispatchMode::PortableLive,
                 );
                 match step {
+                    InstructionStep::Raised(error) => return self.fail(error),
                     InstructionStep::Continue => {}
                     InstructionStep::Call {
                         target,

@@ -3,7 +3,7 @@
 // module rather than treating a successful wasm32 cargo check as proof.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { initSync, execute_project, execute_lua, execute_lua_project, WasmLuaDebugSession } from "../packages/sol-runtime/pkg/sol.js";
+import { initSync, execute_project, execute_lua, execute_lua_project, WasmDebugSession, WasmLuaDebugSession, WasmTypedDebugSession } from "../packages/sol-runtime/pkg/sol.js";
 
 const bytes = readFileSync(new URL("../packages/sol-runtime/pkg/sol_bg.wasm", import.meta.url));
 const module = new WebAssembly.Module(bytes);
@@ -24,6 +24,80 @@ for (const [, name, expected] of typedCases.matchAll(/\("([^"]+\.sol)", "([^"]+)
   typedCount++;
 }
 assert.equal(typedCount, 33, "typed qualification must not silently skip corpus fixtures");
+
+const typedDebug = WasmTypedDebugSession.launch_project("main.sol", ["main.sol", "math/base.sol"], [
+  "import math.base\nfunction main(): i64\n local base: i64=40\n local result=math.base.add(base)\n return base+result\nend",
+  "export function add(x: i64): i64\n local y=x+2\n return y\nend",
+]);
+try {
+  const bp = typedDebug.set_breakpoint("math/base.sol", 2);
+  try { assert.equal(bp.verified, true); } finally { bp.free(); }
+  const stop = typedDebug.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); assert.equal(stop.source, "math/base.sol"); } finally { stop.free(); }
+  assert.equal(typedDebug.take_output(), "");
+  const frames = typedDebug.get_stack_trace(0);
+  try { assert.equal(frames.length, 2); assert.equal(frames[1].source, "main.sol"); assert.equal(frames[1].line, 4); }
+  finally { frames.forEach((frame) => frame.free()); }
+  for (const [frame, name, expression] of [[0, "x", "41"], [1, "base", "1"]]) {
+    const result = typedDebug.set_variable(0, frame, name, expression);
+    try { assert.equal(result.ok, true, result.display); } finally { result.free(); }
+  }
+  const failed = typedDebug.evaluate(0, "1//0", 0);
+  try { assert.equal(failed.ok, false); } finally { failed.free(); }
+  const done = typedDebug.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  assert.equal(typedDebug.take_output(), "44");
+} finally { typedDebug.free(); }
+
+// Force a real stack-independent typed collection, not the historical
+// no-op. A discarded large array has its own chunk and must be reclaimed;
+// paused arrays/maps and inspector handles must retain their graph.
+const garbage = execute_project("main.sol", ["main.sol"], [
+  "function main(): i64 local discarded=new_array_i64(200000) return discarded[0] end",
+]);
+try { assert.equal(garbage.error, undefined); } finally { garbage.free(); }
+const typedGc = WasmTypedDebugSession.launch_project("main.sol", ["main.sol"], [
+  "function main(): i64\n local xs: Array<i64> = {40,2}\n local m: Map<i64,i64> = {[1]=2}\n return xs[0]+m[1]\nend",
+]);
+// Compatibility API users may retain a historical trace concurrently with
+// a live session. Its snapshots must participate in the same root registry.
+const traceOwner = WasmDebugSession.launch("function main(): i64 local xs: Array<i64> = {9,10} return xs[0] end");
+const traceRun = traceOwner.run(); traceRun.free();
+try {
+  const bp = typedGc.set_breakpoint("main.sol", 4); bp.free();
+  const stop = typedGc.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); } finally { stop.free(); }
+  const before = typedGc.memory_stats();
+  const beforeBytes = before.live_bytes; before.free();
+  const locals = typedGc.get_locals(0, 0);
+  const arrayReference = locals.find((local) => local.name === "xs").reference;
+  locals.forEach((local) => local.free());
+  typedGc.force_gc();
+  const traceLocals = traceOwner.locals_at(traceOwner.trace_length() - 1);
+  const traceArray = traceLocals.find((local) => {
+    const value = local.value; try { return value.is_reference; } finally { value.free(); }
+  });
+  const traceValue = traceArray.value;
+  const traceEntries = traceOwner.expand(traceArray.type_id, traceValue.reference);
+  try {
+    const value = traceEntries[0].value;
+    try { assert.equal(value.scalar, "9"); } finally { value.free(); }
+  } finally {
+    traceValue.free(); traceEntries.forEach((entry) => entry.free()); traceLocals.forEach((local) => local.free());
+  }
+  const after = typedGc.memory_stats();
+  try { assert.ok(beforeBytes - after.live_bytes > 1_000_000, "typed GC must reclaim discarded array storage"); }
+  finally { after.free(); }
+  const value = typedGc.evaluate(0, "xs[0]+m[1]", 0);
+  try { assert.equal(value.ok, true, value.display); assert.equal(value.display, "42"); } finally { value.free(); }
+  const entries = typedGc.get_table_entries(arrayReference, 0, 10);
+  try { assert.equal(entries[0].display, "40"); } finally { entries.forEach((entry) => entry.free()); }
+  const done = typedGc.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  typedGc.force_gc();
+  const retained = typedGc.get_table_entries(arrayReference, 0, 10);
+  try { assert.equal(retained[0].display, "40"); } finally { retained.forEach((entry) => entry.free()); }
+} finally { typedGc.free(); traceOwner.free(); }
 
 const fixtures = readFileSync(new URL("../crate/sol/tests/wasm-portable.tsv", import.meta.url), "utf8").trimEnd().split("\n");
 for (const row of fixtures) {

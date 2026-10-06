@@ -84,6 +84,7 @@ pub trait Hooks {
 impl Hooks for () {}
 
 enum InstructionStep {
+    Raised(String),
     Continue,
     Call {
         target: u8,
@@ -98,6 +99,12 @@ enum InstructionStep {
     },
     Returned(u64),
     TailCall(sol_core::CallRequest<u64>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchMode {
+    NativeTiered,
+    PortableLive,
 }
 
 /// Speculative-specialization state for one function - see
@@ -476,7 +483,15 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 .map(|loc| loc.line)
                 .unwrap_or(bf.source_line);
             self.hooks.on_instruction(func_id, pc as u32, line, &regs);
-            match self.execute_instruction(func_id, bf, &mut regs, &mut pc, &mut frame, true) {
+            match self.execute_instruction(
+                func_id,
+                bf,
+                &mut regs,
+                &mut pc,
+                &mut frame,
+                DispatchMode::NativeTiered,
+            ) {
+                InstructionStep::Raised(error) => return sol_core::CallOutcome::Raised(error),
                 InstructionStep::Continue => {}
                 InstructionStep::Call {
                     target,
@@ -520,7 +535,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         regs: &mut [u64],
         cursor: &mut usize,
         frame: &mut sol_core::FrameHeader,
-        allow_osr: bool,
+        mode: DispatchMode,
     ) -> InstructionStep {
         let mut pc = *cursor;
         let mut outcome = InstructionStep::Continue;
@@ -529,6 +544,15 @@ impl<'a, H: Hooks> Runtime<'a, H> {
         let a = instr.a() as usize;
         let b = instr.b() as usize;
         let c = instr.c() as usize;
+
+        macro_rules! checked_trap {
+            ($message:expr) => {
+                if mode == DispatchMode::PortableLive {
+                    return InstructionStep::Raised($message.into());
+                }
+                trap();
+            };
+        }
 
         macro_rules! ri {
             ($r:expr) => {
@@ -590,7 +614,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
             }
             Op::TrapIfZero => {
                 if regs[a] == 0 {
-                    trap();
+                    checked_trap!("zero numeric-for step");
                 }
             }
             Op::AddNoOverflow => {
@@ -610,13 +634,13 @@ impl<'a, H: Hooks> Runtime<'a, H> {
             Op::MulI => seti!(ri!(b).wrapping_mul(ri!(c))),
             Op::DivI => {
                 if ri!(c) == 0 {
-                    trap();
+                    checked_trap!("integer division by zero");
                 }
                 seti!(crate::numeric::floor_div(ri!(b), ri!(c)))
             }
             Op::ModI => {
                 if ri!(c) == 0 {
-                    trap();
+                    checked_trap!("integer modulo by zero");
                 }
                 seti!(crate::numeric::modulo(ri!(b), ri!(c)))
             }
@@ -651,7 +675,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
             Op::Jump => {
                 let target = (pc as i64 + instr.sbx() as i64) as usize;
                 // Linear scan: `top_level_loops` is typically tiny.
-                if allow_osr {
+                if mode == DispatchMode::NativeTiered {
                     if let Some(&(_, stmt_index)) = bf
                         .top_level_loops
                         .iter()
@@ -677,9 +701,20 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 let len = unsafe { *(regs[b] as *const i64) };
                 seti!(len)
             }
-            Op::NewArrayI64 => regs[a] = runtime::sol_new_array_i64(ri!(b)) as u64,
-            Op::NewArrayF64 => regs[a] = runtime::sol_new_array_f64(ri!(b)) as u64,
-            Op::NewArrayPtr => regs[a] = runtime::sol_new_array_ptr(ri!(b)) as u64,
+            Op::NewArrayI64 | Op::NewArrayF64 | Op::NewArrayPtr => {
+                let length = ri!(b);
+                if length < 0
+                    || length.checked_mul(8).is_none()
+                    || length as u64 > (isize::MAX as u64) / 8
+                {
+                    checked_trap!("invalid array length");
+                }
+                regs[a] = match instr.op() {
+                    Op::NewArrayI64 => runtime::sol_new_array_i64(length),
+                    Op::NewArrayF64 => runtime::sol_new_array_f64(length),
+                    _ => runtime::sol_new_array_ptr(length),
+                } as u64;
+            }
             Op::ArrayMapI64 => {
                 let input = regs[b] as *const runtime::ArrayHeader;
                 let output = runtime::sol_new_array_i64(unsafe { (*input).len });
@@ -711,7 +746,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 // Unsigned compare also catches a negative index (wraps huge).
                 let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *const u8) };
                 if ri!(c) as u64 >= len {
-                    trap();
+                    checked_trap!("array index out of bounds");
                 }
                 regs[a] = unsafe { *(data.add(ri!(c) as usize * 8) as *const u64) };
             }
@@ -719,7 +754,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 let hdr = regs[a] as *const i64;
                 let (len, data) = unsafe { (*hdr as u64, *(hdr.add(1)) as *mut u8) };
                 if ri!(b) as u64 >= len {
-                    trap();
+                    checked_trap!("array index out of bounds");
                 }
                 unsafe { *(data.add(ri!(b) as usize * 8) as *mut u64) = regs[c] };
                 gc::sol_gc_write_barrier(data as i64, regs[c] as i64);
@@ -751,7 +786,7 @@ impl<'a, H: Hooks> Runtime<'a, H> {
                 let ptr = regs[b] as *const i64;
                 let tag = unsafe { *ptr };
                 if tag != expected_tag {
-                    trap();
+                    checked_trap!("boxed value type mismatch");
                 }
                 regs[a] = unsafe { *(ptr.add(1)) as u64 };
             }

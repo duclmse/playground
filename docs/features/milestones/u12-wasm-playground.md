@@ -1477,3 +1477,56 @@ trace adapter: it must be connected to the live driver with named full-frame
 inspection, evaluation/mutation, portable rooted collection, and bounded
 analysis. Mixed/generic browser projects, production removal of the legacy
 package, and final bundle/initialization qualification also remain open.
+
+## Work item 16 — live typed browser debugger and registered-root collection
+
+The opt-in all-Sol debugger now uses `WasmTypedDebugSession`, driven by the
+resumable specialized frames from item 15 rather than an instruction replay.
+The Lua and typed live adapters share worker-protocol handling. Typed sessions
+verify breakpoints against actual source filenames across every function,
+retain full caller/child stacks and call-site locations, expose initialized
+named locals, and evaluate/edit the selected real frame. Conditions, hit
+counts, interpolated logpoints, stepping, output polling, and retained
+array/map/record inspector references use this live state. Captures follow
+the current typed lambda-lifted-parameter contract; no fictitious dynamic
+globals or metatables are added to specialized code.
+
+Frame expressions use the existing parser/type checker and specialized
+representations, including aggregate parameters and resolved record layouts.
+The parser receives the project's known record names. Assignment expressions
+are checked against the destination type before changing a register.
+Evaluation results retain their temporary bytecode owner and registered
+root, including nested string-literal storage inside a newly assigned
+record. Declaration injection, indirect specialized callbacks, and generic
+arithmetic helpers without recoverable adapters are rejected explicitly.
+Checked portable operations report divide/modulo-by-zero, invalid array
+length, bounds, and boxed-type failures as errors; ordinary native tiered
+execution retains its existing trap behavior.
+
+Typed WASM forced collection now scans registered owners without requiring
+a native stack. Live registers, inspector handles, and retained evaluation
+results stay rooted. Historical exported trace sessions also register their
+snapshot buffers, so a simultaneous live collection cannot invalidate a
+retained compatibility trace. Native conservative-stack collection keeps its
+existing API and guard. This closes item 15's forced-collection no-op for the
+new browser adapter; it is not a claim that the legacy specialized heap has
+already completed the roadmap's broader object-model migration.
+
+Five focused adapter regressions cover live nested-frame edits, aggregate
+evaluation/assignment and literal lifetime, recoverable expression failures,
+condition/hit/log/step behavior, and bounded runaway execution without a
+history buffer. The linked-WASM smoke test stops in an imported typed module,
+edits both it and its caller, and verifies the changed result. It also forces
+collection of a discarded large array while retaining paused array/map
+graphs, an inspector reference after termination, and a concurrent historical
+trace. Chromium exercises the same live worker protocol and real reclamation.
+The native Sol suite, 177 jit-free WASM-feature library tests, linked-WASM
+33-fixture typed qualification, Lua fixture checks, manifest validation, and
+opt-in web production build pass.
+
+The canonical WASM now measures 2,071,325 bytes raw / 631,726 bytes with Node's
+default gzip. The production flag remains default-off and the opt-in bundle
+still ships both engines. Bounded typed profiling/timeline still need to
+replace their historical one-shot trace path. Mixed/generic browser projects,
+the final legacy-package removal, and bundle/initialization qualification
+remain required before U12 is complete.

@@ -135,6 +135,8 @@ use crate::types::Type;
 
 mod lua_debug;
 pub use lua_debug::*;
+mod typed_debug;
+pub use typed_debug::*;
 
 // -------------------------------------------------------------------------
 // execute(): one-shot run, non-throwing (mirrors crate/lua-vm's own
