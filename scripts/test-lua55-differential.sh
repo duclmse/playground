@@ -12,9 +12,7 @@
 # refuses to run if that executable is missing rather than silently falling
 # back to whatever `lua` happens to be on PATH.
 #
-# stdout is diffed byte-for-byte after removing Sol's documented top-level
-# return echo (`nil` for ordinary corpus chunks and the explicit marker for
-# generated cases). Exit status is compared only as "did this
+# stdout is diffed byte-for-byte. Exit status is compared only as "did this
 # program fail at all" (both zero, or both nonzero) - Sol's CLI and PUC Lua's
 # `lua` do not share a nonzero-exit-code convention (e.g. panics vs. runtime
 # errors vs. usage errors), so requiring the literal codes to match would be
@@ -42,20 +40,10 @@
 # saved as a permanent fixture under tests/lua55/fuzz-fixtures/ (the L8
 # checklist's "differential fuzz failures become permanent fixtures" rule)
 # and its seed recorded in failure-report.md (a real number, not the fixed
-# corpus's `n/a`). Every generated program ends with a fixed marker return
-# statement (`return "SOL_LUA55_FUZZ_DONE"`) so this script can strip Sol
-# CLI's one intentional, documented divergence from real Lua's CLI - it
-# echoes its script's return value (mirroring `.sol`'s typed `main` contract,
-# see docs/spec/functions-and-modules.md and
-# crate/sol/tests/lua55.rs's `dynamic_lua_code_can_call_a_natively_typed_helper_function`
-# - a deliberate, tested design choice, not a bug) - before diffing; without
-# this every generated case would show a false stdout divergence on that one
-# trailing line. The fixed corpus loop above does not get this treatment: it
-# runs corpus files as-is and this quirk is a pre-existing, separate gap in
-# that comparison outside this task's scope.
+# corpus's `n/a`). Generated programs return normally, as ordinary Lua chunks
+# do; their top-level return values are deliberately not CLI output.
 set -u
 
-FUZZ_MARKER="SOL_LUA55_FUZZ_DONE"
 fuzz_cases=${SOL_LUA55_DIFF_FUZZ_CASES:-0}
 fuzz_seed=${SOL_LUA55_DIFF_FUZZ_SEED:-1}
 
@@ -148,8 +136,6 @@ fuzz_generate_case() {
     fuzz_lcg_range ${#fuzz_blocks[@]}
     "${fuzz_blocks[$fuzz_lcg_last]}"
   done
-  case_source+="return \"$FUZZ_MARKER\"
-"
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -269,7 +255,6 @@ while IFS=$'\034' read -r path status category requires fixture note budget allo
     continue
   fi
   sol_out="$results_dir/$path.sol.stdout"
-  sol_out_compare="$results_dir/$path.sol.stdout.compare"
   sol_err="$results_dir/$path.sol.stderr"
   ref_out="$results_dir/$path.reference.stdout"
   ref_err="$results_dir/$path.reference.stderr"
@@ -282,9 +267,8 @@ while IFS=$'\034' read -r path status category requires fixture note budget allo
   ( cd "$suite_dir" && "$reference_bin" "$path" >"$ref_out" 2>"$ref_err" )
   ref_status=$?
 
-  strip_sol_cli_return_line "$sol_out" "$sol_out_compare" nil
   reasons=()
-  diff -u "$ref_out" "$sol_out_compare" >"$results_dir/$path.stdout.diff" || reasons+=("stdout")
+  diff -u "$ref_out" "$sol_out" >"$results_dir/$path.stdout.diff" || reasons+=("stdout")
 
   sol_failed=1; [[ $sol_status -eq 0 ]] && sol_failed=0
   ref_failed=1; [[ $ref_status -eq 0 ]] && ref_failed=0
@@ -344,13 +328,8 @@ if [[ $fuzz_cases -gt 0 ]]; then
     "$reference_bin" "$fuzz_file" >"$ref_out" 2>"$ref_err"
     ref_status=$?
 
-    # Strip Sol CLI's one deliberate, documented divergence from real Lua's
-    # CLI before diffing - see the header comment above `FUZZ_MARKER`.
-    sol_out_compare="$results_dir/$label.sol.stdout.compare"
-    strip_sol_cli_return_line "$sol_out" "$sol_out_compare" "$FUZZ_MARKER"
-
     reasons=()
-    diff -u "$ref_out" "$sol_out_compare" >"$results_dir/$label.stdout.diff" || reasons+=("stdout")
+    diff -u "$ref_out" "$sol_out" >"$results_dir/$label.stdout.diff" || reasons+=("stdout")
 
     sol_failed=1; [[ $sol_status -eq 0 ]] && sol_failed=0
     ref_failed=1; [[ $ref_status -eq 0 ]] && ref_failed=0

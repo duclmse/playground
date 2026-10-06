@@ -615,14 +615,9 @@ previously-unknown crash bugs, which are fixed alongside:
   terminating Lua programs, then runs each through both Sol and the
   reference build and diffs the same three axes (stdout, exit-status,
   stderr-presence) as the fixed-corpus loop. Every generated program ends
-  with `return "SOL_LUA55_FUZZ_DONE"`, a marker stripped from Sol's stdout
-  before diffing — this works around, rather than "fixes", Sol's CLI
-  unconditionally echoing its `main`'s return value (a deliberate, tested,
-  documented behavior — see `docs/spec/functions-and-modules.md` and
-  `dynamic_lua_code_can_call_a_natively_typed_helper_function` in
-  `crates/sol/tests/lua55.rs`; an initial attempt to instead strip this echo
-  from `crates/sol/src/main.rs` itself was caught by the existing test suite
-  and reverted). A diverging case now gets its source copied to
+  with ordinary top-level returns; the differential runner compares their
+  stdout directly because dynamic `.lua` CLI runs now follow Lua and do not
+  echo a chunk return value. A diverging case now gets its source copied to
   `tests/lua55/fuzz-fixtures/` (new, with a README explaining it's expected
   to stay empty) and a real seed recorded in `failure-report.md`. Verified
   against the real reference Lua 5.5.1 build available in this environment

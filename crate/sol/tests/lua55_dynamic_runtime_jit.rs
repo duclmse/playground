@@ -27,9 +27,9 @@ fn forcing_the_promotion_threshold_to_one_triggers_a_promotion_attempt_with_no_b
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    // "42" from the script's own `print`, "nil" from `sol run`'s own
-    // trailing print of the chunk's (absent) return value.
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "42\nnil");
+    // `42` comes from the script's own `print`; `sol run` does not display
+    // the chunk's top-level return value.
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "42");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("[dynjit] promotion requested for 'add_one'"),
@@ -68,7 +68,7 @@ fn a_call_free_numeric_loop_is_promoted_to_native_code_with_no_behavior_change()
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "5050\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "5050");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'loop_sum' promoted to native code"),
@@ -107,7 +107,7 @@ fn table_field_global_and_index_access_is_promoted_to_native_code_with_no_behavi
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "61\n62\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "61\n62");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'touch' promoted to native code"),
@@ -145,7 +145,7 @@ fn table_field_global_and_index_access_survives_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "61\n62\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "61\n62");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'touch' promoted to native code"),
@@ -181,7 +181,7 @@ fn a_function_with_nested_calls_is_promoted_to_native_code_with_no_behavior_chan
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "21\n23\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "21\n23");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'compute' promoted to native code"),
@@ -215,7 +215,7 @@ fn pcall_around_a_call_from_a_promoted_function_behaves_identically() {
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "10\n-1\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "10\n-1");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'safe_call' promoted to native code"),
@@ -249,7 +249,7 @@ fn coroutine_yield_from_a_call_inside_a_promoted_function_behaves_identically() 
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'driver' promoted to native code"),
@@ -283,7 +283,7 @@ fn a_generic_for_loop_is_promoted_to_native_code_with_no_behavior_change() {
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "100\n100\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "100\n100");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'sum_table' promoted to native code"),
@@ -317,7 +317,7 @@ fn a_to_be_closed_variable_in_a_promoted_function_behaves_identically() {
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "2\n4\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "2\n4");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'use_closers' promoted to native code"),
@@ -353,7 +353,7 @@ fn a_function_with_a_captured_upvalue_is_promoted_to_native_code_with_no_behavio
         .output()
         .unwrap();
     assert!(promoted.status.success());
-    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6\nnil");
+    assert_eq!(String::from_utf8_lossy(&promoted.stdout).trim(), "6\n6");
     let stderr = String::from_utf8_lossy(&promoted.stderr);
     assert!(
         stderr.contains("'make_counter' promoted to native code"),
@@ -389,7 +389,7 @@ fn a_function_with_a_captured_upvalue_survives_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "6\n6\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "6\n6");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'make_counter' promoted to native code"),
@@ -432,7 +432,7 @@ fn constant_driven_arithmetic_is_optimized_to_native_code_with_no_behavior_chang
         .output()
         .unwrap();
     assert!(optimized.status.success());
-    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "79\n79\nnil");
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "79\n79");
     let stderr = String::from_utf8_lossy(&optimized.stderr);
     assert!(
         stderr.contains("'compute' promoted to native code"),
@@ -472,7 +472,7 @@ fn constant_driven_arithmetic_survives_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "79\n79\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "79\n79");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'compute' optimized to native code"),
@@ -515,7 +515,7 @@ fn a_hot_while_loop_is_entered_via_osr_mid_activation_with_no_behavior_change() 
         .output()
         .unwrap();
     assert!(osr.status.success());
-    assert_eq!(String::from_utf8_lossy(&osr.stdout).trim(), "2001000\nnil");
+    assert_eq!(String::from_utf8_lossy(&osr.stdout).trim(), "2001000");
     let stderr = String::from_utf8_lossy(&osr.stderr);
     assert!(
         stderr.contains("OSR entry requested for 'loop_sum'"),
@@ -572,7 +572,7 @@ fn a_monomorphic_call_site_is_inlined_to_native_code_with_no_behavior_change() {
         .output()
         .unwrap();
     assert!(optimized.status.success());
-    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n8\nnil");
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n8");
     let stderr = String::from_utf8_lossy(&optimized.stderr);
     assert!(
         stderr.contains("'caller' optimized to native code"),
@@ -611,7 +611,7 @@ fn a_monomorphic_call_site_survives_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n8\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n8");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'caller' optimized to native code"),
@@ -657,7 +657,7 @@ fn a_call_site_that_turns_polymorphic_deopts_the_inlined_guard_correctly() {
         .output()
         .unwrap();
     assert!(optimized.status.success());
-    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n70\nnil");
+    assert_eq!(String::from_utf8_lossy(&optimized.stdout).trim(), "8\n8\n70");
     let stderr = String::from_utf8_lossy(&optimized.stderr);
     assert!(
         stderr.contains("'caller' optimized to native code"),
@@ -695,7 +695,7 @@ fn a_call_site_that_turns_polymorphic_deopts_correctly_under_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n70\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "8\n8\n70");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'caller' optimized to native code"),
@@ -730,7 +730,7 @@ fn a_hot_while_loop_entered_via_osr_survives_gc_stress_mode() {
         .output()
         .unwrap();
     assert!(stressed.status.success());
-    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "2001000\nnil");
+    assert_eq!(String::from_utf8_lossy(&stressed.stdout).trim(), "2001000");
     let stderr = String::from_utf8_lossy(&stressed.stderr);
     assert!(
         stderr.contains("'loop_sum' gained an OSR entry"),

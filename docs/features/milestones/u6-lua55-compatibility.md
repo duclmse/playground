@@ -11,6 +11,13 @@ are **16 pass, 1 pending, 10 host-required, and 7 divergences**. The older
 summary in the historical roadmap is stale; do not use it for a release claim.
 Rows become `pass` only after an unchanged pinned-oracle comparison.
 
+Dynamic `.lua` CLI output now matches the Lua interpreter: a top-level chunk
+return is available to the embedding/runtime caller but is not written to
+stdout. Explicit `print` and `io.write` output is unchanged. The differential
+runner therefore compares stdout directly rather than normalizing a synthetic
+trailing return line. Manifest classifications remain unchanged until the
+pinned reference comparison is rerun.
+
 ## Deliverables
 
 - [~] Complete portable grammar, coercion, `_ENV`, goto/scope, `<close>`,

@@ -44,10 +44,8 @@ for lua_script in "$ROOT"/benchmarks/*.lua; do
     SOL_LUA_ALLOCATION_BUDGET=18446744073709551615 \
     "$sol_bin" run "$lua_script")
   dynamic_file="$work_dir/$name.raw"
-  normalized_file="$work_dir/$name.normalized"
   printf '%s\n' "$dynamic_raw" >"$dynamic_file"
-  strip_sol_cli_return_line "$dynamic_file" "$normalized_file" nil
-  dynamic_output=$(<"$normalized_file")
+  dynamic_output=$(<"$dynamic_file")
   equivalent_number "$lua_output" "$dynamic_output" \
     || die "$name dynamic result differs: Lua='$lua_output', Sol dynamic='$dynamic_output'"
   if [[ -f "$sol_script" ]]; then

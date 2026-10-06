@@ -50,10 +50,9 @@ fn native_lua_features_agree_across_tiers() {
                 file.display(),
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                "true",
-                "{} ({mode})",
+            assert!(
+                out.stdout.is_empty(),
+                "{} ({mode}): unexpected CLI stdout",
                 file.display()
             );
         }
@@ -326,7 +325,29 @@ fn cli_accepts_non_utf8_lua_source_bytes() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"\xff\n");
+    // A Lua script's top-level return values are not CLI output, even when
+    // their bytes are not valid UTF-8.
+    assert_eq!(output.stdout, b"");
+}
+
+#[test]
+fn cli_lua_run_only_writes_program_output_not_top_level_returns() {
+    let path = std::env::temp_dir().join(format!(
+        "sol_lua55_cli_top_level_return_{}.lua",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"print('visible')\nreturn 42\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sol"))
+        .args(["run", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"visible\n");
 }
 
 #[test]
@@ -1432,7 +1453,7 @@ fn aot_supports_the_lua_string_subset() {
 fn cli_accepts_lua_and_sol_sources() {
     let lua = Path::new(FIXTURES).join("native/operators.lua");
     let sol = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension_probe.sol");
-    for (source, expected) in [(lua, "true"), (sol, "42")] {
+    for (source, expected) in [(lua, ""), (sol, "42")] {
         let output = Command::new(env!("CARGO_BIN_EXE_sol"))
             .args(["run", source.to_str().unwrap()])
             .output()
@@ -1447,7 +1468,7 @@ fn cli_accepts_lua_and_sol_sources() {
 }
 
 #[test]
-fn annotation_free_lua_and_sol_use_the_same_generic_runtime_semantics() {
+fn annotation_free_lua_and_sol_do_not_echo_top_level_returns() {
     let directory = std::env::temp_dir();
     let stem = format!("sol_unified_generic_{}", std::process::id());
     let lua = directory.join(format!("{stem}.lua"));
@@ -1469,8 +1490,8 @@ fn annotation_free_lua_and_sol_use_the_same_generic_runtime_semantics() {
 
     assert!(lua_output.status.success());
     assert!(sol_output.status.success());
-    assert_eq!(lua_output.stdout, sol_output.stdout);
-    assert_eq!(String::from_utf8_lossy(&lua_output.stdout).trim(), "2.5");
+    assert!(lua_output.stdout.is_empty());
+    assert!(sol_output.stdout.is_empty());
 }
 
 #[test]
@@ -1499,7 +1520,7 @@ fn annotation_free_lua_is_unchanged_across_type_policies() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "10");
+        assert!(output.stdout.is_empty());
     }
     assert_eq!(off.stdout, infer.stdout);
     assert_eq!(infer.stdout, strict.stdout);
@@ -1534,7 +1555,7 @@ fn legacy_partition_path_remains_available_for_runtime_differential_checks() {
     assert!(unified.status.success());
     assert!(legacy.status.success());
     assert_eq!(unified.stdout, legacy.stdout);
-    assert_eq!(String::from_utf8_lossy(&unified.stdout).trim(), "42");
+    assert!(unified.stdout.is_empty());
 }
 
 #[test]
@@ -1584,7 +1605,7 @@ fn dynamic_lua_code_can_call_a_natively_typed_helper_function() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "55\n0");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "55");
 }
 
 #[test]
@@ -1618,7 +1639,7 @@ fn dynamic_protected_call_catches_a_typed_boundary_error() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "false\tstring\n0"
+        "false\tstring"
     );
 }
 
@@ -1654,7 +1675,7 @@ fn typed_main_calls_a_dynamic_function_through_the_unified_dispatcher() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "41\n42");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "41");
 }
 
 #[test]
@@ -1690,7 +1711,7 @@ fn typed_to_dynamic_tail_call_keeps_the_generic_frame_depth_bounded() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "7");
+    assert!(output.stdout.is_empty());
 }
 
 /// A dynamic-only function that's never called from `main` (or anything

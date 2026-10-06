@@ -777,15 +777,9 @@ while proving the typed path retains its defining advantage.
       table indexing, multi-return, conditionals, `while` loops) into a
       self-contained, always-terminating program, runs it through both Sol
       and the reference build directly (no manifest entry needed), and diffs
-      the same three axes as the corpus loop. Sol's CLI unconditionally
-      echoes its synthesized `main`'s return value after a run's stdout (see
-      `docs/spec/functions-and-modules.md` and
-      `dynamic_lua_code_can_call_a_natively_typed_helper_function` in
-      `crates/sol/tests/lua55.rs` - this is deliberate and tested, not a bug,
-      and must not be "fixed"), which real Lua's CLI never does; every
-      generated case ends with `return "SOL_LUA55_FUZZ_DONE"` so that one
-      known, marker-tagged line can be stripped from Sol's stdout before
-      diffing, rather than working around it by weakening the comparison. A
+      the same three axes as the corpus loop. Dynamic `.lua` runs now follow
+      Lua's CLI contract: top-level chunk return values are not stdout, while
+      explicit `print`/`io.write` output is retained. A
       diverging case's source is copied to `tests/lua55/fuzz-fixtures/` as a
       permanent fixture and given a real `seed:` value in `failure-report.md`
       (previously always `n/a`). Verified with the real reference Lua 5.5.1

@@ -4,16 +4,16 @@ use std::process::Command;
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/inference");
 
 #[test]
-fn u4_inference_fixtures_elide_the_expected_dynamic_checks_without_changing_results() {
+fn u4_inference_fixtures_elide_the_expected_dynamic_checks_without_cli_return_echoes() {
     let cases = [
-        ("literal.lua", "42", "operator Add"),
-        ("dominated_type_test.lua", "3", "dominated type test"),
-        ("loop_index.lua", "10", "numeric-for index"),
-        ("local_function.lua", "42", "local function signature"),
-        ("table_shape.lua", "42", "field answer"),
+        ("literal.lua", "operator Add"),
+        ("dominated_type_test.lua", "dominated type test"),
+        ("loop_index.lua", "numeric-for index"),
+        ("local_function.lua", "local function signature"),
+        ("table_shape.lua", "field answer"),
     ];
 
-    for (fixture, expected, proof) in cases {
+    for (fixture, proof) in cases {
         let path = Path::new(FIXTURES).join(fixture);
         let output = Command::new(env!("CARGO_BIN_EXE_sol"))
             .args(["run", "--type-policy", "infer", "--explain-types"])
@@ -25,7 +25,7 @@ fn u4_inference_fixtures_elide_the_expected_dynamic_checks_without_changing_resu
             "{fixture}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        assert!(output.stdout.is_empty(), "{fixture}: unexpected CLI stdout");
         let report = String::from_utf8_lossy(&output.stderr);
         assert!(
             report.contains(proof),

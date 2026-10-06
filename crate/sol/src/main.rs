@@ -594,12 +594,26 @@ enum PartitionOutcome {
 /// back to the interpreter wholesale (M13 L4's per-function typed/dynamic
 /// split - see `docs/features/lua-compatibility.md`).
 fn write_lua_run(result: sol::lua_runtime::LuaRun) -> Result<(), String> {
-    let mut stdout = io::stdout().lock();
-    stdout
+    // A Lua chunk's return values are available to an embedding caller but
+    // are not CLI output. `lua script.lua` writes only bytes explicitly
+    // emitted by the program (print/io.write); unlike typed `.sol`'s
+    // `main()` convention, it never echoes the top-level return value.
+    io::stdout()
+        .lock()
         .write_all(&result.output)
-        .and_then(|()| stdout.write_all(&result.value.display_bytes()))
-        .and_then(|()| stdout.write_all(b"\n"))
         .map_err(|error| format!("failed to write Lua output: {error}"))
+}
+
+fn write_mixed_run(result: sol::lua_runtime::LuaRun, render_main_result: bool) -> Result<(), String> {
+    let return_value = render_main_result.then(|| result.value.display_bytes());
+    write_lua_run(result)?;
+    if let Some(value) = return_value {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&value)
+            .and_then(|()| stdout.write_all(b"\n"))
+            .map_err(|error| format!("failed to write Sol main result: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Converts an uncaught `LuaError` to the CLI's plain-string error type,
@@ -661,6 +675,7 @@ fn try_run_mixed_main(
     program: &sol::ast::Program,
     partition: &sol::typeck::LuaPartition,
     dynamic_contracts: &[sol::modules::DynamicModuleContract],
+    render_main_result: bool,
 ) -> Result<bool, String> {
     if legacy_partition_requested()
         || !partition
@@ -818,7 +833,7 @@ fn try_run_mixed_main(
         BridgeScalar::Bool => LuaValue::Bool(raw != 0),
     };
     let output = dynamic.borrow_mut().take_output();
-    write_lua_run(sol::lua_runtime::LuaRun { value, output })?;
+    write_mixed_run(sol::lua_runtime::LuaRun { value, output }, render_main_result)?;
     Ok(true)
 }
 
@@ -851,7 +866,7 @@ fn run_lua_partitioned(
                 Some(cli_chunk_name(path)),
             )
             .map_err(report_lua_error)?;
-            write_lua_run(result)?;
+            write_mixed_run(result, language_config(path).sol_extensions)?;
             return Ok(PartitionOutcome::Done);
         }
         Err(error) => return Err(render_source_error(path, source, error)),
@@ -861,7 +876,7 @@ fn run_lua_partitioned(
         .mixed
         .iter()
         .any(|function| function.name == "main");
-    if try_run_mixed_main(program, &partition, dynamic_contracts)? {
+    if try_run_mixed_main(program, &partition, dynamic_contracts, language_config(path).sol_extensions)? {
         return Ok(PartitionOutcome::Done);
     }
     if mixed_main && unified_mixed_required() {
@@ -959,7 +974,7 @@ fn run_lua_partitioned(
         Some(cli_chunk_name(path)),
     )
     .map_err(report_lua_error)?;
-    write_lua_run(result)?;
+    write_mixed_run(result, language_config(path).sol_extensions)?;
     Ok(PartitionOutcome::Done)
 }
 
