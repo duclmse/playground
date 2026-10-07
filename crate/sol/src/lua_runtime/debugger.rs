@@ -20,6 +20,7 @@ pub struct LuaDebugSession {
     resume_parents: Vec<ResumeParent>,
     incoming: Option<Vec<LuaValue>>,
     root_charged: bool,
+    returned_values: Vec<LuaValue>,
 }
 
 struct ResumeParent {
@@ -69,6 +70,7 @@ impl LuaDebugSession {
             resume_parents: Vec::new(),
             incoming: None,
             root_charged: true,
+            returned_values: Vec::new(),
         })
     }
 
@@ -161,7 +163,11 @@ impl LuaDebugSession {
             break outcome;
         };
         self.status = match outcome {
-            DriveOutcome::Returned(_) => DebugStatus::Returned,
+            DriveOutcome::Returned(values) => {
+                for value in &values { self.retain(value); }
+                self.returned_values = values;
+                DebugStatus::Returned
+            }
             DriveOutcome::Yielded(_) => {
                 DebugStatus::Raised("attempt to yield outside a coroutine".into())
             }
@@ -178,6 +184,13 @@ impl LuaDebugSession {
             self.root_charged = false;
         }
         self.status.clone()
+    }
+
+    /// Rooted terminal results for a semantic scheduler. Chunk returns are
+    /// deliberately separate from captured output, and unavailable while
+    /// paused or failed. Handles remain owned by this session.
+    pub fn returned_values(&self) -> Option<&[LuaValue]> {
+        (self.status == DebugStatus::Returned).then_some(self.returned_values.as_slice())
     }
 
     fn deliver_resume_error(&mut self, error: LuaError, wrapped: bool) -> Option<DriveOutcome> {
@@ -847,6 +860,25 @@ fn collect_lines(proto: &crate::lua_bytecode::Proto, lines: &mut HashSet<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_semantic_results_are_separate_from_output_and_survive_collection() {
+        let mut session = LuaDebugSession::launch(
+            b"local t={answer=42}; return t, 'result', nil", "callee.lua").unwrap();
+        assert!(session.returned_values().is_none());
+        assert_eq!(session.continue_burst(1000), DebugStatus::Returned);
+        assert!(session.take_output().is_empty());
+        session.force_gc();
+        let values = session.returned_values().unwrap();
+        assert_eq!(values.len(), 3);
+        assert!(session.table_entries(&values[0]).iter().any(|(name, value)| name.contains("answer") && *value == LuaValue::Integer(42)));
+        assert!(matches!(&values[1], LuaValue::String(bytes) if bytes.as_bytes() == b"result"));
+        assert_eq!(values[2], LuaValue::Nil);
+        assert_eq!(session.continue_burst(1000), DebugStatus::Returned);
+        assert_eq!(session.returned_values().unwrap().len(), 3);
+        let mut failed = LuaDebugSession::launch(b"error('expected')", "failed.lua").unwrap();
+        assert!(matches!(failed.continue_burst(1000), DebugStatus::Raised(_)));
+        assert!(failed.returned_values().is_none());
+    }
     #[test]
     fn generic_sol_extensions_use_live_generic_frames_without_return_echo() {
         let mut session = LuaDebugSession::launch_with_config(

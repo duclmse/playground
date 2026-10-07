@@ -11,6 +11,22 @@ pub enum Stop {
     Raised(String),
 }
 
+/// An explicit cross-tier boundary. The scheduler owns conversion and the
+/// callee's execution; no synchronous semantic callback is invoked here.
+/// Arguments stay rooted even when a proper tail call has removed its frame.
+pub struct SemanticCall {
+    pub function: u8,
+    arguments: Vec<u64>,
+    exit_function: u8,
+    _guard: gc::RootGuard,
+}
+
+impl SemanticCall {
+    pub fn arguments(&self) -> &[u64] {
+        &self.arguments
+    }
+}
+
 enum Pending {
     Call(usize),
     Map {
@@ -70,6 +86,7 @@ pub struct Execution<H: Hooks + 'static> {
     terminal: Option<Stop>,
     max_depth: usize,
     next_identity: u64,
+    semantic_call: Option<SemanticCall>,
 }
 
 impl<H: Hooks + 'static> Execution<H> {
@@ -84,6 +101,7 @@ impl<H: Hooks + 'static> Execution<H> {
             terminal: None,
             max_depth: 1000,
             next_identity: 0,
+            semantic_call: None,
         };
         execution.enter(function, args, None)?;
         Ok(execution)
@@ -91,6 +109,25 @@ impl<H: Hooks + 'static> Execution<H> {
 
     pub fn frames(&self) -> &[Frame] {
         &self.frames
+    }
+
+    pub fn semantic_call(&self) -> Option<&SemanticCall> {
+        self.semantic_call.as_ref()
+    }
+
+    /// Finish exactly one parked cross-tier call. A missing/already-consumed
+    /// continuation is rejected without changing the live execution.
+    pub fn finish_semantic_call(&mut self, result: Result<u64, String>) -> Result<(), String> {
+        let request = self.semantic_call.take()
+            .ok_or_else(|| "no semantic call is awaiting a result".to_string())?;
+        match result {
+            Ok(value) => {
+                self.runtime.hooks.on_call_exit(request.exit_function, value);
+                self.deliver(value);
+            }
+            Err(error) => { self.fail(error); }
+        }
+        Ok(())
     }
 
     /// Mutate a paused frame's real register file, never a replay snapshot.
@@ -171,9 +208,11 @@ impl<H: Hooks + 'static> Execution<H> {
                 self.deliver(value);
             }
             Slot::Semantic(_) => {
-                return Err(
-                    "live specialized execution requires a resumable semantic adapter".into(),
-                )
+                let arguments = args.to_vec();
+                let guard = gc::RootGuard::new(arguments.as_ptr(), arguments.len());
+                self.semantic_call = Some(SemanticCall {
+                    function, arguments, exit_function: tail_exit.unwrap_or(function), _guard: guard,
+                });
             }
         }
         Ok(())
@@ -213,6 +252,7 @@ impl<H: Hooks + 'static> Execution<H> {
     }
 
     fn fail(&mut self, error: String) -> Stop {
+        self.semantic_call = None;
         for frame in &mut self.frames {
             frame.header.state = sol_core::FrameState::Failed;
             self.runtime.hooks.on_frame_state(&frame.header);
@@ -224,12 +264,17 @@ impl<H: Hooks + 'static> Execution<H> {
     }
 
     /// Execute at most `limit` opcode/continuation operations. No Rust call
-    /// stack or instruction-history buffer survives a pause.
+    /// stack or instruction-history buffer survives a pause. When
+    /// `semantic_call()` is present, `Paused` waits for the external
+    /// scheduler's `finish_semantic_call` instead of dispatching more code.
     pub fn resume(&mut self, limit: u64) -> Stop {
         if let Some(stop) = &self.terminal {
             return stop.clone();
         }
         for _ in 0..limit {
+            if self.semantic_call.is_some() {
+                break;
+            }
             let remaining = self.runtime.instructions_remaining.get();
             if remaining == 0 {
                 return self.fail("instruction budget exceeded".into());
@@ -356,6 +401,74 @@ mod tests {
     fn engine(source: &str, budget: u64) -> Engine {
         let (program, _) = crate::compile(source).unwrap();
         Engine::new_with_budget(program, (), budget).unwrap()
+    }
+
+    fn semantic_execution(source: &str, budget: u64) -> Execution<()> {
+        let (program, _) = crate::compile(source).unwrap();
+        let ids = crate::bccompile::function_index(&program).unwrap();
+        assert!(program.externs.is_empty());
+        let slots = program.functions.iter().map(|function| {
+            if function.name == "external" {
+                Slot::Semantic(Rc::new(|_| panic!("a live boundary must not invoke a blocking callback")))
+            } else {
+                Slot::Bytecode(Rc::new(crate::bccompile::compile_function(function, &ids).unwrap()))
+            }
+        }).collect();
+        let runtime = Runtime::new(slots, u32::MAX, |_| None, u32::MAX, |_, _| None,
+            crate::interp::SpeculativeConfig { candidates: std::collections::HashMap::new(), threshold: u32::MAX, promote: Box::new(|_| None) }, (), budget);
+        Execution::new(Rc::new(runtime), ids["main"], &[]).unwrap()
+    }
+
+    #[test]
+    fn semantic_calls_park_real_callers_without_invoking_callbacks_or_spending_wait_budget() {
+        let mut live = semantic_execution("function external(x:i64):i64 return x end\nfunction main():i64 local n:i64=40 local v=external(n) return v+n end", 100);
+        assert_eq!(live.resume(100), Stop::Paused);
+        let request = live.semantic_call().unwrap();
+        assert_eq!(request.arguments(), &[40]);
+        assert_eq!(live.frames().len(), 1);
+        assert!(live.frames()[0].is_waiting_for_result());
+        let remaining = live.runtime.instructions_remaining.get();
+        for _ in 0..10 { assert_eq!(live.resume(1_000_000), Stop::Paused); }
+        assert_eq!(live.runtime.instructions_remaining.get(), remaining);
+        let n = live.frames()[0].resolve_local("n").unwrap();
+        live.set_register(0, n, 1).unwrap();
+        live.finish_semantic_call(Ok(43)).unwrap();
+        assert!(live.semantic_call().is_none());
+        assert!(live.finish_semantic_call(Ok(99)).is_err());
+        assert_eq!(live.resume(100), Stop::Returned(44));
+    }
+
+    #[test]
+    fn semantic_tail_calls_keep_owned_arguments_after_removing_the_caller() {
+        let mut live = semantic_execution("function external(x:i64):i64 return x end function main():i64 return external(42) end", 100);
+        assert_eq!(live.resume(100), Stop::Paused);
+        assert!(live.frames().is_empty());
+        assert_eq!(live.semantic_call().unwrap().arguments(), &[42]);
+        assert_eq!(live.resume(100), Stop::Paused);
+        live.finish_semantic_call(Ok(44)).unwrap();
+        assert_eq!(live.resume(0), Stop::Returned(44));
+    }
+
+    #[test]
+    fn semantic_failures_clear_parked_frames_and_remain_terminal() {
+        let mut live = semantic_execution("function external(x:i64):i64 return x end function main():i64 return external(40)+2 end", 100);
+        assert_eq!(live.resume(100), Stop::Paused);
+        live.finish_semantic_call(Err("generic failure".into())).unwrap();
+        assert!(live.frames().is_empty());
+        assert!(live.semantic_call().is_none());
+        assert_eq!(live.resume(100), Stop::Raised("generic failure".into()));
+        assert!(live.finish_semantic_call(Ok(42)).is_err());
+    }
+
+    #[test]
+    fn mapped_semantic_callbacks_resume_their_existing_array_continuation() {
+        let mut live = semantic_execution("function external(x:i64):i64 return x end function main():i64 local xs:Array<i64> = {10,20,30} local ys=map(xs,external) return ys[0]+ys[1]+ys[2] end", 1000);
+        for expected in [10,20,30] {
+            assert_eq!(live.resume(1000), Stop::Paused);
+            assert_eq!(live.semantic_call().unwrap().arguments(), &[expected]);
+            live.finish_semantic_call(Ok(expected+1)).unwrap();
+        }
+        assert_eq!(live.resume(1000), Stop::Returned(63));
     }
 
     #[test]

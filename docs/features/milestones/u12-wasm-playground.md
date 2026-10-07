@@ -1610,3 +1610,35 @@ crossing mandatory typed/generic call boundaries still need a shared bridge
 adapter. Production still imports the old package and initializes both
 engines under the default-off flag. That bridge, final legacy removal, and
 bundle/initialization qualification remain U12 completion requirements.
+
+## Work item 19 — parked semantic-call continuations
+
+The specialized live driver can now park a semantic-slot call as an explicit
+request instead of rejecting it or invoking its blocking callback. The
+request owns rooted raw arguments, including after a proper tail call has
+removed the caller. The scheduler can inspect the callee ID and arguments,
+then complete exactly one continuation with a value or error. Caller frames
+and map continuations stay live; waiting does not consume more bytecode
+budget, and duplicate completion is rejected without changing execution.
+
+The generic live driver also retains its terminal return values as rooted
+results available to a semantic scheduler. They remain distinct from
+captured stdout, preserve multiple returns and nil, and survive collection
+after frames have been removed. They are not implicitly displayed as
+playground output.
+
+Four specialized regressions cover live caller mutation, proper tail calls,
+error cleanup, and mapped callbacks while ensuring blocking callbacks are
+never invoked. A generic regression covers terminal table/string/nil results,
+forced collection, and failed-result isolation. All 193 jit-free WASM-feature
+library tests pass, as do the native live-driver tests. This is continuation
+infrastructure, not yet the mixed browser bridge: checked cross-tier value
+conversion, shared execution budgets/depth, module initialization/state,
+reentrant scheduling, and combined debugger/analysis frames still need an
+adapter before production routing can change.
+
+The complete native Sol suite and regenerated canonical WASM pass their
+regression checks, including linked-module smoke qualification, Chromium
+worker/DOM debugging, and the opt-in production web build. It measures 2,144,737 bytes raw /
+653,577 bytes with Node's default gzip; these remain observations, not proof
+that the final bundle/initialization exit targets have been met.
