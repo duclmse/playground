@@ -24,7 +24,7 @@ findings to the relevant feature document and corpus manifest.
 | U9 | Planned | [Baseline dynamic JIT](u9-baseline-jit.md) |
 | U10 | Planned | [Optimizing JIT, OSR, and deoptimization](u10-optimizing-jit-osr.md) |
 | U11 | Planned | [AOT and annotation-driven performance](u11-aot-typed-performance.md) |
-| U12 | In progress | [Canonical WASM playground](u12-wasm-playground.md) |
+| U12 | Complete (portable profile) | [Canonical WASM playground](u12-wasm-playground.md) |
 | U13 | Planned | [Semantic LSP and VS Code client](u13-lsp-vscode.md) |
 | U14 | Planned | [Integrated release qualification](u14-release-qualification.md) |
 

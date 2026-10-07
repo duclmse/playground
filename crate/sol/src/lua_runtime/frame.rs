@@ -133,6 +133,7 @@ pub(super) enum BinaryResolution {
 #[derive(Clone)]
 pub(super) struct LuaFrame {
     pub(super) debug_identity: u64,
+    pub(super) debug_profile_seen: bool,
     pub(super) header: FrameHeader,
     /// The exact closure invoked for this activation. Multiple closures can
     /// share a prototype, so `debug.getinfo(level, "f")` cannot reconstruct

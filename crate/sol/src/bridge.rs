@@ -157,6 +157,8 @@ pub struct MixedExecution {
     pub program: TProgram,
     pub engine: Engine,
     pub layers: Vec<Layer>,
+    /// Owning resume-chain thread for each parked execution layer.
+    pub layer_threads: Vec<u32>,
     pub names: HashMap<u8, String>,
     signatures: HashMap<u8, (Vec<Type>, Type)>,
     pub remaining: u64,
@@ -214,8 +216,32 @@ impl MixedExecution {
             }
         }
         crate::aliases::expand(&mut ast)?;
-        crate::closures::lower(&mut ast)?;
+        // Lower specialized local functions without attempting to lambda-lift
+        // generic coroutine bodies. Only the shared type checker's explicit
+        // dynamic-body classification may accept an unlowered function.
+        let mut lowered = Vec::new();
+        let mut lower_errors = Vec::new();
+        for function in std::mem::take(&mut ast.functions) {
+            let mut candidate = ast.clone();
+            candidate.functions = vec![function.clone()];
+            match crate::closures::lower(&mut candidate) {
+                Ok(()) => lowered.extend(candidate.functions),
+                Err(error) => {
+                    if !crate::closures::requires_generic_anonymous_environment(&error) {
+                        return Err(error);
+                    }
+                    lower_errors.push((function.name.clone(), error));
+                    lowered.push(function);
+                }
+            }
+        }
+        ast.functions = lowered;
         let partition = crate::typeck::check_partitioned(&ast)?;
+        for (name, error) in lower_errors {
+            if !partition.interpreted.contains(&name) {
+                return Err(error);
+            }
+        }
         let mut program = partition.native;
         program.functions.extend(partition.mixed);
         program.functions.sort_by(|a, b| a.name.cmp(&b.name));
@@ -369,6 +395,7 @@ impl MixedExecution {
                 program,
                 engine,
                 layers,
+                layer_threads: vec![0],
                 names,
                 signatures,
                 remaining: 10_000_000,
@@ -393,7 +420,7 @@ impl MixedExecution {
         matches!(self.layers.last(), Some(Layer::Typed(_)))
     }
     pub fn position(&self, lua: &LuaDebugSession) -> Option<(String, String, u32, usize)> {
-        let depth = self.typed_depth() + lua.frames().len();
+        let depth = self.typed_depth() + lua.total_frame_depth();
         match self.layers.last()? {
             Layer::Typed(exec) => {
                 let f = exec.frames().last()?;
@@ -458,7 +485,10 @@ impl MixedExecution {
                     })
                 })();
                 match call {
-                    Ok(layer) => self.layers.push(layer),
+                    Ok(layer) => {
+                        self.layer_threads.push(lua.active_thread());
+                        self.layers.push(layer);
+                    }
                     Err(error) => {
                         exec.finish_semantic_call(Err(error)).unwrap();
                     }
@@ -504,7 +534,10 @@ impl MixedExecution {
                     self.engine.start_live(&self.names[&id], &raw)
                 })();
                 match call {
-                    Ok(exec) => self.layers.push(Layer::Typed(exec)),
+                    Ok(exec) => {
+                        self.layer_threads.push(lua.active_thread());
+                        self.layers.push(Layer::Typed(exec));
+                    }
                     Err(error) => lua.finish_semantic_request(Err(error)),
                 }
                 return;
@@ -515,6 +548,7 @@ impl MixedExecution {
                 }
                 _ => {
                     self.remaining = lua.bridge_budget();
+                    self.layer_threads.pop();
                     let Layer::Generic { result, .. } = self.layers.pop().unwrap() else {
                         unreachable!()
                     };
@@ -540,6 +574,7 @@ impl MixedExecution {
     }
     fn complete_typed(&mut self, lua: &mut LuaDebugSession, result: Result<u64, String>) {
         self.layers.pop();
+        self.layer_threads.pop();
         if self.layers.is_empty() {
             let ty = self
                 .program

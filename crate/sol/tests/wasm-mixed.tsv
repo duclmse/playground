@@ -7,3 +7,7 @@ project/shadow.sol	project/shadow.sol,project/scope.sol	313332
 project/initialize.sol	project/initialize.sol,project/init.sol	696e69740a3834
 project/float.sol	project/float.sol,project/float_helper.lua	34302e300a3432
 project/string.sol	project/string.sol,project/helper.lua	33390a6f6b
+project/coroutine.sol	project/coroutine.sol,project/runner.lua	34300a34320a34320934340a3435
+project/nested_coroutine.sol	project/nested_coroutine.sol	747275650934310a370a7472756509747275650934320a6465616409646561640a
+project/coroutine_errors.sol	project/coroutine_errors.sol	66616c73650a636c6f7365640a66616c736509646561640a66616c73650a747275650934310a
+project/coroutine_yield_boundary.sol	project/coroutine_yield_boundary.sol	66616c736509646561640a66616c73650a

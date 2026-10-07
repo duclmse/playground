@@ -36,6 +36,9 @@ const server=createServer((req,res)=>{
 await new Promise((resolve,reject)=>{server.once("error",reject);server.listen(0,"127.0.0.1",resolve);});
 const origin=`http://127.0.0.1:${server.address().port}`;
 const initSamples=[];let last;let browserVersion;
+const mixedFixture=(name)=>readFileSync(resolve(app,"../../crate/sol/tests/fixtures/wasm-mixed/project",name),"utf8");
+const coroutineFiles={"main.sol":mixedFixture("coroutine.sol"),"runner.lua":mixedFixture("runner.lua")};
+const nestedCoroutine=mixedFixture("nested_coroutine.sol");
 try{
   // Each initialization sample excludes browser startup but uses a fresh
   // browser process, avoiding a shared compiled-WASM/HTTP worker cache.
@@ -43,7 +46,7 @@ try{
     const browser=await chromium.launch({args:["--no-sandbox"]});
     try{
       browserVersion=browser.version();const page=await browser.newPage();await page.goto(origin+"/qualify");
-      const result=await page.evaluate(async({workerPath,lastTrial})=>{
+      const result=await page.evaluate(async({workerPath,lastTrial,coroutineFiles,nestedCoroutine})=>{
         const start=performance.now();const worker=new Worker(workerPath,{type:"module"});
         let pending;let id=1;
         const ready=new Promise((resolve,reject)=>{
@@ -79,13 +82,40 @@ try{
           check(!reentrant.error&&reentrant.output==="1\n0\n43","reentrant mixed execution");
           const caught=await rpc({type:"run",entry:"main.sol",files:{"main.sol":"function add(n:i64):i64 return n+2 end\nprint(add(40)); print(pcall(add,'bad'))"}});
           check(!caught.error&&caught.output.startsWith("42\nfalse\t"),"generic protected call catches checked bridge error");
+          const coRun=await rpc({type:"run",entry:"main.sol",files:coroutineFiles});
+          check(!coRun.error&&coRun.output==="40\n42\n42\t44\n45","mixed coroutine run/yield/resume");
+          await rpc({type:"debugLaunch",entry:"main.sol",files:coroutineFiles});
+          const coBp=(await rpc({type:"debugSetBreakpoint",sourceId:"runner.lua",line:3})).breakpoint;
+          await rpc({type:"debugSetBreakpointCondition",breakpointId:coBp.id,condition:"value == 41"});
+          check((await rpc({type:"debugContinueBurst",maxInstructions:1000})).stop?.reason==="breakpoint","child mixed breakpoint condition");
+          const coThreads=await rpc({type:"debugGetThreads"});
+          check(coThreads.threads.map((t)=>t.status).join(",")==="normal,running","mixed resume chain statuses");
+          for(const [threadId,length]of [[0,2],[1,3]])check((await rpc({type:"debugGetStackTrace",threadId})).frames.length===length,"mixed thread frame isolation");
+          for(const [threadId,frameIndex,name,valueExpr]of [[0,1,"base","2"],[1,0,"value","42"]])check((await rpc({type:"debugSetVariable",threadId,frameIndex,name,valueExpr})).result.ok,"mixed coroutine live edits");
+          await rpc({type:"debugForceGc"});
+          check((await rpc({type:"profile",entry:"main.sol",files:coroutineFiles})).stats.some((s)=>s.functionId==="typed"&&s.calls===2),"mixed coroutine profiling");
+          check((await rpc({type:"debugGetUpvalues",threadId:1,frameIndex:2})).variables.some((v)=>v.name==="keep"&&v.expandable),"mixed child upvalue roots");
+          check(!(await rpc({type:"recordTimeline",entry:"main.sol",files:coroutineFiles,maxEvents:2})).timeline.error,"mixed coroutine timeline");
+          check((await rpc({type:"debugEvaluate",threadId:1,frameIndex:0,expression:"value"})).result.display==="42","analysis retains child edit");
+          await rpc({type:"debugRemoveBreakpoint",breakpointId:coBp.id});
+          check((await rpc({type:"debugContinueBurst",maxInstructions:1000})).stop?.reason==="terminated","mixed coroutine resumed to completion");
+          check((await rpc({type:"debugTakeOutput"})).text==="40\n43\n43\t45\n47","mixed coroutine edited output");
+          await rpc({type:"debugLaunch",entry:"main.sol",files:{"main.sol":nestedCoroutine}});
+          const nestedBp=(await rpc({type:"debugSetBreakpoint",sourceId:"main.sol",line:3})).breakpoint;
+          check((await rpc({type:"debugContinueBurst",maxInstructions:1000})).stop?.reason==="breakpoint","nested typed coroutine stop");
+          check((await rpc({type:"debugGetThreads"})).threads.map((t)=>t.status).join(",")==="normal,normal,running","three-level mixed resume chain");
+          await rpc({type:"debugRemoveBreakpoint",breakpointId:nestedBp.id});
+          for(const length of [3,2]){
+            check((await rpc({type:"debugStepOut"})).stop.reason==="step","step out across mixed coroutine boundary");
+            check((await rpc({type:"debugGetThreads"})).threads.length===length,"step out returns to correct thread");
+          }
           await rpc({type:"debugLaunch",entry:"main.sol",files:{"main.sol":"function typed(n:i64):i64 return n+1 end\nwhile true do typed(40) end"}});
           const bursts=[];for(let sample=0;sample<25;sample++){
             const start=performance.now();const burst=await rpc({type:"debugContinueBurst",maxInstructions:1000});check(!burst.stopped,"bounded runaway burst");bursts.push(performance.now()-start);
           }
           return{initMs,warmRuns,bursts};
         }finally{worker.terminate();}
-      },{workerPath:"/assets/"+workers[0],lastTrial:trial===9});
+      },{workerPath:"/assets/"+workers[0],lastTrial:trial===9,coroutineFiles,nestedCoroutine});
       initSamples.push(result.initMs);if(trial===9)last=result;
     }finally{await browser.close();}
   }

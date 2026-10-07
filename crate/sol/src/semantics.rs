@@ -11,7 +11,7 @@ pub fn requires_specialized_execution(program: &crate::ast::Program) -> bool {
         || program.functions.iter().any(function_requires_types)
 }
 
-fn function_requires_types(function: &crate::ast::Function) -> bool {
+pub(crate) fn function_requires_types(function: &crate::ast::Function) -> bool {
     function.return_type.is_some()
         || function
             .params

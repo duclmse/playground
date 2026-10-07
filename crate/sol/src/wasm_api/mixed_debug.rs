@@ -63,11 +63,20 @@ impl WasmMixedDebugSession {
             finalized: false,
         })
     }
-    fn routes(&self) -> Vec<FrameLocation> {
+    fn routes(&mut self, thread: u32) -> Vec<FrameLocation> {
         let mut routes = Vec::new();
-        let total = self.lua.inner.frames().len();
+        let Ok(total) = self
+            .lua
+            .inner
+            .with_thread(thread, |inner| Ok(inner.frames().len()))
+        else {
+            return routes;
+        };
         let mut end = total;
         for (index, layer) in self.core.layers.iter().enumerate().rev() {
+            if self.core.layer_threads[index] != thread {
+                continue;
+            }
             match layer {
                 Layer::Typed(exec) => routes.extend(
                     (0..exec.frames().len()).map(|frame| FrameLocation::Typed(index, frame as u32)),
@@ -81,15 +90,11 @@ impl WasmMixedDebugSession {
                 }
             }
         }
+        routes.extend((total - end..total).map(|frame| FrameLocation::Generic(frame as u32)));
         routes
     }
     fn active_lua_thread(&self) -> u32 {
-        self.lua
-            .inner
-            .threads()
-            .last()
-            .map(|(id, _)| *id)
-            .unwrap_or(0)
+        self.lua.inner.active_thread()
     }
     fn with_typed<T>(
         &mut self,
@@ -218,7 +223,7 @@ impl WasmMixedDebugSession {
                         let condition = bp.condition.clone();
                         let log = bp.log.clone();
                         if let Some(condition) = condition {
-                            let value = self.evaluate(0, &condition, 0);
+                            let value = self.evaluate(self.active_lua_thread(), &condition, 0);
                             if !value.ok {
                                 return self.stop("exception", Some(value.display));
                             }
@@ -234,7 +239,7 @@ impl WasmMixedDebugSession {
                                     rest = after;
                                     break;
                                 };
-                                let value = self.evaluate(0, expr, 0);
+                                let value = self.evaluate(self.active_lua_thread(), expr, 0);
                                 self.output.push_str(&value.display);
                                 rest = next;
                             }
@@ -262,29 +267,44 @@ impl WasmMixedDebugSession {
         let mut events = Vec::new();
         let mut truncated = false;
         while session.core.terminal.is_none() {
-            let lua_ids = session.lua.inner.frame_identities();
-            let lua_frames = session.lua.inner.frames();
             let mut stack = Vec::new();
-            for route in session.routes().into_iter().rev() {
-                match route {
-                    FrameLocation::Typed(layer, frame) => {
-                        let Layer::Typed(exec) = &session.core.layers[layer] else {
-                            unreachable!()
-                        };
-                        let f = &exec.frames()[exec.frames().len() - 1 - frame as usize];
-                        stack.push((
-                            format!("t:{layer}:{}", f.identity),
-                            f.bytecode.metadata.name.clone(),
-                        ));
-                    }
-                    FrameLocation::Generic(frame) => {
-                        let f = &lua_frames[frame as usize];
-                        stack.push((format!("g:{}", lua_ids[frame as usize]), f.0.clone()));
+            for thread in 0..=session.active_lua_thread() {
+                let calls = session
+                    .lua
+                    .inner
+                    .with_thread(thread, |inner| Ok(inner.take_profile_calls()))
+                    .map_err(|error| error.to_string())?;
+                for name in calls {
+                    stats.entry(name).or_default().0 += 1;
+                }
+                let (lua_ids, lua_frames) = session
+                    .lua
+                    .inner
+                    .with_thread(thread, |inner| {
+                        Ok((inner.frame_identities(), inner.frames()))
+                    })
+                    .map_err(|error| error.to_string())?;
+                for route in session.routes(thread).into_iter().rev() {
+                    match route {
+                        FrameLocation::Typed(layer, frame) => {
+                            let Layer::Typed(exec) = &session.core.layers[layer] else {
+                                unreachable!()
+                            };
+                            let f = &exec.frames()[exec.frames().len() - 1 - frame as usize];
+                            stack.push((
+                                format!("t:{layer}:{}", f.identity),
+                                f.bytecode.metadata.name.clone(),
+                            ));
+                        }
+                        FrameLocation::Generic(frame) => {
+                            let f = &lua_frames[frame as usize];
+                            stack.push((format!("g:{}", lua_ids[frame as usize]), f.0.clone()));
+                        }
                     }
                 }
             }
             for (id, name) in &stack {
-                if !previous.contains(id) {
+                if id.starts_with("t:") && !previous.contains(id) {
                     stats.entry(name.clone()).or_default().0 += 1;
                 }
             }
@@ -476,22 +496,23 @@ impl WasmMixedDebugSession {
         }
     }
     pub fn get_threads(&self) -> Vec<WasmThreadInfo> {
-        vec![WasmThreadInfo {
-            id: 0,
-            status: if self.core.terminal.is_some() {
-                "dead"
-            } else {
-                "suspended"
-            }
-            .into(),
-        }]
+        self.lua
+            .inner
+            .threads()
+            .into_iter()
+            .map(|(id, status)| WasmThreadInfo {
+                id,
+                status: if self.core.terminal.is_some() {
+                    "dead".into()
+                } else {
+                    status
+                },
+            })
+            .collect()
     }
     pub fn get_stack_trace(&mut self, thread: u32) -> Vec<LuaDebugFrame> {
-        if thread != 0 {
-            return Vec::new();
-        }
-        let lua_frames = self.lua.get_stack_trace(self.active_lua_thread());
-        self.routes()
+        let lua_frames = self.lua.get_stack_trace(thread);
+        self.routes(thread)
             .into_iter()
             .enumerate()
             .map(|(index, route)| {
@@ -515,27 +536,17 @@ impl WasmMixedDebugSession {
             .collect()
     }
     pub fn get_locals(&mut self, thread: u32, frame: u32) -> Vec<LuaDebugVariable> {
-        if thread != 0 {
-            return Vec::new();
-        }
-        match self.routes().get(frame as usize).copied() {
+        match self.routes(thread).get(frame as usize).copied() {
             Some(FrameLocation::Typed(layer, frame)) => {
                 Self::tag(self.with_typed(layer, |view| view.get_locals(0, frame)))
             }
-            Some(FrameLocation::Generic(frame)) => {
-                self.lua.get_locals(self.active_lua_thread(), frame)
-            }
+            Some(FrameLocation::Generic(frame)) => self.lua.get_locals(thread, frame),
             None => Vec::new(),
         }
     }
     pub fn get_upvalues(&mut self, thread: u32, frame: u32) -> Vec<LuaDebugVariable> {
-        if thread != 0 {
-            return Vec::new();
-        }
-        match self.routes().get(frame as usize).copied() {
-            Some(FrameLocation::Generic(frame)) => {
-                self.lua.get_upvalues(self.active_lua_thread(), frame)
-            }
+        match self.routes(thread).get(frame as usize).copied() {
+            Some(FrameLocation::Generic(frame)) => self.lua.get_upvalues(thread, frame),
             _ => Vec::new(),
         }
     }
@@ -567,20 +578,17 @@ impl WasmMixedDebugSession {
         }
     }
     pub fn evaluate(&mut self, thread: u32, expression: &str, frame: u32) -> WasmEvalResult {
-        if thread != 0 {
+        if thread > self.active_lua_thread() {
             return WasmEvalResult {
                 ok: false,
                 display: "unknown thread".into(),
             };
         }
-        match self.routes().get(frame as usize).copied() {
+        match self.routes(thread).get(frame as usize).copied() {
             Some(FrameLocation::Typed(layer, frame)) => {
                 self.with_typed(layer, |view| view.evaluate(0, expression, frame))
             }
-            Some(FrameLocation::Generic(frame)) => {
-                self.lua
-                    .evaluate(self.active_lua_thread(), expression, frame)
-            }
+            Some(FrameLocation::Generic(frame)) => self.lua.evaluate(thread, expression, frame),
             None => WasmEvalResult {
                 ok: false,
                 display: "unknown frame".into(),
@@ -594,19 +602,18 @@ impl WasmMixedDebugSession {
         name: &str,
         expression: &str,
     ) -> WasmEvalResult {
-        if thread != 0 {
+        if thread > self.active_lua_thread() {
             return WasmEvalResult {
                 ok: false,
                 display: "unknown thread".into(),
             };
         }
-        match self.routes().get(frame as usize).copied() {
+        match self.routes(thread).get(frame as usize).copied() {
             Some(FrameLocation::Typed(layer, frame)) => {
                 self.with_typed(layer, |view| view.set_variable(0, frame, name, expression))
             }
             Some(FrameLocation::Generic(frame)) => {
-                self.lua
-                    .set_variable(self.active_lua_thread(), frame, name, expression)
+                self.lua.set_variable(thread, frame, name, expression)
             }
             None => WasmEvalResult {
                 ok: false,
@@ -726,6 +733,172 @@ mod tests {
         assert_eq!(session.evaluate(0, "y", 0).display, "43");
         assert_eq!(session.continue_burst(1000).reason, "terminated");
         assert_eq!(session.take_output(), "43\n44");
+    }
+    #[test]
+    fn mixed_coroutine_threads_keep_parent_and_child_frames_isolated() {
+        let mut session = WasmMixedDebugSession::build(
+            "main.sol".into(),
+            vec![
+                (
+                    "main.sol".into(),
+                    include_bytes!("../../tests/fixtures/wasm-mixed/project/coroutine.sol")
+                        .to_vec(),
+                ),
+                (
+                    "runner.lua".into(),
+                    include_bytes!("../../tests/fixtures/wasm-mixed/project/runner.lua").to_vec(),
+                ),
+            ],
+        )
+        .unwrap();
+        let bp = session.set_breakpoint("runner.lua".into(), 3);
+        assert!(bp.verified);
+        session.set_breakpoint_condition(bp.id, Some("value == 41".into()));
+        assert_eq!(session.continue_burst(1000).reason, "breakpoint");
+        assert_eq!(
+            session
+                .get_threads()
+                .iter()
+                .map(|t| t.status.as_str())
+                .collect::<Vec<_>>(),
+            ["normal", "running"]
+        );
+        let parent = session.get_stack_trace(0);
+        let child = session.get_stack_trace(1);
+        assert_eq!(
+            parent.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["runner.run", "main"]
+        );
+        assert_eq!(child.len(), 3);
+        assert_eq!(child[0].name, "runner.bump");
+        assert_eq!(child[1].name, "typed");
+        let keep = session
+            .get_upvalues(1, 2)
+            .into_iter()
+            .find(|v| v.name == "keep")
+            .unwrap();
+        assert!(keep.expandable);
+        let keep_ref = keep.reference.unwrap();
+        assert_eq!(session.evaluate(0, "base", 1).display, "1");
+        assert_eq!(session.evaluate(1, "value", 0).display, "41");
+        assert_eq!(session.evaluate(1, "n", 1).display, "40");
+        assert!(session.set_variable(0, 1, "base", "2").ok);
+        assert!(session.set_variable(1, 0, "value", "42").ok);
+        session.force_gc();
+        assert!(session
+            .get_table_entries(keep_ref, 0, 10)
+            .iter()
+            .any(|v| v.display == "40"));
+        assert_eq!(session.evaluate(0, "keep.value", 0).display, "40");
+        assert!(session.get_stack_trace(2).is_empty());
+        assert!(!session.evaluate(2, "value", 0).ok);
+        session.remove_breakpoint(bp.id);
+        let stats = session.profile().unwrap();
+        assert!(stats
+            .iter()
+            .any(|s| s.function_name == child[2].name && s.calls == 1.0));
+        assert!(stats
+            .iter()
+            .any(|s| s.function_name == "typed" && s.calls == 2.0));
+        assert_eq!(session.record_timeline(2).events.len(), 2);
+        assert_eq!(session.evaluate(1, "value", 0).display, "42");
+        assert_eq!(session.continue_burst(1000).reason, "terminated");
+        assert_eq!(session.take_output(), "40\n43\n43\t45\n47");
+        assert_eq!(session.get_threads()[0].status, "dead");
+    }
+    #[test]
+    fn nested_mixed_threads_step_out_without_losing_parent_edits() {
+        let mut session = WasmMixedDebugSession::build(
+            "main.sol".into(),
+            vec![(
+                "main.sol".into(),
+                include_bytes!("../../tests/fixtures/wasm-mixed/project/nested_coroutine.sol")
+                    .to_vec(),
+            )],
+        )
+        .unwrap();
+        let bp = session.set_breakpoint("main.sol".into(), 3);
+        session.set_breakpoint_condition(bp.id, Some("value == 41".into()));
+        assert_eq!(session.continue_burst(1000).reason, "breakpoint");
+        assert_eq!(
+            session
+                .get_threads()
+                .iter()
+                .map(|t| t.status.as_str())
+                .collect::<Vec<_>>(),
+            ["normal", "normal", "running"]
+        );
+        assert_eq!(session.get_stack_trace(0).len(), 1);
+        assert_eq!(session.get_stack_trace(1).len(), 1);
+        assert_eq!(session.get_stack_trace(2).len(), 2);
+        assert_eq!(session.get_stack_trace(2)[0].name, "typed");
+        assert!(session.set_variable(1, 0, "marker", "8").ok);
+        assert!(session.set_variable(2, 0, "value", "44").ok);
+        session.force_gc();
+        assert_eq!(session.evaluate(0, "root.value", 0).display, "40");
+        assert_eq!(session.evaluate(1, "marker", 0).display, "8");
+        assert_eq!(session.evaluate(2, "value", 1).display, "40");
+        session.remove_breakpoint(bp.id);
+        assert_eq!(session.step_out().reason, "step");
+        assert_eq!(session.get_threads().len(), 3);
+        assert_eq!(session.get_stack_trace(2).len(), 1);
+        assert_eq!(session.step_out().reason, "step");
+        assert_eq!(session.get_threads().len(), 2);
+        assert_eq!(session.continue_burst(1000).reason, "terminated");
+        assert_eq!(
+            session.take_output(),
+            "true\t44\n8\ntrue\ttrue\t45\ndead\tdead\n"
+        );
+    }
+    #[test]
+    fn coroutine_boundary_errors_and_direct_typed_bodies_do_not_corrupt_resume_state() {
+        let mut session = WasmMixedDebugSession::build(
+            "main.sol".into(),
+            vec![(
+                "main.sol".into(),
+                include_bytes!("../../tests/fixtures/wasm-mixed/project/coroutine_errors.sol")
+                    .to_vec(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(session.continue_burst(1000).reason, "terminated");
+        let output = session.take_output();
+        assert!(
+            output.starts_with("false\nclosed\nfalse\tdead\nfalse\n"),
+            "{output}"
+        );
+        assert!(output.ends_with("true\t41\n"), "{output}");
+        assert_eq!(session.core.layer_threads.len(), 0);
+    }
+    #[test]
+    fn generic_coroutine_support_does_not_silently_box_invalid_typed_closures() {
+        for source in [
+            "function main():i64 local base:i64=1; local function f():i64 base=2; return base end; return f() end",
+            "function main():i64 local f= function(n:i64):i64 return n end; return f(42) end",
+        ] {
+            assert!(WasmMixedDebugSession::build("main.sol".into(), vec![("main.sol".into(), source.as_bytes().to_vec())]).is_err());
+        }
+    }
+    #[test]
+    fn mixed_coroutine_runaway_consumes_one_shared_budget_in_bounded_bursts() {
+        let source = "function typed(n:i64):i64 return n+1 end\nlocal co=coroutine.create(function() while true do typed(40) end end)\ncoroutine.resume(co)";
+        let mut session = WasmMixedDebugSession::build(
+            "main.sol".into(),
+            vec![("main.sol".into(), source.as_bytes().to_vec())],
+        )
+        .unwrap();
+        session.core.remaining = 1000;
+        let mut stop = session.continue_burst(50);
+        for _ in 0..100 {
+            if stop.reason != "running" {
+                break;
+            }
+            assert!(session.core.layers.len() <= 2);
+            stop = session.continue_burst(50);
+        }
+        assert_eq!(stop.reason, "exception");
+        assert!(stop.message.unwrap().contains("instruction budget"));
+        assert_eq!(session.core.remaining, 0);
     }
     #[test]
     fn mixed_runaway_bursts_and_timeline_are_bounded() {

@@ -38,6 +38,7 @@ struct BridgeContext {
 }
 
 struct ResumeParent {
+    base_depth: usize,
     thread: ThreadRef,
     parent: ThreadRef,
     depth_charged: usize,
@@ -294,6 +295,17 @@ impl LuaDebugSession {
         self.runtime.frames.iter().rev().filter_map(|frame|match frame {Frame::Lua(frame)=>Some(frame.debug_identity),_=>None}).collect()
     }
 
+    /// One bit per live/suspended activation, not a history of retired frames.
+    /// Resuming a yielded frame must not count a second function invocation.
+    pub fn take_profile_calls(&mut self) -> Vec<String> {
+        self.runtime.frames.iter_mut().filter_map(|frame| {
+            let Frame::Lua(frame) = frame else { return None; };
+            if frame.debug_profile_seen { return None; }
+            frame.debug_profile_seen = true;
+            Some(frame.proto.metadata.name.clone())
+        }).collect()
+    }
+
     fn deliver_resume_error(&mut self, error: LuaError, wrapped: bool) -> Option<DriveOutcome> {
         if !wrapped {
             self.set_incoming(vec![
@@ -304,7 +316,7 @@ impl LuaDebugSession {
         }
         match self
             .runtime
-            .unwind_error_to_marker(error, 0, &mut self.depth_charged)
+            .unwind_error_to_marker(error, self.base_depth, &mut self.depth_charged)
         {
             Ok(CallStep::Pending) => None,
             Ok(CallStep::Done(values)) => {
@@ -353,6 +365,7 @@ impl LuaDebugSession {
         let depth_charged = std::mem::replace(&mut self.depth_charged, co.depth_charged.take());
         self.runtime.call_depth += self.depth_charged;
         self.resume_parents.push(ResumeParent {
+            base_depth: std::mem::replace(&mut self.base_depth, 0),
             thread: request.thread,
             parent,
             depth_charged,
@@ -438,6 +451,7 @@ impl LuaDebugSession {
         self.runtime.coroutine_stack.pop();
         parent.status.set(CoroutineStatus::Running);
         self.depth_charged = state.depth_charged - 1;
+        self.base_depth = state.base_depth;
         self.runtime.release_call_depth(1);
         if !state.wrapped || result.is_ok() {
             if let Err(error) = self.runtime.fire_hook("return", None) {
@@ -468,8 +482,7 @@ impl LuaDebugSession {
     /// browser protocol's main-thread zero and per-stop coroutine selection.
     pub fn threads(&self) -> Vec<(u32, String)> {
         let mut threads = self
-            .resume_parents
-            .iter()
+            .all_resume_parents()
             .enumerate()
             .map(|(id, state)| {
                 (
@@ -484,7 +497,7 @@ impl LuaDebugSession {
             })
             .collect::<Vec<_>>();
         threads.push((
-            self.resume_parents.len() as u32,
+            self.active_thread(),
             if self.status == DebugStatus::Paused {
                 "running"
             } else {
@@ -495,19 +508,38 @@ impl LuaDebugSession {
         threads
     }
 
+    fn all_resume_parents(&self) -> impl Iterator<Item = &ResumeParent> {
+        self.bridge_contexts
+            .iter()
+            .flat_map(|context| context.resume_parents.iter())
+            .chain(self.resume_parents.iter())
+    }
+
+    pub(crate) fn active_thread(&self) -> u32 {
+        self.all_resume_parents().count() as u32
+    }
+
+    pub(crate) fn total_frame_depth(&self) -> usize {
+        self.frames().len()
+            + self.all_resume_parents().map(|state| {
+                self.runtime.coroutine(state.parent).frames.borrow().iter()
+                    .filter(|frame| matches!(frame, Frame::Lua(_))).count()
+            }).sum::<usize>()
+    }
+
     pub fn with_thread<T>(
         &mut self,
         thread: u32,
         operation: impl FnOnce(&mut Self) -> LuaResult<T>,
     ) -> LuaResult<T> {
         let thread = thread as usize;
-        if thread > self.resume_parents.len() {
+        if thread > self.active_thread() as usize {
             return Err(LuaError::new("unknown thread"));
         }
-        if thread == self.resume_parents.len() {
+        if thread == self.active_thread() as usize {
             return operation(self);
         }
-        let selected = self.runtime.coroutine(self.resume_parents[thread].parent);
+        let selected = self.runtime.coroutine(self.all_resume_parents().nth(thread).unwrap().parent);
         let active = self
             .runtime
             .coroutine(*self.runtime.coroutine_stack.last().unwrap());
@@ -925,24 +957,32 @@ impl LuaDebugSession {
 
 impl Drop for LuaDebugSession {
     fn drop(&mut self) {
-        while let Some(state) = self.resume_parents.pop() {
-            self.runtime.close_frames_above_optional(0, None);
+        loop {
+            while let Some(state) = self.resume_parents.pop() {
+                self.runtime.close_frames_above_optional(0, None);
+                self.runtime.release_call_depth(self.depth_charged);
+                self.runtime
+                    .coroutine(state.thread)
+                    .status
+                    .set(CoroutineStatus::Dead);
+                let parent = self.runtime.coroutine(state.parent);
+                self.runtime.frames = parent.frames.take();
+                self.runtime.active_hook = state.hook;
+                self.runtime.coroutine_stack.pop();
+                parent.status.set(CoroutineStatus::Running);
+                self.depth_charged = state.depth_charged;
+                self.base_depth = state.base_depth;
+            }
+            self.runtime.close_frames_above_optional(self.base_depth, None);
             self.runtime.release_call_depth(self.depth_charged);
-            self.runtime
-                .coroutine(state.thread)
-                .status
-                .set(CoroutineStatus::Dead);
-            let parent = self.runtime.coroutine(state.parent);
-            self.runtime.frames = parent.frames.take();
-            self.runtime.active_hook = state.hook;
-            self.runtime.coroutine_stack.pop();
-            parent.status.set(CoroutineStatus::Running);
-            self.depth_charged = state.depth_charged;
-        }
-        self.runtime.close_frames_above_optional(0, None);
-        self.runtime.release_call_depth(self.depth_charged);
-        if self.root_charged {
-            self.runtime.release_call_depth(1);
+            if self.root_charged {
+                self.runtime.release_call_depth(1);
+            }
+            let Some(context) = self.bridge_contexts.pop() else { break; };
+            self.base_depth = context.base_depth;
+            self.depth_charged = context.depth_charged;
+            self.root_charged = context.root_charged;
+            self.resume_parents = context.resume_parents;
         }
     }
 }

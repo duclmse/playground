@@ -1,12 +1,12 @@
 # U12 — Canonical WASM playground and debugger
 
-**Status:** in progress
+**Status:** complete for the documented portable capability/scalar-call profile
 
 **Purpose:** make the web product use the canonical runtime, not a separate VM.
 
 - [x] Create the WASM adapter and `packages/sol-runtime` from Tier 0
       (feature-gated `crate/sol`, rather than a separate `sol-wasm` crate).
-- [ ] Reproduce budgets, modules, output, debug stepping, frames, locals,
+- [x] Reproduce budgets, modules, output, debug stepping, frames, locals,
       evaluation, profiling, and timeline.
 - [x] Support `.lua` and `.sol` with shared parser/type diagnostics.
 - [x] Keep worker execution and default-deny capabilities.
@@ -14,8 +14,8 @@
 - [x] Meet the documented portable-profile bundle/init/responsiveness targets.
 
 Production is canonical by default. Live mixed coroutine/thread isolation
-remains unqualified; see work item 20 for the qualified scalar profile and
-remaining limits. Earlier default-off observations below are historical.
+is qualified in work item 21; work item 20 records the scalar-call profile
+and language limits. Earlier default-off observations below are historical.
 
 **Exit gate:** canonical-runtime web E2E scenarios and portable native/WASM
 fixtures agree; production no longer imports the old runtime package.
@@ -1734,9 +1734,72 @@ cross-tier reentry from atomic native callbacks are unsupported and rejected.
 These are explicit current language/profile limits, not filename-selected
 alternative semantics.
 
-The mixed debugger currently exposes one combined scheduler thread. Generic
+At item 20's checkpoint, the mixed debugger exposed one combined scheduler thread. Generic
 coroutine-parent frame isolation and cross-tier suspended coroutine scenarios
 are not yet qualified (the pure generic debugger retains its coroutine-chain
 thread support). This keeps the broad debugger parity deliverable and U12
 status open despite completing the requested bridge, production-package
 cutover, and portable-profile artifact/latency qualification.
+
+## Work item 21 — mixed coroutine/thread qualification
+
+Mixed sessions now expose the complete active resume chain, including parents
+parked across specialized/generic boundaries. Thread IDs are per-stop chain
+positions (main is zero), matching the generic adapter; unrelated suspended
+coroutines are not enumerated. Each typed execution layer keeps its owning
+thread, and selected stack traces interleave only that thread's generic and
+specialized frames. Locals, upvalues, evaluation, and edits use that same
+routing. Conditions and logpoints evaluate in the active child, not main.
+
+Coroutine resume saves the parent's trampoline boundary and starts the child's
+boundary at zero. Return/error/yield restores the parent boundary and depth
+charge. Errors from wrapped resumes unwind only the current bridge call.
+Disposal unwinds resume chains in parked bridge contexts as well as the active
+context. Step depth includes all parked parents, so step-out crosses a typed
+return and then a coroutine yield into the correct parent thread.
+
+Generic anonymous coroutine bodies stay generic; specialized nonescaping local
+functions still use the existing lambda lifting. A dedicated generic-closure
+diagnostic plus the shared dynamic-body classifier allows that fallback;
+invalid typed captures and explicitly typed anonymous closures remain errors,
+not silently boxed typed programs.
+
+Mixed profiling covers all live chain frames and counts a yielded activation
+once, using one bit on its retained frame rather than an unbounded retired-ID
+history. Fresh profile/timeline executions preserve the paused session's
+parent and child edits and precise roots. Repeated coroutine bursts consume
+the same project budget; neither resume nor cross-tier reentry resets it.
+
+Four more shared native-core/linked-WASM fixtures bring the mixed manifest to
+12: generic yield/resume between typed calls, three-level nested resumes,
+protected errors/wrap/close/direct typed coroutine bodies, and rejected yield
+across a typed foreign call. Native and actual WASM debugger regressions cover
+per-thread isolation, invalid thread IDs, parent/child edits, forced GC,
+conditions, cross-thread step-out, bounded runaway execution, and analysis
+isolation. The production Chromium worker qualification additionally exercises
+the mixed two- and three-level chains and their protocol responses.
+
+This closes item 20's coroutine qualification gap and the U12 portable-profile
+exit gate. It does not extend the scalar foreign-call ABI, support typed heap
+closures, or permit yielding through a typed call; that last boundary remains
+an explicit, tested rejection. It also does not claim full Lua 5.5 corpus
+conformance or completion of the native runtime convergence milestones.
+
+Final validation passed on 2026-10-07: the complete native Sol suite, native
+library recheck after the per-frame profiling change, all 207 jit-free
+WASM-feature library tests, actual linked WASM (33 typed and 12 mixed fixtures
+plus live coroutine/thread debugger checks), production web build, updated
+Chromium qualification, corpus-manifest validation, and project-status checks.
+The final frozen-old/default-canonical differential also passes six real Lua
+output comparisons, existing live/DOM debugger E2E, and the 90 typed acceptance
+classifications (not typed semantic parity).
+Regular Clippy passes with the same pre-existing warnings; strict lint remains
+a separate baseline issue, not a suppressed gate.
+
+The final artifact is 2,323,329 bytes raw / 708,340 bytes Node-default gzip,
+SHA-256 `74442c70b8602ffdfff96f87e1e05c5cc301946c5abe4d4365a18bbdb9ad34d5`.
+The worker remains 34,757 bytes. On the item 20 lab environment, the final
+rerun (including child upvalue/GC inspection) measures p95 init 40.3 ms,
+warm run 1.2 ms, and a 1,000-operation mixed burst 0.6 ms. All six
+documented ceilings pass; these remain localhost measurements, not network
+latency promises. The regenerated qualification report includes full samples.

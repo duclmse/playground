@@ -10,6 +10,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, AssignTarget, Expr, ExprKind, Function, Stmt, TypeName};
 
+const GENERIC_ANONYMOUS_CODE: &str = "[EGENERICCLOSURE]";
+
+pub(crate) fn requires_generic_anonymous_environment(error: &str) -> bool {
+    error.ends_with(GENERIC_ANONYMOUS_CODE)
+}
+
 #[derive(Clone)]
 struct Binding {
     lifted_name: String,
@@ -739,9 +745,14 @@ fn rewrite_expr(expr: &mut Expr, bindings: &HashMap<String, Binding>) -> Result<
                 rewrite_expr(value, bindings)
             }
         }),
-        ExprKind::Function(_) => Err(format!(
-            "line {}: typed anonymous closures require a heap environment",
-            expr.line
+        ExprKind::Function(function) => Err(format!(
+            "line {}: typed anonymous closures require a heap environment{}",
+            expr.line,
+            if crate::semantics::function_requires_types(function) {
+                ""
+            } else {
+                " [EGENERICCLOSURE]"
+            }
         )),
         ExprKind::StructLiteral(_, fields) => fields
             .iter_mut()

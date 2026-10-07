@@ -57,6 +57,49 @@ try {
 } finally { genericAnalysis.free(); }
 
 const mixedNames = ["main.sol", "helper.lua"];
+const coroutineFiles = ["coroutine.sol", "runner.lua"].map((name) => readFileSync(new URL(`../crate/sol/tests/fixtures/wasm-mixed/project/${name}`, import.meta.url), "utf8"));
+const mixedCoroutine = WasmMixedDebugSession.launch_project("main.sol", ["main.sol", "runner.lua"], coroutineFiles);
+try {
+  const bp = mixedCoroutine.set_breakpoint("runner.lua", 3);
+  const id = bp.id; assert.equal(bp.verified, true); bp.free();
+  mixedCoroutine.set_breakpoint_condition(id, "value == 41");
+  const stop = mixedCoroutine.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); } finally { stop.free(); }
+  const threads = mixedCoroutine.get_threads();
+  try { assert.deepEqual(threads.map((t) => t.status), ["normal", "running"]); } finally { threads.forEach((t) => t.free()); }
+  for (const [thread, expected] of [[0, ["runner.run", "main"]], [1, ["runner.bump", "typed"]]]) {
+    const frames = mixedCoroutine.get_stack_trace(thread);
+    try { assert.deepEqual(frames.slice(0, 2).map((f) => f.name), expected); } finally { frames.forEach((f) => f.free()); }
+  }
+  for (const [thread, frame, name, expression] of [[0, 1, "base", "2"], [1, 0, "value", "42"]]) {
+    const result = mixedCoroutine.set_variable(thread, frame, name, expression);
+    try { assert.equal(result.ok, true, result.display); } finally { result.free(); }
+  }
+  mixedCoroutine.force_gc();
+  const upvalues = mixedCoroutine.get_upvalues(1, 2);
+  try { assert.ok(upvalues.some((v) => v.name === "keep" && v.expandable)); } finally { upvalues.forEach((v) => v.free()); }
+  const stats = mixedCoroutine.profile();
+  try { assert.ok(stats.some((s) => s.function_name === "typed" && s.calls === 2)); } finally { stats.forEach((s) => s.free()); }
+  const timeline = mixedCoroutine.record_timeline(2);
+  try { assert.equal(timeline.error, undefined); const events = timeline.events; assert.equal(events.length, 2); events.forEach((e) => e.free()); } finally { timeline.free(); }
+  const value = mixedCoroutine.evaluate(1, "value", 0);
+  try { assert.equal(value.display, "42"); } finally { value.free(); }
+  mixedCoroutine.remove_breakpoint(id);
+  const done = mixedCoroutine.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  assert.equal(mixedCoroutine.take_output(), "40\n43\n43\t45\n47");
+} finally { mixedCoroutine.free(); }
+const nestedMixed = WasmMixedDebugSession.launch_project("main.sol", ["main.sol"], [readFileSync(new URL("../crate/sol/tests/fixtures/wasm-mixed/project/nested_coroutine.sol", import.meta.url), "utf8")]);
+try {
+  const bp = nestedMixed.set_breakpoint("main.sol", 3); const id = bp.id; bp.free();
+  const stop = nestedMixed.continue_burst(1000); try { assert.equal(stop.reason, "breakpoint"); } finally { stop.free(); }
+  const threads = nestedMixed.get_threads(); try { assert.deepEqual(threads.map((t) => t.status), ["normal", "normal", "running"]); } finally { threads.forEach((t) => t.free()); }
+  nestedMixed.remove_breakpoint(id);
+  for (const length of [3, 2]) {
+    const stop = nestedMixed.step_out(); try { assert.equal(stop.reason, "step"); } finally { stop.free(); }
+    const threads = nestedMixed.get_threads(); try { assert.equal(threads.length, length); } finally { threads.forEach((t) => t.free()); }
+  }
+} finally { nestedMixed.free(); }
 let mixedCount = 0;
 for (const row of readFileSync(new URL("../crate/sol/tests/wasm-mixed.tsv", import.meta.url), "utf8").split("\n").filter((line) => line && !line.startsWith("#"))) {
   const [entry, paths, expected] = row.split("\t");

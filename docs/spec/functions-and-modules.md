@@ -69,6 +69,9 @@ current flattened import interface discovers top-level function declarations,
 not functions nested in a lexical chunk initializer. Cross-boundary strings,
 aggregates, function values, typed yields, and reentry from atomic native
 callbacks are not supported. A string returned by the typed root is displayable
-without extending the foreign-call ABI. Mixed debugger coroutine/thread
-isolation is not yet qualified; see
-[U12 work item 20](../features/milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).
+without extending the foreign-call ABI. Mixed debugger thread IDs select
+positions on the active coroutine resume chain, with main at zero. Each
+selected trace contains only that thread's specialized and generic frames;
+parent/child edits and roots survive yield/resume between typed calls. Yield
+through a typed foreign call remains a runtime boundary error. See
+[U12 work item 21](../features/milestones/u12-wasm-playground.md#work-item-21--mixed-coroutinethread-qualification).

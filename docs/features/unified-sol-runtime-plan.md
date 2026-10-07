@@ -2876,16 +2876,17 @@ the exit gate reached.
 
 Deliverables:
 
-- [ ] create `sol-wasm` and `packages/sol-runtime` from the Tier-0 runtime;
-- [ ] reproduce execution budgets, virtual modules, output capture, breakpoints,
+- [x] create the WASM adapter and `packages/sol-runtime` from Tier 0
+      (feature-gated `crate/sol`, not a separate crate);
+- [x] reproduce execution budgets, virtual modules, output capture, breakpoints,
       stepping, stack frames, locals/upvalues, evaluation, profiling, and
       timeline;
-- [ ] accept `.lua` and `.sol` projects and use the shared parser/type
+- [x] accept `.lua` and `.sol` projects and use the shared parser/type
       diagnostics;
-- [ ] keep execution in a worker and capabilities default-deny;
-- [ ] switch the web adapter behind a feature flag, run old/new browser
+- [x] keep execution in a worker and capabilities default-deny;
+- [x] switch the web adapter behind a feature flag, run old/new browser
       differentials, then remove the Piccolo production dependency;
-- [ ] address bundle size, initialization latency, and long-running
+- [x] address bundle size, initialization latency, and long-running
       responsiveness.
 
 Exit gate: existing web end-to-end debugger scenarios pass on the canonical
@@ -2895,8 +2896,9 @@ describe the initial default-off spike, not the current shipping adapter.
 Canonical Tier 0 is now the production default, with generic, specialized,
 and checked scalar mixed projects, live debugger/analysis, portable fixture
 agreement, and measured bundle/init gates. Mixed coroutine/thread isolation
-remains unqualified, so U12 is still in progress. Current evidence and limits
-are maintained in [work item 20](milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).
+is now qualified and U12 is complete for the documented portable profile.
+Current evidence and language limits are maintained in
+[work items 20–21](milestones/u12-wasm-playground.md#work-item-21--mixed-coroutinethread-qualification).
 
 Item 1 (2026-10-02): `crate/sol` wasm32 boundary spike - the blocking item
 every other U12 item depends on. Found `interp.rs` already fully decoupled

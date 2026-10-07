@@ -1074,6 +1074,7 @@ impl LuaRuntime {
         }
         let frame = LuaFrame {
             debug_identity: self.next_debug_frame,
+            debug_profile_seen: false,
             header: FrameHeader::new(function, 0, 0),
             closure,
             proto,

@@ -1193,6 +1193,7 @@ mod tests {
         let cells: Cells = vec![None; register_count];
         LuaFrame {
             debug_identity: 0,
+            debug_profile_seen: false,
             header: sol_core::FrameHeader::new(sol_core::FunctionId::new(0), 0, 0),
             closure,
             proto,
