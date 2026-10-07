@@ -148,6 +148,7 @@ pub struct LuaRuntime {
     allocation_budget: usize,
     capabilities: Capabilities,
     module_sources: HashMap<Vec<u8>, Vec<u8>>,
+    module_configs: HashMap<Vec<u8>, crate::parser::LanguageConfig>,
     loading_modules: HashSet<Vec<u8>>,
     package_loaded: TableRef,
     /// The original `package` table object created in `install_base`,

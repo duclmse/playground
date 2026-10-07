@@ -113,137 +113,6 @@ fn explain_source_if_requested(
     Ok(())
 }
 
-/// Chooses the specialized tier from semantic type surface, never from the
-/// filename. Annotation-free Lua and Sol programs therefore enter the same
-/// generic runtime; explicit contracts and typed-only declarations keep the
-/// existing specialized/AOT path.
-fn requires_specialized_execution(program: &sol::ast::Program) -> bool {
-    !program.imports.is_empty()
-        || !program.exports.is_empty()
-        || !program.aliases.is_empty()
-        || !program.structs.is_empty()
-        || !program.externs.is_empty()
-        || program.functions.iter().any(function_requires_types)
-}
-
-fn function_requires_types(function: &sol::ast::Function) -> bool {
-    function.return_type.is_some()
-        || function
-            .params
-            .iter()
-            .any(|(_, ty)| !matches!(ty, sol::ast::TypeName::Any))
-        || function.body.iter().any(statement_requires_types)
-}
-
-fn target_requires_types(target: &sol::ast::AssignTarget) -> bool {
-    match target {
-        sol::ast::AssignTarget::Name(_) => false,
-        sol::ast::AssignTarget::Index(base, index) => {
-            expression_requires_types(base) || expression_requires_types(index)
-        }
-        sol::ast::AssignTarget::Field(base, _) => expression_requires_types(base),
-    }
-}
-
-fn statement_requires_types(statement: &sol::ast::Stmt) -> bool {
-    use sol::ast::Stmt;
-    match statement {
-        Stmt::Global { values, .. } => values.iter().any(expression_requires_types),
-        Stmt::GlobalFunction(function) | Stmt::LocalFunction(function) => {
-            function_requires_types(function)
-        }
-        Stmt::Label { .. } | Stmt::Goto { .. } | Stmt::Break { .. } => false,
-        Stmt::MultiLocal { names, values, .. } => {
-            names.iter().any(|(_, ty, _, _)| ty.is_some())
-                || values.iter().any(expression_requires_types)
-        }
-        Stmt::MultiAssign {
-            targets, values, ..
-        } => {
-            targets.iter().any(target_requires_types)
-                || values.iter().any(expression_requires_types)
-        }
-        Stmt::Block(body) => body.iter().any(statement_requires_types),
-        Stmt::Repeat { body, cond, .. } => {
-            body.iter().any(statement_requires_types) || expression_requires_types(cond)
-        }
-        Stmt::Expr(expression) => expression_requires_types(expression),
-        Stmt::Local { ty, value, .. } => ty.is_some() || expression_requires_types(value),
-        Stmt::Assign { target, value, .. } => {
-            target_requires_types(target) || expression_requires_types(value)
-        }
-        Stmt::If {
-            cond,
-            then_block,
-            else_block,
-            ..
-        } => {
-            expression_requires_types(cond)
-                || then_block.iter().any(statement_requires_types)
-                || else_block
-                    .as_ref()
-                    .is_some_and(|body| body.iter().any(statement_requires_types))
-        }
-        Stmt::While { cond, body, .. } => {
-            expression_requires_types(cond) || body.iter().any(statement_requires_types)
-        }
-        Stmt::NumericFor {
-            start,
-            stop,
-            step,
-            body,
-            ..
-        } => {
-            expression_requires_types(start)
-                || expression_requires_types(stop)
-                || step.as_ref().is_some_and(expression_requires_types)
-                || body.iter().any(statement_requires_types)
-        }
-        Stmt::GenericFor {
-            iterators, body, ..
-        } => {
-            iterators.iter().any(expression_requires_types)
-                || body.iter().any(statement_requires_types)
-        }
-        Stmt::Return { value, .. } => value.as_ref().is_some_and(expression_requires_types),
-        Stmt::MultiReturn { values, .. } => values.iter().any(expression_requires_types),
-    }
-}
-
-fn expression_requires_types(expression: &sol::ast::Expr) -> bool {
-    use sol::ast::{ExprKind, TableField};
-    match &expression.kind {
-        ExprKind::StructLiteral(..) | ExprKind::TypeTest(..) | ExprKind::Cast(..) => true,
-        ExprKind::Table(fields) => fields.iter().any(|field| match field {
-            TableField::Value(value) | TableField::Named(_, value) => {
-                expression_requires_types(value)
-            }
-            TableField::Key(key, value) => {
-                expression_requires_types(key) || expression_requires_types(value)
-            }
-        }),
-        ExprKind::Function(function) => function_requires_types(function),
-        ExprKind::Unary(_, value)
-        | ExprKind::Len(value)
-        | ExprKind::Field(value, _)
-        | ExprKind::Paren(value) => expression_requires_types(value),
-        ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
-            expression_requires_types(left) || expression_requires_types(right)
-        }
-        ExprKind::Call(_, args) => args.iter().any(expression_requires_types),
-        ExprKind::CallExpr(callee, args) | ExprKind::MethodCall(callee, _, args) => {
-            expression_requires_types(callee) || args.iter().any(expression_requires_types)
-        }
-        ExprKind::Vararg
-        | ExprKind::StringLit(_)
-        | ExprKind::NilLit
-        | ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Name(_) => false,
-    }
-}
-
 fn compile_source(path: &str, source: &[u8]) -> Result<(types::TProgram, types::Type), String> {
     let language = language_config(path);
     if language.sol_extensions {
@@ -1003,7 +872,7 @@ fn run(
             type_analysis.as_ref().expect("requested above").render()
         );
     }
-    if !requires_specialized_execution(&parsed_program) && !legacy_partition_requested() {
+    if !sol::semantics::requires_specialized_execution(&parsed_program) && !legacy_partition_requested() {
         if profile_in.is_some() || profile_out.is_some() || profile_time.is_some() {
             return Err("profiling the generic semantic interpreter is not implemented yet".into());
         }

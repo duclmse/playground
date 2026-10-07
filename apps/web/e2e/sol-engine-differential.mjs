@@ -289,6 +289,31 @@ async function canonicalLuaDebugScenario(page, workerPath) {
     });
     const check = (value, message) => { if (!value) throw new Error(message); };
     try {
+      await rpc({ type: "debugLaunch", entry: "main.sol", files: { "main.sol":
+        "fn f(n)\n local x=n+2\n print(x)\nend\nf(40)" } });
+      const genericBp = await rpc({ type: "debugSetBreakpoint", sourceId: "main.sol", line: 3 });
+      check(genericBp.breakpoint.verified, "generic Sol breakpoint verification");
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "breakpoint", "generic Sol live stop");
+      check((await rpc({ type: "debugSetVariable", threadId: 0, frameIndex: 0, name: "x", valueExpr: "44" })).result.ok, "generic Sol live edit");
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "terminated", "generic Sol resume");
+      check((await rpc({ type: "debugTakeOutput" })).text === "44\n", "generic Sol program output without return echo");
+      const genericFiles = {
+        "main.lua": "local m=require('math.base'); print(m.add(40)); assert(m==require('math.base'))",
+        "math/base.sol": "fn add(n)\n local x=n+require('helper')\n return x\nend\nreturn {add=add}",
+        "helper.lua": "return 2",
+      };
+      await rpc({ type: "debugLaunch", entry: "main.lua", files: genericFiles });
+      check((await rpc({ type: "debugSetBreakpoint", sourceId: "math/base.sol", line: 3 })).breakpoint.verified, "generic mixed-project breakpoint verification");
+      const genericModuleStop = await rpc({ type: "debugContinueBurst", maxInstructions: 1000 });
+      check(genericModuleStop.stop?.reason === "breakpoint" && genericModuleStop.source === "math/base.sol", "generic mixed-project live module stop");
+      check((await rpc({ type: "debugSetVariable", threadId: 0, frameIndex: 0, name: "x", valueExpr: "44" })).result.ok, "generic mixed-project module edit");
+      await rpc({ type: "debugForceGc" });
+      const genericProfile = await rpc({ type: "profile", entry: "main.lua", files: genericFiles });
+      check(genericProfile.stats.some((stat) => stat.functionId.includes("add") && stat.calls === 1), "generic mixed-project profile");
+      const genericTimeline = await rpc({ type: "recordTimeline", entry: "main.lua", files: genericFiles, maxEvents: 2 });
+      check(genericTimeline.timeline.events.length === 2 && genericTimeline.timeline.truncated && !genericTimeline.timeline.error, "generic mixed-project bounded timeline");
+      check((await rpc({ type: "debugContinueBurst", maxInstructions: 1000 })).stop?.reason === "terminated", "generic mixed-project resume after separate analysis");
+      check((await rpc({ type: "debugTakeOutput" })).text === "44\n", "generic mixed-project edited output");
       await rpc({ type: "debugLaunch", entry: "main.sol", files: {
         "main.sol": "import math.base\nfunction main(): i64\n local base: i64=40\n local result=math.base.add(base)\n return base+result\nend",
         "math/base.sol": "export function add(x: i64): i64\n local y=x+2\n return y\nend",

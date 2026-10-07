@@ -572,9 +572,7 @@ impl LuaRuntime {
         self.table_set(self.package_loaded, key.clone(), LuaValue::Bool(true))?;
         self.loading_modules.insert(name.clone());
         let result = (|| {
-            let program =
-                crate::parser::parse_lua(crate::lexer::lex_bytes(&source).map_err(LuaError::new)?)
-                    .map_err(LuaError::new)?;
+            let program = self.parse_module_source(&name, &source)?;
             let base = self.globals.clone();
             let module = Globals::module(&base, self);
             module.define(
@@ -601,8 +599,7 @@ impl LuaRuntime {
     }
 
     pub(super) fn prepare_debug_module(&mut self, name: &[u8], source: &[u8]) -> LuaResult<LuaValue> {
-        let program = crate::parser::parse_lua(crate::lexer::lex_bytes(source).map_err(LuaError::new)?)
-            .map_err(LuaError::new)?;
+        let program = self.parse_module_source(name, source)?;
         let module = Globals::module(&self.globals, self);
         module.define(self, "_NAME", LuaValue::String(self.intern_str(name)), true);
         let root = self.encode_value(&module.as_value())?;

@@ -322,7 +322,7 @@ impl Loader<'_> {
     }
 }
 
-fn virtual_path(name: &str) -> Result<PathBuf, String> {
+pub(crate) fn virtual_path(name: &str) -> Result<PathBuf, String> {
     let path = Path::new(name);
     if path.is_absolute() || name.is_empty() {
         return Err(format!("in-memory project path '{name}' must be a non-empty relative path"));

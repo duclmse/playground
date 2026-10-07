@@ -85,6 +85,21 @@ pub struct WasmLuaDebugSession {
 
 #[wasm_bindgen]
 impl WasmLuaDebugSession {
+    pub fn launch_generic_project(entry: String, names: Vec<String>, contents: Vec<String>) -> Result<Self, JsValue> {
+        let inner = generic_project_session(&entry, &names, &contents)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        Ok(Self { inner, breakpoints: HashMap::new(), next_breakpoint: 1, references: HashMap::new(),
+            next_reference: 1, skip_breakpoint_once: false })
+    }
+    /// Generic, extension-enabled Sol uses the same semantic runtime and live
+    /// debugger; mandatory typed surfaces are not silently boxed here.
+    pub fn launch_generic_sol(source: &str, name: &str) -> Result<Self, JsValue> {
+        crate::modules::virtual_path(name).map_err(|error| JsValue::from_str(&error))?;
+        let inner = LuaDebugSession::launch_with_config(source.as_bytes(), name, crate::parser::LanguageConfig::SOL)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        Ok(Self { inner, breakpoints: HashMap::new(), next_breakpoint: 1, references: HashMap::new(),
+            next_reference: 1, skip_breakpoint_once: false })
+    }
     pub fn launch_project(
         entry: String,
         names: Vec<String>,

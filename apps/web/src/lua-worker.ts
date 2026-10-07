@@ -53,6 +53,13 @@ function isCanonicalSolProject(files: Record<string, string>, entry: string): bo
   return SOL_ENGINE_ENABLED && entry.endsWith(".sol") && names.every((name) => name.endsWith(".sol"));
 }
 
+function isCanonicalGenericProject(files: Record<string, string>, entry: string): boolean {
+  // Frontend defaults may follow filenames; execution is selected from ASTs.
+  return SOL_ENGINE_ENABLED && Object.keys(files).every((name) => name.endsWith(".sol") || name.endsWith(".lua"))
+    && Object.prototype.hasOwnProperty.call(files, entry)
+    && Object.entries(files).every(([name, source]) => !requireSolRuntime().source_requires_specialization(source, name.endsWith(".sol")));
+}
+
 function handleCanonicalLiveDebug(message: DebugRequest): boolean {
   const canonical = luaDebugSession ?? typedDebugSession;
   if (!canonical || !("id" in message) || message.type === "debugLaunch") return false;
@@ -138,10 +145,17 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       case "run": {
         const names = Object.keys(message.files);
         const contents = names.map((name) => message.files[name]);
+        if (isCanonicalGenericProject(message.files, message.entry)) {
+          const result = requireSolRuntime().execute_generic_project(message.entry, names, contents);
+          post({ type: "result", output: result.result ?? "", error: result.error ?? null,
+            errorSource: result.error ? message.entry : null, errorLine: null });
+          result.free(); return;
+        }
         if (isCanonicalSolProject(message.files, message.entry)) {
           // The canonical engine accepts exactly the typed `.sol` profile.
-          // Keep any `.lua`/mixed project on the existing runtime, whose
-          // dynamic standard library and mixed-module adapter are required.
+          // Generic projects have already selected their shared live path.
+          // Projects crossing a mandatory typed/generic boundary still
+          // require the mixed semantic bridge adapter.
           const runtime = requireSolRuntime();
           const solResult = runtime.execute_project(message.entry, names, contents);
           post({
@@ -186,6 +200,10 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         typedDebugSession = null;
         session?.free();
         session = null;
+        if (isCanonicalGenericProject(message.files, message.entry)) {
+          luaDebugSession = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
+          post({ type: "debugLaunched", id: message.id }); return;
+        }
         if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
           luaDebugSession = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
           post({ type: "debugLaunched", id: message.id });
@@ -429,6 +447,18 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       case "profile": {
         const names = Object.keys(message.files);
         const contents = names.map((name) => message.files[name]);
+        if (isCanonicalGenericProject(message.files, message.entry)) {
+          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
+          try {
+            const stats = canonical.profile().map((stat) => {
+              const value = { functionId: stat.function_name, calls: stat.calls,
+                totalInstructions: stat.total_instructions, selfInstructions: stat.self_instructions };
+              stat.free(); return value;
+            });
+            post({ type: "profileResult", id: message.id, stats });
+          } finally { canonical.free(); }
+          return;
+        }
         if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
           const canonical = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
           try {
@@ -465,6 +495,21 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       case "recordTimeline": {
         const names = Object.keys(message.files);
         const contents = names.map((name) => message.files[name]);
+        if (isCanonicalGenericProject(message.files, message.entry)) {
+          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
+          try {
+            const result = canonical.record_timeline(message.maxEvents);
+            try {
+              const events = result.events.map((event) => {
+                const value = { eventType: event.event_type, source: event.source, line: event.line ?? null,
+                  local0: event.local0 ?? null, duration: event.duration };
+                event.free(); return value;
+              });
+              post({ type: "timelineResult", id: message.id, timeline: { events, truncated: result.truncated, error: result.error ?? null } });
+            } finally { result.free(); }
+          } finally { canonical.free(); }
+          return;
+        }
         if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
           const canonical = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
           try {

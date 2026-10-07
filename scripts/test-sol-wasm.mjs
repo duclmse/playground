@@ -3,12 +3,58 @@
 // module rather than treating a successful wasm32 cargo check as proof.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { initSync, execute_project, execute_lua, execute_lua_project, WasmDebugSession, WasmLuaDebugSession, WasmTypedDebugSession } from "../packages/sol-runtime/pkg/sol.js";
+import { initSync, execute_project, execute_generic_sol, execute_generic_project, source_requires_specialization, execute_lua, execute_lua_project, WasmDebugSession, WasmLuaDebugSession, WasmTypedDebugSession } from "../packages/sol-runtime/pkg/sol.js";
 
 const bytes = readFileSync(new URL("../packages/sol-runtime/pkg/sol_bg.wasm", import.meta.url));
 const module = new WebAssembly.Module(bytes);
 assert.deepEqual(WebAssembly.Module.imports(module).filter((entry) => entry.module === "env"), [], "browser runtime must not import host libc");
 initSync({ module });
+
+assert.equal(source_requires_specialization("print(5/2)", true), false);
+assert.equal(source_requires_specialization("function main():i64 return 42 end", true), true);
+const genericResult = execute_generic_sol("fn f(x) return x/2 end; print(f(5)); return 99", "main.sol");
+try { assert.equal(genericResult.error, undefined); assert.equal(genericResult.result, "2.5\n"); }
+finally { genericResult.free(); }
+const genericDebug = WasmLuaDebugSession.launch_generic_sol("fn f(n)\n local x=n+2\n print(x)\nend\nf(40)", "main.sol");
+try {
+  const bp = genericDebug.set_breakpoint("main.sol", 3);
+  try { assert.equal(bp.verified, true); } finally { bp.free(); }
+  const stop = genericDebug.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); } finally { stop.free(); }
+  const edit = genericDebug.set_variable(0, 0, "x", "44");
+  try { assert.equal(edit.ok, true, edit.display); } finally { edit.free(); }
+  const done = genericDebug.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  assert.equal(genericDebug.take_output(), "44\n");
+} finally { genericDebug.free(); }
+
+const genericNames = ["main.lua", "math/base.sol", "helper.lua"];
+const genericSources = ["local m=require('math.base'); print(m.add(40)); assert(m==require('math.base'))",
+  "fn add(n)\n local x=n+require('helper')\n return x\nend\nreturn {add=add}", "return 2"];
+const genericProject = execute_generic_project("main.lua", genericNames, genericSources);
+try { assert.equal(genericProject.error, undefined); assert.equal(genericProject.result, "42\n"); }
+finally { genericProject.free(); }
+const genericModuleDebug = WasmLuaDebugSession.launch_generic_project("main.lua", genericNames, genericSources);
+try {
+  const bp = genericModuleDebug.set_breakpoint("math/base.sol", 3);
+  try { assert.equal(bp.verified, true); } finally { bp.free(); }
+  const stop = genericModuleDebug.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); assert.equal(stop.source, "math/base.sol"); } finally { stop.free(); }
+  const edit = genericModuleDebug.set_variable(0, 0, "x", "44");
+  try { assert.equal(edit.ok, true, edit.display); } finally { edit.free(); }
+  genericModuleDebug.force_gc();
+  const done = genericModuleDebug.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  assert.equal(genericModuleDebug.take_output(), "44\n");
+} finally { genericModuleDebug.free(); }
+const genericAnalysis = WasmLuaDebugSession.launch_generic_project("main.lua", genericNames, genericSources);
+try {
+  const timeline = genericAnalysis.record_timeline(2);
+  try {
+    assert.equal(timeline.error, undefined); assert.equal(timeline.truncated, true);
+    const events = timeline.events; assert.equal(events.length, 2); events.forEach((event) => event.free());
+  } finally { timeline.free(); }
+} finally { genericAnalysis.free(); }
 
 // The typed corpus's native Tier-0 test uses these same expectations. Run
 // the actual linked WASM too; successful cargo checks are not parity proof.

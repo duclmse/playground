@@ -56,6 +56,7 @@ impl LuaRuntime {
             allocation_budget,
             capabilities: Capabilities::default(),
             module_sources: HashMap::new(),
+            module_configs: HashMap::new(),
             loading_modules: HashSet::new(),
             package_loaded,
             package_table,
@@ -200,9 +201,29 @@ impl LuaRuntime {
     /// Module names are exact byte strings; no filesystem search or native
     /// loader is consulted.
     pub fn add_module(&mut self, name: impl AsRef<[u8]>, source: impl AsRef<[u8]>) {
+        self.module_configs.remove(name.as_ref());
         self.capabilities.package = true;
         self.module_sources
             .insert(name.as_ref().to_vec(), source.as_ref().to_vec());
+    }
+
+    /// Registers an extension-enabled generic module without weakening a
+    /// mandatory typed contract. The profile controls parsing, not values.
+    pub fn add_generic_module(&mut self, name: &[u8], source: &[u8], config: crate::parser::LanguageConfig) -> LuaResult<()> {
+        let program = crate::parser::parse_with_config(crate::lexer::lex_bytes(source).map_err(LuaError::new)?, config)
+            .map_err(LuaError::new)?;
+        if crate::semantics::requires_specialized_execution(&program) {
+            return Err(LuaError::new("module requires specialized execution"));
+        }
+        self.add_module(name, source);
+        self.module_configs.insert(name.to_vec(), config);
+        Ok(())
+    }
+
+    pub(super) fn parse_module_source(&self, name: &[u8], source: &[u8]) -> LuaResult<crate::ast::Program> {
+        let config = self.module_configs.get(name).copied().unwrap_or(crate::parser::LanguageConfig::LUA);
+        crate::parser::parse_with_config(crate::lexer::lex_bytes(source).map_err(LuaError::new)?, config)
+            .map_err(LuaError::new)
     }
 
     pub fn capabilities(&self) -> Capabilities {

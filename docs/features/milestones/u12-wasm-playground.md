@@ -1568,3 +1568,45 @@ configurations pass. The canonical module measures 2,110,084 bytes raw /
 This closes item 16's typed-analysis replay gap. Generic/mixed browser
 projects, final legacy-package removal, and bundle/initialization
 qualification still keep U12 in progress and its production flag default-off.
+
+## Work item 18 — shared semantic selection and generic projects
+
+The CLI's AST-based execution selector is now a shared library facility.
+The browser uses it before choosing a generic or specialized adapter;
+filename defaults select accepted syntax, not permanent runtime semantics.
+Annotation-free `.sol` executes with canonical Lua values, division, captured
+output, and chunk returns that are not implicitly echoed. Explicit typed
+contracts, casts, records, imports/exports, and other typed-only surfaces are
+not silently boxed into this path.
+
+Generic in-memory projects can contain both `.lua` and `.sol` frontend
+profiles. The deterministic `require` loader retains each module's parser
+configuration and uses the same live trampoline, module cache, precise roots,
+and standard library. Original filenames remain available to breakpoints,
+frames, profiling, and timeline events. Registration validates every AST,
+rejects escaping/duplicate paths and ambiguous module names, and never
+enables host filesystem or native loading. This slice covers `require`, not
+an extension-enabled replacement for Lua's dynamic `load`/`dofile` parsing.
+
+Live debugging, frame edits, forced collection, profiling, and bounded
+timeline requests use the generic project adapter. A browser regression
+also caught and fixed executable-line verification for separately compiled
+top-level generic functions: their breakpoints could previously stop without
+being marked verified. Focused native and actual linked-WASM checks now
+assert both verification and execution.
+
+Qualification covers a Lua entry requiring an extension-enabled Sol module
+which itself requires another Lua module, cached module identity, a real
+paused module-local edit changing output from 42 to 44, forced collection,
+and separate analysis preserving the paused session. The jit-free WASM
+library suite has 188 passing tests; the complete native Sol suite, actual
+linked-WASM fixtures, Chromium worker/DOM debugging, both web build
+configurations, and Lua corpus-manifest validation pass. The canonical
+module measures 2,131,010 bytes raw / 651,981 bytes with Node's default gzip;
+the opt-in worker is 65.55 KB.
+
+Generic projects containing both extensions are supported, but projects
+crossing mandatory typed/generic call boundaries still need a shared bridge
+adapter. Production still imports the old package and initializes both
+engines under the default-off flag. That bridge, final legacy removal, and
+bundle/initialization qualification remain U12 completion requirements.

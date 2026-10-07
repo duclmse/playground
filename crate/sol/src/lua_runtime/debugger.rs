@@ -32,9 +32,16 @@ struct ResumeParent {
 
 impl LuaDebugSession {
     pub fn launch(source: &[u8], name: &str) -> LuaResult<Self> {
+        Self::launch_with_config(source, name, crate::parser::LanguageConfig::LUA)
+    }
+
+    pub fn launch_with_config(source: &[u8], name: &str, config: crate::parser::LanguageConfig) -> LuaResult<Self> {
         let program =
-            crate::parser::parse_lua(crate::lexer::lex_bytes(source).map_err(LuaError::new)?)
+            crate::parser::parse_with_config(crate::lexer::lex_bytes(source).map_err(LuaError::new)?, config)
                 .map_err(LuaError::new)?;
+        if config.sol_extensions && crate::semantics::requires_specialized_execution(&program) {
+            return Err(LuaError::new("program requires specialized execution"));
+        }
         let mut runtime = LuaRuntime::with_limits(10_000_000, 1_000);
         runtime.set_chunk_name(format!("@{name}").into_bytes());
         runtime.load_with_natives(&program, &HashSet::new(), HashMap::new())?;
@@ -47,6 +54,11 @@ impl LuaDebugSession {
         let mut executable_lines = HashMap::new();
         let mut lines = HashSet::new();
         collect_lines(&frame.proto, &mut lines);
+        for function in &program.functions {
+            let proto = crate::lua_bytecode::Compiler::compile_top_level(function)
+                .map_err(LuaError::new)?;
+            collect_lines(&proto, &mut lines);
+        }
         executable_lines.insert(name.to_string(), lines);
         runtime.frames.push(Frame::Lua(frame));
         Ok(Self {
@@ -67,19 +79,27 @@ impl LuaDebugSession {
 
     pub fn add_named_module(&mut self, name: &[u8], source_name: &str, source: &[u8]) {
         self.runtime.add_module(name, source);
+        self.register_module_lines(name, source_name, source);
+    }
+
+    pub fn add_generic_named_module(&mut self, name: &[u8], source_name: &str, source: &[u8], config: crate::parser::LanguageConfig) -> LuaResult<()> {
+        self.runtime.add_generic_module(name, source, config)?;
+        self.register_module_lines(name, source_name, source);
+        Ok(())
+    }
+
+    fn register_module_lines(&mut self, name: &[u8], source_name: &str, source: &[u8]) {
         self.runtime
             .debug_module_names
             .insert(name.to_vec(), format!("@{source_name}").into_bytes());
-        if let Ok(tokens) = crate::lexer::lex_bytes(source) {
-            if let Ok(program) = crate::parser::parse_lua(tokens) {
-                let mut lines = HashSet::new();
-                for function in &program.functions {
-                    if let Ok(proto) = crate::lua_bytecode::Compiler::compile_top_level(function) {
-                        collect_lines(&proto, &mut lines);
-                    }
+        if let Ok(program) = self.runtime.parse_module_source(name, source) {
+            let mut lines = HashSet::new();
+            for function in &program.functions {
+                if let Ok(proto) = crate::lua_bytecode::Compiler::compile_top_level(function) {
+                    collect_lines(&proto, &mut lines);
                 }
-                self.executable_lines.insert(source_name.to_string(), lines);
             }
+            self.executable_lines.insert(source_name.to_string(), lines);
         }
     }
 
@@ -827,6 +847,22 @@ fn collect_lines(proto: &crate::lua_bytecode::Proto, lines: &mut HashSet<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_sol_extensions_use_live_generic_frames_without_return_echo() {
+        let mut session = LuaDebugSession::launch_with_config(
+            b"fn f(n)\n local x=n+2\n print(x)\nend\nf(40)", "main.sol", crate::parser::LanguageConfig::SOL).unwrap();
+        assert!(session.has_executable_line("main.sol", 3));
+        while session.position().unwrap().1 != 3 {
+            assert_eq!(session.continue_burst(1), DebugStatus::Paused);
+        }
+        assert!(session.take_output().is_empty());
+        assert_eq!(session.evaluate(0, "x").unwrap(), LuaValue::Integer(42));
+        session.set_variable(0, "x", "44").unwrap();
+        assert_eq!(session.continue_burst(100), DebugStatus::Returned);
+        assert_eq!(session.take_output(), b"44\n");
+        assert!(LuaDebugSession::launch_with_config(
+            b"function main():i64 return 42 end", "main.sol", crate::parser::LanguageConfig::SOL).is_err());
+    }
 
     #[test]
     fn live_slices_preserve_locals_and_delay_output_until_execution() {

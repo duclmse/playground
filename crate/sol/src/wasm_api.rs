@@ -207,6 +207,36 @@ pub fn execute(source: &str) -> ExecuteResult {
     execute_compiled(crate::compile(source))
 }
 
+/// Uses the native CLI's semantic selector, not an extension-based runtime
+/// rule. The profile flag controls accepted syntax only.
+#[wasm_bindgen]
+pub fn source_requires_specialization(source: &str, sol_extensions: bool) -> Result<bool, JsValue> {
+    let config = if sol_extensions { crate::parser::LanguageConfig::SOL } else { crate::parser::LanguageConfig::LUA };
+    let result = crate::lexer::lex_bytes(source.as_bytes()).and_then(|tokens| crate::parser::parse_with_config(tokens, config));
+    result.map(|program| crate::semantics::requires_specialized_execution(&program)).map_err(|error| JsValue::from_str(&error))
+}
+
+/// Single-file generic Sol entry point, reusing its already-selected frontend
+/// profile and canonical generic semantics. No synthetic main return echo.
+#[wasm_bindgen]
+pub fn execute_generic_sol(source: &str, name: &str) -> ExecuteResult {
+    if let Err(error) = crate::modules::virtual_path(name) {
+        return ExecuteResult { result: None, error: Some(error) };
+    }
+    let result = crate::lexer::lex_bytes(source.as_bytes()).and_then(|tokens| crate::parser::parse_with_config(tokens, crate::parser::LanguageConfig::SOL));
+    match result {
+        Err(error) => ExecuteResult { result: None, error: Some(error) },
+        Ok(program) => {
+            if crate::semantics::requires_specialized_execution(&program) {
+                return ExecuteResult { result: None, error: Some("program requires specialized execution".into()) };
+            }
+            execute_lua_run(crate::lua_runtime::run_program_with_natives_and_budgets(
+                &program, &std::collections::HashSet::new(), std::collections::HashMap::new(),
+                crate::lua_runtime::Capabilities::default(), 10_000_000, 1000, 64 * 1024 * 1024, false, Some(format!("@{name}").into_bytes())))
+        }
+    }
+}
+
 /// Runs one browser-sandboxed Lua chunk through Sol's canonical dynamic
 /// runtime. Its standard output is the result, matching the worker's normal
 /// Lua playground contract; filesystem, process, and native-module access
@@ -251,6 +281,58 @@ fn validate_lua_project(entry: &str, names: &[String], contents: &[String]) -> R
     }
     if !paths.contains(&entry.to_string()) { return Err(format!("entry file '{entry}' is not present in the in-memory project")); }
     Ok(())
+}
+
+fn generic_project_session(entry: &str, names: &[String], contents: &[String]) -> Result<crate::lua_runtime::debugger::LuaDebugSession, String> {
+    use crate::lua_runtime::debugger::LuaDebugSession;
+    use crate::parser::LanguageConfig;
+    if names.len() != contents.len() { return Err("project names and contents have different lengths".into()); }
+    let mut paths = std::collections::HashSet::new();
+    let mut modules = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for (name, source) in names.iter().zip(contents) {
+        crate::modules::virtual_path(name)?;
+        if name.contains('\\') || name.split('/').any(|part| matches!(part, "" | "." | "..")) {
+            return Err(format!("invalid generic project path '{name}'"));
+        }
+        let (stem, config) = if let Some(stem) = name.strip_suffix(".sol") { (stem, LanguageConfig::SOL) }
+            else if let Some(stem) = name.strip_suffix(".lua") { (stem, LanguageConfig::LUA) }
+            else { return Err(format!("unsupported generic project path '{name}'")); };
+        let module = stem.replace('/', ".");
+        if !paths.insert(name) { return Err(format!("duplicate project path '{name}'")); }
+        if !modules.insert(module.clone()) { return Err(format!("ambiguous generic module path '{name}'")); }
+        let program = crate::parser::parse_with_config(crate::lexer::lex_bytes(source.as_bytes())?, config)?;
+        if crate::semantics::requires_specialized_execution(&program) {
+            return Err(format!("file '{name}' requires specialized execution"));
+        }
+        entries.push((name, source, module, config));
+    }
+    let index = names.iter().position(|name| name == entry)
+        .ok_or_else(|| format!("entry file '{entry}' is not present in the in-memory project"))?;
+    let mut session = LuaDebugSession::launch_with_config(contents[index].as_bytes(), entry, entries[index].3).map_err(|error| error.to_string())?;
+    for (i, (name, source, module, config)) in entries.into_iter().enumerate() {
+        if i != index { session.add_generic_named_module(module.as_bytes(), name, source.as_bytes(), config).map_err(|error| error.to_string())?; }
+    }
+    Ok(session)
+}
+
+/// Generic projects can contain both frontend profiles. Selection is based
+/// on every parsed AST; typed modules are never implicitly boxed here.
+#[wasm_bindgen]
+pub fn execute_generic_project(entry: String, names: Vec<String>, contents: Vec<String>) -> ExecuteResult {
+    use crate::lua_runtime::debugger::DebugStatus;
+    let mut session = match generic_project_session(&entry, &names, &contents) {
+        Ok(session) => session,
+        Err(error) => return ExecuteResult { result: None, error: Some(error.to_string()) },
+    };
+    let error = loop {
+        match session.continue_burst(10_000) {
+            DebugStatus::Paused => {},
+            DebugStatus::Returned => break None,
+            DebugStatus::Raised(error) => break Some(error),
+        }
+    };
+    ExecuteResult { result: Some(String::from_utf8_lossy(&session.take_output()).into_owned()), error }
 }
 
 fn execute_lua_run(run: crate::lua_runtime::LuaResult<crate::lua_runtime::LuaRun>) -> ExecuteResult {
@@ -1061,6 +1143,54 @@ impl WasmDebugSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generic_projects_share_live_modules_across_frontend_profiles() {
+        use crate::lua_runtime::debugger::DebugStatus;
+        let names = vec!["main.lua".into(), "math/base.sol".into(), "helper.lua".into()];
+        let contents = vec!["local m=require('math.base'); print(m.add(40)); assert(m==require('math.base'))".into(),
+            "fn add(n)\n local x=n+require('helper')\n return x\nend\nreturn {add=add}".into(), "return 2".into()];
+        let result = execute_generic_project("main.lua".into(), names.clone(), contents.clone());
+        assert_eq!(result.error(), None);
+        assert_eq!(result.result(), Some("42\n".into()));
+        let mut debug = generic_project_session("main.lua", &names, &contents).unwrap();
+        assert!(debug.has_executable_line("math/base.sol", 3));
+        while debug.position().is_none_or(|(source, line, _)| source != "math/base.sol" || line != 3) {
+            assert_eq!(debug.continue_burst(1), DebugStatus::Paused);
+        }
+        debug.set_variable(0, "x", "44").unwrap();
+        debug.force_gc();
+        assert_eq!(debug.continue_burst(1000), DebugStatus::Returned);
+        assert_eq!(debug.take_output(), b"44\n");
+        let profile = generic_project_session("main.lua", &names, &contents).unwrap().analyze(2);
+        assert!(profile.error.is_none());
+        assert!(profile.truncated);
+        assert_eq!(profile.events.len(), 2);
+    }
+
+    #[test]
+    fn generic_projects_reject_typed_contracts_and_unsafe_or_ambiguous_paths() {
+        for (names, contents) in [
+            (vec!["main.sol", "base.sol"], vec!["print(42)", "function f():i64 return 2 end"]),
+            (vec!["main.sol", "base.sol", "base.lua"], vec!["print(42)", "return 2", "return 2"]),
+            (vec!["main.sol", "../base.lua"], vec!["print(42)", "return 2"]),
+            (vec!["main.sol", "a.b.lua", "a/b.lua"], vec!["print(42)", "return 2", "return 2"]),
+        ] {
+            let names = names.into_iter().map(String::from).collect::<Vec<_>>();
+            let contents = contents.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(generic_project_session("main.sol", &names, &contents).is_err());
+        }
+    }
+    #[test]
+    fn generic_sol_uses_canonical_lua_semantics_without_return_echo() {
+        let result = execute_generic_sol("fn f(x) return x/2 end; print(f(5)); return 99", "main.sol");
+        assert_eq!(result.error(), None);
+        assert_eq!(result.result(), Some("2.5\n".into()));
+        let error = execute_generic_sol("print(42); error('expected')", "main.sol");
+        assert_eq!(error.result(), Some("42\n".into()));
+        assert!(error.error().unwrap().contains("expected"));
+        let typed = execute_generic_sol("function main():i64 return 42 end", "main.sol");
+        assert!(typed.error().unwrap().contains("specialized"));
+    }
 
     #[test]
     fn execute_runs_a_simple_sol_program() {
