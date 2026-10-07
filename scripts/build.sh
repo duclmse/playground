@@ -7,7 +7,7 @@ source ./lib.sh
 
 require_cmd npm "Install Node.js: https://nodejs.org"
 
-./build-wasm.sh
+./build-sol-wasm.sh
 
 if [ ! -d "$ROOT/node_modules" ]; then
   log "node_modules missing, running npm install"

@@ -25,7 +25,7 @@ struct Reference {
 pub struct WasmTypedDebugSession {
     program: TProgram,
     _engine: crate::tier0::Engine,
-    execution: Execution<()>,
+    pub(super) execution: Execution<()>,
     entry: String,
     return_type: Type,
     breakpoints: BTreeMap<u32, Breakpoint>,
@@ -67,7 +67,10 @@ impl WasmTypedDebugSession {
             crate::modules::compile_debug_project_from_sources(&entry, &files)?;
         let engine: crate::tier0::Engine = crate::tier0::Engine::new(program.clone(), ())?;
         let execution = engine.start_live("main", &[])?;
-        Ok(Self {
+        Ok(Self::from_parts(program, engine, execution, entry, return_type))
+    }
+    pub(super) fn from_parts(program: TProgram, engine: crate::tier0::Engine, execution: Execution<()>, entry: String, return_type: Type) -> Self {
+        Self {
             program,
             _engine: engine,
             execution,
@@ -81,7 +84,7 @@ impl WasmTypedDebugSession {
             skip_once: false,
             terminal: None,
             output: String::new(),
-        })
+        }
     }
 }
 

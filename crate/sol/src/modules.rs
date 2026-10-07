@@ -88,6 +88,22 @@ fn compile_memory_project(
     files: &[(String, Vec<u8>)],
     debug: bool,
 ) -> Result<(TProgram, Type), String> {
+    let project = load_project_program_from_sources(entry, files)?;
+    if project.has_dynamic_modules {
+        return Err("Tier-0 in-memory projects support .sol modules only; imported .lua modules require the native dynamic runtime".to_string());
+    }
+    if debug {
+        crate::compile_debug_program(project.program, crate::parser::SourceMode::Sol.into())
+    } else {
+        crate::compile_program(project.program)
+    }
+}
+
+/// Uses the canonical import graph without forcing either execution tier.
+pub fn load_project_program_from_sources(
+    entry: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<ProjectProgram, String> {
     let mut sources = HashMap::new();
     for (name, contents) in files {
         let path = virtual_path(name)?;
@@ -100,15 +116,7 @@ fn compile_memory_project(
         .get(&root)
         .ok_or_else(|| format!("entry file '{entry}' is not present in the in-memory project"))?
         .clone();
-    let project = load_project_program_with_provider(root, &source, SourceProvider::Memory(&sources))?;
-    if project.has_dynamic_modules {
-        return Err("Tier-0 in-memory projects support .sol modules only; imported .lua modules require the native dynamic runtime".to_string());
-    }
-    if debug {
-        crate::compile_debug_program(project.program, crate::parser::SourceMode::Sol.into())
-    } else {
-        crate::compile_program(project.program)
-    }
+    load_project_program_with_provider(root, &source, SourceProvider::Memory(&sources))
 }
 
 /// Canonicalized source-level module graph used by mixed-tier execution.
@@ -119,6 +127,9 @@ pub struct ProjectProgram {
     /// uses these names to build the same namespace table in `package.loaded`
     /// that typed `import` calls through.
     pub dynamic_contracts: Vec<DynamicModuleContract>,
+    pub namespace_contracts: Vec<DynamicModuleContract>,
+    pub loaded_paths: HashSet<String>,
+    pub initializer_names: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,14 +186,35 @@ fn load_project_program_with_provider(
         if program.initializer {
             initializers.push(format!("{}.main", module.name));
         }
-        namespace_program(&mut program, &module.name, &module.path);
+        let imported_functions = imported_function_names(&program, &by_name);
+        namespace_program(
+            &mut program,
+            &module.name,
+            &module.path,
+            &imported_functions,
+        );
         aliases.extend(program.aliases);
         structs.extend(program.structs);
         functions.extend(program.functions);
         externs.extend(program.externs);
     }
+    let root_imported = imported_function_names(&root_program, &by_name);
+    for function in &mut root_program.functions {
+        let visible = root_imported
+            .iter()
+            .filter(|name| {
+                !function
+                    .params
+                    .iter()
+                    .any(|(param, _)| name.starts_with(&format!("{param}.")))
+            })
+            .cloned()
+            .collect();
+        namespace_block(&mut function.body, "", &visible, &HashSet::new());
+    }
     root_program.imports.clear();
     root_program.exports.clear();
+    let initializer_names = initializers.iter().cloned().collect();
     if let Some(main) = root_program
         .functions
         .iter_mut()
@@ -216,6 +248,22 @@ fn load_project_program_with_provider(
             })
         })
         .collect();
+    let namespace_contracts = loader
+        .order
+        .iter()
+        .map(|key| {
+            let module = &loader.loaded[key];
+            DynamicModuleContract {
+                name: module.name.clone(),
+                exports: module.program.exports.clone(),
+            }
+        })
+        .collect();
+    let loaded_paths = loader
+        .loaded
+        .values()
+        .map(|module| module.path.display().to_string())
+        .collect();
     Ok(ProjectProgram {
         program: ast::Program {
             imports: Vec::new(),
@@ -228,6 +276,9 @@ fn load_project_program_with_provider(
         },
         has_dynamic_modules,
         dynamic_contracts,
+        namespace_contracts,
+        loaded_paths,
+        initializer_names,
     })
 }
 
@@ -239,15 +290,18 @@ impl Loader<'_> {
         importer: &Path,
         import_line: u32,
     ) -> Result<(), String> {
-        let path = self.source_provider.resolve(name, relative_to).ok_or_else(|| {
-            let relative = name.replace('.', "/");
-            format!(
-                "{}:{import_line}: module '{name}' not found; tried '{}' then '{}'",
-                importer.display(),
-                relative_to.join(format!("{relative}.sol")).display(),
-                relative_to.join(format!("{relative}.lua")).display()
-            )
-        })?;
+        let path = self
+            .source_provider
+            .resolve(name, relative_to)
+            .ok_or_else(|| {
+                let relative = name.replace('.', "/");
+                format!(
+                    "{}:{import_line}: module '{name}' not found; tried '{}' then '{}'",
+                    importer.display(),
+                    relative_to.join(format!("{relative}.sol")).display(),
+                    relative_to.join(format!("{relative}.lua")).display()
+                )
+            })?;
         let key = self.source_provider.key(&path);
         if let Some(start) = self.visiting.iter().position(|entry| entry == &key) {
             let mut cycle = self.visiting[start..]
@@ -325,15 +379,21 @@ impl Loader<'_> {
 pub(crate) fn virtual_path(name: &str) -> Result<PathBuf, String> {
     let path = Path::new(name);
     if path.is_absolute() || name.is_empty() {
-        return Err(format!("in-memory project path '{name}' must be a non-empty relative path"));
+        return Err(format!(
+            "in-memory project path '{name}' must be a non-empty relative path"
+        ));
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::Normal(part) => normalized.push(part),
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(format!("in-memory project path '{name}' must not escape its project root"));
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "in-memory project path '{name}' must not escape its project root"
+                ));
             }
         }
     }
@@ -638,12 +698,40 @@ fn collect_expr(expr: &Expr, out: &mut Vec<(String, u32)>) {
     }
 }
 
-fn namespace_program(program: &mut ast::Program, namespace: &str, path: &Path) {
-    let local_functions: HashSet<String> = program
+fn imported_function_names(
+    program: &ast::Program,
+    modules: &HashMap<String, &LoadedModule>,
+) -> HashSet<String> {
+    program
+        .imports
+        .iter()
+        .flat_map(|import| {
+            modules
+                .get(&import.module)
+                .into_iter()
+                .flat_map(move |module| {
+                    module
+                        .program
+                        .functions
+                        .iter()
+                        .filter(|function| module.program.exports.contains(&function.name))
+                        .map(move |function| format!("{}.{}", import.module, function.name))
+                })
+        })
+        .collect()
+}
+fn namespace_program(
+    program: &mut ast::Program,
+    namespace: &str,
+    path: &Path,
+    imported_functions: &HashSet<String>,
+) {
+    let mut local_functions: HashSet<String> = program
         .functions
         .iter()
         .map(|function| function.name.clone())
         .collect();
+    local_functions.extend(imported_functions.iter().cloned());
     let local_structs: HashSet<String> = program
         .structs
         .iter()
@@ -674,10 +762,20 @@ fn namespace_program(program: &mut ast::Program, namespace: &str, path: &Path) {
         if let Some(ty) = &mut function.return_type {
             namespace_type(ty, namespace, &local_types);
         }
+        let visible_functions = local_functions
+            .iter()
+            .filter(|name| {
+                !function
+                    .params
+                    .iter()
+                    .any(|(param, _)| shadows_function(param, name))
+            })
+            .cloned()
+            .collect();
         namespace_block(
             &mut function.body,
             namespace,
-            &local_functions,
+            &visible_functions,
             &local_types,
         );
     }
@@ -708,13 +806,31 @@ fn namespace_type(ty: &mut TypeName, namespace: &str, local_structs: &HashSet<St
     }
 }
 
+fn shadows_function(binding: &str, function: &str) -> bool {
+    function == binding
+        || function
+            .strip_prefix(binding)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn hide_binding(functions: &mut HashSet<String>, binding: &str) {
+    functions.retain(|function| !shadows_function(binding, function));
+}
+
 fn namespace_block(
     block: &mut [Stmt],
     namespace: &str,
     local_functions: &HashSet<String>,
     local_structs: &HashSet<String>,
-) {
+) -> HashSet<String> {
+    let mut visible_functions = local_functions.clone();
     for statement in block {
+        let local_functions = &visible_functions;
+        let local_function_name = if let Stmt::LocalFunction(function) = statement {
+            Some(function.name.clone())
+        } else {
+            None
+        };
         match statement {
             Stmt::Global { values, .. } => values
                 .iter_mut()
@@ -736,15 +852,32 @@ fn namespace_block(
                 if let Some(ty) = &mut function.return_type {
                     namespace_type(ty, namespace, local_structs);
                 }
+                let mut nested_functions = local_functions.clone();
+                nested_functions.retain(|name| {
+                    !function
+                        .params
+                        .iter()
+                        .any(|(param, _)| shadows_function(param, name))
+                });
+                if let Some(name) = &local_function_name {
+                    hide_binding(&mut nested_functions, name);
+                }
                 namespace_block(
                     &mut function.body,
                     namespace,
-                    local_functions,
+                    &nested_functions,
                     local_structs,
                 );
             }
-            Stmt::Block(body) => namespace_block(body, namespace, local_functions, local_structs),
-            Stmt::Repeat { body, cond, .. } | Stmt::While { body, cond, .. } => {
+            Stmt::Block(body) => {
+                namespace_block(body, namespace, local_functions, local_structs);
+            }
+            Stmt::Repeat { body, cond, .. } => {
+                let scoped_functions =
+                    namespace_block(body, namespace, local_functions, local_structs);
+                namespace_expr(cond, namespace, &scoped_functions, local_structs);
+            }
+            Stmt::While { body, cond, .. } => {
                 namespace_block(body, namespace, local_functions, local_structs);
                 namespace_expr(cond, namespace, local_functions, local_structs);
             }
@@ -782,6 +915,7 @@ fn namespace_block(
                 }
             }
             Stmt::NumericFor {
+                var,
                 start,
                 stop,
                 step,
@@ -793,15 +927,25 @@ fn namespace_block(
                 if let Some(step) = step {
                     namespace_expr(step, namespace, local_functions, local_structs);
                 }
-                namespace_block(body, namespace, local_functions, local_structs);
+                let mut scoped_functions = local_functions.clone();
+                hide_binding(&mut scoped_functions, var);
+                namespace_block(body, namespace, &scoped_functions, local_structs);
             }
             Stmt::GenericFor {
-                iterators, body, ..
+                vars,
+                iterators,
+                body,
+                ..
             } => {
                 iterators.iter_mut().for_each(|value| {
                     namespace_expr(value, namespace, local_functions, local_structs)
                 });
-                namespace_block(body, namespace, local_functions, local_structs);
+                let scoped_functions = local_functions
+                    .iter()
+                    .filter(|name| !vars.iter().any(|var| shadows_function(var, name)))
+                    .cloned()
+                    .collect();
+                namespace_block(body, namespace, &scoped_functions, local_structs);
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
@@ -813,7 +957,22 @@ fn namespace_block(
                 .for_each(|value| namespace_expr(value, namespace, local_functions, local_structs)),
             Stmt::Label { .. } | Stmt::Goto { .. } | Stmt::Break { .. } => {}
         }
+        match statement {
+            Stmt::Local { name, .. } => {
+                hide_binding(&mut visible_functions, name);
+            }
+            Stmt::MultiLocal { names, .. } => {
+                for (name, _, _, _) in names {
+                    hide_binding(&mut visible_functions, name);
+                }
+            }
+            Stmt::LocalFunction(function) => {
+                hide_binding(&mut visible_functions, &function.name);
+            }
+            _ => {}
+        }
     }
+    visible_functions
 }
 
 fn namespace_target(
@@ -842,11 +1001,24 @@ fn namespace_expr(
 ) {
     match &mut expr.kind {
         ExprKind::Call(name, args) => {
-            if local_functions.contains(name) {
-                *name = format!("{namespace}.{name}");
-            }
+            let bound = local_functions.contains(name).then(|| {
+                if name.contains('.') || namespace.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{namespace}.{name}")
+                }
+            });
             args.iter_mut()
                 .for_each(|arg| namespace_expr(arg, namespace, local_functions, local_structs));
+            if let Some(name) = bound {
+                expr.kind = ExprKind::CallExpr(
+                    Box::new(Expr {
+                        kind: ExprKind::Name(name),
+                        line: expr.line,
+                    }),
+                    std::mem::take(args),
+                );
+            }
         }
         ExprKind::CallExpr(callee, args) => {
             namespace_expr(callee, namespace, local_functions, local_structs);
@@ -857,6 +1029,13 @@ fn namespace_expr(
             namespace_expr(base, namespace, local_functions, local_structs);
             args.iter_mut()
                 .for_each(|arg| namespace_expr(arg, namespace, local_functions, local_structs));
+        }
+        ExprKind::Field(base, field) if matches!(&base.kind,ExprKind::Name(name) if local_functions.contains(&format!("{name}.{field}"))) =>
+        {
+            let ExprKind::Name(name) = &base.kind else {
+                unreachable!()
+            };
+            expr.kind = ExprKind::Name(format!("{name}.{field}"));
         }
         ExprKind::Unary(_, inner)
         | ExprKind::Len(inner)
@@ -881,12 +1060,29 @@ fn namespace_expr(
                 namespace_expr(value, namespace, local_functions, local_structs);
             }
         }),
-        ExprKind::Function(function) => namespace_block(
-            &mut function.body,
-            namespace,
-            local_functions,
-            local_structs,
-        ),
+        ExprKind::Function(function) => {
+            let visible_functions = local_functions
+                .iter()
+                .filter(|name| {
+                    !function
+                        .params
+                        .iter()
+                        .any(|(param, _)| shadows_function(param, name))
+                })
+                .cloned()
+                .collect();
+            namespace_block(
+                &mut function.body,
+                namespace,
+                &visible_functions,
+                local_structs,
+            );
+        }
+        ExprKind::Name(name)
+            if local_functions.contains(name) && !name.contains('.') && !namespace.is_empty() =>
+        {
+            *name = format!("{namespace}.{name}");
+        }
         ExprKind::StructLiteral(name, fields) => {
             if local_structs.contains(name) {
                 *name = format!("{namespace}.{name}");
@@ -902,5 +1098,26 @@ fn namespace_expr(
         | ExprKind::FloatLit(_)
         | ExprKind::BoolLit(_)
         | ExprKind::Name(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod namespace_scope_tests {
+    use super::*;
+
+    #[test]
+    fn local_bindings_hide_import_aliases_without_hiding_similar_names() {
+        let mut functions = ["helper.add", "helper", "helper2.add", "other.add"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        hide_binding(&mut functions, "helper");
+        assert_eq!(
+            functions,
+            ["helper2.add", "other.add"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
     }
 }

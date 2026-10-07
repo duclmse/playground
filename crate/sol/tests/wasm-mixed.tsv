@@ -1,0 +1,9 @@
+# entry<TAB>comma-separated in-memory files<TAB>stdout including explicit typed main result, hex
+project/main.sol	project/main.sol,project/helper.lua	34320a3832
+project/reentrant.sol	project/reentrant.sol	310a300a3433
+project/protected.sol	project/protected.sol	34320a66616c73650a
+project/cache.sol	project/cache.sol,project/counter.lua	310a320a3432
+project/shadow.sol	project/shadow.sol,project/scope.sol	313332
+project/initialize.sol	project/initialize.sol,project/init.sol	696e69740a3834
+project/float.sol	project/float.sol,project/float_helper.lua	34302e300a3432
+project/string.sol	project/string.sol,project/helper.lua	33390a6f6b

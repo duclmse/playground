@@ -49,7 +49,13 @@ impl Compiler {
                     return Ok(reg);
                 }
                 let r = self.stack[level].alloc_reg();
-                self.compile_name_into(name, r, line)?;
+                if name.contains('.') {
+                    // Only module lowering creates a dotted Name node;
+                    // source-level field access is an ExprKind::Field.
+                    self.emit_environment_get(level, name, r, line);
+                } else {
+                    self.compile_name_into(name, r, line)?;
+                }
                 Ok(r)
             }
             ExprKind::Function(function) => {

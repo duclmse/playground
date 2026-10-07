@@ -23,6 +23,7 @@ use crate::types::TProgram;
 /// to `Engine::new_with_budget` to override.
 pub const DEFAULT_INSTRUCTION_BUDGET: u64 = 10_000_000;
 
+#[derive(Clone)]
 pub struct Engine<H: interp::Hooks = ()> {
     runtime: std::rc::Rc<interp::Runtime<'static, H>>,
     name_to_id: HashMap<String, u8>,
@@ -76,9 +77,14 @@ impl<H: interp::Hooks> Engine<H> {
         hooks: H,
         instruction_budget: u64,
     ) -> Result<Self, String> {
+        Self::new_with_adapters(program, hooks, instruction_budget, HashMap::new())
+    }
+
+    pub(crate) fn new_with_adapters(program: TProgram, hooks: H, instruction_budget: u64,
+        adapters: HashMap<String, std::rc::Rc<interp::SemanticCallable>>) -> Result<Self, String> {
         let mut unsupported_externs = Vec::new();
         for extern_fn in &program.externs {
-            if known_runtime_extern_shim(&extern_fn.name).is_none() {
+            if !adapters.contains_key(&extern_fn.name) && known_runtime_extern_shim(&extern_fn.name).is_none() {
                 unsupported_externs.push(extern_fn.name.clone());
             }
         }
@@ -103,6 +109,10 @@ impl<H: interp::Hooks> Engine<H> {
             }
         }
         for extern_fn in &program.externs {
+            if let Some(adapter) = adapters.get(&extern_fn.name) {
+                slots.push(Slot::Semantic(adapter.clone()));
+                continue;
+            }
             let shim = known_runtime_extern_shim(&extern_fn.name)
                 .expect("already validated above - every extern here has a known shim");
             slots.push(Slot::Native(shim as *const u8));
@@ -141,6 +151,8 @@ impl<H: interp::Hooks> Engine<H> {
     pub fn hooks(&self) -> &H {
         self.runtime.hooks()
     }
+
+    pub(crate) fn remaining_budget(&self) -> u64 { self.runtime.instructions_remaining.get() }
 
     /// A live, bounded Tier-0 execution over the same bytecode and opcode
     /// semantics as ordinary calls. The execution owns its suspended roots.

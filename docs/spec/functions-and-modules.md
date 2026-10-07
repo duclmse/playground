@@ -55,3 +55,20 @@ loaded by `import` is also installed in `package.loaded`, so a later
 identities rather than executing a second module instance. Unannotated dynamic
 functions remain private to typed import. `sol build` and `sol debug` do not yet
 support dynamic module bodies.
+
+The browser's canonical mixed adapter supports the same checked scalar
+contracts, with parked continuations rather than blocking callbacks. Typed
+registers remain unboxed between boundary calls; both directions share a
+project budget and depth limit. Imported namespaces, initializers, and cached
+callable identities are shared across reentrant calls. Imported function values
+are qualified without overriding lexical parameter/local/loop bindings.
+
+Typed modules must enter the canonical import graph before dynamic `require`;
+an unimported typed module is not silently executed as generic code. The
+current flattened import interface discovers top-level function declarations,
+not functions nested in a lexical chunk initializer. Cross-boundary strings,
+aggregates, function values, typed yields, and reentry from atomic native
+callbacks are not supported. A string returned by the typed root is displayable
+without extending the foreign-call ABI. Mixed debugger coroutine/thread
+isolation is not yet qualified; see
+[U12 work item 20](../features/milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).

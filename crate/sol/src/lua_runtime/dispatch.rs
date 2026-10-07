@@ -1073,6 +1073,7 @@ impl LuaRuntime {
                 .map(|source| String::from_utf8_lossy(source).trim_start_matches('@').to_string()).unwrap_or_default(), proto.metadata.name));
         }
         let frame = LuaFrame {
+            debug_identity: self.next_debug_frame,
             header: FrameHeader::new(function, 0, 0),
             closure,
             proto,
@@ -1093,6 +1094,7 @@ impl LuaRuntime {
             debugger_last_pc: None,
             debugger_last_line: None,
         };
+        self.next_debug_frame += 1;
         self.record_event("call", &frame);
         Ok(frame)
     }
@@ -1303,6 +1305,11 @@ impl LuaRuntime {
                     // here so it never leaks onto some later, unrelated call.
                     let new_frame_label = self.pending_frame_label.take();
                     match step {
+                        Ok(StepResult::DebugSemantic(function, args)) => {
+                            self.frames.push(Frame::Lua(frame));
+                            self.debug_semantic_request = Some((function, args));
+                            return Ok(DriveOutcome::Yielded(Vec::new()));
+                        }
                         Ok(StepResult::DebugPause) => {
                             self.debug_pause_requested = true;
                             self.frames.push(Frame::Lua(frame));
@@ -1891,6 +1898,10 @@ impl LuaRuntime {
     ) -> LuaResult<CallStep> {
         let callee_for_naming = callee.clone();
         match self.step_result_for_call(callee, args) {
+            Ok(StepResult::DebugSemantic(function, args)) => {
+                self.debug_semantic_request = Some((function, args));
+                Ok(CallStep::Yielded(Vec::new()))
+            }
             Ok(StepResult::DebugPause) => unreachable!("call resolution does not execute bytecode"),
             Ok(StepResult::DebugResume(request)) => {
                 self.debug_resume_request = Some(request);
@@ -3311,6 +3322,14 @@ impl LuaRuntime {
         let mut full_args = args;
         let mut hops = 0usize;
         loop {
+            if let LuaValue::RegisteredNative(callable) = &resolved {
+                if let Some(function) = self.semantic_functions.get(callable).copied() {
+                    if self.debug_slice_remaining.is_some() && self.debug_drive_nesting <= 1 && !self.running_hook {
+                        return Ok(StepResult::DebugSemantic(function, full_args));
+                    }
+                    return Err(LuaError::new("cross-tier call requires the live scheduler; atomic native callbacks cannot reenter it"));
+                }
+            }
             if self.debug_slice_remaining.is_some() && self.debug_drive_nesting <= 1 && !self.running_hook {
                 if matches!(resolved, LuaValue::NativeFunction(NativeFunction::CoroutineResume)) {
                     let mut arguments = full_args;

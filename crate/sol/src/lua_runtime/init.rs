@@ -57,6 +57,9 @@ impl LuaRuntime {
             capabilities: Capabilities::default(),
             module_sources: HashMap::new(),
             module_configs: HashMap::new(),
+            semantic_functions: HashMap::new(),
+            debug_semantic_request: None,
+            next_debug_frame: 0,
             loading_modules: HashSet::new(),
             package_loaded,
             package_table,
@@ -916,7 +919,7 @@ impl LuaRuntime {
                 None => Compiler::compile_top_level(function),
             }
             .map_err(LuaError::new)?;
-            if let Some(chunk_name) = self.default_chunk_name.clone() {
+            if let Some(chunk_name) = function.source_file.as_ref().map(|file| Rc::new(format!("@{file}").into_bytes())).or_else(|| self.default_chunk_name.clone()) {
                 self.register_chunk_source(&proto, &chunk_name);
             }
             let closure = self.new_closure(proto, Vec::new(), globals.clone(), None)?;

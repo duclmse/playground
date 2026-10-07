@@ -75,12 +75,19 @@ struct Breakpoint {
 
 #[wasm_bindgen]
 pub struct WasmLuaDebugSession {
-    inner: LuaDebugSession,
+    pub(super) inner: LuaDebugSession,
     breakpoints: HashMap<u32, Breakpoint>,
     next_breakpoint: u32,
     references: HashMap<u32, LuaValue>,
     next_reference: u32,
     skip_breakpoint_once: bool,
+}
+
+impl WasmLuaDebugSession {
+    pub(super) fn from_inner(inner: LuaDebugSession) -> Self {
+        Self { inner, breakpoints: HashMap::new(), next_breakpoint: 1, references: HashMap::new(),
+            next_reference: 1, skip_breakpoint_once: false }
+    }
 }
 
 #[wasm_bindgen]

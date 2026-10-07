@@ -115,6 +115,11 @@ impl<H: Hooks + 'static> Execution<H> {
         self.semantic_call.as_ref()
     }
 
+    pub(crate) fn configure_bridge_limits(&mut self, budget: u64, max_depth: usize) {
+        self.runtime.instructions_remaining.set(budget);
+        self.max_depth = max_depth;
+    }
+
     /// Finish exactly one parked cross-tier call. A missing/already-consumed
     /// continuation is rejected without changing the live execution.
     pub fn finish_semantic_call(&mut self, result: Result<u64, String>) -> Result<(), String> {

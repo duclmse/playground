@@ -132,6 +132,7 @@ pub(super) enum BinaryResolution {
 /// iteratively instead of recursively.
 #[derive(Clone)]
 pub(super) struct LuaFrame {
+    pub(super) debug_identity: u64,
     pub(super) header: FrameHeader,
     /// The exact closure invoked for this activation. Multiple closures can
     /// share a prototype, so `debug.getinfo(level, "f")` cannot reconstruct
@@ -364,6 +365,7 @@ pub(super) enum GsubOutcome {
 
 /// What `LuaRuntime::dispatch_step` produced for the frame it just ran.
 pub(super) enum StepResult {
+    DebugSemantic(u8, Vec<LuaValue>),
     DebugResume(DebugResumeRequest),
     /// Embedding debugger suspension before the next instruction. Unlike a
     /// Lua yield, no pending call results are created or consumed.

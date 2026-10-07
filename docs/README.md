@@ -16,9 +16,12 @@ file is kept as-is - it's the source rationale and contains useful
 diagrams/examples - but the documents below are the ones to build from; they
 correct a few assumptions the original made and fill in gaps it left open.
 
-**Current browser runtime:** Rust + Piccolo compiled to WebAssembly. It remains
-the shipping engine and migration oracle until the canonical `sol-wasm`
-runtime reaches debugger and semantic parity. See
+**Current browser runtime:** canonical Sol Tier 0 compiled to WebAssembly,
+loaded once in the worker through `packages/sol-runtime`. Generic, specialized,
+and checked scalar mixed projects use live execution; production no longer
+imports the Piccolo package. See the
+[U12 qualification and remaining limits](features/milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).
+Earlier browser implementation sections below describe migration history. See
 [architecture.md](./architecture.md#historicalcurrent-browser-runtime-rust--piccolo)
 for its historical rationale.
 
@@ -38,7 +41,7 @@ Start with [the Sol overview](sol.md), then use:
 
 1. [product-brief.md](./product-brief.md) - the unified product contract.
 2. [features/unified-sol-runtime-plan.md](./features/unified-sol-runtime-plan.md) - shared final architecture and gates; see [features/milestones/](./features/milestones/README.md) for U0-U14 specifications.
-3. [architecture.md](./architecture.md) - target layers plus the current Piccolo implementation.
+3. [architecture.md](./architecture.md) - target layers plus the historical Piccolo implementation.
 4. [debug-protocol.md](./debug-protocol.md) - the current debugger protocol and inspector model.
 5. [roadmap.md](./roadmap.md) - historical browser delivery phases.
 6. [risks.md](./risks.md) - browser implementation risks and decision history.

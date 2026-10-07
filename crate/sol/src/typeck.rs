@@ -1283,6 +1283,13 @@ fn block_in_current_scope(checker: &mut Checker, block: &ast::Block) -> Result<T
 
 fn check_expr(checker: &mut Checker, expr: &ast::Expr) -> Result<TExpr, String> {
     let line = expr.line;
+    if let ast::ExprKind::CallExpr(callee, args) = &expr.kind {
+        if let ast::ExprKind::Name(name) = &callee.kind {
+            if checker.resolve(name).is_none() && checker.sigs.contains_key(name) {
+                return check_expr(checker, &ast::Expr {kind:ast::ExprKind::Call(name.clone(),args.clone()),line});
+            }
+        }
+    }
     match &expr.kind {
         ast::ExprKind::Table(_)
         | ast::ExprKind::Function(_)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# U12 item 6: regenerates packages/sol-runtime/pkg from crate/sol's
-# `wasm` feature (wasm_api.rs's `execute`/`WasmDebugSession` surface - see
-# docs/features/milestones/u12-wasm-playground.md's Work item 6 section for
-# the full scope/honesty-gap writeup). Parallel to scripts/build-wasm.sh's
+# Regenerates the production packages/sol-runtime/pkg from crate/sol's
+# `wasm` feature (generic, specialized, and checked mixed live adapters;
+# see docs/features/milestones/u12-wasm-playground.md). Like the historical
+# scripts/build-wasm.sh, uses the
 # pre-stub shape (raw `cargo build` + standalone `wasm-bindgen` CLI, not
 # wasm-pack), targeting crate/sol instead of the retired crate/lua-vm, and
 # with `--no-default-features` so the `jit` feature's Cranelift dependencies

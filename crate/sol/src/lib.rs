@@ -40,6 +40,7 @@ pub mod parser;
 pub mod profile;
 pub mod runtime;
 pub mod semantics;
+pub mod bridge;
 pub mod sol_ir;
 pub mod strings;
 #[cfg(feature = "jit")]

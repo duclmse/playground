@@ -1,67 +1,33 @@
 /// <reference lib="webworker" />
-import init, { execute_project, DebugSession, profile_project, record_timeline_project } from "@lua-playground/runtime";
+import init, * as runtime from "@lua-playground/sol-runtime";
 import type { DebugRequest, WorkerEvent } from "./debug-protocol";
 import type * as SolRuntime from "@lua-playground/sol-runtime";
-
 export type { WorkerEvent } from "./debug-protocol";
-
-// U12 opt-in canonical runtime. All-Lua and specialized all-Sol projects
-// have live debugger adapters; imports use the worker's in-memory file map.
-// Mixed projects still use the compatibility adapter pending qualification.
-// The production switch remains OFF unless VITE_SOL_ENGINE=1 is supplied.
-const SOL_ENGINE_ENABLED = import.meta.env.VITE_SOL_ENGINE === "1";
-
+type CanonicalSession = SolRuntime.WasmLuaDebugSession | SolRuntime.WasmTypedDebugSession | SolRuntime.WasmMixedDebugSession;
 let ready: Promise<unknown> | null = null;
-let session: DebugSession | null = null;
-let solRuntime: typeof SolRuntime | null = null;
-let luaDebugSession: SolRuntime.WasmLuaDebugSession | null = null;
-let typedDebugSession: SolRuntime.WasmTypedDebugSession | null = null;
-
-async function ensureReady() {
-  if (!ready) {
-    ready = SOL_ENGINE_ENABLED
-      ? (async () => {
-          const runtime = await import("@lua-playground/sol-runtime");
-          await Promise.all([init(), runtime.default()]);
-          solRuntime = runtime;
-        })()
-      : init();
-  }
-  await ready;
-}
-
-function requireSolRuntime(): typeof SolRuntime {
-  if (!solRuntime) {
-    throw new Error("canonical Sol runtime was not initialized");
-  }
-  return solRuntime;
-}
-
-function post(event: WorkerEvent) {
-  self.postMessage(event);
-}
-
-function requireSession(): DebugSession {
-  if (!session) {
-    throw new Error("no debug session: call debugLaunch first");
-  }
-  return session;
-}
-
-function isCanonicalSolProject(files: Record<string, string>, entry: string): boolean {
+let debugSession: CanonicalSession | null = null;
+function ensureReady() { return ready ??= init(); }
+function post(event: WorkerEvent) { self.postMessage(event); }
+function launch(files: Record<string,string>, entry: string): CanonicalSession {
   const names = Object.keys(files);
-  return SOL_ENGINE_ENABLED && entry.endsWith(".sol") && names.every((name) => name.endsWith(".sol"));
+  const contents = names.map((name) => files[name]);
+  if (!Object.prototype.hasOwnProperty.call(files, entry)) throw new Error("entry is missing from project");
+  names.forEach((name) => {
+    if (!name.endsWith(".lua") && !name.endsWith(".sol")) throw new Error(`unsupported project path '${name}'`);
+  });
+  const generic = !runtime.source_requires_specialization(files[entry],entry.endsWith(".sol"));
+  if (generic) return runtime.WasmLuaDebugSession.launch_generic_project(entry,names,contents);
+  try {
+    return runtime.WasmTypedDebugSession.launch_project(entry,names,contents);
+  } catch (typedError) {
+    // The mixed compiler validates the same source contracts and canonical
+    // import graph. Genuine static/FFI errors are not silently boxed away.
+    try { return runtime.WasmMixedDebugSession.launch_project(entry,names,contents); }
+    catch { throw typedError; }
+  }
 }
-
-function isCanonicalGenericProject(files: Record<string, string>, entry: string): boolean {
-  // Frontend defaults may follow filenames; execution is selected from ASTs.
-  return SOL_ENGINE_ENABLED && Object.keys(files).every((name) => name.endsWith(".sol") || name.endsWith(".lua"))
-    && Object.prototype.hasOwnProperty.call(files, entry)
-    && Object.entries(files).every(([name, source]) => !requireSolRuntime().source_requires_specialization(source, name.endsWith(".sol")));
-}
-
 function handleCanonicalLiveDebug(message: DebugRequest): boolean {
-  const canonical = luaDebugSession ?? typedDebugSession;
+  const canonical = debugSession;
   if (!canonical || !("id" in message) || message.type === "debugLaunch") return false;
   const id = message.id;
   const variables = (values: SolRuntime.LuaDebugVariable[]) => {
@@ -135,456 +101,58 @@ function handleCanonicalLiveDebug(message: DebugRequest): boolean {
   return true;
 }
 
-self.onmessage = async (event: MessageEvent<DebugRequest>) => {
-  const message = event.data;
-  await ensureReady();
 
+self.onmessage = async ({ data: message }: MessageEvent<DebugRequest>) => {
   try {
+    await ensureReady();
     if (handleCanonicalLiveDebug(message)) return;
     switch (message.type) {
-      case "run": {
-        const names = Object.keys(message.files);
-        const contents = names.map((name) => message.files[name]);
-        if (isCanonicalGenericProject(message.files, message.entry)) {
-          const result = requireSolRuntime().execute_generic_project(message.entry, names, contents);
-          post({ type: "result", output: result.result ?? "", error: result.error ?? null,
-            errorSource: result.error ? message.entry : null, errorLine: null });
-          result.free(); return;
-        }
-        if (isCanonicalSolProject(message.files, message.entry)) {
-          // The canonical engine accepts exactly the typed `.sol` profile.
-          // Generic projects have already selected their shared live path.
-          // Projects crossing a mandatory typed/generic boundary still
-          // require the mixed semantic bridge adapter.
-          const runtime = requireSolRuntime();
-          const solResult = runtime.execute_project(message.entry, names, contents);
-          post({
-            type: "result",
-            output: solResult.result ?? "",
-            error: solResult.error ?? null,
-            errorSource: solResult.error ? names[0] : null,
-            errorLine: null,
-          });
-          solResult.free();
-          return;
-        }
-        if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
-          const solResult = requireSolRuntime().execute_lua_project(message.entry, names, contents);
-          post({
-            type: "result",
-            output: solResult.result ?? "",
-            error: solResult.error ?? null,
-            errorSource: solResult.error ? message.entry : null,
-            errorLine: null,
-          });
-          solResult.free();
-          return;
-        }
-        const result = execute_project(names, contents, message.entry);
-        post({
-          type: "result",
-          output: result.output,
-          error: result.error ?? null,
-          errorSource: result.error_source ?? null,
-          errorLine: result.error_line ?? null,
-        });
-        return;
-      }
-
       case "debugLaunch": {
-        const names = Object.keys(message.files);
-        const contents = names.map((name) => message.files[name]);
-        luaDebugSession?.free();
-        luaDebugSession = null;
-        typedDebugSession?.free();
-        typedDebugSession = null;
-        session?.free();
-        session = null;
-        if (isCanonicalGenericProject(message.files, message.entry)) {
-          luaDebugSession = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
-          post({ type: "debugLaunched", id: message.id }); return;
-        }
-        if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
-          luaDebugSession = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
-          post({ type: "debugLaunched", id: message.id });
-          return;
-        }
-        if (isCanonicalSolProject(message.files, message.entry)) {
-          const runtime = requireSolRuntime();
-          typedDebugSession = runtime.WasmTypedDebugSession.launch_project(message.entry, names, contents);
-          session = null;
-          post({ type: "debugLaunched", id: message.id });
-          return;
-        }
-        session = DebugSession.launch_project(names, contents, message.entry);
-        post({ type: "debugLaunched", id: message.id });
+        const next = launch(message.files,message.entry);
+        debugSession?.free(); debugSession=next;
+        post({type:"debugLaunched",id:message.id}); return;
+      }
+      case "run": {
+        const execution=launch(message.files,message.entry);
+        try {
+          let stop=execution.continue_();
+          while (stop.reason==="running") { stop.free(); stop=execution.continue_(); }
+          try { post({type:"result",output:execution.take_output(),error:stop.reason==="exception" ? stop.message ?? "execution failed" : null,
+            errorSource:stop.reason==="exception" ? stop.source ?? message.entry : null,errorLine:stop.line ?? null}); }
+          finally {stop.free();}
+        } finally {execution.free();}
         return;
       }
-
-      case "debugContinue": {
-        const stop = requireSession().continue_();
-        post({
-          type: "debugStopped",
-          id: message.id,
-          stop: { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null },
-        });
-        return;
-      }
-      case "debugContinueBurst": {
-        const burst = requireSession().continue_burst(message.maxInstructions);
-        const stop = burst.stop;
-        post({
-          type: "debugBurst",
-          id: message.id,
-          stopped: burst.stopped,
-          stop: stop ? { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null } : null,
-          source: burst.source ?? null,
-          line: burst.line ?? null,
-        });
-        return;
-      }
-      case "debugStepOver": {
-        const stop = requireSession().step_over();
-        post({
-          type: "debugStopped",
-          id: message.id,
-          stop: { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null },
-        });
-        return;
-      }
-      case "debugStepInto": {
-        const stop = requireSession().step_into();
-        post({
-          type: "debugStopped",
-          id: message.id,
-          stop: { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null },
-        });
-        return;
-      }
-      case "debugStepOut": {
-        const stop = requireSession().step_out();
-        post({
-          type: "debugStopped",
-          id: message.id,
-          stop: { reason: stop.reason, line: stop.line ?? null, message: stop.message ?? null },
-        });
-        return;
-      }
-
-      case "debugSetBreakpoint": {
-        const bp = requireSession().set_breakpoint(message.sourceId, message.line);
-        post({
-          type: "debugBreakpoint",
-          id: message.id,
-          breakpoint: { id: bp.id, sourceId: bp.source_id, line: bp.line, verified: bp.verified },
-        });
-        return;
-      }
-      case "debugRemoveBreakpoint": {
-        requireSession().remove_breakpoint(message.breakpointId);
-        post({ type: "debugAck", id: message.id });
-        return;
-      }
-      case "debugSetBreakpointCondition": {
-        requireSession().set_breakpoint_condition(message.breakpointId, message.condition ?? undefined);
-        post({ type: "debugAck", id: message.id });
-        return;
-      }
-      case "debugSetBreakpointHitCondition": {
-        requireSession().set_breakpoint_hit_condition(message.breakpointId, message.hitCondition ?? undefined);
-        post({ type: "debugAck", id: message.id });
-        return;
-      }
-      case "debugSetBreakpointLogMessage": {
-        requireSession().set_breakpoint_log_message(
-          message.breakpointId,
-          message.logMessage ?? undefined,
-        );
-        post({ type: "debugAck", id: message.id });
-        return;
-      }
-
-      case "debugGetThreads": {
-        const threads = requireSession()
-          .get_threads()
-          .map((t) => ({ id: t.id, status: t.status }));
-        post({ type: "debugThreads", id: message.id, threads });
-        return;
-      }
-      case "debugGetStackTrace": {
-        const frames = requireSession()
-          .get_stack_trace(message.threadId)
-          .map((f) => ({
-            index: f.index,
-            name: f.name,
-            source: f.source,
-            line: f.line ?? null,
-            functionType: f.function_type,
-          }));
-        post({ type: "debugStackTrace", id: message.id, frames });
-        return;
-      }
-      case "debugGetLocals": {
-        const variables = requireSession()
-          .get_locals(message.threadId, message.frameIndex)
-          .map((v) => ({
-            name: v.name,
-            valueType: v.value_type,
-            display: v.display,
-            expandable: v.expandable,
-            reference: v.reference ?? null,
-          }));
-        post({ type: "debugVariables", id: message.id, variables });
-        return;
-      }
-      case "debugGetUpvalues": {
-        const variables = requireSession()
-          .get_upvalues(message.threadId, message.frameIndex)
-          .map((v) => ({
-            name: v.name,
-            valueType: v.value_type,
-            display: v.display,
-            expandable: v.expandable,
-            reference: v.reference ?? null,
-          }));
-        post({ type: "debugVariables", id: message.id, variables });
-        return;
-      }
-      case "debugGetGlobals": {
-        const variables = requireSession()
-          .get_globals()
-          .map((v) => ({
-            name: v.name,
-            valueType: v.value_type,
-            display: v.display,
-            expandable: v.expandable,
-            reference: v.reference ?? null,
-          }));
-        post({ type: "debugVariables", id: message.id, variables });
-        return;
-      }
-      case "debugGetTableEntries": {
-        const variables = requireSession()
-          .get_table_entries(message.reference, message.start, message.count)
-          .map((v) => ({
-            name: v.name,
-            valueType: v.value_type,
-            display: v.display,
-            expandable: v.expandable,
-            reference: v.reference ?? null,
-          }));
-        post({ type: "debugVariables", id: message.id, variables });
-        return;
-      }
-      case "debugGetMetatable": {
-        const reference = requireSession().get_metatable(message.reference);
-        post({ type: "debugMetatable", id: message.id, reference: reference ?? null });
-        return;
-      }
-
-      case "debugEvaluate": {
-        const result = requireSession().evaluate(
-          message.threadId,
-          message.expression,
-          message.frameIndex,
-        );
-        post({
-          type: "debugEvalResult",
-          id: message.id,
-          result: { ok: result.ok, display: result.display },
-        });
-        return;
-      }
-      case "debugSetVariable": {
-        const result = requireSession().set_variable(
-          message.threadId,
-          message.frameIndex,
-          message.name,
-          message.valueExpr,
-        );
-        post({
-          type: "debugEvalResult",
-          id: message.id,
-          result: { ok: result.ok, display: result.display },
-        });
-        return;
-      }
-      case "debugTakeOutput": {
-        const text = requireSession().take_output();
-        post({ type: "debugOutput", id: message.id, text });
-        return;
-      }
-      case "debugGetMemoryStats": {
-        const stats = requireSession().get_memory_stats();
-        post({
-          type: "debugMemoryStats",
-          id: message.id,
-          stats: {
-            totalAllocation: stats.total_allocation,
-            gcAllocation: stats.gc_allocation,
-            externalAllocation: stats.external_allocation,
-            allocationDebt: stats.allocation_debt,
-          },
-        });
-        return;
-      }
-      case "debugForceGc": {
-        requireSession().force_gc();
-        const stats = requireSession().get_memory_stats();
-        post({
-          type: "debugMemoryStats",
-          id: message.id,
-          stats: {
-            totalAllocation: stats.total_allocation,
-            gcAllocation: stats.gc_allocation,
-            externalAllocation: stats.external_allocation,
-            allocationDebt: stats.allocation_debt,
-          },
-        });
-        return;
-      }
-
       case "profile": {
-        const names = Object.keys(message.files);
-        const contents = names.map((name) => message.files[name]);
-        if (isCanonicalGenericProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
-          try {
-            const stats = canonical.profile().map((stat) => {
-              const value = { functionId: stat.function_name, calls: stat.calls,
-                totalInstructions: stat.total_instructions, selfInstructions: stat.self_instructions };
-              stat.free(); return value;
-            });
-            post({ type: "profileResult", id: message.id, stats });
-          } finally { canonical.free(); }
-          return;
-        }
-        if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
-          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
-          try {
-            const stats = canonical.profile().map((stat) => {
-              const result = { functionId: stat.function_name, calls: stat.calls,
-                totalInstructions: stat.total_instructions, selfInstructions: stat.self_instructions };
-              stat.free(); return result;
-            });
-            post({ type: "profileResult", id: message.id, stats });
-          } finally { canonical.free(); }
-          return;
-        }
-        if (isCanonicalSolProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmTypedDebugSession.launch_project(message.entry, names, contents);
-          try {
-            const stats = canonical.profile().map((stat) => {
-              const value = { functionId: stat.function_name, calls: stat.calls,
-                totalInstructions: stat.total_instructions, selfInstructions: stat.self_instructions };
-              stat.free(); return value;
-            });
-            post({ type: "profileResult", id: message.id, stats });
-          } finally { canonical.free(); }
-          return;
-        }
-        const stats = profile_project(names, contents, message.entry).map((s) => ({
-          functionId: s.function_id,
-          calls: s.calls,
-          totalInstructions: s.total_instructions,
-          selfInstructions: s.self_instructions,
-        }));
-        post({ type: "profileResult", id: message.id, stats });
+        const execution=launch(message.files,message.entry);
+        try {
+          const stats=execution.profile().map((stat)=>{
+            const result={functionId:stat.function_name,calls:stat.calls,totalInstructions:stat.total_instructions,selfInstructions:stat.self_instructions};
+            stat.free(); return result;
+          });
+          post({type:"profileResult",id:message.id,stats});
+        } finally {execution.free();}
         return;
       }
       case "recordTimeline": {
-        const names = Object.keys(message.files);
-        const contents = names.map((name) => message.files[name]);
-        if (isCanonicalGenericProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_generic_project(message.entry, names, contents);
+        const execution=launch(message.files,message.entry);
+        try {
+          const timeline=execution.record_timeline(message.maxEvents);
           try {
-            const result = canonical.record_timeline(message.maxEvents);
-            try {
-              const events = result.events.map((event) => {
-                const value = { eventType: event.event_type, source: event.source, line: event.line ?? null,
-                  local0: event.local0 ?? null, duration: event.duration };
-                event.free(); return value;
-              });
-              post({ type: "timelineResult", id: message.id, timeline: { events, truncated: result.truncated, error: result.error ?? null } });
-            } finally { result.free(); }
-          } finally { canonical.free(); }
-          return;
-        }
-        if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
-          const canonical = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
-          try {
-            const result = canonical.record_timeline(message.maxEvents);
-            try {
-              const events = result.events.map((event) => {
-                const mapped = { eventType: event.event_type, source: event.source,
-                  line: event.line ?? null, local0: event.local0 ?? null, duration: event.duration };
-                event.free(); return mapped;
-              });
-              post({ type: "timelineResult", id: message.id,
-                timeline: { events, truncated: result.truncated, error: result.error ?? null } });
-            } finally { result.free(); }
-          } finally { canonical.free(); }
-          return;
-        }
-        if (isCanonicalSolProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmTypedDebugSession.launch_project(message.entry, names, contents);
-          try {
-            const result = canonical.record_timeline(message.maxEvents);
-            try {
-              const events = result.events.map((event) => {
-                const mapped = { eventType: event.event_type, source: event.source,
-                  line: event.line ?? null, local0: event.local0 ?? null, duration: event.duration };
-                event.free(); return mapped;
-              });
-              post({ type: "timelineResult", id: message.id,
-                timeline: { events, truncated: result.truncated, error: result.error ?? null } });
-            } finally { result.free(); }
-          } finally { canonical.free(); }
-          return;
-        }
-        const result = record_timeline_project(names, contents, message.entry, message.maxEvents);
-        const events = result.events.map((e) => ({
-          eventType: e.event_type,
-          source: e.source ?? null,
-          line: e.line ?? null,
-          local0: e.local0 ?? null,
-          duration: e.duration,
-        }));
-        post({
-          type: "timelineResult",
-          id: message.id,
-          timeline: { events, truncated: result.truncated, error: result.error ?? null },
-        });
+            const events=timeline.events.map((event)=>{
+              const result={eventType:event.event_type,source:event.source,line:event.line ?? null,local0:event.local0 ?? null,duration:event.duration};
+              event.free(); return result;
+            });
+            post({type:"timelineResult",id:message.id,timeline:{events,truncated:timeline.truncated,error:timeline.error ?? null}});
+          } finally {timeline.free();}
+        } finally {execution.free();}
         return;
       }
+      default: throw new Error("no debug session: call debugLaunch first");
     }
-  } catch (err) {
-    if ("id" in message) {
-      post({ type: "error", id: message.id, message: String(err) });
-    } else if (message.type === "run") {
-      // U12 item 7 finding: a "run" message carries no `id` (unlike every
-      // debug* message), so without this branch a thrown exception here -
-      // e.g. the new `executeSol` engine's Tier-0 interpreter hitting a trap
-      // (`crate/sol/src/interp.rs:50`'s `trap()`/`std::process::abort()`,
-      // which lowers to a wasm `unreachable` trap and surfaces as a thrown
-      // `WebAssembly.RuntimeError` from the synchronous `executeSol` call,
-      // not a value `executeSol` itself returns) - silently vanished with no
-      // reply ever posted, hanging the caller forever instead of surfacing
-      // an error. See
-      // docs/features/milestones/u12-wasm-playground.md's Work item 7
-      // section for the differential run that found this via real trap
-      // fixtures (e.g. `division_by_zero.sol`).
-      post({
-        type: "result",
-        output: "",
-        error: String(err),
-        errorSource: null,
-        errorLine: null,
-      });
-    }
+  } catch (error) {
+    if (message.type==="run") post({type:"result",output:"",error:String(error),errorSource:message.entry,errorLine:null});
+    else if ("id" in message) post({type:"error",id:message.id,message:String(error)});
   }
 };
-
-ensureReady().then(() => {
-  post({ type: "ready" });
-});
+ensureReady().then(()=>post({type:"ready"})).catch(()=>{/* Requests report initialization failure. */});

@@ -174,7 +174,7 @@ pub struct Runtime<'a, H: Hooks = ()> {
     /// behavior exactly; only promoted/native code is exempt, since a
     /// runaway loop that's already been promoted is the JIT's own problem,
     /// not Tier-0's.
-    instructions_remaining: Cell<u64>,
+    pub(crate) instructions_remaining: Cell<u64>,
 }
 
 impl<'a, H: Hooks> Runtime<'a, H> {

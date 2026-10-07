@@ -7,9 +7,9 @@ source ./lib.sh
 
 require_cmd npm "Install Node.js: https://nodejs.org"
 
-PKG_WASM="$ROOT/packages/lua-runtime/pkg/lua_vm_bg.wasm"
-[ -f "$PKG_WASM" ] || die "generated WASM package is missing; the retired crates/vm backend can no longer regenerate it"
-log "Using checked-in WASM package pending the sol-core browser adapter"
+PKG_WASM="$ROOT/packages/sol-runtime/pkg/sol_bg.wasm"
+[ -f "$PKG_WASM" ] || "$ROOT/scripts/build-sol-wasm.sh"
+log "Using the canonical Sol WASM package"
 
 if [ ! -d "$ROOT/node_modules" ]; then
   log "node_modules missing, running npm install"

@@ -10,8 +10,10 @@ are defined in the
 The implementation has not reached that architecture yet. Typed `.sol` and
 dynamic `.lua` currently take separate compiler/runtime paths. The vendored
 `crates/vm` fork is retired; its old `crates/lua-vm` browser adapter remains
-outside the canonical workspace as migration history pending the `sol-core`
-WASM adapter. Current behavior remains documented here and in
+outside the canonical workspace as migration history. The production browser
+now loads canonical Tier 0 through `packages/sol-runtime`, including the
+[checked scalar mixed bridge](features/milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).
+Current behavior remains documented here and in
 [the specification](spec/README.md) until each convergence milestone lands.
 
 ## Status

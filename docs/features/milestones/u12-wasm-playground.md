@@ -4,13 +4,18 @@
 
 **Purpose:** make the web product use the canonical runtime, not a separate VM.
 
-- [ ] Create `sol-wasm` and `packages/sol-runtime` from the Tier-0 runtime.
+- [x] Create the WASM adapter and `packages/sol-runtime` from Tier 0
+      (feature-gated `crate/sol`, rather than a separate `sol-wasm` crate).
 - [ ] Reproduce budgets, modules, output, debug stepping, frames, locals,
       evaluation, profiling, and timeline.
-- [ ] Support `.lua` and `.sol` with shared parser/type diagnostics.
-- [ ] Keep worker execution and default-deny capabilities.
-- [ ] Differentially switch the web adapter and remove Piccolo only after proof.
-- [ ] Meet bundle-size, initialization, and responsiveness targets.
+- [x] Support `.lua` and `.sol` with shared parser/type diagnostics.
+- [x] Keep worker execution and default-deny capabilities.
+- [x] Differentially switch the web adapter and remove the Piccolo production dependency.
+- [x] Meet the documented portable-profile bundle/init/responsiveness targets.
+
+Production is canonical by default. Live mixed coroutine/thread isolation
+remains unqualified; see work item 20 for the qualified scalar profile and
+remaining limits. Earlier default-off observations below are historical.
 
 **Exit gate:** canonical-runtime web E2E scenarios and portable native/WASM
 fixtures agree; production no longer imports the old runtime package.
@@ -1642,3 +1647,96 @@ regression checks, including linked-module smoke qualification, Chromium
 worker/DOM debugging, and the opt-in production web build. It measures 2,144,737 bytes raw /
 653,577 bytes with Node's default gzip; these remain observations, not proof
 that the final bundle/initialization exit targets have been met.
+
+## Work item 20 — checked mixed bridge and production cutover
+
+The portable scheduler now joins specialized `Execution` frames and generic
+Lua frames using parked semantic requests in both directions. Scalar arguments
+and results are checked at each boundary; typed registers remain unboxed.
+Reentrant calls share the canonical import graph, module cache, initializers,
+captured output, remaining opcode budget, and depth limit. Protected generic
+calls catch boundary errors without a recursive Rust callback stack. Debugger
+inspection and edits operate on both live representations; forced collection
+preserves paused values. Profiling and capped timelines use fresh executions
+and leave the user's paused session intact. Mixed profiling accounts actual
+bytecodes with O(stack-depth) live-stack work per opcode, not retained execution
+history or guessed native instruction counts.
+
+Namespace lowering now preserves imported function-value identity and respects
+parameter/local/loop shadowing. Declared exported `main` functions are not
+mistaken for synthesized module initializers. Source filenames are retained
+for nested project entries and module breakpoints. Typed root floats retain
+the specialized display format, and typed root strings are copied into a
+rooted canonical string for display (not a new string foreign-call ABI).
+
+The production worker imports only `@lua-playground/sol-runtime`, initializes
+one WASM module once, and has no default-off runtime switch. `apps/web` no
+longer depends on `@lua-playground/runtime`; root build/dev wrappers regenerate
+the canonical package. The historical `packages/lua-runtime` workspace and
+retired adapter sources remain migration history, not production imports or
+bundle assets. Generated bindings are regenerated, never hand-edited.
+
+`tests/wasm-mixed.tsv` drives eight identical portable native-core/WASM fixtures:
+scalar imports, reentry, protected errors, shared module cache/callable identity,
+function values and lexical shadowing, initializer-once behavior, float
+formatting, and a string root result. These supplement the existing 33 typed
+and generic Lua linked-WASM fixtures; they do not claim the full Lua 5.5 corpus
+or native-JIT equivalence. Chromium additionally checks a real bundled mixed
+worker, module breakpoints, combined live frames, both caller/callee edits,
+forced GC, and analysis preserving a paused session. The old/new differential
+uses the frozen legacy bundle only as a migration oracle; its typed acceptance
+classification is not typed semantic parity.
+
+### Repeatable artifact and latency gates
+
+Run `scripts/build-sol-wasm.sh`, `npm run build --workspace apps/web`, then
+`npm run qualify:runtime --workspace apps/web`. The qualification script
+requires installed Playwright Chromium and permission to bind a localhost
+HTTP server. `SOL_QUAL_DIST` selects an alternate built directory, and
+`SOL_QUAL_REPORT` optionally writes a JSON evidence artifact.
+
+The lab regression ceilings are 3 MiB raw WASM, 900 KiB Node-default-gzip WASM,
+100 KiB raw worker JavaScript, 1,000 ms p95 initialization, 25 ms p95 warm run,
+and 50 ms p95 per 1,000-operation mixed burst. Initialization samples use ten
+fresh Chromium processes/workers; browser startup is excluded. Warm runs and
+bursts each use 25 samples. The script rejects legacy/multiple WASM assets and
+audits WASM imports for ambient `env` capabilities. These are localhost
+regression gates, not WAN download or cold filesystem-cache guarantees.
+
+Final qualification on 2026-10-07 passed on an Apple M1 Pro, macOS arm64,
+Node v24.14.0, Chromium 151.0.7922.34. WASM is 2,298,290 bytes raw / 704,846
+bytes with Node's default gzip; the worker is 34,757 bytes. Artifact SHA-256:
+`0f53d003b3eefbf0f159b025935db12e8564d400e666dcc59a01289afefeeaab`.
+P95 initialization is 34.9 ms, warm run 1.2 ms, and mixed burst 0.4 ms; all
+six gates pass. Full samples are emitted by the script; the local evidence
+artifact is in ignored `crate/sol/scratch/u12-qualification.json`.
+
+Validation passed: the complete native Sol crate suite, 202 jit-free
+WASM-feature library tests, regenerated/linked WASM (33 typed and eight mixed
+fixtures plus generic Lua/debugger checks), production web build, Chromium
+qualification, Lua corpus-manifest validation, and project-status checks.
+The final frozen-old/default-canonical Chromium differential also passes:
+six real Lua output comparisons, live generic/typed debugger checks, DOM
+debugger-feature E2E, and 90 typed acceptance classifications (not typed
+semantic parity).
+Web lint passes with two pre-existing UI warnings. Strict Clippy is still
+blocked by pre-existing warnings (including `sol-core`'s
+`doc_lazy_continuation`); no unrelated lint suppression was introduced.
+
+### Remaining limits
+
+The cross-tier call ABI is `i64`/`f64`/`bool`, matching the existing native
+contract. Typed modules must be imported before dynamic `require`; unused
+typed sources are explicit loader errors, not silently boxed. The flattened
+import interface does not discover exports nested inside lexical chunk
+initializers. Aggregate/string/function foreign arguments, typed yields, and
+cross-tier reentry from atomic native callbacks are unsupported and rejected.
+These are explicit current language/profile limits, not filename-selected
+alternative semantics.
+
+The mixed debugger currently exposes one combined scheduler thread. Generic
+coroutine-parent frame isolation and cross-tier suspended coroutine scenarios
+are not yet qualified (the pure generic debugger retains its coroutine-chain
+thread support). This keeps the broad debugger parity deliverable and U12
+status open despite completing the requested bridge, production-package
+cutover, and portable-profile artifact/latency qualification.

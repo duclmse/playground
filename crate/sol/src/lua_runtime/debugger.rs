@@ -21,6 +21,20 @@ pub struct LuaDebugSession {
     incoming: Option<Vec<LuaValue>>,
     root_charged: bool,
     returned_values: Vec<LuaValue>,
+    base_depth: usize,
+    bridge_contexts: Vec<BridgeContext>,
+    pending_outcome: Option<DriveOutcome>,
+}
+
+struct BridgeContext {
+    base_depth: usize,
+    depth_charged: usize,
+    root_charged: bool,
+    status: DebugStatus,
+    resume_parents: Vec<ResumeParent>,
+    incoming: Option<Vec<LuaValue>>,
+    request: Option<(u8, Vec<LuaValue>)>,
+    returned_values: Vec<LuaValue>,
 }
 
 struct ResumeParent {
@@ -71,6 +85,9 @@ impl LuaDebugSession {
             incoming: None,
             root_charged: true,
             returned_values: Vec::new(),
+            base_depth: 0,
+            bridge_contexts: Vec::new(),
+            pending_outcome: None,
         })
     }
 
@@ -114,11 +131,12 @@ impl LuaDebugSession {
     /// Executes at most `instructions` outer bytecode instructions and
     /// retains the live frame stack when the slice expires.
     pub fn continue_burst(&mut self, instructions: u64) -> DebugStatus {
+        if self.runtime.debug_semantic_request.is_some() { return DebugStatus::Paused; }
         if self.status != DebugStatus::Paused {
             return self.status.clone();
         }
         let mut remaining = instructions;
-        let mut immediate = None;
+        let mut immediate = self.pending_outcome.take();
         let outcome = loop {
             let settling = self.incoming.is_some();
             self.runtime.debug_slice_remaining = Some(if settling { 0 } else { remaining });
@@ -128,7 +146,7 @@ impl LuaDebugSession {
             } else {
                 let outcome = self
                     .runtime
-                    .drive(0, &mut self.depth_charged, self.incoming.take());
+                    .drive(self.base_depth, &mut self.depth_charged, self.incoming.take());
                 if settling {
                     self.runtime.debug_incoming_roots.clear();
                 }
@@ -138,6 +156,10 @@ impl LuaDebugSession {
                 remaining = self.runtime.debug_slice_remaining.unwrap_or(0);
             }
             let paused = self.runtime.debug_pause_requested;
+            if self.runtime.debug_semantic_request.is_some() {
+                self.runtime.debug_slice_remaining = None;
+                return DebugStatus::Paused;
+            }
             if let Some(request) = self.runtime.debug_resume_request.take() {
                 immediate = self.begin_resume(request);
                 self.runtime.debug_slice_remaining = None;
@@ -164,7 +186,9 @@ impl LuaDebugSession {
         };
         self.status = match outcome {
             DriveOutcome::Returned(values) => {
-                for value in &values { self.retain(value); }
+                for value in &values {
+                    if !matches!(value, LuaValue::Integer(_) | LuaValue::Float(_) | LuaValue::Bool(_) | LuaValue::Nil) { self.retain(value); }
+                }
                 self.returned_values = values;
                 DebugStatus::Returned
             }
@@ -172,7 +196,7 @@ impl LuaDebugSession {
                 DebugStatus::Raised("attempt to yield outside a coroutine".into())
             }
             DriveOutcome::Raised(error) => {
-                let error = self.runtime.close_frames_above(0, error);
+                let error = self.runtime.close_frames_above(self.base_depth, error);
                 self.runtime.release_call_depth(self.depth_charged);
                 self.depth_charged = 0;
                 DebugStatus::Raised(error.to_string())
@@ -191,6 +215,83 @@ impl LuaDebugSession {
     /// paused or failed. Handles remain owned by this session.
     pub fn returned_values(&self) -> Option<&[LuaValue]> {
         (self.status == DebugStatus::Returned).then_some(self.returned_values.as_slice())
+    }
+
+    pub(crate) fn bridge_session(program: &crate::ast::Program, typed: &[(String, u8)], contracts: &[crate::modules::DynamicModuleContract], entry: &str) -> LuaResult<Self> {
+        let excluded = typed.iter().map(|(name, _)| name.clone()).collect::<HashSet<_>>();
+        let mut runtime = LuaRuntime::with_limits(10_000_000, 1000);
+        runtime.set_chunk_name(format!("@{entry}").into_bytes());
+        runtime.load_with_natives(program, &excluded, HashMap::new())?;
+        for (name, function) in typed {
+            let callable = sol_core::NativeCallableId::new(3, *function as u32);
+            runtime.semantic_functions.insert(callable, *function);
+            runtime.globals.clone().define(&runtime, name, LuaValue::RegisteredNative(callable), false);
+        }
+        for contract in contracts { runtime.preload_namespace_module(&contract.name, &contract.exports)?; }
+        let mut executable_lines = HashMap::new();
+        for function in &program.functions {
+            if excluded.contains(&function.name) { continue; }
+            let proto = crate::lua_bytecode::Compiler::compile_top_level(function).map_err(LuaError::new)?;
+            let mut lines = HashSet::new(); collect_lines(&proto, &mut lines);
+            executable_lines.entry(function.source_file.clone().unwrap_or_else(|| entry.into())).or_insert_with(HashSet::new).extend(lines);
+        }
+        Ok(Self { runtime, depth_charged: 0, status: DebugStatus::Paused, executable_lines,
+            resume_parents: Vec::new(), incoming: None, root_charged: false, returned_values: Vec::new(),
+            base_depth: 0, bridge_contexts: Vec::new(), pending_outcome: None })
+    }
+
+    pub(crate) fn begin_bridge_call(&mut self, name: &str, args: Vec<LuaValue>) -> LuaResult<()> {
+        if self.runtime.call_depth >= self.runtime.max_call_depth { return Err(self.runtime.call_depth_overflow_error()); }
+        let LuaValue::Closure(closure) = self.runtime.globals.get(&self.runtime, name) else { return Err(LuaError::new(format!("'{name}' is not a generic closure"))); };
+        let (proto, upvals, globals) = self.runtime.closure_parts(closure)?;
+        let frame = self.runtime.new_lua_frame(closure, proto, upvals, globals, args, 0)?;
+        self.bridge_contexts.push(BridgeContext { base_depth: self.base_depth, depth_charged: self.depth_charged,
+            root_charged: self.root_charged, status: self.status.clone(), resume_parents: std::mem::take(&mut self.resume_parents),
+            incoming: self.incoming.take(), request: self.runtime.debug_semantic_request.take(), returned_values: std::mem::take(&mut self.returned_values) });
+        self.base_depth = self.runtime.frames.len();
+        self.runtime.frames.push(Frame::Lua(frame));
+        self.runtime.call_depth += 1;
+        self.depth_charged = 0; self.root_charged = true; self.status = DebugStatus::Paused;
+        Ok(())
+    }
+
+    pub(crate) fn end_bridge_call(&mut self) -> Result<Vec<LuaValue>, String> {
+        if self.status == DebugStatus::Paused { return Err("generic call is still running".into()); }
+        let result = match &self.status { DebugStatus::Returned => Ok(std::mem::take(&mut self.returned_values)), DebugStatus::Raised(error) => Err(error.clone()), _ => unreachable!() };
+        let context = self.bridge_contexts.pop().expect("a bridge callee owns a context");
+        self.base_depth = context.base_depth; self.depth_charged = context.depth_charged; self.root_charged = context.root_charged;
+        self.status = context.status; self.resume_parents = context.resume_parents; self.incoming = context.incoming;
+        self.runtime.debug_semantic_request = context.request; self.returned_values = context.returned_values;
+        result
+    }
+
+    pub(crate) fn semantic_request(&self) -> Option<&(u8, Vec<LuaValue>)> { self.runtime.debug_semantic_request.as_ref() }
+    pub(crate) fn finish_semantic_request(&mut self, result: Result<Vec<LuaValue>, String>) {
+        assert!(self.runtime.debug_semantic_request.take().is_some());
+        match result {
+            Ok(values) => self.set_incoming(values),
+            Err(error) => {
+                self.pending_outcome = match self.runtime.unwind_error_to_marker(LuaError::new(error), self.base_depth, &mut self.depth_charged) {
+                    Ok(CallStep::Pending) => None,
+                    Ok(CallStep::Done(values)) => {
+                        if self.runtime.frames.len() == self.base_depth { Some(DriveOutcome::Returned(values)) }
+                        else { self.set_incoming(values); None }
+                    },
+                    Ok(CallStep::Yielded(values)) => Some(DriveOutcome::Yielded(values)),
+                    Err(error) => Some(DriveOutcome::Raised(error)),
+                };
+            }
+        }
+    }
+    pub(crate) fn bridge_budget(&self) -> u64 { self.runtime.instructions_remaining }
+    pub(crate) fn configure_bridge_limits(&mut self, budget: u64, max_depth: usize) {
+        self.runtime.instructions_remaining = budget; self.runtime.max_call_depth = max_depth;
+    }
+    pub(crate) fn bridge_depth(&self) -> usize { self.runtime.call_depth }
+    pub(crate) fn bridge_string_result(&self, bytes:&[u8]) -> LuaValue { LuaValue::String(self.runtime.intern_str(bytes)) }
+    /// Stable activation identities, in the same order as `frames()`.
+    pub fn frame_identities(&self) -> Vec<u64> {
+        self.runtime.frames.iter().rev().filter_map(|frame|match frame {Frame::Lua(frame)=>Some(frame.debug_identity),_=>None}).collect()
     }
 
     fn deliver_resume_error(&mut self, error: LuaError, wrapped: bool) -> Option<DriveOutcome> {

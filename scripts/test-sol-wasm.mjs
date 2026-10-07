@@ -3,7 +3,7 @@
 // module rather than treating a successful wasm32 cargo check as proof.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { initSync, execute_project, execute_generic_sol, execute_generic_project, source_requires_specialization, execute_lua, execute_lua_project, WasmDebugSession, WasmLuaDebugSession, WasmTypedDebugSession } from "../packages/sol-runtime/pkg/sol.js";
+import { initSync, execute_project, execute_generic_sol, execute_generic_project, execute_mixed_project, source_requires_specialization, execute_lua, execute_lua_project, WasmDebugSession, WasmLuaDebugSession, WasmTypedDebugSession, WasmMixedDebugSession } from "../packages/sol-runtime/pkg/sol.js";
 
 const bytes = readFileSync(new URL("../packages/sol-runtime/pkg/sol_bg.wasm", import.meta.url));
 const module = new WebAssembly.Module(bytes);
@@ -55,6 +55,51 @@ try {
     const events = timeline.events; assert.equal(events.length, 2); events.forEach((event) => event.free());
   } finally { timeline.free(); }
 } finally { genericAnalysis.free(); }
+
+const mixedNames = ["main.sol", "helper.lua"];
+let mixedCount = 0;
+for (const row of readFileSync(new URL("../crate/sol/tests/wasm-mixed.tsv", import.meta.url), "utf8").split("\n").filter((line) => line && !line.startsWith("#"))) {
+  const [entry, paths, expected] = row.split("\t");
+  const names = paths.split(",");
+  const sources = names.map((name) => readFileSync(new URL(`../crate/sol/tests/fixtures/wasm-mixed/${name}`, import.meta.url), "utf8"));
+  const result = execute_mixed_project(entry, names, sources);
+  try { assert.equal(result.error, undefined, entry); assert.equal(Buffer.from(result.result).toString("hex"), expected, entry); }
+  finally { result.free(); }
+  mixedCount++;
+}
+const mixedSources = ["import helper\nfunction main():i64\n local base:i64=40\n local result=helper.add(base)\n return base+result\nend",
+  "function add(n:i64):i64\n local y=n+2\n print(y)\n return y\nend"];
+const mixedRun = execute_mixed_project("main.sol", mixedNames, mixedSources);
+try { assert.equal(mixedRun.error, undefined); assert.equal(mixedRun.result, "42\n82"); }
+finally { mixedRun.free(); }
+const mixedDebug = WasmMixedDebugSession.launch_project("main.sol", mixedNames, mixedSources);
+try {
+  const bp = mixedDebug.set_breakpoint("helper.lua", 3);
+  try { assert.equal(bp.verified, true); } finally { bp.free(); }
+  const stop = mixedDebug.continue_burst(1000);
+  try { assert.equal(stop.reason, "breakpoint"); assert.equal(stop.source, "helper.lua"); } finally { stop.free(); }
+  const frames = mixedDebug.get_stack_trace(0);
+  try { assert.equal(frames.length, 2); assert.equal(frames[1].source, "main.sol"); }
+  finally { frames.forEach((frame) => frame.free()); }
+  for (const [frame, name, expr] of [[0, "y", "43"], [1, "base", "1"]]) {
+    const result = mixedDebug.set_variable(0, frame, name, expr);
+    try { assert.equal(result.ok, true, result.display); } finally { result.free(); }
+  }
+  mixedDebug.force_gc();
+  const profile = mixedDebug.profile();
+  try { assert.ok(profile.some((stat) => stat.function_name === "helper.add" && stat.calls === 1)); }
+  finally { profile.forEach((stat) => stat.free()); }
+  const timeline = mixedDebug.record_timeline(2);
+  try { assert.equal(timeline.truncated, true); assert.equal(timeline.error, undefined);
+    const events = timeline.events; assert.equal(events.length, 2); events.forEach((event) => event.free()); }
+  finally { timeline.free(); }
+  const done = mixedDebug.continue_burst(1000);
+  try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
+  assert.equal(mixedDebug.take_output(), "43\n44");
+} finally { mixedDebug.free(); }
+const reentrant = execute_mixed_project("main.sol", ["main.sol"], ["function generic(n:i64):i64 print(n); if n==0 then return 40 end; return typed(n-1)+1 end\nfunction typed(n:i64):i64 return generic(n)+1 end\nfunction main():i64 return typed(1) end"]);
+try { assert.equal(reentrant.error, undefined); assert.equal(reentrant.result, "1\n0\n43"); }
+finally { reentrant.free(); }
 
 // The typed corpus's native Tier-0 test uses these same expectations. Run
 // the actual linked WASM too; successful cargo checks are not parity proof.
@@ -235,4 +280,4 @@ try {
   try { assert.equal(done.reason, "terminated"); } finally { done.free(); }
   assert.equal(coroutine.take_output(), "true\t44\n44\ntrue\n");
 } finally { coroutine.free(); }
-console.log(`PASS: canonical WASM imports, ${typedCount} typed fixtures, Lua execution, error output, modules, live debugging and GC`);
+console.log(`PASS: canonical WASM imports, ${typedCount} typed and ${mixedCount} mixed fixtures, Lua execution, error output, modules, live debugging and GC`);

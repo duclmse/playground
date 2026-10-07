@@ -137,6 +137,8 @@ mod lua_debug;
 pub use lua_debug::*;
 mod typed_debug;
 pub use typed_debug::*;
+mod mixed_debug;
+pub use mixed_debug::*;
 
 // -------------------------------------------------------------------------
 // execute(): one-shot run, non-throwing (mirrors crate/lua-vm's own
@@ -302,10 +304,13 @@ fn generic_project_session(entry: &str, names: &[String], contents: &[String]) -
         if !paths.insert(name) { return Err(format!("duplicate project path '{name}'")); }
         if !modules.insert(module.clone()) { return Err(format!("ambiguous generic module path '{name}'")); }
         let program = crate::parser::parse_with_config(crate::lexer::lex_bytes(source.as_bytes())?, config)?;
-        if crate::semantics::requires_specialized_execution(&program) {
+        if name == entry && crate::semantics::requires_specialized_execution(&program) {
             return Err(format!("file '{name}' requires specialized execution"));
         }
-        entries.push((name, source, module, config));
+        let module_source = if crate::semantics::requires_specialized_execution(&program) {
+            "error('typed modules must be imported before require')"
+        } else { source.as_str() };
+        entries.push((name, module_source, module, config));
     }
     let index = names.iter().position(|name| name == entry)
         .ok_or_else(|| format!("entry file '{entry}' is not present in the in-memory project"))?;
@@ -1170,7 +1175,7 @@ mod tests {
     #[test]
     fn generic_projects_reject_typed_contracts_and_unsafe_or_ambiguous_paths() {
         for (names, contents) in [
-            (vec!["main.sol", "base.sol"], vec!["print(42)", "function f():i64 return 2 end"]),
+            (vec!["main.sol", "base.sol"], vec!["function main():i64 return 42 end", "return 2"]),
             (vec!["main.sol", "base.sol", "base.lua"], vec!["print(42)", "return 2", "return 2"]),
             (vec!["main.sol", "../base.lua"], vec!["print(42)", "return 2"]),
             (vec!["main.sol", "a.b.lua", "a/b.lua"], vec!["print(42)", "return 2", "return 2"]),

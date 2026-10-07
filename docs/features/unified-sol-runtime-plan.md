@@ -2890,11 +2890,13 @@ Deliverables:
 
 Exit gate: existing web end-to-end debugger scenarios pass on the canonical
 runtime; native/WASM portable-profile fixtures agree; the production worker no
-longer imports `@lua-playground/runtime`. **Not yet reached** - items 1-6
-below have landed a working, narrowly-scoped single-file `.sol`
-execute/debug surface reachable from a real browser behind a default-off
-flag; multi-file projects, `.lua` support, the remaining debugger parity
-gaps, and the actual flag-default flip/Piccolo removal are not yet done.
+longer imports `@lua-playground/runtime`. The historical items 1-6 below
+describe the initial default-off spike, not the current shipping adapter.
+Canonical Tier 0 is now the production default, with generic, specialized,
+and checked scalar mixed projects, live debugger/analysis, portable fixture
+agreement, and measured bundle/init gates. Mixed coroutine/thread isolation
+remains unqualified, so U12 is still in progress. Current evidence and limits
+are maintained in [work item 20](milestones/u12-wasm-playground.md#work-item-20--checked-mixed-bridge-and-production-cutover).
 
 Item 1 (2026-10-02): `crate/sol` wasm32 boundary spike - the blocking item
 every other U12 item depends on. Found `interp.rs` already fully decoupled

@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build:wasm": "bash scripts/build-wasm.sh",
+    "build:wasm": "bash scripts/build-sol-wasm.sh",
     "build": "bash scripts/build.sh",
     "dev": "bash scripts/dev.sh",
     "test": "bash scripts/test.sh"

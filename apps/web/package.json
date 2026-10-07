@@ -8,10 +8,10 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "e2e": "node e2e/verify-debugger-features.mjs"
+    "e2e": "node e2e/verify-debugger-features.mjs",
+    "qualify:runtime": "node e2e/qualify-canonical-runtime.mjs"
   },
   "dependencies": {
-    "@lua-playground/runtime": "*",
     "@lua-playground/sol-runtime": "*",
     "@monaco-editor/react": "^4.7.0",
     "monaco-editor": "^0.56.0",
