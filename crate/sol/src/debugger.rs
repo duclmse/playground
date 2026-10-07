@@ -31,6 +31,7 @@ use crate::tier0;
 use crate::types::{self, StructLayout, TFunction, TProgram, Type};
 
 pub mod live;
+pub mod analysis;
 
 // ---------------------------------------------------------------------
 // Deliverable 3: breakpoint matching (sourceId+line -> verified/pending)

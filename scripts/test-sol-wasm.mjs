@@ -99,6 +99,22 @@ try {
   try { assert.equal(retained[0].display, "40"); } finally { retained.forEach((entry) => entry.free()); }
 } finally { typedGc.free(); traceOwner.free(); }
 
+const typedAnalysis = WasmTypedDebugSession.launch_project("main.sol", ["main.sol"], [
+  "function add(x:i64):i64\n return x+1\nend\nfunction main():i64\n local a=add(40)\n local b=add(41)\n return a+b\nend",
+]);
+try {
+  const stats = typedAnalysis.profile();
+  try { assert.equal(stats.find((stat) => stat.function_name === "add").calls, 2); }
+  finally { stats.forEach((stat) => stat.free()); }
+  const timeline = typedAnalysis.record_timeline(2);
+  try {
+    const events = timeline.events;
+    try { assert.equal(events.length, 2); assert.equal(events[1].source, "main.sol"); assert.ok(events[1].line > 0); }
+    finally { events.forEach((event) => event.free()); }
+    assert.equal(timeline.truncated, true); assert.equal(timeline.error, undefined);
+  } finally { timeline.free(); }
+} finally { typedAnalysis.free(); }
+
 const fixtures = readFileSync(new URL("../crate/sol/tests/wasm-portable.tsv", import.meta.url), "utf8").trimEnd().split("\n");
 for (const row of fixtures) {
   const [name, source, encoded] = row.split("\t");

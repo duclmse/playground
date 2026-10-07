@@ -323,6 +323,14 @@ async function canonicalLuaDebugScenario(page, workerPath) {
       check((await rpc({ type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "xs[0]+m[1]" })).result.display === "42", "typed live graph must survive GC");
       const typedArrayEntries = await rpc({ type: "debugGetTableEntries", reference: typedArray.reference, start: 0, count: 10 });
       check(typedArrayEntries.variables[0].display === "40", "typed inspector reference must survive GC");
+      const typedAnalysisFiles = { "main.sol":
+        "function add(x:i64):i64\n return x+1\nend\nfunction main():i64\n local a=add(40)\n local b=add(41)\n return a+b\nend" };
+      const typedProfile = await rpc({ type: "profile", entry: "main.sol", files: typedAnalysisFiles });
+      check(typedProfile.stats.some((stat) => stat.functionId === "add" && stat.calls === 2), "typed bounded profile call accounting");
+      const typedTimeline = await rpc({ type: "recordTimeline", entry: "main.sol", files: typedAnalysisFiles, maxEvents: 2 });
+      check(typedTimeline.timeline.events.length === 2 && typedTimeline.timeline.truncated, "typed bounded timeline window");
+      check(typedTimeline.timeline.events.every((event) => event.source === "main.sol" && event.line > 0), "typed timeline real source lines");
+      check((await rpc({ type: "debugEvaluate", threadId: 0, frameIndex: 0, expression: "xs[0]+m[1]" })).result.display === "42", "analysis must not replace the paused typed session");
       await rpc({ type: "debugLaunch", entry: "main.lua", files: { "main.lua":
         "local x = 40\nlocal function f()\n local t = {answer = x}\n print(t.answer)\nend\nf()" } });
       const bp = await rpc({ type: "debugSetBreakpoint", sourceId: "main.lua", line: 4 });

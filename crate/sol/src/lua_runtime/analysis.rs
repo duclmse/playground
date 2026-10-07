@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 #[derive(Clone, Default)]
 pub struct FunctionStats {
     pub name: String,
-    pub calls: u32,
-    pub self_instructions: u32,
-    pub total_instructions: u32,
+    pub calls: u64,
+    pub self_instructions: u64,
+    pub total_instructions: u64,
 }
 
 #[derive(Clone)]

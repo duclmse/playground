@@ -608,9 +608,11 @@ impl WasmThreadInfo {
 #[derive(Debug, Clone)]
 pub struct WasmFunctionStats {
     function_name: std::string::String,
-    calls: u32,
-    self_instructions: u32,
-    total_instructions: u32,
+    // Browser budgets/depths keep these below 2^53, so JS numbers preserve
+    // exact counters without truncating recursive inclusive totals to u32.
+    calls: f64,
+    self_instructions: f64,
+    total_instructions: f64,
 }
 
 #[wasm_bindgen]
@@ -620,15 +622,15 @@ impl WasmFunctionStats {
         self.function_name.clone()
     }
     #[wasm_bindgen(getter)]
-    pub fn calls(&self) -> u32 {
+    pub fn calls(&self) -> f64 {
         self.calls
     }
     #[wasm_bindgen(getter)]
-    pub fn self_instructions(&self) -> u32 {
+    pub fn self_instructions(&self) -> f64 {
         self.self_instructions
     }
     #[wasm_bindgen(getter)]
-    pub fn total_instructions(&self) -> u32 {
+    pub fn total_instructions(&self) -> f64 {
         self.total_instructions
     }
 }
@@ -1025,9 +1027,9 @@ impl WasmDebugSession {
             .into_iter()
             .map(|s| WasmFunctionStats {
                 function_name: s.function_name,
-                calls: s.calls as u32,
-                self_instructions: s.self_instructions as u32,
-                total_instructions: s.total_instructions as u32,
+                calls: s.calls as f64,
+                self_instructions: s.self_instructions as f64,
+                total_instructions: s.total_instructions as f64,
             })
             .collect()
     }

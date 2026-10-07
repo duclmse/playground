@@ -1530,3 +1530,41 @@ still ships both engines. Bounded typed profiling/timeline still need to
 replace their historical one-shot trace path. Mixed/generic browser projects,
 the final legacy-package removal, and bundle/initialization qualification
 remain required before U12 is complete.
+
+## Work item 17 — bounded typed profiling and timeline
+
+Typed worker analysis requests now use live specialized execution instead of
+the historical replay adapter. Profiling retains per-function call,
+self-bytecode, and inclusive-bytecode counters only. Inclusive totals use
+activation intervals finalized at return, tail replacement, or error, rather
+than walking every ancestor at each opcode. Proper tail calls count each new
+activation without growing the stack. Native helper calls are counted, but
+native machine instructions are not guessed.
+
+Timeline storage is capped before recording, at the requested limit or
+100,000 events, whichever is smaller. Events carry actual source filenames,
+lines, initialized first-local snapshots, and bytecode deltas. Line changes
+and loop backedges are recorded without retaining an instruction/register
+history. Profiling disables event snapshots entirely. Both requests use a
+fresh execution and preserve the user's paused session. Runtime failures are
+reported rather than silently treated as completed recordings.
+
+Function counters are 64-bit internally in both analysis adapters, and the
+WASM wire uses exact JS numbers within browser budget/depth bounds. This
+prevents recursive inclusive totals from wrapping at 32 bits. The unused
+typed replay branches and helpers have been removed from the web worker;
+the historical exported canonical API remains available for compatibility,
+but the product worker no longer routes requests through it.
+
+Five native analysis regressions cover call/self/inclusive accounting,
+source/local snapshots, repeated proper tail calls, bounded runaway failure,
+and the 32-bit overflow boundary. The actual WASM smoke test and Chromium
+worker scenario verify profiling and a two-event truncated timeline while
+retaining a paused typed session. The Sol native suite, 182 jit-free
+WASM-feature library tests, actual linked-WASM fixtures, and both web build
+configurations pass. The canonical module measures 2,110,084 bytes raw /
+644,175 bytes with Node's default gzip; the opt-in worker is 63.14 KB.
+
+This closes item 16's typed-analysis replay gap. Generic/mixed browser
+projects, final legacy-package removal, and bundle/initialization
+qualification still keep U12 in progress and its production flag default-off.

@@ -311,6 +311,26 @@ impl WasmTypedDebugSession {
             live_blocks: crate::gc::live_blocks() as f64,
         }
     }
+    pub fn profile(&self) -> Result<Vec<WasmFunctionStats>, JsValue> {
+        let analysis = crate::debugger::analysis::analyze(&self.program, &self.entry, 0)
+            .map_err(|error| JsValue::from_str(&error))?;
+        if let Some(error) = analysis.error { return Err(JsValue::from_str(&error)); }
+        Ok(analysis.functions.into_iter().map(|stat| WasmFunctionStats {
+            function_name: stat.function_name, calls: stat.calls as f64,
+            self_instructions: stat.self_instructions as f64, total_instructions: stat.total_instructions as f64,
+        }).collect())
+    }
+    pub fn record_timeline(&self, max_events: u32) -> LuaTimeline {
+        match crate::debugger::analysis::analyze(&self.program, &self.entry, max_events as usize) {
+            Err(error) => LuaTimeline { events: Vec::new(), truncated: false, error: Some(error) },
+            Ok(analysis) => LuaTimeline {
+                events: analysis.events.into_iter().map(|event| LuaTimelineEvent {
+                    event_type: event.kind, source: event.source, line: event.line,
+                    local0: event.local0, duration: event.duration,
+                }).collect(), truncated: analysis.truncated, error: analysis.error,
+            },
+        }
+    }
     /// Collect from retained specialized frames, evaluations and inspector
     /// handles. Native conservative-stack collection keeps its existing API.
     pub fn force_gc(&self) {

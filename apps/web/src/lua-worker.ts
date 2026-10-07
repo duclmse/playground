@@ -14,16 +14,8 @@ const SOL_ENGINE_ENABLED = import.meta.env.VITE_SOL_ENGINE === "1";
 let ready: Promise<unknown> | null = null;
 let session: DebugSession | null = null;
 let solRuntime: typeof SolRuntime | null = null;
-let solDebugSession: SolRuntime.WasmDebugSession | null = null;
 let luaDebugSession: SolRuntime.WasmLuaDebugSession | null = null;
 let typedDebugSession: SolRuntime.WasmTypedDebugSession | null = null;
-let solDebugEntry: string | null = null;
-let solDebugCursor = 0;
-let solDebugStarted = false;
-// The canonical WASM API deliberately keeps its recursive Rust Type private.
-// Remember each reference's opaque type id so a later debugGetTableEntries
-// request can expand it without guessing its layout in JavaScript.
-const solDebugReferenceTypes = new Map<number, number>();
 
 async function ensureReady() {
   if (!ready) {
@@ -59,48 +51,6 @@ function requireSession(): DebugSession {
 function isCanonicalSolProject(files: Record<string, string>, entry: string): boolean {
   const names = Object.keys(files);
   return SOL_ENGINE_ENABLED && entry.endsWith(".sol") && names.every((name) => name.endsWith(".sol"));
-}
-
-function requireSolDebugSession(): SolRuntime.WasmDebugSession {
-  if (!solDebugSession) {
-    throw new Error("no canonical Sol debug session: call debugLaunch first");
-  }
-  return solDebugSession;
-}
-
-function solStop(reason: "breakpoint" | "step" | "exception" | "terminated", message: string | null = null) {
-  const step = solDebugSession?.trace_step(solDebugCursor);
-  return { reason, line: step?.line ?? null, message };
-}
-
-function solVariable(name: string, typeName: string, typeId: number, value: SolRuntime.WasmValue) {
-  const reference = value.reference;
-  if (reference !== undefined) {
-    const numericReference = Number(reference);
-    solDebugReferenceTypes.set(numericReference, typeId);
-    return {
-      name,
-      valueType: typeName,
-      display: value.summary ?? typeName,
-      expandable: true,
-      reference: numericReference,
-    };
-  }
-  return {
-    name,
-    valueType: typeName,
-    display: value.scalar ?? "nil",
-    expandable: false,
-    reference: null,
-  };
-}
-
-function solBreakpointFunction(sourceId: string): string {
-  // The typed compiler currently retains line maps per lowered function, not
-  // per source file. The entry source's user-visible breakpoint therefore
-  // maps to its required `main` function; imported functions can be targeted
-  // by their documented namespace-lowered name (for example `math.base.f`).
-  return sourceId === solDebugEntry ? "main" : sourceId;
 }
 
 function handleCanonicalLiveDebug(message: DebugRequest): boolean {
@@ -234,64 +184,26 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         luaDebugSession = null;
         typedDebugSession?.free();
         typedDebugSession = null;
-        solDebugSession?.free();
-        solDebugSession = null;
         session?.free();
         session = null;
         if (SOL_ENGINE_ENABLED && message.entry.endsWith(".lua") && names.every((name) => name.endsWith(".lua"))) {
           luaDebugSession = requireSolRuntime().WasmLuaDebugSession.launch_project(message.entry, names, contents);
-          solDebugEntry = null;
           post({ type: "debugLaunched", id: message.id });
           return;
         }
         if (isCanonicalSolProject(message.files, message.entry)) {
           const runtime = requireSolRuntime();
           typedDebugSession = runtime.WasmTypedDebugSession.launch_project(message.entry, names, contents);
-          solDebugEntry = message.entry;
-          solDebugCursor = 0;
-          solDebugStarted = false;
-          solDebugReferenceTypes.clear();
           session = null;
           post({ type: "debugLaunched", id: message.id });
           return;
         }
-        solDebugSession = null;
-        solDebugEntry = null;
         session = DebugSession.launch_project(names, contents, message.entry);
         post({ type: "debugLaunched", id: message.id });
         return;
       }
 
       case "debugContinue": {
-        if (solDebugSession) {
-          const canonical = requireSolDebugSession();
-          if (!solDebugStarted) {
-            solDebugStarted = true;
-            const result = canonical.run();
-            if (result.error) {
-              post({ type: "debugStopped", id: message.id, stop: solStop("exception", result.error) });
-              return;
-            }
-            const hit = canonical.first_breakpoint_hit();
-            if (hit !== undefined) {
-              solDebugCursor = hit;
-              post({ type: "debugStopped", id: message.id, stop: solStop("breakpoint") });
-              return;
-            }
-            solDebugCursor = Math.max(0, canonical.trace_length() - 1);
-            post({ type: "debugStopped", id: message.id, stop: solStop("terminated") });
-            return;
-          }
-          const hit = canonical.continue_to_breakpoint(solDebugCursor);
-          if (hit !== undefined) {
-            solDebugCursor = hit;
-            post({ type: "debugStopped", id: message.id, stop: solStop("breakpoint") });
-          } else {
-            solDebugCursor = Math.max(0, canonical.trace_length() - 1);
-            post({ type: "debugStopped", id: message.id, stop: solStop("terminated") });
-          }
-          return;
-        }
         const stop = requireSession().continue_();
         post({
           type: "debugStopped",
@@ -301,35 +213,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugContinueBurst": {
-        if (solDebugSession) {
-          const canonical = requireSolDebugSession();
-          if (!solDebugStarted) {
-            solDebugStarted = true;
-            const result = canonical.run();
-            if (result.error) {
-              post({
-                type: "debugBurst", id: message.id, stopped: true,
-                stop: solStop("exception", result.error), source: solDebugEntry, line: null,
-              });
-              return;
-            }
-            const hit = canonical.first_breakpoint_hit();
-            if (hit !== undefined) {
-              solDebugCursor = hit;
-              post({ type: "debugBurst", id: message.id, stopped: true, stop: solStop("breakpoint"), source: solDebugEntry, line: solStop("breakpoint").line });
-              return;
-            }
-          }
-          const burst = canonical.continue_burst(solDebugCursor, message.maxInstructions);
-          solDebugCursor = burst.index;
-          const stopped = burst.stopped || burst.exhausted;
-          post({
-            type: "debugBurst", id: message.id, stopped,
-            stop: stopped ? solStop(burst.stopped ? "breakpoint" : "terminated") : null,
-            source: solDebugEntry, line: solStop("step").line,
-          });
-          return;
-        }
         const burst = requireSession().continue_burst(message.maxInstructions);
         const stop = burst.stop;
         post({
@@ -343,12 +226,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugStepOver": {
-        if (solDebugSession) {
-          const next = requireSolDebugSession().step_over(solDebugCursor);
-          if (next !== undefined) solDebugCursor = next;
-          post({ type: "debugStopped", id: message.id, stop: solStop(next === undefined ? "terminated" : "step") });
-          return;
-        }
         const stop = requireSession().step_over();
         post({
           type: "debugStopped",
@@ -358,12 +235,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugStepInto": {
-        if (solDebugSession) {
-          const next = requireSolDebugSession().step_into(solDebugCursor);
-          if (next !== undefined) solDebugCursor = next;
-          post({ type: "debugStopped", id: message.id, stop: solStop(next === undefined ? "terminated" : "step") });
-          return;
-        }
         const stop = requireSession().step_into();
         post({
           type: "debugStopped",
@@ -373,12 +244,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugStepOut": {
-        if (solDebugSession) {
-          const next = requireSolDebugSession().step_out(solDebugCursor);
-          if (next !== undefined) solDebugCursor = next;
-          post({ type: "debugStopped", id: message.id, stop: solStop(next === undefined ? "terminated" : "step") });
-          return;
-        }
         const stop = requireSession().step_out();
         post({
           type: "debugStopped",
@@ -389,11 +254,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
 
       case "debugSetBreakpoint": {
-        if (solDebugSession) {
-          const bp = requireSolDebugSession().set_breakpoint(solBreakpointFunction(message.sourceId), message.line);
-          post({ type: "debugBreakpoint", id: message.id, breakpoint: { id: bp.id, sourceId: message.sourceId, line: bp.line, verified: bp.verified } });
-          return;
-        }
         const bp = requireSession().set_breakpoint(message.sourceId, message.line);
         post({
           type: "debugBreakpoint",
@@ -403,27 +263,21 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugRemoveBreakpoint": {
-        if (solDebugSession) requireSolDebugSession().remove_breakpoint(message.breakpointId);
-        else requireSession().remove_breakpoint(message.breakpointId);
+        requireSession().remove_breakpoint(message.breakpointId);
         post({ type: "debugAck", id: message.id });
         return;
       }
       case "debugSetBreakpointCondition": {
-        if (solDebugSession) requireSolDebugSession().set_breakpoint_condition(message.breakpointId, message.condition ?? undefined);
-        else requireSession().set_breakpoint_condition(message.breakpointId, message.condition ?? undefined);
+        requireSession().set_breakpoint_condition(message.breakpointId, message.condition ?? undefined);
         post({ type: "debugAck", id: message.id });
         return;
       }
       case "debugSetBreakpointHitCondition": {
-        if (solDebugSession) requireSolDebugSession().set_breakpoint_hit_condition(message.breakpointId, message.hitCondition ?? undefined);
-        else requireSession().set_breakpoint_hit_condition(message.breakpointId, message.hitCondition ?? undefined);
+        requireSession().set_breakpoint_hit_condition(message.breakpointId, message.hitCondition ?? undefined);
         post({ type: "debugAck", id: message.id });
         return;
       }
       case "debugSetBreakpointLogMessage": {
-        if (solDebugSession) {
-          throw new Error("canonical Sol debugger does not support breakpoint log messages");
-        }
         requireSession().set_breakpoint_log_message(
           message.breakpointId,
           message.logMessage ?? undefined,
@@ -433,11 +287,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
       }
 
       case "debugGetThreads": {
-        if (solDebugSession) {
-          const threads = requireSolDebugSession().threads().map((thread) => ({ id: thread.id, status: thread.status }));
-          post({ type: "debugThreads", id: message.id, threads });
-          return;
-        }
         const threads = requireSession()
           .get_threads()
           .map((t) => ({ id: t.id, status: t.status }));
@@ -445,22 +294,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetStackTrace": {
-        if (solDebugSession) {
-          if (message.threadId !== 0) {
-            post({ type: "debugStackTrace", id: message.id, frames: [] });
-            return;
-          }
-          const step = requireSolDebugSession().trace_step(solDebugCursor);
-          const frames = step ? [{
-            index: 0,
-            name: step.function_name,
-            source: solDebugEntry ?? "main.sol",
-            line: step.line,
-            functionType: "sol",
-          }] : [];
-          post({ type: "debugStackTrace", id: message.id, frames });
-          return;
-        }
         const frames = requireSession()
           .get_stack_trace(message.threadId)
           .map((f) => ({
@@ -474,19 +307,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetLocals": {
-        if (solDebugSession) {
-          const locals = message.threadId === 0 && message.frameIndex === 0
-            ? requireSolDebugSession().locals_at(solDebugCursor) ?? []
-            : [];
-          const variables = locals.map((local) => solVariable(
-            `local${local.local_id}`,
-            local.type_name,
-            local.type_id,
-            local.value,
-          ));
-          post({ type: "debugVariables", id: message.id, variables });
-          return;
-        }
         const variables = requireSession()
           .get_locals(message.threadId, message.frameIndex)
           .map((v) => ({
@@ -500,10 +320,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetUpvalues": {
-        if (solDebugSession) {
-          post({ type: "debugVariables", id: message.id, variables: [] });
-          return;
-        }
         const variables = requireSession()
           .get_upvalues(message.threadId, message.frameIndex)
           .map((v) => ({
@@ -517,10 +333,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetGlobals": {
-        if (solDebugSession) {
-          post({ type: "debugVariables", id: message.id, variables: [] });
-          return;
-        }
         const variables = requireSession()
           .get_globals()
           .map((v) => ({
@@ -534,17 +346,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetTableEntries": {
-        if (solDebugSession) {
-          const typeId = solDebugReferenceTypes.get(message.reference);
-          const entries = typeId === undefined
-            ? []
-            : requireSolDebugSession().expand(typeId, BigInt(message.reference)) ?? [];
-          const variables = entries
-            .slice(message.start, message.start + message.count)
-            .map((entry) => solVariable(entry.label, entry.type_name, entry.type_id, entry.value));
-          post({ type: "debugVariables", id: message.id, variables });
-          return;
-        }
         const variables = requireSession()
           .get_table_entries(message.reference, message.start, message.count)
           .map((v) => ({
@@ -558,23 +359,12 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugGetMetatable": {
-        if (solDebugSession) {
-          post({ type: "debugMetatable", id: message.id, reference: null });
-          return;
-        }
         const reference = requireSession().get_metatable(message.reference);
         post({ type: "debugMetatable", id: message.id, reference: reference ?? null });
         return;
       }
 
       case "debugEvaluate": {
-        if (solDebugSession) {
-          const result = message.threadId === 0 && message.frameIndex === 0
-            ? requireSolDebugSession().evaluate(solDebugCursor, message.expression)
-            : { ok: false, display: "canonical Sol debugger has only frame 0 on thread 0" };
-          post({ type: "debugEvalResult", id: message.id, result: { ok: result.ok, display: result.display } });
-          return;
-        }
         const result = requireSession().evaluate(
           message.threadId,
           message.expression,
@@ -588,10 +378,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugSetVariable": {
-        if (solDebugSession) {
-          post({ type: "debugEvalResult", id: message.id, result: { ok: false, display: "canonical Sol debugger does not support variable mutation" } });
-          return;
-        }
         const result = requireSession().set_variable(
           message.threadId,
           message.frameIndex,
@@ -606,20 +392,11 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugTakeOutput": {
-        if (solDebugSession) {
-          post({ type: "debugOutput", id: message.id, text: "" });
-          return;
-        }
         const text = requireSession().take_output();
         post({ type: "debugOutput", id: message.id, text });
         return;
       }
       case "debugGetMemoryStats": {
-        if (solDebugSession) {
-          const stats = requireSolDebugSession().memory_stats();
-          post({ type: "debugMemoryStats", id: message.id, stats: { totalAllocation: stats.live_bytes, gcAllocation: stats.live_bytes, externalAllocation: 0, allocationDebt: 0 } });
-          return;
-        }
         const stats = requireSession().get_memory_stats();
         post({
           type: "debugMemoryStats",
@@ -634,13 +411,6 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
         return;
       }
       case "debugForceGc": {
-        if (solDebugSession) {
-          const canonical = requireSolDebugSession();
-          canonical.force_gc();
-          const stats = canonical.memory_stats();
-          post({ type: "debugMemoryStats", id: message.id, stats: { totalAllocation: stats.live_bytes, gcAllocation: stats.live_bytes, externalAllocation: 0, allocationDebt: 0 } });
-          return;
-        }
         requireSession().force_gc();
         const stats = requireSession().get_memory_stats();
         post({
@@ -672,14 +442,15 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
           return;
         }
         if (isCanonicalSolProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmDebugSession.launch_project(message.entry, names, contents);
-          const stats = canonical.profile().map((stat) => ({
-            functionId: stat.function_name,
-            calls: stat.calls,
-            totalInstructions: stat.total_instructions,
-            selfInstructions: stat.self_instructions,
-          }));
-          post({ type: "profileResult", id: message.id, stats });
+          const canonical = requireSolRuntime().WasmTypedDebugSession.launch_project(message.entry, names, contents);
+          try {
+            const stats = canonical.profile().map((stat) => {
+              const value = { functionId: stat.function_name, calls: stat.calls,
+                totalInstructions: stat.total_instructions, selfInstructions: stat.self_instructions };
+              stat.free(); return value;
+            });
+            post({ type: "profileResult", id: message.id, stats });
+          } finally { canonical.free(); }
           return;
         }
         const stats = profile_project(names, contents, message.entry).map((s) => ({
@@ -711,20 +482,19 @@ self.onmessage = async (event: MessageEvent<DebugRequest>) => {
           return;
         }
         if (isCanonicalSolProject(message.files, message.entry)) {
-          const canonical = requireSolRuntime().WasmDebugSession.launch_project(message.entry, names, contents);
-          const rawEvents = canonical.record_timeline();
-          const events = rawEvents.slice(0, message.maxEvents).map((event, index) => ({
-            eventType: event.kind,
-            source: message.entry,
-            line: null,
-            local0: null,
-            duration: index === 0 ? event.step_index : event.step_index - rawEvents[index - 1].step_index,
-          }));
-          post({
-            type: "timelineResult",
-            id: message.id,
-            timeline: { events, truncated: rawEvents.length > message.maxEvents, error: null },
-          });
+          const canonical = requireSolRuntime().WasmTypedDebugSession.launch_project(message.entry, names, contents);
+          try {
+            const result = canonical.record_timeline(message.maxEvents);
+            try {
+              const events = result.events.map((event) => {
+                const mapped = { eventType: event.event_type, source: event.source,
+                  line: event.line ?? null, local0: event.local0 ?? null, duration: event.duration };
+                event.free(); return mapped;
+              });
+              post({ type: "timelineResult", id: message.id,
+                timeline: { events, truncated: result.truncated, error: result.error ?? null } });
+            } finally { result.free(); }
+          } finally { canonical.free(); }
           return;
         }
         const result = record_timeline_project(names, contents, message.entry, message.maxEvents);

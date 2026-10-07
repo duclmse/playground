@@ -44,9 +44,9 @@ pub struct LuaTimelineEvent {
 
 #[wasm_bindgen]
 pub struct LuaTimeline {
-    events: Vec<LuaTimelineEvent>,
-    truncated: bool,
-    error: Option<String>,
+    pub(super) events: Vec<LuaTimelineEvent>,
+    pub(super) truncated: bool,
+    pub(super) error: Option<String>,
 }
 #[wasm_bindgen]
 impl LuaTimeline {
@@ -284,9 +284,9 @@ impl WasmLuaDebugSession {
             .into_iter()
             .map(|stat| WasmFunctionStats {
                 function_name: stat.name,
-                calls: stat.calls,
-                self_instructions: stat.self_instructions,
-                total_instructions: stat.total_instructions,
+                calls: stat.calls as f64,
+                self_instructions: stat.self_instructions as f64,
+                total_instructions: stat.total_instructions as f64,
             })
             .collect())
     }
